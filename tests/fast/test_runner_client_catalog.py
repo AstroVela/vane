@@ -19,7 +19,6 @@ def no_runner(monkeypatch):
         raise AssertionError("client catalog handling must precede runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
 
 
 @pytest.mark.parametrize("runner_type", ["ray", "local-fast"])
@@ -368,17 +367,17 @@ def test_explicit_plan_factories_reject_temporary_tables(monkeypatch, no_runner,
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
-def test_local_fte_copy_rejects_temporary_sources(monkeypatch, no_runner, tmp_path, entry):
-    monkeypatch.setenv("VANE_RUNNER", "local")
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_native_local_copy_accepts_temporary_sources(monkeypatch, no_runner, tmp_path, entry, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
     path = tmp_path / "temporary.parquet"
     with vane.connect() as connection:
-        connection.execute("CREATE TEMP TABLE source(value INTEGER)")
-        with pytest.raises(vane.NotImplementedException, match="temporary table"):
-            if entry == "relation":
-                connection.table("source").write_parquet(str(path))
-            else:
-                getattr(connection, entry)(f"COPY source TO '{path}' (FORMAT PARQUET)")
-    assert not path.exists()
+        connection.execute("CREATE TEMP TABLE source AS SELECT 7 AS value")
+        if entry == "relation":
+            connection.table("source").write_parquet(str(path))
+        else:
+            getattr(connection, entry)(f"COPY source TO '{path}' (FORMAT PARQUET)")
+        assert connection.read_parquet(str(path)).fetchall() == [(7,)]
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
@@ -386,9 +385,8 @@ def test_native_temporary_table_reads_remain_available(monkeypatch, no_runner, r
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         connection.execute("CREATE TEMP TABLE source(value INTEGER)")
-        if runner_type == "local-fast":
-            connection.execute("INSERT INTO source VALUES (7)")
-        assert connection.table("source").fetchall() == ([(7,)] if runner_type == "local-fast" else [])
+        connection.execute("INSERT INTO source VALUES (7)")
+        assert connection.table("source").fetchall() == [(7,)]
 
 
 def test_temporary_arrow_views_remain_transportable(ray_local, monkeypatch):

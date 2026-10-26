@@ -128,7 +128,7 @@ def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_ty
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 @pytest.mark.parametrize(
     "runner_type, operation",
-    [("ray", "select"), *[(runner, op) for runner in ["local", "ray"] for op in ["copy", "insert", "ctas"]]],
+    [("ray", op) for op in ["select", "copy", "insert", "ctas"]],
 )
 @pytest.mark.parametrize(
     "expression",
@@ -149,7 +149,6 @@ def test_runner_rejects_bound_database_effects_in_autocommit(
         raise AssertionError("bound effects must be rejected before initializing a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     database = str(tmp_path / "bind_effects.duckdb")
     destination = tmp_path / "rejected.parquet"
     with vane.connect(database) as connection:
@@ -165,11 +164,6 @@ def test_runner_rejects_bound_database_effects_in_autocommit(
         }[operation]
         message = "database-modifying expressions"
         errors = (vane.NotImplementedException,)
-        if runner_type == "local" and operation in {"insert", "ctas"}:
-            # Local FTE can reject the terminal itself before inspecting a
-            # runtime lambda body; it does not support these table writes.
-            message += "|requires a ray or local-fast connection"
-            errors += (vane.InvalidInputException,)
         with pytest.raises(errors, match=message):
             result = _run_sql_entry(connection, entry, query)
             if result is not None:
@@ -218,7 +212,7 @@ def test_native_read_binding_keeps_table_argument_effects(monkeypatch, runner_ty
         connection.commit()
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 @pytest.mark.parametrize("query", ["CALL checkpoint()", "CALL range(3)"])
 def test_sql_call_is_not_dispatched_as_a_distributed_read(monkeypatch, runner_type, entry, query):
@@ -228,7 +222,6 @@ def test_sql_call_is_not_dispatched_as_a_distributed_read(monkeypatch, runner_ty
         raise AssertionError("SQL CALL must fail before runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     with vane.connect() as connection:
         with pytest.raises(vane.NotImplementedException, match="SQL CALL"):
             if entry == "executemany":
@@ -249,7 +242,7 @@ def _run_sql_entry(connection, entry, query, query_relation=None):
     return getattr(connection, entry)(query)
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 @pytest.mark.parametrize("transactional", [False, True])
 @pytest.mark.parametrize(
@@ -271,7 +264,6 @@ def test_rejected_wrappers_do_not_bind_effectful_arguments(
         raise AssertionError("unsupported wrappers must fail before runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     database = str(tmp_path / "wrappers.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
@@ -292,7 +284,7 @@ def test_rejected_wrappers_do_not_bind_effectful_arguments(
             assert inspector.table("followup").fetchall() == []
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 @pytest.mark.parametrize("operation", ["copy_from", "client_context", "insert"])
 def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_path, runner_type, entry, operation):
@@ -302,7 +294,6 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
         raise AssertionError("admission rejection must precede runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     source = tmp_path / "input.csv"
     source.write_text("value\n1\n")
     destination = tmp_path / "rejected.parquet"
@@ -316,9 +307,7 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
         query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
         connection.begin()
         connection.execute("CREATE TABLE marker(value INTEGER)")
-        with pytest.raises(
-            vane.BinderException, match="COPY FROM|client metadata|requires a ray or local-fast|auto-commit"
-        ):
+        with pytest.raises(vane.BinderException, match="COPY FROM|client metadata|auto-commit"):
             _run_sql_entry(connection, entry, query, query_relation)
         connection.execute("CREATE TABLE followup(value INTEGER)")
         connection.commit()
@@ -337,7 +326,6 @@ def test_direct_client_pragmas_keep_native_execution(monkeypatch, runner_type):
         raise AssertionError("client PRAGMA queries must stay native")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     with vane.connect() as connection:
         connection.begin()
         connection.execute("CREATE TABLE marker(value INTEGER)")
@@ -374,7 +362,6 @@ def test_pragma_control_commands_stay_on_the_client(monkeypatch, runner_type, en
         raise AssertionError("PRAGMA control commands must not initialize a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     with vane.connect() as connection:
         for query in ["PRAGMA threads=1", "PRAGMA enable_profiling", "PRAGMA disable_profiling"]:
             result = getattr(connection, entry)(query)
@@ -392,7 +379,6 @@ def test_query_pragmas_observe_the_client_catalog(monkeypatch, runner_type, entr
         raise AssertionError("client catalog inspection must not initialize a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     with vane.connect() as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
         connection.execute("ATTACH ':memory:' AS client_catalog")
@@ -413,7 +399,6 @@ def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypa
         raise AssertionError("VACUUM and ANALYZE must stay on the client connection")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     database = str(tmp_path / "maintenance.duckdb")
     with vane.connect(database) as inspector:
@@ -490,7 +475,7 @@ def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch
     assert not destination.exists()
 
 
-@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("runner_type", ["ray"])
 @pytest.mark.parametrize("entry", ["execute", "sql"])
 def test_native_controls_can_disable_query_verification(monkeypatch, tmp_path, runner_type, entry):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
@@ -499,7 +484,6 @@ def test_native_controls_can_disable_query_verification(monkeypatch, tmp_path, r
         raise AssertionError("verification rejection and native controls must precede runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
     database = str(tmp_path / "verification.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")

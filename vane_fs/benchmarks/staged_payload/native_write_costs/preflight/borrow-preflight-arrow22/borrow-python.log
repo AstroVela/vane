@@ -1,0 +1,19 @@
+
+==================================== ERRORS ====================================
+_____________________ ERROR collecting tests/test_vane.py ______________________
+/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_vane.py:17: in <module>
+    vane = pytest.importorskip("vane")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane/__init__.py:268: in <module>
+    from vane._tensor import tensor, tensor_array, tensor_data, tensor_shape
+/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane/_tensor.py:135: in <module>
+    pa.unregister_extension_type(_EXTENSION_NAME)
+pyarrow/types.pxi:2280: in pyarrow.lib.unregister_extension_type
+    ???
+pyarrow/error.pxi:92: in pyarrow.lib.check_status
+    ???
+E   pyarrow.lib.ArrowKeyError: No type extension with name arrow.variable_shape_tensor found
+=========================== short test summary info ============================
+ERROR ../home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_vane.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 1.53s

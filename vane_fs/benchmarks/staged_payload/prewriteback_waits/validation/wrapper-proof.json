@@ -1,0 +1,31 @@
+{
+  "status": "PASS",
+  "original_sha256": "7020ea9c6456872684697c03bc8e0562f5986f887572144a7a166c56f345afa4",
+  "exact_reverse": true,
+  "changes": [
+    [
+      "template = Path(build[\"parent\"]) / \"fuse-screen\"",
+      "template = Path(build[\"template\"])"
+    ],
+    [
+      "replace(\"(1 if args.diagnostic else 3)\", \"(2 if args.diagnostic else 3)\")",
+      "replace('m.ORDERS = m.FIRST = [[\"baseline\", \"updated\"], [\"updated\", \"baseline\"]] * 3', 'm.ORDERS = m.FIRST = [[\"baseline\", \"updated\"], [\"updated\", \"baseline\"]] * 2')"
+    ],
+    [
+      "    replace(\"import types\", \"import types\\nimport threading\")",
+      "    replace(\"import types\", \"import types\\nimport threading\")\n    replace('assert not args.diagnostic, \"Ordinary uninstrumented components only\"', 'assert args.diagnostic, \"Diagnostic components only\"')"
+    ],
+    [
+      "interpretation=\"Borrowed input buffers in matched format-1004 FUSE components on ext4; native CPU screen is separate\",",
+      "interpretation=\"Advisory 64 MiB payload prewriteback: full ordinary FUSE window; both formats 1005\","
+    ],
+    [
+      "interpretation=\"Wait attribution for both frozen buffer implementations; original FUSE gate failures remain\",",
+      "interpretation=\"Advisory prewriteback FULL/read attribution; all original 4 ordinary FUSE failures remain\","
+    ],
+    [
+      "(out / \"workload.py\").write_bytes((template / \"workload.py\").read_bytes())",
+      "workload_source = (template / \"workload.py\").read_text()\n    read_changes = [\n        ('        count = 0\\n        while b := os.read(fd, MIB):', '        read_begin_ns = time.monotonic_ns()\\n        count = 0\\n        while b := os.read(fd, MIB):'),\n        ('            count += len(b)\\n        seconds = time.perf_counter() - t', '            count += len(b)\\n        read_end_ns = time.monotonic_ns()\\n        seconds = time.perf_counter() - t'),\n        ('                \"workload\": \"read_64\",', '                \"workload\": \"read_64\",\\n                \"application_begin_ns\": read_begin_ns,\\n                \"application_end_ns\": read_end_ns,\\n                \"application_pid\": os.getpid(),'),\n    ]\n    read_reverse = workload_source\n    for before, after in read_changes:\n        assert workload_source.count(before) == 1, before\n        workload_source = workload_source.replace(before, after)\n    read_reverse = workload_source\n    for before, after in reversed(read_changes):\n        assert read_reverse.count(after) == 1\n        read_reverse = read_reverse.replace(after, before)\n    assert read_reverse == (template / \"workload.py\").read_text()\n    (out / \"workload.py\").write_text(workload_source)\n    save(out / \"read-workload-proof.json\", dict(status=\"PASS\", exact_reverse=True, changes=read_changes, original_sha256=digest(template / \"workload.py\")))"
+    ]
+  ]
+}

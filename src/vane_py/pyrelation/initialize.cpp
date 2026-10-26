@@ -34,6 +34,9 @@ static void InitializeReadOnlyProperties(py::class_<DuckDBPyRelation> &m) {
 
 static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	m.def("execute", &DuckDBPyRelation::Execute, "Transform the relation into a result set")
+	    .def("execute_result", &DuckDBPyRelation::ExecuteResult,
+	         "Execute with the configured local runtime and return a managed result", py::kw_only(),
+	         py::arg("delivery_timeout") = py::none(), py::arg("stream") = false, py::arg("rows_per_batch") = 2048)
 	    .def("close", &DuckDBPyRelation::Close, "Closes the result");
 	m.def(
 	    "write_datasink",
@@ -68,6 +71,8 @@ static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	DefineMethod({"to_file", "write_file"}, m, &DuckDBPyRelation::ToFile,
 	             "Write the relation object with a registered DuckDB COPY format", py::arg("file_name"), py::kw_only(),
 	             py::arg("format"));
+	m.def("_write_file_batch", &DuckDBPyRelation::WriteFileBatch, py::arg("connection"), py::arg("path"),
+	      py::arg("format"), py::arg("compression") = py::none(), py::arg("partition_by") = vector<string> {});
 
 	m.def("fetchone", &DuckDBPyRelation::FetchOne, "Execute and fetch a single row as a tuple")
 	    .def("fetchmany", &DuckDBPyRelation::FetchMany, "Execute and fetch the next set of rows as a list of tuples",
@@ -327,6 +332,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	                    "Return the Arrow schema without executing the relation");
 	relation_module.def("_validate_datasink_transaction", &DuckDBPyRelation::ValidateDataSinkTransaction);
 	relation_module.def("_get_runner_type", &DuckDBPyRelation::GetRunnerType);
+	relation_module.def("_collect_local_resource_graph", &DuckDBPyRelation::CollectLocalResourceGraph,
+	                    "Bind and plan native resource metadata without executing the relation");
 	relation_module.def("_run_datasink", &DuckDBPyRelation::RunDataSink);
 	relation_module.def("_validate_datasink_retry_input", &DuckDBPyRelation::ValidateDataSinkRetryInput);
 	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
@@ -372,7 +379,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    "declared Tensor shape before checked element conversion, including tensors nested in containers. "
 	    "NumPy, pandas and cuDF outputs must use the selected format. The default pyarrow "
 	    "format also accepts existing dict outputs. batch_size controls each UDF call. Ordinary synchronous Ray "
-	    "Actor map_batches may group several complete compute batches into one transport task using the input "
+	    "and local Actor map_batches may group several complete compute batches into one transport task using the "
+	    "input "
 	    "byte budget; ready Actors can receive smaller complete batches immediately. Input end and byte pressure "
 	    "drain short tails. Explicit min_task_batch_size retains its upstream-block soft-minimum semantics. "
 	    "Retrying Task and Actor "

@@ -23,10 +23,18 @@ jobs:
   native-and-mounted-filesystem:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sqlite_sync: fsync
+            triplet: x64-linux-release
+          - sqlite_sync: fdatasync
+            triplet: x64-linux-fdatasync-release
     env:
       VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
-      CMAKE_PREFIX_PATH: ${{ github.workspace }}/vane_fs/vcpkg_installed/x64-linux-release
+      CMAKE_PREFIX_PATH: ${{ github.workspace }}/vane_fs/vcpkg_installed/${{ matrix.triplet }}
       VANE_FS_MOUNT_BINARY: ${{ github.workspace }}/vane_fs/build/core/vane-fs-mount
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -47,7 +55,7 @@ jobs:
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: .cache/vcpkg-archives
-          key: vane-fs-sqlite-${{ runner.os }}-${{ hashFiles('vane_fs/vcpkg.json') }}
+          key: vane-fs-sqlite-${{ runner.os }}-${{ matrix.triplet }}-${{ hashFiles('vane_fs/vcpkg.json', 'vane_fs/triplets/*.cmake') }}
       - name: Build the pinned SQLite dependency
         run: |
           baseline="$(python -c 'import json; print(json.load(open("vane_fs/vcpkg.json"))["builtin-baseline"])')"
@@ -56,13 +64,15 @@ jobs:
           "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
           "$VCPKG_ROOT/vcpkg" install \
             --x-manifest-root="$PWD/vane_fs" --x-install-root="$PWD/vane_fs/vcpkg_installed" \
-            --triplet=x64-linux-release --host-triplet=x64-linux-release \
+            --overlay-triplets="$PWD/vane_fs/triplets" \
+            --triplet="${{ matrix.triplet }}" --host-triplet=x64-linux-release \
             --clean-buildtrees-after-build --clean-packages-after-build
           python -I scripts/check_copyleft.py
       - name: Build and test the C++ core and mount executable
         run: |
           cmake -S vane_fs -B vane_fs/build/core -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+            -DVANE_FS_TEST_SQLITE_SYNC="${{ matrix.sqlite_sync }}" \
             -DVANE_FS_BUILD_TOOLS=ON -DVANE_FS_BUILD_FUSE=ON
           cmake --build vane_fs/build/core -j 2
           ctest --test-dir vane_fs/build/core --output-on-failure
@@ -80,7 +90,7 @@ jobs:
               names = source.getnames()
           excluded = {"build", "vcpkg_installed", ".venv", ".cache", "__pycache__"}
           assert not any(excluded.intersection(pathlib.PurePosixPath(name).parts) for name in names), names
-          required = {"src/owner_lock.hpp", "src/fuse.cpp", "src/native_reader.cpp", "src/native_reader.hpp", "include/vane_fs/reader_abi.h", "tests/test_crash.cpp", "benchmarks/run.py"}
+          required = {"src/owner_lock.hpp", "src/fuse.cpp", "src/native_reader.cpp", "src/native_reader.hpp", "include/vane_fs/reader_abi.h", "tests/test_crash.cpp", "tests/test_sync_syscalls.cpp", "triplets/x64-linux-fdatasync-release.cmake", "benchmarks/run.py"}
           prefix = archive.name.removesuffix(".tar.gz")
           assert all(f"{prefix}/{name}" in names for name in required), names
           PY
@@ -96,6 +106,7 @@ jobs:
         run: |
           cmake -S vane_fs -B vane_fs/build/sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+            -DVANE_FS_TEST_SQLITE_SYNC="${{ matrix.sqlite_sync }}" \
             -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
             -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
           cmake --build vane_fs/build/sanitize -j 2
@@ -107,7 +118,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: vane-fs-validation
+          name: vane-fs-validation-${{ matrix.sqlite_sync }}
           path: |
             vane_fs/build/tests.xml
             vane_fs/build/core/Testing/Temporary/LastTest.log

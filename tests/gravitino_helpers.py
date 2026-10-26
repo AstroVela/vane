@@ -5,14 +5,18 @@
 
 import copy
 import gzip
+import hashlib
 import json
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 
 def serve_gravitino(state, ready):
+    uploads = {}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
@@ -114,7 +118,68 @@ def serve_gravitino(state, ready):
             state["object_requests"].append((self.command, self.headers.get("Authorization")))
             request = urlsplit(self.path)
             objects = {"object.txt": state["object"], **dict(state["objects"])}
-            query = parse_qs(request.query)
+            query = parse_qs(request.query, keep_blank_values=True)
+            key = unquote(request.path.removeprefix("/bucket/"))
+            state["object_paths"].append((self.command, key))
+            fault = state["object_fault"]
+            if fault == "marker-unknown" and key.endswith("/committed"):
+                if self.command == "PUT":
+                    state["objects"][key] = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if key in state["objects"]:
+                    return self.respond(503, {"error": "injected marker response/readback failure"})
+            if fault == "manifest-write" and key.endswith("/manifest.txt") and self.command in ("PUT", "POST"):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                return self.respond(503, {"error": "injected manifest publication failure"})
+            if (
+                fault == "result-read"
+                and key.endswith("/manifest.txt")
+                and self.command == "GET"
+                and key.removesuffix("manifest.txt") + "committed" in state["objects"]
+            ):
+                return self.respond(503, {"error": "injected post-commit manifest read failure"})
+            if self.command in ("PUT", "POST", "DELETE"):
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = self.rfile.read(length)
+                upload_id = query.get("uploadId", [""])[0]
+                if self.command == "POST" and "uploads" in query:
+                    upload_id = uuid.uuid4().hex
+                    uploads[upload_id] = {}
+                    root = Element("InitiateMultipartUploadResult")
+                    SubElement(root, "Bucket").text = "bucket"
+                    SubElement(root, "Key").text = key
+                    SubElement(root, "UploadId").text = upload_id
+                elif self.command == "PUT" and upload_id:
+                    uploads[upload_id][int(query["partNumber"][0])] = payload
+                    root = None
+                elif self.command == "POST" and upload_id:
+                    parts = uploads.pop(upload_id)
+                    payload = b"".join(parts[number] for number in sorted(parts))
+                    state["objects"][key] = payload
+                    root = Element("CompleteMultipartUploadResult")
+                    SubElement(root, "Bucket").text = "bucket"
+                    SubElement(root, "Key").text = key
+                    SubElement(root, "ETag").text = '"fixture-etag"'
+                elif self.command == "PUT":
+                    state["objects"][key] = payload
+                    root = None
+                else:
+                    if upload_id:
+                        uploads.pop(upload_id, None)
+                    else:
+                        state["objects"].pop(key, None)
+                    root = None
+                if fault == "pause-data" and key.endswith((".parquet", ".csv")) and key in state["objects"]:
+                    state["object_blocked"] = key
+                    deadline = time.monotonic() + 30
+                    while state["object_fault"] == "pause-data" and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                body = tostring(root) if root is not None else b""
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("ETag", '"' + hashlib.md5(payload, usedforsecurity=False).hexdigest() + '"')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if "list-type" in query:
                 root = Element("ListBucketResult")
                 SubElement(root, "IsTruncated").text = "false"
@@ -128,7 +193,6 @@ def serve_gravitino(state, ready):
                         SubElement(item, "LastModified").text = "2026-09-29T00:00:00.000Z"
                 body = tostring(root)
             else:
-                key = unquote(request.path.removeprefix("/bucket/"))
                 if key not in objects:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")

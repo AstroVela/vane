@@ -20,6 +20,7 @@ struct DataSourceStreamFactory {
 
 	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
+	~DataSourceStreamFactory();
 
 	//! Unpickle a task and create its cancellable, scheduler-aware batch stream.
 	static unique_ptr<DataSourceStream> ProduceStream(const char *pickled_task, idx_t pickled_len,
@@ -52,8 +53,7 @@ idx_t ReleaseDataSourceFactoriesForQuery(const string &query_id);
 //! Return process-local registry diagnostics used by lifecycle regression tests.
 py::dict DataSourceFactoryRegistryStateForTest();
 
-//! Register global callbacks on DataSourceScanFunction.
-//! Call once from Python module init.
-void RegisterDataSourceGlobalCallbacks();
+//! Install the Python source runtime on the connection's database.
+void RegisterDataSourceCallbacks(DatabaseInstance &db);
 
 } // namespace duckdb

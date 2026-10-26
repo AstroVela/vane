@@ -17,9 +17,9 @@ from vane_fs import Workspace, register_workspace, snapshot_url, unregister_work
 vane = pytest.importorskip("vane")
 
 
-@pytest.fixture
-def native(tmp_path, monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.fixture(params=["local", "local-fast"])
+def native(request, tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", request.param)
     database = tmp_path / "workspace.sqlite"
     with Workspace(database) as workspace, vane.connect() as connection:
         main = workspace.checkout()
@@ -300,7 +300,7 @@ def test_literal_unicode_and_percent_paths(native):
     workspace.drop_snapshot(frozen)
 
 
-def test_registration_validates_provider_and_requires_local_fast(native, tmp_path, monkeypatch):
+def test_registration_validates_provider_and_supports_ray(native, tmp_path, monkeypatch):
     workspace, connection, database, _, _ = native
     with pytest.raises(vane.InvalidInputException, match="capsule"):
         connection._register_vane_fs(object())
@@ -316,8 +316,7 @@ def test_registration_validates_provider_and_requires_local_fast(native, tmp_pat
     assert not (tmp_path / "missing.sqlite").exists()
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as other:
-        with pytest.raises(vane.InvalidInputException, match="local-fast"):
-            register_workspace(other, database)
+        assert register_workspace(other, database) == workspace.id
     # Re-registering is safe, including for an already registered workspace.
     assert register_workspace(connection, database) == workspace.id
 

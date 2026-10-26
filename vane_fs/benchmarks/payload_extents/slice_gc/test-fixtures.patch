@@ -1,0 +1,7 @@
+--- a/tests/test_extents.py
++++ b/tests/test_extents.py
+@@ -110,2 +110,2 @@
+-    # One dead 4 KiB slice cannot release a still-referenced immutable extent.
+-    assert sql(path, "", "SELECT sum(length(data)) FROM block_payloads") == [[extent + 4096]]
++    # GC repacks the surviving original slices and preserves the replacement block.
++    assert sql(path, "", "SELECT sum(length(data)) FROM block_payloads") == [[extent]]

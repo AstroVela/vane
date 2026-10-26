@@ -1,0 +1,53 @@
+{
+  "status": "FROZEN_BEFORE_DIAGNOSTIC_WINDOW",
+  "frozen_epoch": 1791877705.6732502,
+  "parent": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-progress-20261012T153141Z/fuse-screen",
+  "medium": "ext4",
+  "states": [
+    "fresh",
+    "post_gc"
+  ],
+  "orders": [
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ]
+  ],
+  "mounts": 16,
+  "baseline_role": "Original 5 ms CLEAN policy versus selective pre-OPEN backfill",
+  "variant_gc_python_modules": {
+    "baseline": {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4"
+    },
+    "updated": {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "5c1b975c307aabf74764433f6bde42a44d052245579abc799977093b41e1a0df"
+    }
+  },
+  "variant_logic_unchanged_by_instrumentation": true,
+  "nominal_cpu_sample_interval_ms": 5,
+  "frequency_or_affinity_changes": false,
+  "global_cache_eviction": false,
+  "owned_build_or_test_overlap": false,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_request_costs/run.py": "c31f0e1e84062e8bbf58d76b30708e6a5bb5c48d5d13f450959e21ad29366b64",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-progress-20261012T153141Z/fuse-screen/run_fuse.py": "d556c34026b2f3c56019fc198f6018089a7b47a49b57425afcc1d2f3fefe722b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-progress-20261012T153141Z/fuse-screen/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/request_costs/sample_cpu.py": "34a0df98daf2c4ae3a77212ffe67b0c67d6668b8cc8728b7f3831fdb785a0f7b"
+  },
+  "prepared_runner_sha256": "83737cd25601cbc551d1b9589b67c1d786b0793f87af3fd3d208277fbf54be01",
+  "prepared_workload_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+}

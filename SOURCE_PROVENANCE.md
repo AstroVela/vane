@@ -34,9 +34,14 @@ The `integration/duckdb-2.0` baseline imports the official v2.0.0 tag at commit
 `d54cbbe3df17e8e5ce68312f483b4155836112aa`. The complete `external/duckdb` tree
 matches the official Git tree `c671df12df7e48e80306cb6a42d4761417c01695`,
 including file modes and upstream license notices. No Vane engine changes are
-included in this initial snapshot. The preceding Vane implementation remains
-available at commit `95acdea830eb1fff407f0e09f4b97ee7b0a02e83`; its Python
-bindings and other root-level integration code have not yet been migrated.
+included in this initial snapshot. The current Vane migration reference is
+`main` at commit `06cfbd5cc39f8b2c19531676f2bdcfff64e1a6e4`. Its Vane-owned
+code and tests are synchronized into the integration branch, but its 1.5.5
+engine customizations remain migration inputs; neither pristine 2.0 subtree
+contains them. The initial import started from the older Vane commit
+`95acdea830eb1fff407f0e09f4b97ee7b0a02e83`. Both references and the original
+subtree import ancestry are preserved. Root build and Python binding
+integration with 2.0 remains pending.
 See [the migration roadmap](DUCKDB_2_MIGRATION_DESIGN.md#roadmap-and-acceptance-criteria)
 and [the current build status](DEVELOPMENT.md#duckdb-20-integration-baseline).
 
@@ -44,11 +49,14 @@ The previous squashed subtree snapshot was imported from the official v1.5.0 tag
 commit `3a3967aa8190d0a2d1931d4ca4f5d920760030b4`. The reviewed maintenance
 history through the official v1.5.5 tag at commit
 `d8cdaa33fda8df955cc76ef58a280f68f4cd43fa` and Vane's customizations are
-preserved in the history preceding the 2.0 import.
+preserved in main's history through the current migration reference above.
 
-Those historical engine customizations include binding supplied SQL parameters
-on query relations for distributed plan transport; those changes retain
-DuckDB's MIT license. They are migration inputs, not part of the pure 2.0 tree.
+The 1.5.5 engine customizations in the current Vane reference include binding
+supplied SQL parameters on query relations for distributed plan transport and
+taking pending-query progress snapshots under the client context lock so query
+cleanup cannot invalidate progress readers. Those changes retain DuckDB's MIT
+license. They are preserved in Git history as migration inputs, not part of
+the pure 2.0 tree.
 The former `AstroVela/duckdb` history maps to Vane as follows:
 
 | Former fork commit | Parent | Corresponding Vane commit |

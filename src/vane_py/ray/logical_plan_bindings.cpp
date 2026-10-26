@@ -112,6 +112,7 @@ struct PyLogicalPlan {
 	py::object source_connection_ = py::none();
 	py::object udf_registrations_ = py::none();
 	py::object connection_snapshot_ = py::none();
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins_ = CreateVaneFSQueryPins();
 	// Query-owned Ray ObjectRefs for Arrow snapshots. The plan contains only
 	// compact datasource task descriptors that refer to these objects.
 	py::object memory_source_refs_ = py::none();
@@ -132,6 +133,7 @@ struct PyLogicalPlan {
 struct SerializedLogicalPlanResult {
 	string serialized_plan;
 	py::object memory_source_refs = py::none();
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins;
 };
 
 struct PythonMemorySourceCacheKey {
@@ -572,6 +574,7 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared
 		                            "explicit transaction");
 	}
 	SerializedLogicalPlanResult result;
+	VaneFSQueryPinScope vane_fs_pins(*context);
 	context->RunFunctionInTransaction([&]() {
 		auto statement_binder = Binder::CreateBinder(*context);
 		auto statement = make_uniq<RelationStatement>(rel, *statement_binder);
@@ -588,6 +591,7 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared
 		auto bound = AdmitRunnerBoundPlan(planner, planner.plan, prepared, {}, RunnerPlanAdmission::TRANSPORT);
 		result = SerializeBoundLogicalPlan(bound->plan, *bound->binder, context);
 	});
+	result.vane_fs_query_pins = vane_fs_pins.Pins();
 	return result;
 }
 
@@ -1052,6 +1056,7 @@ struct QueryPythonReplayState {
 	// Driver-only state. Fragment wrappers take isolated cursors from this
 	// connection, and DistributedPhysicalPlan pickle state never includes it.
 	duckdb::distributed::python::ray::SafePyObject coordinator_connection;
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins = CreateVaneFSQueryPins();
 
 	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
 	                       py::object udf_actor_handles_p, py::object memory_source_refs_p,
@@ -1686,7 +1691,9 @@ static void ApplyAttachedDatabaseSnapshot(duckdb::Connection &conn, const py::di
 	}
 }
 
-static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, const py::object &conn_obj) {
+static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, const py::object &conn_obj,
+                                            const shared_ptr<VaneFSQueryPins> &vane_fs_pins = nullptr) {
+	auto vane_fs_workspaces = CaptureVaneFSWorkspaces(*conn_wrapper.con.GetConnection().context, vane_fs_pins);
 	auto bootstrap_obj = conn_wrapper.ExportConnectionBootstrapConfig();
 	auto non_static_extensions_before = LoadedNonStaticExtensionNames(conn_wrapper);
 	auto dynamic_extensions = CaptureDynamicExtensionSnapshot(conn_obj);
@@ -1755,6 +1762,9 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, co
 	auto &source_database = DatabaseInstance::GetDatabase(*conn_wrapper.con.GetConnection().context);
 	snapshot_obj[py::str("distributed_extension_contracts")] = CaptureDistributedExtensionContracts(source_database);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
+	if (py::len(vane_fs_workspaces) > 0) {
+		snapshot_obj[py::str("vane_fs_workspaces")] = std::move(vane_fs_workspaces);
+	}
 	snapshot_obj[py::str("attached_databases")] = CaptureAttachedDatabaseSnapshot(conn_wrapper);
 	if (conn_wrapper.GetRunnerType() == "ray") {
 		conn_wrapper.MarkVaneRaySessionOpened();
@@ -1779,10 +1789,13 @@ py::object SerializeRunnerBoundPlan(RunnerBoundPlan &bound, const py::object &co
 	plan.query_id_ = UUID::ToString(UUID::GenerateRandomUUID());
 	SerializedLogicalPlanResult serialized;
 	bound.context->RunWithBoundPlan(bound.query_number, [&]() {
+		VaneFSQueryPinScope vane_fs_pins(*bound.context);
 		serialized = SerializeBoundLogicalPlan(bound.plan, *bound.binder, bound.context);
+		serialized.vane_fs_query_pins = vane_fs_pins.Pins();
 	});
 	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
 	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);
+	plan.vane_fs_query_pins_ = std::move(serialized.vane_fs_query_pins);
 	if (!owner.is_none()) {
 		auto &connection = owner.cast<DuckDBPyConnection &>();
 		plan.source_connection_ = connection_owner;
@@ -1790,7 +1803,7 @@ py::object SerializeRunnerBoundPlan(RunnerBoundPlan &bound, const py::object &co
 		if (py::len(registrations) > 0) {
 			plan.udf_registrations_ = std::move(registrations);
 		}
-		plan.connection_snapshot_ = CaptureConnectionSnapshot(connection, owner);
+		plan.connection_snapshot_ = CaptureConnectionSnapshot(connection, owner, plan.vane_fs_query_pins_);
 	}
 	return py::cast(std::move(plan));
 }
@@ -1843,6 +1856,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	auto serialized = SerializeLogicalPlanFromRelation(rel);
 	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
 	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);
+	plan.vane_fs_query_pins_ = std::move(serialized.vane_fs_query_pins);
 	auto connection_owner = pyrel.GetConnectionOwner();
 	if (connection_owner && !connection_owner.is_none() && py::isinstance<DuckDBPyConnection>(connection_owner)) {
 		auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
@@ -1853,7 +1867,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 		if (py::len(registrations) > 0) {
 			plan.udf_registrations_ = std::move(registrations);
 		}
-		plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper, connection_owner);
+		plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper, connection_owner, plan.vane_fs_query_pins_);
 	}
 	return plan;
 }
@@ -1864,6 +1878,8 @@ struct ConnectionSnapshotApplyOptions {
 	bool apply_s3_credentials = true;
 	bool apply_settings = true;
 	bool apply_attached_databases = false;
+	bool apply_vane_fs = true;
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins;
 };
 
 static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
@@ -1916,6 +1932,7 @@ static void ValidateConnectionSnapshotExtensions(py::object conn_obj, const py::
 	validation_options.apply_s3_credentials = false;
 	validation_options.apply_settings = false;
 	validation_options.apply_attached_databases = false;
+	validation_options.apply_vane_fs = false;
 	ApplyConnectionSnapshot(conn_obj, snapshot_obj, validation_options);
 }
 
@@ -2010,9 +2027,13 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	if (options.apply_attached_databases) {
 		ApplyAttachedDatabaseSnapshot(conn, snapshot);
 	}
+	if (options.apply_vane_fs && snapshot.contains("vane_fs_workspaces")) {
+		ApplyVaneFSWorkspaces(conn_wrapper, snapshot["vane_fs_workspaces"], options.vane_fs_query_pins);
+	}
 }
 
-static void PrepareConnectionSnapshotExtensions(py::object conn_obj, const py::object &snapshot_obj) {
+static void PrepareConnectionSnapshotExtensions(py::object conn_obj, const py::object &snapshot_obj,
+                                                const shared_ptr<VaneFSQueryPins> &vane_fs_pins = nullptr) {
 	auto snapshot = ValidateConnectionSnapshotSourceID(snapshot_obj);
 	auto static_extensions = ParseStaticExtensionSnapshot(snapshot);
 	if (!snapshot.contains(py::str("dynamic_extensions")) ||
@@ -2032,6 +2053,9 @@ static void PrepareConnectionSnapshotExtensions(py::object conn_obj, const py::o
 	LoadStaticRayExtensions(conn, static_extensions);
 	PrepareDynamicExtensionSnapshot(conn_obj, dynamic_extensions);
 	ValidateConnectionSnapshotExtensions(conn_obj, snapshot_obj, true);
+	if (snapshot.contains("vane_fs_workspaces")) {
+		ApplyVaneFSWorkspaces(conn_wrapper, snapshot["vane_fs_workspaces"], vane_fs_pins);
+	}
 }
 
 string PyLogicalPlan::session_id() const {
@@ -2082,7 +2106,8 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
                                            const py::object &udf_actor_handles, const py::object &memory_source_refs,
                                            const py::object &connection_snapshot,
-                                           const py::object &coordinator_connection) {
+                                           const py::object &coordinator_connection,
+                                           const shared_ptr<VaneFSQueryPins> &vane_fs_pins = nullptr) {
 	if (query_id.empty()) {
 		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
 	}
@@ -2101,6 +2126,9 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		        py::reinterpret_borrow<py::object>(udf_actor_handles),
 		        py::reinterpret_borrow<py::object>(memory_source_refs),
 		        py::reinterpret_borrow<py::object>(connection_snapshot), std::move(retained_coordinator_connection))));
+		if (vane_fs_pins) {
+			g_query_python_replay_states.at(query_id)->vane_fs_query_pins = CreateVaneFSQueryPins(vane_fs_pins);
+		}
 		return true;
 	}
 	auto &state = *entry->second;
@@ -2128,6 +2156,12 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		    duckdb::distributed::python::ray::SafePyObject(std::move(retained_coordinator_connection));
 	}
 	return false;
+}
+
+static shared_ptr<VaneFSQueryPins> LookupQueryVaneFSPins(const string &query_id) {
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	auto entry = g_query_python_replay_states.find(query_id);
+	return entry == g_query_python_replay_states.end() ? nullptr : entry->second->vane_fs_query_pins;
 }
 
 static py::object LookupQueryUDFRegistrations(const string &query_id) {
@@ -2267,24 +2301,4 @@ static void CollectMutableUDFBindData(PhysicalOperator &op, vector<UDFFunctionDa
 	if (auto *bind_data = TryGetMutableUDFBindData(op)) {
 		out.push_back(bind_data);
 	}
-}
-
-static duckdb::shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
-	if (obj.is_none()) {
-		return nullptr;
-	}
-	auto *boxed = new py::object(py::reinterpret_borrow<py::object>(obj));
-	return duckdb::shared_ptr<void>(boxed, [](void *ptr) {
-		if (!ptr) {
-			return;
-		}
-		auto *boxed_obj = static_cast<py::object *>(ptr);
-		if (!Py_IsInitialized() || PythonIsFinalizing()) {
-			boxed_obj->release();
-			delete boxed_obj;
-			return;
-		}
-		PythonGILWrapper gil;
-		delete boxed_obj;
-	});
 }

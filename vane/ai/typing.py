@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 else:
     Embedding: TypeAlias = Any
 
+EmbeddingResult: TypeAlias = Embedding | dict[str, Embedding | None]
+
 Options = dict[str, Any]
 JSONSchema: TypeAlias = dict[str, Any]
 

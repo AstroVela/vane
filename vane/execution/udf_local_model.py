@@ -1,0 +1,643 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Session-owned local models with explicit physical-plan bindings.
+
+These are internal execution APIs. They do not install a process-global cache
+or change the lifetime of unregistered class UDFs.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import threading
+import time
+import weakref
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
+
+from vane import pickle as vane_pickle
+from vane.execution.local_resource_graph import LocalResourceGraphAdapter, PreparedLocalResourceGraph
+from vane.execution.request_admission import RequestAdmissionLimits, RequestTicket, RuntimeRequestAdmission
+from vane.execution.resources import ResourceVector, udf_process_resources
+from vane.execution.result_delivery import ResultDeliveryLimits, RuntimeResultDelivery
+from vane.execution.udf_actor_pool_lifecycle import (
+    OwnedActorPoolsError,
+    actor_pool_cleanup_pending,
+    rollback_actor_pools,
+)
+from vane.execution.udf_admission import LocalTaskProgress
+from vane.execution.udf_data_admission import DataAdmissionLimits
+from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
+from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
+from vane.execution.udf_input_cleanup import QueryInputCleanup
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
+from vane.execution.udf_local_gpu import LocalGpuModelAdapter, _device_ids
+from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
+from vane.execution.udf_resource_usage import UnitResourceActivity, unit_usage_snapshot
+from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
+from vane.execution.udf_worker_metrics import WorkerMetrics
+
+if TYPE_CHECKING:
+    from vane.execution.local_query_admission import LocalQueryAdmission
+    from vane.execution.udf_local_request import LocalModelRequest
+    from vane.execution.udf_shm_store import LocalQueryShmStore
+    from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+
+def _payload_bytes(payload: Mapping[str, Any]) -> bytes:
+    # Preserve the complete payload used to initialize workers.
+    return vane_pickle.dumps(dict(sorted(payload.items())))
+
+
+def _model_fingerprint(payload: Mapping[str, Any]) -> str:
+    # SQL binding assigns a fresh expression_id to each call. It identifies a
+    # query expression, not the model. Keep exact matching for initialization,
+    # schema, device and execution settings, including any unknown fields.
+    excluded = {"expression_id"}
+    if "local_model_token" in payload:
+        # The explicit query-model API fixes argument/output contracts at
+        # registration. Native passthrough columns and SQL alias names belong
+        # to each query, not the worker's initialization or UDF output schema.
+        excluded.update(("ref_output_types", "udf_name"))
+    compatible_payload = {key: value for key, value in payload.items() if key not in excluded}
+    return hashlib.sha256(_payload_bytes(compatible_payload)).hexdigest()
+
+
+@dataclass(frozen=True)
+class RegisteredLocalModel:
+    identity: ModelPoolIdentity
+    pool_size: int
+    resident_resources: ResourceVector
+    _registry: ModelPoolRegistry[LocalSubprocessActorPool] = field(repr=False)
+    _session_config: tuple[tuple[str, str], ...] = field(repr=False)
+    _request_admission: RuntimeRequestAdmission | None = field(default=None, repr=False)
+    _request_ticket: RequestTicket | None = field(default=None, repr=False)
+    _request_cancellation: ExecutionCancellationScope | None = field(default=None, repr=False)
+    _gpu_devices: tuple[str, ...] = field(default=(), repr=False)
+
+    def validate(
+        self,
+        payload: Mapping[str, Any],
+        pool_size: int,
+        session_config: Mapping[str, Any] | None,
+        *,
+        session_id: str | None,
+    ) -> None:
+        if session_id != self.identity.session_id:
+            raise ValueError("registered local model belongs to a different Vane session")
+        if session_config is None or tuple(sorted(session_config.items())) != self._session_config:
+            raise ValueError("registered local model belongs to a different Vane session configuration")
+        if pool_size != self.pool_size or _model_fingerprint(payload) != self.identity.initialization:
+            raise ValueError("registered local model payload or pool size does not match the UDF node")
+
+    def _require_admission(self) -> None:
+        if self._request_admission is not None:
+            if self._request_ticket is None:
+                self._request_admission.require_open()
+            else:
+                self._request_admission.require_claimed(self._request_ticket)
+
+    def validate_gpu_pool(self, payload: Mapping[str, Any], pool: Any, session_config: Any) -> None:
+        from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+        if (
+            not self._gpu_devices
+            or not isinstance(pool, LocalSubprocessActorPool)
+            or pool._gpu_devices != self._gpu_devices
+            or not self._registry.owns_pool(self.identity, pool)
+        ):
+            raise ValueError("GPU resources require the registered model's resident device pool")
+        self.validate(payload, pool.pool_size, session_config, session_id=self.identity.session_id)
+
+    def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
+        self._require_admission()
+        borrow = self._registry.acquire(self.identity, cancellation=self._request_cancellation)
+        try:
+            # Initialization can cross drain. Keep the pool owned by the
+            # registry, but do not publish a new public borrow afterward.
+            self._require_admission()
+        except BaseException:
+            borrow.release()
+            raise
+        return borrow
+
+    def prewarm(self) -> None:
+        with self.acquire():
+            pass
+
+
+class LocalModelRuntime:
+    """Own subprocess models for one explicitly identified Vane session.
+
+    Register from a collected UDF payload, optionally prewarm, then prepare a
+    physical plan with explicit model/node bindings. Preparation acquires borrows
+    through the existing local_actor_pool path. Runtime close is explicit and
+    must run after query executors have finished and released their borrows.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        session_config: Mapping[str, Any],
+        resident_limit: ResourceVector | None = None,
+        gpu_devices: Sequence[str] | None = None,
+        task_limit: TaskAdmissionLimits | None = None,
+        track_data: bool = False,
+        track_graph: bool = False,
+        data_limit: DataAdmissionLimits | None = None,
+        request_limit: RequestAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
+    ) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("local model runtime requires a non-empty session_id")
+        self._gpu_devices = () if gpu_devices is None else _device_ids(gpu_devices)
+        if resident_limit is not None and resident_limit.object_store_bytes:
+            raise ValueError("local resident limits do not support object-store bytes")
+        if resident_limit is not None and resident_limit.gpu and not self._gpu_devices:
+            raise ValueError("GPU resources require an explicit gpu_devices inventory")
+        if type(track_data) is not bool:
+            raise TypeError("track_data must be a bool")
+        if type(track_graph) is not bool:
+            raise TypeError("track_graph must be a bool")
+        self._track_graph = track_graph
+        self._prepared_graphs: dict[str, PreparedLocalResourceGraph] = {}
+        self._unit_activities: weakref.WeakValueDictionary[str, UnitResourceActivity] = weakref.WeakValueDictionary()
+        if result_limit is not None and request_limit is None:
+            raise ValueError("result delivery requires a configured request_limit")
+        self._session_id = session_id
+        self._session_config = {str(key): str(value) for key, value in session_config.items()}
+        self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
+        self._gpu_adapter = (
+            LocalGpuModelAdapter(self._registry, devices=self._gpu_devices) if self._gpu_devices else None
+        )
+        self._worker_metrics = WorkerMetrics()
+        self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
+        self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
+        if self._data_ledger is not None and self._data_ledger.unit_budgets_enabled:
+            self._track_graph = True
+        self._request_admission = RuntimeRequestAdmission(request_limit) if request_limit is not None else None
+        self._result_delivery = RuntimeResultDelivery(result_limit) if result_limit is not None else None
+        self._request_cleanup: set[LocalModelRequest] = set()
+        self._models: dict[str, RegisteredLocalModel] = {}
+        self._lock = threading.Lock()
+        self._draining = False
+
+    def register(
+        self,
+        name: str,
+        *,
+        version: str,
+        payload: Mapping[str, Any],
+        gpu_devices: Sequence[str] | None = None,
+    ) -> RegisteredLocalModel:
+        from vane.execution.udf_subprocess import LocalSubprocessActorPool, _local_actor_pool_size_from_node
+
+        if self._request_admission is not None:
+            self._request_admission.require_open()
+        if str(payload.get("execution_backend") or "").strip().lower() != "subprocess_actor":
+            raise ValueError("local model registration requires a subprocess_actor UDF")
+        frozen_payload = _payload_bytes(payload)
+        snapshot = vane_pickle.loads(frozen_payload)
+        per_actor = udf_process_resources(snapshot)
+        if per_actor.gpu > 0.0 and (self._gpu_adapter is None or gpu_devices is None):
+            raise ValueError("GPU resources require an explicit gpu_devices inventory and model assignment")
+        if per_actor.gpu == 0.0 and gpu_devices is not None:
+            raise ValueError("gpu_devices requires a model declaring exactly one GPU per replica")
+        pool_size = _local_actor_pool_size_from_node({}, snapshot)
+        resources = ResourceVector(
+            cpu=per_actor.cpu * pool_size,
+            heap_bytes=per_actor.heap_bytes * pool_size,
+        )
+        config = dict(self._session_config)
+        worker_metrics = self._worker_metrics
+        identity = ModelPoolIdentity(
+            session_id=self._session_id,
+            model=name,
+            version=version,
+            backend="subprocess_actor",
+            initialization=_model_fingerprint(snapshot),
+            configuration=hashlib.sha256(vane_pickle.dumps((pool_size, tuple(sorted(config.items()))))).hexdigest(),
+        )
+
+        def create() -> LocalSubprocessActorPool:
+            return LocalSubprocessActorPool(
+                vane_pickle.loads(frozen_payload),
+                pool_size,
+                name=f"model-{name}-{version}",
+                session_config=config,
+                worker_metrics=worker_metrics,
+            )
+
+        devices: tuple[str, ...] = ()
+        exclusive_resources: tuple[str, ...] = ()
+        if per_actor.gpu > 0.0:
+            assert self._gpu_adapter is not None and gpu_devices is not None
+            registration = self._gpu_adapter.prepare_registration(
+                name,
+                version=version,
+                session_id=self._session_id,
+                session_config=config,
+                payload=snapshot,
+                devices=gpu_devices,
+                worker_metrics=worker_metrics,
+            )
+            identity, create, resources = registration.identity, registration.create, registration.resources
+            devices, exclusive_resources = registration.devices, registration.exclusive_resources
+        model = RegisteredLocalModel(
+            identity,
+            pool_size,
+            resources,
+            self._registry,
+            tuple(sorted(config.items())),
+            self._request_admission,
+            _gpu_devices=devices,
+        )
+        with self._lock:
+            # Serialization can run user reducers and cross a concurrent drain.
+            # Serialize publication with the lifecycle fence, not that work.
+            if self._draining:
+                raise RuntimeError("local model runtime is draining")
+            if name in self._models:
+                raise ValueError(f"local model {name!r} is already registered; use a distinct name for another version")
+            self._registry.register(identity, create, resources=resources, exclusive_resources=exclusive_resources)
+            self._models[name] = model
+        return model
+
+    def prepare(
+        self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None
+    ) -> list[
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | QueryTaskAdmission
+        | QueryDataScope
+        | QueryInputCleanup
+        | QueryExecutorCleanup
+        | PreparedLocalResourceGraph
+        | LocalQueryAdmission
+        | LocalQueryShmStore
+    ]:
+        """Validate bindings, acquire query resources, and publish their handles.
+
+        Call once per execution and retain the returned resources until all query
+        executors have finished. Their shutdown releases only the query's owners.
+        Different sessions are rejected even when their configurations match.
+        """
+        if self._request_admission is not None:
+            raise RuntimeError("request-limited runtimes require request().execute()")
+        return self._prepare(plan, bindings, conn=conn)
+
+    def request(self, *, queue_timeout: float | None = None) -> LocalModelRequest:
+        """Queue lightweight request metadata before borrowing execution resources."""
+        from vane.execution.udf_local_request import LocalModelRequest
+
+        if self._request_admission is None:
+            raise RuntimeError("local requests require a configured request_limit")
+        return LocalModelRequest(self, self._request_admission.request(queue_timeout=queue_timeout))
+
+    def _retain_request_cleanup(self, request: LocalModelRequest, *, pending: bool) -> None:
+        with self._lock:
+            if pending:
+                self._request_cleanup.add(request)
+            else:
+                self._request_cleanup.discard(request)
+
+    def _prepare(
+        self,
+        plan: Any,
+        bindings: Mapping[str, str],
+        *,
+        conn: Any = None,
+        request_ticket: RequestTicket | None = None,
+        request_cancellation: ExecutionCancellationScope | None = None,
+    ) -> list[
+        LocalSubprocessActorPool
+        | ModelPoolBorrow[LocalSubprocessActorPool]
+        | LocalTaskProgress
+        | QueryTaskAdmission
+        | QueryDataScope
+        | QueryInputCleanup
+        | QueryExecutorCleanup
+        | PreparedLocalResourceGraph
+        | LocalQueryAdmission
+        | LocalQueryShmStore
+    ]:
+        from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
+        from vane.execution.udf_subprocess import (
+            _local_actor_pool_size_from_node,
+            ensure_local_subprocess_actor_pools_for_nodes,
+        )
+
+        if self._request_admission is not None:
+            self._request_admission.require_claimed(request_ticket)
+        if (
+            not bindings
+            and self._task_admission is None
+            and self._data_ledger is None
+            and self._request_admission is None
+            and not self._track_graph
+        ):
+            raise ValueError("local model preparation requires explicit model bindings")
+        if plan.session_id() != self._session_id or plan.session_config() != self._session_config:
+            raise ValueError("local model runtime belongs to a different Vane session")
+        nodes = {str(node["node_id"]): dict(node) for node in plan.collect_udf_nodes(conn=conn)}
+        unknown = set(bindings) - set(nodes)
+        if unknown:
+            raise ValueError(f"unknown model UDF node IDs: {sorted(unknown)}")
+        # Session isolation applies to every UDF, including unregistered actors
+        # and tasks. Copy options so validation cannot mutate the original plan.
+        executor_options_by_node = {}
+        for node_id, node in nodes.items():
+            backend = str(node["payload"].get("execution_backend") or "").strip().lower()
+            if (
+                self._task_admission is not None or self._data_ledger is not None or self._request_admission is not None
+            ) and backend not in {
+                "subprocess_actor",
+                "subprocess_task",
+            }:
+                feature = (
+                    "task admission"
+                    if self._task_admission is not None
+                    else "data accounting"
+                    if self._data_ledger is not None
+                    else "request admission"
+                )
+                raise ValueError(f"runtime {feature} requires local subprocess UDFs")
+            if (
+                self._data_ledger is not None
+                and self._data_ledger.limits is not None
+                and not payload_requests_local_ref_bundle_output(node["payload"])
+            ):
+                raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
+            options = dict(node.get("executor_options") or {})
+            if "local_resource_unit" in options or "local_resource_activity" in options:
+                raise ValueError("UDF node already has a local resource graph binding")
+            if "local_task_admission" in options:
+                raise ValueError("UDF node already has a query task admission binding")
+            if "local_query_admission" in options:
+                raise ValueError("UDF node already has a query resource policy")
+            if "local_task_progress" in options:
+                raise ValueError("UDF node already has a task progress binding")
+            if "local_data_scope" in options:
+                raise ValueError("UDF node already has a query data binding")
+            if "local_input_cleanup" in options:
+                raise ValueError("UDF node already has a query input cleanup binding")
+            if "local_executor_cleanup" in options:
+                raise ValueError("UDF node already has a query executor cleanup binding")
+            if "local_request_cancellation" in options:
+                raise ValueError("UDF node already has a request cancellation binding")
+            if "local_worker_metrics" in options:
+                raise ValueError("UDF node already has a worker metrics binding")
+            if backend in {"subprocess_actor", "subprocess_task"}:
+                options["local_worker_metrics"] = self._worker_metrics
+            if request_cancellation is not None:
+                options["local_request_cancellation"] = request_cancellation
+            options["session_config"] = dict(self._session_config)
+            node["executor_options"] = options
+            executor_options_by_node[node_id] = options
+        graph_scope = None
+        policy_metadata = (
+            LocalResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=conn)
+            if nodes or self._track_graph
+            else None
+        )
+        if self._track_graph:
+            assert policy_metadata is not None
+            graph_scope = PreparedLocalResourceGraph(
+                policy_metadata,
+                release=self._release_graph,
+                data_ledger=self._data_ledger,
+            )
+            contexts = graph_scope.contexts()
+            if set(contexts) != set(nodes):
+                raise ValueError("resource graph does not match the plan's physical UDF bindings")
+            for node_id, context in contexts.items():
+                if context.backend != nodes[node_id]["payload"].get("execution_backend"):
+                    raise ValueError("resource graph UDF backend does not match the plan")
+                executor_options_by_node[node_id]["local_resource_unit"] = context
+                executor_options_by_node[node_id]["local_resource_activity"] = graph_scope.activities[
+                    context.resource_unit_id
+                ]
+        with self._lock:
+            models = {node_id: self._models[name] for node_id, name in bindings.items()}
+        # Compatibility serialization may call user reducers. Acquiring the
+        # actual borrow below rechecks admission if validation crosses drain.
+        for node_id, model in models.items():
+            node = nodes[node_id]
+            payload = node["payload"]
+            model.validate(
+                payload,
+                _local_actor_pool_size_from_node(node, payload),
+                self._session_config,
+                session_id=self._session_id,
+            )
+            options = node["executor_options"]
+            if "local_actor_pool" in options or "local_model_pool" in options:
+                raise ValueError("UDF node already has a local actor pool binding")
+            # Do not grant the externally returned handle a drain bypass.
+            # The preparation copy is authorized by one live request only.
+            options["local_model_pool"] = (
+                replace(model, _request_ticket=request_ticket, _request_cancellation=request_cancellation)
+                if request_ticket is not None
+                else model
+            )
+        # Actor preparation skips task nodes. Publish their configuration too,
+        # inside the helper's rollback boundary in case handle injection fails.
+        query = self._task_admission.open_query() if self._task_admission is not None else None
+        if query is not None:
+            for options in executor_options_by_node.values():
+                options["local_task_admission"] = query
+        data_query = None
+        # Data scopes already retain failed input cleanup. Requests without
+        # accounting still need a durable owner after native executors detach.
+        input_query = QueryInputCleanup() if request_ticket is not None and self._data_ledger is None else None
+        # Input cleanup can finish before result callbacks return their output
+        # and physical slots. Retain those executors even without task limits.
+        executor_query = QueryExecutorCleanup() if request_ticket is not None else None
+        try:
+            if graph_scope is not None:
+                with self._lock:
+                    # Claimed requests may finish preparation after ingress drains.
+                    if self._draining and request_ticket is None:
+                        raise RuntimeError("local model runtime is draining")
+                    self._prepared_graphs[graph_scope.graph.query_id] = graph_scope
+                    self._unit_activities.update(graph_scope.activities)
+            if executor_query is not None:
+                for options in executor_options_by_node.values():
+                    options["local_executor_cleanup"] = executor_query
+            if input_query is not None:
+                for options in executor_options_by_node.values():
+                    options["local_input_cleanup"] = input_query
+            if self._data_ledger is not None:
+                data_query = self._data_ledger.open_query(
+                    resource_units=graph_scope.contexts().values() if graph_scope is not None else ()
+                )
+                for options in executor_options_by_node.values():
+                    options["local_data_scope"] = data_query
+            resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
+                list(nodes.values()),
+                resource_graph=policy_metadata,
+                plan_identity=id(plan),
+                session_id=self._session_id,
+                set_handles=lambda options: plan.set_local_udf_executor_options(
+                    {**executor_options_by_node, **options}, conn=conn
+                ),
+            )
+            # The actor helper has no publication callback for a task-only plan.
+            # There are no actor owners to roll back in this case.
+            if not actor_options and executor_options_by_node:
+                plan.set_local_udf_executor_options(executor_options_by_node, conn=conn)
+        except BaseException as error:
+            from vane.execution.udf_local_request import _shutdown_resource
+
+            cleanup_errors: list[BaseException] = []
+            pending = rollback_actor_pools(
+                [owner for owner in (query, data_query, input_query, executor_query, graph_scope) if owner is not None],
+                RuntimeError("query preparation cleanup"),
+                shutdown=lambda owner: _shutdown_resource(owner, kill=True),
+                cleanup_pending=actor_pool_cleanup_pending,
+                record_error=cleanup_errors.append,
+            )
+            if cleanup_errors:
+                raise OwnedActorPoolsError(
+                    "query preparation cleanup failed; retain owners for retry",
+                    owned_actor_pools=[*getattr(error, "owned_actor_pools", ()), *pending],
+                    creation_error=error,
+                ) from cleanup_errors[0]
+            raise
+        return [
+            *[owner for owner in resources if not isinstance(owner, LocalTaskProgress)],
+            *[owner for owner in (query, data_query, input_query, executor_query, graph_scope) if owner is not None],
+            *[owner for owner in resources if isinstance(owner, LocalTaskProgress)],
+        ]
+
+    def prewarm(self, name: str) -> None:
+        if self._request_admission is not None:
+            self._request_admission.require_open()
+        with self._lock:
+            model = self._models[name]
+        model.prewarm()
+
+    def drain(self) -> None:
+        with self._lock:
+            self._draining = True
+            if self._request_admission is not None:
+                # Requests already executing may still be preparing their model
+                # borrows. Fence ingress now; drain inner gates after they finish.
+                self._request_admission.drain()
+        if self._request_admission is None:
+            # Task gates may invoke wakeups; keep them outside the runtime lock.
+            self._drain_execution()
+
+    def _drain_execution(self) -> None:
+        if self._data_ledger is not None:
+            self._data_ledger.drain()
+        # Every task-limited preparation passes this gate, including task-only
+        # plans that never acquire a model borrow. Fence it before model drain.
+        if self._task_admission is not None:
+            self._task_admission.drain()
+        self._registry.drain()
+
+    def _release_graph(self, query_id: str) -> None:
+        with self._lock:
+            self._prepared_graphs.pop(query_id, None)
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        snapshot = self._registry.resource_snapshot()
+        snapshot["worker_failures"] = self._worker_metrics.snapshot()
+        if self._gpu_devices:
+            from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+            with self._lock:
+                models = tuple(model for model in self._models.values() if model._gpu_devices)
+            pools = self._registry.pool_snapshots(
+                lambda pool: pool.gpu_execution_snapshot() if isinstance(pool, LocalSubprocessActorPool) else {}
+            )
+            snapshot["gpu"] = {
+                "devices": list(self._gpu_devices),
+                "models": [
+                    {
+                        "name": model.identity.model,
+                        "version": model.identity.version,
+                        "devices": list(model._gpu_devices),
+                        "pools": pools.get(model.identity, []),
+                    }
+                    for model in models
+                ],
+            }
+        if self._track_graph:
+            with self._lock:
+                prepared = tuple(self._prepared_graphs.values())
+                # Weakref callbacks can remove values without taking _lock.
+                # Retain each live value while copying, instead of looking it up later.
+                activities = dict(self._unit_activities.items())
+            snapshot["prepared_query_graphs"] = [scope.snapshot() for scope in prepared]
+            snapshot["udf_units"] = unit_usage_snapshot(
+                activities,
+                self._data_ledger.unit_snapshots() if self._data_ledger is not None else None,
+                prepared_query_ids={scope.graph.query_id for scope in prepared},
+            )
+        if self._task_admission is not None:
+            snapshot["task_admission"] = self._task_admission.snapshot()
+        if self._data_ledger is not None:
+            snapshot["data"] = self._data_ledger.snapshot()
+        if self._result_delivery is not None:
+            snapshot["result_delivery"] = self._result_delivery.snapshot()
+        if self._request_admission is not None:
+            snapshot["request_admission"] = self._request_admission.snapshot()
+            snapshot["draining"] = snapshot["draining"] or snapshot["request_admission"]["draining"]
+            with self._lock:
+                snapshot["request_admission"]["cleanup_pending_requests"] = len(self._request_cleanup)
+        return snapshot
+
+    def close(self, *, timeout: float = 0.0, kill: bool = False) -> None:
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("model runtime close timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        self.drain()
+        if self._result_delivery is not None:
+            self._result_delivery.cancel_streams()
+        if self._request_admission is not None:
+            with self._lock:
+                pending = list(self._request_cleanup)
+            errors = []
+            for request in pending:
+                try:
+                    request.shutdown(kill=kill)
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise RuntimeError("request cleanup failed during runtime close; retry close") from errors[0]
+            self._request_admission.close(timeout=max(0.0, deadline - time.monotonic()))
+            self._drain_execution()
+        if self._result_delivery is not None:
+            self._result_delivery.close(timeout=max(0.0, deadline - time.monotonic()))
+        if self._data_ledger is not None:
+            self._data_ledger.close(timeout=max(0.0, deadline - time.monotonic()))
+        if self._task_admission is not None:
+            self._task_admission.close(timeout=max(0.0, deadline - time.monotonic()))
+        self._registry.close(timeout=max(0.0, deadline - time.monotonic()), kill=kill)
+        # Diagnostic scopes own no execution resources; discard their registry
+        # entries after all runtime cleanup gates have closed successfully.
+        with self._lock:
+            prepared = tuple(self._prepared_graphs.values())
+        for scope in prepared:
+            scope.shutdown()
+
+    def __enter__(self) -> LocalModelRuntime:
+        if self._request_admission is not None:
+            self._request_admission.require_open()
+        self._registry.__enter__()
+        return self
+
+    def __exit__(self, _type: object, error: BaseException | None, _traceback: object) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if error is not None:
+                raise error from cleanup_error
+            raise

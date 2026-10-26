@@ -1,0 +1,462 @@
+{
+  "baseline_revision": "f4f76ddce4f52e8818316c09e7378899d7c8c74b",
+  "artifact_root": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z",
+  "decision": {
+    "status": "PASS",
+    "decision": "Do not enable the 16 MiB admission candidate. Keep the 64 MiB production budget.",
+    "unchanged_production_sha256": {
+      "vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+      ".venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "6d02862badc3057451407c4e219bd11109e8e3933bb8924eef6ba55006a70479",
+      "vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+      "vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+      "vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    "baseline_frozen_source_inputs_match": true,
+    "related_tests": {
+      "candidate_python": 132,
+      "candidate_cpp_suites": 6,
+      "baseline_cpp_suites": 6
+    },
+    "plain_mounts": 24,
+    "diagnostic_mounts": 4,
+    "direct_trials": 68,
+    "smoke_trials": 4
+  },
+  "windows": {
+    "direct": "direct-results.json",
+    "bounded": "bounded-results.json",
+    "measure-plain": "plain-window.json",
+    "measure-diagnostic": "diagnostic-results.json",
+    "published-validation/smoke": "published-probe-validation.json"
+  },
+  "builds": {
+    "build.json": {
+      "status": "PASS",
+      "command": [
+        "g++",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-pthread",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io-probe",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64"
+      ],
+      "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "sha256": {
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io_probe.cpp": "82b19803227651e937cc6e3fd51239613801ea2fd2d24825b38f547e2ab2f605",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/timeline.cpp": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io-probe": "e30ddda2e42c7733ac510fbb99e07d466a623fd3b9ffbc056d88e6eb6eda917a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+      }
+    },
+    "bounded-build.json": {
+      "status": "PASS",
+      "command": [
+        "g++",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-pthread",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io-probe",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64"
+      ],
+      "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "sha256": {
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io_probe.cpp": "9d2c5c2fd82e463b964ed16ad87f081bdff45b970bea49290f108719ddc27f62",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/timeline.cpp": "1161ba637c5d2cf6fce0e6d410d65454d034502cc5b6d5e90809fad3cb43980e",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io-probe": "9cd284e1207633272a39df835876540910c1d1e03093a6d41f242971b5d8ad46",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+      }
+    },
+    "original-binary-validation.json": {
+      "command": [
+        "g++",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-pthread",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/initial-sources/io_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/initial-sources/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/initial-sources/io-probe",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64"
+      ],
+      "exit_code": 0,
+      "original_sha256": "e30ddda2e42c7733ac510fbb99e07d466a623fd3b9ffbc056d88e6eb6eda917a",
+      "reconstructed_sha256": "e30ddda2e42c7733ac510fbb99e07d466a623fd3b9ffbc056d88e6eb6eda917a",
+      "identical": true
+    },
+    "component-build.json": {
+      "status": "PASS",
+      "started_epoch": 1791651522.6113539,
+      "commands": [
+        {
+          "label": "updated-venv",
+          "argv": [
+            "uv",
+            "venv",
+            "--python",
+            "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv"
+          ],
+          "returncode": 0,
+          "started_epoch": 1791651522.6114006,
+          "ended_epoch": 1791651522.6294448
+        },
+        {
+          "label": "updated-install",
+          "argv": [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv/bin/python",
+            "--no-deps",
+            "--no-build-isolation",
+            ".",
+            "-Ccmake.define.VANE_FS_BUILD_PYTHON=ON",
+            "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+            "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+            "-Ccmake.define.VANE_FS_BUILD_TESTS=ON"
+          ],
+          "returncode": 0,
+          "started_epoch": 1791651522.6734374,
+          "ended_epoch": 1791651545.1263752
+        }
+      ],
+      "components": {
+        "updated": {
+          "environment": {
+            "SKBUILD_BUILD_DIR": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release",
+            "SKBUILD_CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_PREFIX_PATH": "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release",
+            "PKG_CONFIG_PATH": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-payload-20261008T134719Z/pkgconfig"
+          },
+          "build": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release",
+          "python": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv/bin/python",
+          "identities": {
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release/libvane_fs.a": "bd2b3ce0720e3fe22b5ecd0af2f6209b4c43e5b2318570c349b9d84cfd93b7a8",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release/vane-fs-mount": "244937ca084c9d88d1f36c2869fe58da9e5267392d3c79eb20e68cdd8cb5fb4e",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "dcae46de24028e124f358a26acdf8a61f655b71baa8108387898c13231cc48f0"
+          }
+        }
+      },
+      "ended_epoch": 1791651545.1444976
+    },
+    "diagnostic-build.json": {
+      "status": "PASS",
+      "started_epoch": 1791651569.888678,
+      "commands": [
+        {
+          "argv": [
+            "g++",
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-DVANE_FS_SPLIT_WAL_SYNC=0",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/include",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+            "-I/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/include/fuse3",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/diagnostic/baseline/fuse.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/fuse_timeline.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/build/python-release/libvane_fs.a",
+            "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+            "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+            "-Wl,-rpath,/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+            "-ldl",
+            "-pthread",
+            "-Wl,--wrap=sqlite3_step",
+            "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+            "-Wl,--wrap=fsync",
+            "-Wl,--wrap=fdatasync",
+            "-Wl,--wrap=pread",
+            "-Wl,--wrap=pwrite",
+            "-Wl,--wrap=pread64",
+            "-Wl,--wrap=pwrite64",
+            "-Wl,--wrap=ftruncate",
+            "-Wl,--wrap=ftruncate64",
+            "-o",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/diagnostic/baseline/build/vane-fs-mount"
+          ],
+          "started_epoch": 1791651569.9000223,
+          "ended_epoch": 1791651573.1557662,
+          "returncode": 0
+        },
+        {
+          "argv": [
+            "g++",
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-DVANE_FS_SPLIT_WAL_SYNC=0",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/include",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+            "-I/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/include/fuse3",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/diagnostic/updated/fuse.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/fuse_timeline.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release/libvane_fs.a",
+            "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+            "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+            "-Wl,-rpath,/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu",
+            "-ldl",
+            "-pthread",
+            "-Wl,--wrap=sqlite3_step",
+            "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+            "-Wl,--wrap=fsync",
+            "-Wl,--wrap=fdatasync",
+            "-Wl,--wrap=pread",
+            "-Wl,--wrap=pwrite",
+            "-Wl,--wrap=pread64",
+            "-Wl,--wrap=pwrite64",
+            "-Wl,--wrap=ftruncate",
+            "-Wl,--wrap=ftruncate64",
+            "-o",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/diagnostic/updated/build/vane-fs-mount"
+          ],
+          "started_epoch": 1791651573.1743205,
+          "ended_epoch": 1791651576.336002,
+          "returncode": 0
+        }
+      ],
+      "binaries": {
+        "baseline": "587073e67136d37cffcb672b85ec8ed1edf940e84159a0f5e329e0b097c46ac2",
+        "updated": "9c85c918f1c1f18c30e6fbbbea1ae84390a9519349ef03164bb4cc9bd99cf5fa"
+      },
+      "inputs": {
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/build/python-release/libvane_fs.a": "8ff0010dd3af6765f7ed7dceb3d93f59534075c368ca2674356e1adfd179f248",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+        "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so": "f1e75247f42d414df611ee554c8399bfe74565f89eed7c4501e2d97c48f21eab",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/fuse_timeline.cpp": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release/libvane_fs.a": "bd2b3ce0720e3fe22b5ecd0af2f6209b4c43e5b2318570c349b9d84cfd93b7a8",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+      },
+      "ended_epoch": 1791651576.343684
+    },
+    "probe-build.json": {
+      "status": "PASS",
+      "started_epoch": 1791651569.8856921,
+      "commands": [
+        {
+          "argv": [
+            "g++",
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/include",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/blob_probe.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/build/python-release/libvane_fs.a",
+            "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+            "-ldl",
+            "-pthread",
+            "-Wl,--wrap=fsync",
+            "-Wl,--wrap=fdatasync",
+            "-Wl,--wrap=sqlite3_prepare_v2",
+            "-Wl,--wrap=sqlite3_step",
+            "-Wl,--wrap=sqlite3_finalize",
+            "-Wl,--wrap=sqlite3_exec",
+            "-o",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline-blob-probe"
+          ],
+          "returncode": 0,
+          "started_epoch": 1791651569.8857925,
+          "ended_epoch": 1791651573.678039
+        },
+        {
+          "argv": [
+            "g++",
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/include",
+            "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/blob_probe.cpp",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release/libvane_fs.a",
+            "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+            "-ldl",
+            "-pthread",
+            "-Wl,--wrap=fsync",
+            "-Wl,--wrap=fdatasync",
+            "-Wl,--wrap=sqlite3_prepare_v2",
+            "-Wl,--wrap=sqlite3_step",
+            "-Wl,--wrap=sqlite3_finalize",
+            "-Wl,--wrap=sqlite3_exec",
+            "-o",
+            "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated-blob-probe"
+          ],
+          "returncode": 0,
+          "started_epoch": 1791651573.6865835,
+          "ended_epoch": 1791651577.6119561
+        }
+      ],
+      "identities": {
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline-blob-probe": "7caac4cd1368a68e56697779c7e436df39123f1fbc788d9fc12f823ca542bd61",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated-blob-probe": "899b350b55ddd7767a1556ffbadcc5a22252d2de1456e63b40ccd9d8b6a396a3"
+      },
+      "ended_epoch": 1791651577.6214628
+    },
+    "published-validation/smoke/build.json": {
+      "argv": [
+        "g++",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-pthread",
+        "-DVANE_FS_SPLIT_WAL_SYNC=0",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/published-validation/smoke/io_probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/published-validation/smoke/timeline.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/published-validation/smoke/io-probe",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=ftruncate",
+        "-Wl,--wrap=ftruncate64"
+      ],
+      "exit_code": 0,
+      "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "source_sha256": {
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/published-validation/smoke/io_probe.cpp": "10fac7b2f7e7c3205e611321f08317276c40e9d95d0dc7648494c5f7ff366500",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/published-validation/smoke/timeline.cpp": "1161ba637c5d2cf6fce0e6d410d65454d034502cc5b6d5e90809fad3cb43980e",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/run.py": "204d0941cc459e87c9fe54e52ced86861225dc780cf42e8ea927102dee9b1976",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/monitor.py": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+      },
+      "binary_sha256": "9cd284e1207633272a39df835876540910c1d1e03093a6d41f242971b5d8ad46"
+    }
+  },
+  "tests": {
+    "status": "PASS",
+    "started_epoch": 1791651569.8825436,
+    "runs": [
+      {
+        "label": "baseline-native",
+        "argv": [
+          "ctest",
+          "--test-dir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/baseline/build/python-release",
+          "--output-on-failure"
+        ],
+        "returncode": 0,
+        "expected": 0,
+        "started_epoch": 1791651569.882584,
+        "ended_epoch": 1791651578.9701264
+      },
+      {
+        "label": "updated-native",
+        "argv": [
+          "ctest",
+          "--test-dir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/build/python-release",
+          "--output-on-failure"
+        ],
+        "returncode": 0,
+        "expected": 0,
+        "started_epoch": 1791651578.970644,
+        "ended_epoch": 1791651589.110912
+      },
+      {
+        "label": "module-identity",
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv/bin/python",
+          "-I",
+          "-c",
+          "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv' in n.__file__"
+        ],
+        "returncode": 0,
+        "expected": 0,
+        "started_epoch": 1791651589.1118464,
+        "ended_epoch": 1791651589.1765676
+      },
+      {
+        "label": "updated-python",
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/venv/bin/python",
+          "-I",
+          "-m",
+          "pytest",
+          "--rootdir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated",
+          "--confcutdir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated",
+          "--basetemp",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/owned-updated-python",
+          "-q",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/updated/tests"
+        ],
+        "returncode": 0,
+        "expected": 0,
+        "started_epoch": 1791651589.1771116,
+        "ended_epoch": 1791651712.0480356
+      }
+    ],
+    "cleanup": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/owned-updated-python",
+        "removed": true,
+        "mounts_absent": true
+      }
+    ],
+    "ended_epoch": 1791651712.1701589
+  },
+  "summary_file": "summary.json",
+  "source_inputs_file": "source-inputs.json",
+  "host_settings_file": "host-settings.json",
+  "artifact_manifest": "artifact-manifest.json",
+  "owned_build_test_overlap_check": "PASS",
+  "free_bytes_after": 101786013696
+}

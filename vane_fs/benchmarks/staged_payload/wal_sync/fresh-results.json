@@ -1,0 +1,8306 @@
+{
+  "status": "PASS",
+  "config": {
+    "orders": [
+      [
+        "sdk",
+        "fsync",
+        "fdatasync"
+      ],
+      [
+        "fsync",
+        "fdatasync",
+        "sdk"
+      ],
+      [
+        "fdatasync",
+        "sdk",
+        "fsync"
+      ],
+      [
+        "fdatasync",
+        "fsync",
+        "sdk"
+      ],
+      [
+        "sdk",
+        "fdatasync",
+        "fsync"
+      ],
+      [
+        "fsync",
+        "sdk",
+        "fdatasync"
+      ]
+    ],
+    "durability": "fsync",
+    "application_write_bytes": 1048576,
+    "read_fixture_application_write_bytes": 1048576,
+    "logical_block_bytes": 4096,
+    "page_bytes": 4096,
+    "cache_configuration": "production defaults",
+    "strict_wal_trigger_frames": 4096,
+    "external_threshold_bytes": 262144,
+    "wake_mib": 16,
+    "admission_mib": 64,
+    "retained_wal_mib": 16,
+    "global_drop_caches": false,
+    "owned_concurrent_tests_or_builds": false,
+    "fresh_fuse_rounds": 6,
+    "aged_fuse_rounds": 6,
+    "native_rounds": 0,
+    "aged_guard_bytes": 33554432,
+    "aged_guard_write_bytes": 1048576,
+    "aged_guard_zero_stride": 8192,
+    "aged_fuse_read_fixture_bytes": 67108864,
+    "aged_native_read_fixture_bytes": 16777216,
+    "scope": "Same exact-interval UPDATE component. Existing SDK vs identical recompiled SQLite controls varying HAVE_FDATASYNC only. Plain binaries; no per-thread probes. Each workspace remains independent."
+  },
+  "samples": [
+    {
+      "variant": "sdk",
+      "rep": 0,
+      "free_bytes": 104401645568,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594889.7606046,
+          "fsync_seconds": 0.20541136199608445,
+          "close_seconds": 0.00015756301581859589,
+          "seconds": 0.45146208198275417,
+          "ended_epoch": 1791594890.2120712,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0027685010572895408,
+            "median": 0.0030997389694675803,
+            "p95": 0.004976636031642556,
+            "p99": 0.013395827962085605,
+            "max": 0.013395827962085605,
+            "sum": 0.23899197427090257
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 141.76162861545657,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594891.599889,
+          "fsync_seconds": 0.1848490450065583,
+          "close_seconds": 0.0001756770070642233,
+          "seconds": 1.715681554051116,
+          "ended_epoch": 1791594893.3155751,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002621395979076624,
+            "median": 0.002864857029635459,
+            "p95": 0.00515450001694262,
+            "p99": 0.06375322595704347,
+            "max": 0.2969173670280725,
+            "sum": 1.5080145981628448
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 149.21183910587925,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08194700197782367,
+          "mib_per_second": 780.9925739238092,
+          "started_epoch": 1791594896.5617561,
+          "ended_epoch": 1791594896.6437113,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.26766017405316234,
+          "mib_per_second": 59.77729057600515,
+          "started_epoch": 1791594896.6492,
+          "ended_epoch": 1791594896.9240751,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.16708220692817122,
+          "mib_per_second": 11.970155510693019,
+          "fsync_seconds": 0.035854437039233744,
+          "requests_seconds": 0.13122481398750097,
+          "started_epoch": 1791594896.9963398,
+          "ended_epoch": 1791594897.1634269,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011148594785481691,
+            "median": 0.0002392479800619185,
+            "p95": 0.0003296679351478815,
+            "p99": 0.00035580701660364866,
+            "max": 0.0058187139220535755,
+            "sum": 0.1309237830573693
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-oartntjv/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-oartntjv/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2673442190280184,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "449afa11b71781d0fefa98f9d57bb7065259aa747134b9010b59b6495809a34a"
+    },
+    {
+      "variant": "fsync",
+      "rep": 0,
+      "free_bytes": 104401567744,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594900.4339333,
+          "fsync_seconds": 0.17668877099640667,
+          "close_seconds": 0.00014311401173472404,
+          "seconds": 0.38872409297619015,
+          "ended_epoch": 1791594900.8226604,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026727080112323165,
+            "median": 0.0029475230257958174,
+            "p95": 0.0039777320344001055,
+            "p99": 0.011306344997137785,
+            "max": 0.011306344997137785,
+            "sum": 0.20644265576265752
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 164.64119707630286,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594902.3493254,
+          "fsync_seconds": 0.18418681691400707,
+          "close_seconds": 0.00017184403259307146,
+          "seconds": 1.848784880945459,
+          "ended_epoch": 1791594904.1981144,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0027849000180140138,
+            "median": 0.0030876764794811606,
+            "p95": 0.005566613050177693,
+            "p99": 0.09896279801614583,
+            "max": 0.3115908020408824,
+            "sum": 1.641382971778512
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 138.4693279561454,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.0981156179914251,
+          "mib_per_second": 652.2916668128548,
+          "started_epoch": 1791594907.4902046,
+          "ended_epoch": 1791594907.5883284,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.21252582094166428,
+          "mib_per_second": 75.28496974676693,
+          "started_epoch": 1791594907.5936615,
+          "ended_epoch": 1791594907.811686,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.15375042299274355,
+          "mib_per_second": 13.008094293791912,
+          "fsync_seconds": 0.038258971995674074,
+          "requests_seconds": 0.1154894259525463,
+          "started_epoch": 1791594907.876895,
+          "ended_epoch": 1791594908.0306506,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010442803613841534,
+            "median": 0.0001930204452946782,
+            "p95": 0.0002550469944253564,
+            "p99": 0.00034813501406461,
+            "max": 0.01438626495655626,
+            "sum": 0.11528307385742664
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-hy621rej/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-hy621rej/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2676213000668213,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "3953a49ce8a1c8eced004354d78c1015cc7e3cd7382eb1707eb89792f27b003e"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 0,
+      "free_bytes": 104401461248,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594911.286782,
+          "fsync_seconds": 0.17329194699414074,
+          "close_seconds": 0.0001546880230307579,
+          "seconds": 0.3866802239790559,
+          "ended_epoch": 1791594911.6734662,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0027788480510935187,
+            "median": 0.003076914988923818,
+            "p95": 0.0036649410612881184,
+            "p99": 0.011749794939532876,
+            "max": 0.011749794939532876,
+            "sum": 0.20678902056533843
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 165.51143821481415,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594913.2075121,
+          "fsync_seconds": 0.21435107302386314,
+          "close_seconds": 0.00018053606618195772,
+          "seconds": 1.8222153940005228,
+          "ended_epoch": 1791594915.0297494,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002808896009810269,
+            "median": 0.0030770800076425076,
+            "p95": 0.005473980912938714,
+            "p99": 0.06688069307710975,
+            "max": 0.3076770029729232,
+            "sum": 1.584410932729952
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 140.48833131519828,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08110498799942434,
+          "mib_per_second": 789.1006654295326,
+          "started_epoch": 1791594918.486726,
+          "ended_epoch": 1791594918.5678346,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.2036273250123486,
+          "mib_per_second": 78.57491620552257,
+          "started_epoch": 1791594918.5707476,
+          "ended_epoch": 1791594918.7810433,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.15734756691381335,
+          "mib_per_second": 12.710714498022673,
+          "fsync_seconds": 0.03633204603102058,
+          "requests_seconds": 0.12101428990717977,
+          "started_epoch": 1791594918.851756,
+          "ended_epoch": 1791594919.0091085,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 9.425496682524681e-05,
+            "median": 0.00018797296797856688,
+            "p95": 0.00040203204844146967,
+            "p99": 0.000435790978372097,
+            "max": 0.0034873809199780226,
+            "sum": 0.12073251942638308
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-3_noug04/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-3_noug04/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2670494739431888,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "525d9686fb9d9240a39ece1a9c961f13fbed140a638eb957fd3f835f383bbe37"
+    },
+    {
+      "variant": "fsync",
+      "rep": 1,
+      "free_bytes": 104401362944,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594922.2897515,
+          "fsync_seconds": 0.20830343791749328,
+          "close_seconds": 0.00014285999350249767,
+          "seconds": 0.4172195839928463,
+          "ended_epoch": 1791594922.7069747,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026196279795840383,
+            "median": 0.002857598999980837,
+            "p95": 0.003935093991458416,
+            "p99": 0.01179566199425608,
+            "max": 0.01179566199425608,
+            "sum": 0.20201787899713963
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 153.39644267776595,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594924.1733205,
+          "fsync_seconds": 0.1834760250058025,
+          "close_seconds": 0.0001359269954264164,
+          "seconds": 1.798979681916535,
+          "ended_epoch": 1791594925.9723032,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002376181073486805,
+            "median": 0.00300219445489347,
+            "p95": 0.006911940057761967,
+            "p99": 0.06412329303566366,
+            "max": 0.3044711899710819,
+            "sum": 1.5943802535766736
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 142.30288567087737,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.054242782993242145,
+          "mib_per_second": 1179.8804646135775,
+          "started_epoch": 1791594929.2838051,
+          "ended_epoch": 1791594929.3380535,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.22470689902547747,
+          "mib_per_second": 71.20386632270647,
+          "started_epoch": 1791594929.3416362,
+          "ended_epoch": 1791594929.5710344,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.12741390499286354,
+          "mib_per_second": 15.696873901730115,
+          "fsync_seconds": 0.035586846992373466,
+          "requests_seconds": 0.0918262000195682,
+          "started_epoch": 1791594929.625957,
+          "ended_epoch": 1791594929.7533748,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010891107376664877,
+            "median": 0.00016905245138332248,
+            "p95": 0.00019728089682757854,
+            "p99": 0.0002224509371444583,
+            "max": 0.0037684430135414004,
+            "sum": 0.09154314326588064
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-a0hp7x5i/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-a0hp7x5i/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.21766707196366042,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "f6342c39aa9113e011cb96400db10493e240ee4b2009ed188ef5f97b06af666e"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 1,
+      "free_bytes": 104401285120,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594932.888278,
+          "fsync_seconds": 0.1771645499393344,
+          "close_seconds": 9.822798892855644e-05,
+          "seconds": 0.378937304019928,
+          "ended_epoch": 1791594933.2672184,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0022348230704665184,
+            "median": 0.0027944084722548723,
+            "p95": 0.004085041000507772,
+            "p99": 0.012376804021187127,
+            "max": 0.012376804021187127,
+            "sum": 0.19556565105449408
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 168.8933745003746,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594934.7114666,
+          "fsync_seconds": 0.1793209119932726,
+          "close_seconds": 0.0001294269459322095,
+          "seconds": 1.7761318869888783,
+          "ended_epoch": 1791594936.4876025,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0026253409450873733,
+            "median": 0.0030125545454211533,
+            "p95": 0.005057820002548397,
+            "p99": 0.09734465007204562,
+            "max": 0.3026718710316345,
+            "sum": 1.5745863417396322
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 144.13344069510703,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08404156297910959,
+          "mib_per_second": 761.5279598727672,
+          "started_epoch": 1791594939.9108322,
+          "ended_epoch": 1791594939.99488,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23515791492536664,
+          "mib_per_second": 68.03938538525487,
+          "started_epoch": 1791594940.0001667,
+          "ended_epoch": 1791594940.2420366,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.1315332689555362,
+          "mib_per_second": 15.20527860275475,
+          "fsync_seconds": 0.0349671799922362,
+          "requests_seconds": 0.09656506904866546,
+          "started_epoch": 1791594940.314576,
+          "ended_epoch": 1791594940.4461138,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011462392285466194,
+            "median": 0.0001784760388545692,
+            "p95": 0.0002107640029862523,
+            "p99": 0.00025054498109966516,
+            "max": 0.0038348579546436667,
+            "sum": 0.09637295070569962
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-qadkqbyw/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-qadkqbyw/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 1.9719371179817244,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "964f921aa7ad4886e591bdfbaacae5a2c823309c1e77442b85f7edf366b9d4ed"
+    },
+    {
+      "variant": "sdk",
+      "rep": 1,
+      "free_bytes": 104401244160,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594948.6012213,
+          "fsync_seconds": 4.349498415016569,
+          "close_seconds": 0.0001715779071673751,
+          "seconds": 4.82980821991805,
+          "ended_epoch": 1791594953.4310331,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026974170468747616,
+            "median": 0.0029854410677216947,
+            "p95": 0.00515271199401468,
+            "p99": 0.2520939609967172,
+            "max": 0.2520939609967172,
+            "sum": 0.4747848561964929
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 13.251043744566307,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594954.9544713,
+          "fsync_seconds": 0.20463558402843773,
+          "close_seconds": 0.0001923630479723215,
+          "seconds": 1.8140742069808766,
+          "ended_epoch": 1791594956.7685494,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.00267378194257617,
+            "median": 0.003079758957028389,
+            "p95": 0.005807099980302155,
+            "p99": 0.06915713904891163,
+            "max": 0.30207354004960507,
+            "sum": 1.5869259655009955
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 141.11881367083384,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08888059097807854,
+          "mib_per_second": 720.067219352591,
+          "started_epoch": 1791594960.1557777,
+          "ended_epoch": 1791594960.2446647,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23329075798392296,
+          "mib_per_second": 68.5839427942646,
+          "started_epoch": 1791594960.2499855,
+          "ended_epoch": 1791594960.4887905,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.12966803403105587,
+          "mib_per_second": 15.424001874825944,
+          "fsync_seconds": 0.0360808540135622,
+          "requests_seconds": 0.09358613402582705,
+          "started_epoch": 1791594960.5466456,
+          "ended_epoch": 1791594960.6763177,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011049199383705854,
+            "median": 0.00016816897550597787,
+            "p95": 0.00019867997616529465,
+            "p99": 0.0002225650241598487,
+            "max": 0.005284370039589703,
+            "sum": 0.09338509093504399
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-gdho14v3/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-gdho14v3/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2674617099110037,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "5d8f15190d2bfeefa781e425419248cadb36328456706d9a71525b4e0605bf7a"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 2,
+      "free_bytes": 104400474112,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594963.8983376,
+          "fsync_seconds": 0.1761194170685485,
+          "close_seconds": 0.00015379791148006916,
+          "seconds": 0.4207370189251378,
+          "ended_epoch": 1791594964.3190784,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0027151660760864615,
+            "median": 0.0030964715406298637,
+            "p95": 0.004919273080304265,
+            "p99": 0.014372874982655048,
+            "max": 0.014372874982655048,
+            "sum": 0.23727643839083612
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 152.11402163636944,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594965.8333175,
+          "fsync_seconds": 0.18404576496686786,
+          "close_seconds": 0.0001894810702651739,
+          "seconds": 1.747070432989858,
+          "ended_epoch": 1791594967.5803912,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0026808379916474223,
+            "median": 0.0029225259786471725,
+            "p95": 0.005445116083137691,
+            "p99": 0.06921693100593984,
+            "max": 0.30920502298977226,
+            "sum": 1.5402644987916574
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 146.53101281205537,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.07937003299593925,
+          "mib_per_second": 806.3496710814569,
+          "started_epoch": 1791594970.8706207,
+          "ended_epoch": 1791594970.9499946,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.24246986990328878,
+          "mib_per_second": 65.9875802563912,
+          "started_epoch": 1791594970.9554214,
+          "ended_epoch": 1791594971.2043335,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.13642536604311317,
+          "mib_per_second": 14.660030300874983,
+          "fsync_seconds": 0.03935154795181006,
+          "requests_seconds": 0.09707278502173722,
+          "started_epoch": 1791594971.2760303,
+          "ended_epoch": 1791594971.4124606,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011781894136220217,
+            "median": 0.00018015096429735422,
+            "p95": 0.00021311198361217976,
+            "p99": 0.0002463349374011159,
+            "max": 0.0035331359831616282,
+            "sum": 0.09688392281532288
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-7awj4eyn/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-7awj4eyn/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26749732706230134,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "4246328af3ea352f02775b3ad2214f7823fe3b679e07e1f23e7242a3d3b2e36f"
+    },
+    {
+      "variant": "sdk",
+      "rep": 2,
+      "free_bytes": 104401055744,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594974.7111266,
+          "fsync_seconds": 4.220698960940354,
+          "close_seconds": 0.00017302902415394783,
+          "seconds": 4.547999507049099,
+          "ended_epoch": 1791594979.2591293,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026464670663699508,
+            "median": 0.002962618484161794,
+            "p95": 0.005085103097371757,
+            "p99": 0.10309817502275109,
+            "max": 0.10309817502275109,
+            "sum": 0.3198496258119121
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 14.072121138272824,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594980.7674212,
+          "fsync_seconds": 0.18398542702198029,
+          "close_seconds": 0.00021518708672374487,
+          "seconds": 2.040654488024302,
+          "ended_epoch": 1791594982.80808,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0028045109938830137,
+            "median": 0.0030852359486743808,
+            "p95": 0.005659978021867573,
+            "p99": 0.25402539607603103,
+            "max": 0.2960569799179211,
+            "sum": 1.832758603617549
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 125.4499482898015,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08512932399753481,
+          "mib_per_second": 751.7973477840999,
+          "started_epoch": 1791594986.2508824,
+          "ended_epoch": 1791594986.336017,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.24809930904302746,
+          "mib_per_second": 64.49030455471824,
+          "started_epoch": 1791594986.341277,
+          "ended_epoch": 1791594986.5960026,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.1354965689824894,
+          "mib_per_second": 14.760521355034943,
+          "fsync_seconds": 0.034003038075752556,
+          "requests_seconds": 0.10149249597452581,
+          "started_epoch": 1791594986.6663632,
+          "ended_epoch": 1791594986.801864,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010986498091369867,
+            "median": 0.00018319947412237525,
+            "p95": 0.00023054308257997036,
+            "p99": 0.00033266900572925806,
+            "max": 0.004921731073409319,
+            "sum": 0.1012952943565324
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-6s8fk1d3/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-6s8fk1d3/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2666418730514124,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "0013e9a97689ecf517052ad6bef7bcab71a2f410ba4dafc36cd2bdadd4b96f29"
+    },
+    {
+      "variant": "fsync",
+      "rep": 2,
+      "free_bytes": 104400904192,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791594990.146574,
+          "fsync_seconds": 0.1782382510136813,
+          "close_seconds": 0.00014138605911284685,
+          "seconds": 0.3960365060484037,
+          "ended_epoch": 1791594990.5426137,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026031850138679147,
+            "median": 0.0028295000083744526,
+            "p95": 0.004822051036171615,
+            "p99": 0.011396506102755666,
+            "max": 0.011396506102755666,
+            "sum": 0.2111742584966123
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 161.6012640818973,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791594992.0176396,
+          "fsync_seconds": 0.1839206760050729,
+          "close_seconds": 0.00019181007519364357,
+          "seconds": 1.7806563259800896,
+          "ended_epoch": 1791594993.7982993,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0026291970862075686,
+            "median": 0.0029661430162377656,
+            "p95": 0.005316941998898983,
+            "p99": 0.069978674990125,
+            "max": 0.3121283589862287,
+            "sum": 1.5749739924212918
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 143.76721451799256,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08312951098196208,
+          "mib_per_second": 769.8830324394315,
+          "started_epoch": 1791594997.1142855,
+          "ended_epoch": 1791594997.1974204,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23657333804294467,
+          "mib_per_second": 67.63230435162373,
+          "started_epoch": 1791594997.2027702,
+          "ended_epoch": 1791594997.44595,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.12116552202496678,
+          "mib_per_second": 16.506345753933942,
+          "fsync_seconds": 0.03665205207653344,
+          "requests_seconds": 0.08451225596945733,
+          "started_epoch": 1791594997.5167375,
+          "ended_epoch": 1791594997.6379085,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 9.545893408358097e-05,
+            "median": 0.00015077542047947645,
+            "p95": 0.00018937094137072563,
+            "p99": 0.00021577207371592522,
+            "max": 0.004640157916583121,
+            "sum": 0.08435092412400991
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-4iyznkyf/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-4iyznkyf/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26730845600832254,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "33286992d406cd84b6242fbdfeabda24808dcb4f074447c3b96a1efd33f561e6"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 3,
+      "free_bytes": 104400863232,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595000.8750741,
+          "fsync_seconds": 0.1709122940665111,
+          "close_seconds": 0.00014395802281796932,
+          "seconds": 0.39449044701177627,
+          "ended_epoch": 1791595001.2695675,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002681081066839397,
+            "median": 0.0028985884855501354,
+            "p95": 0.004340732004493475,
+            "p99": 0.012111226096749306,
+            "max": 0.012111226096749306,
+            "sum": 0.21680352464318275
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 162.23460031743045,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595002.6834028,
+          "fsync_seconds": 0.20923269994091243,
+          "close_seconds": 0.0001638790126889944,
+          "seconds": 1.7835329009685665,
+          "ended_epoch": 1791595004.4669383,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002302714972756803,
+            "median": 0.0030175045249052346,
+            "p95": 0.005602194927632809,
+            "p99": 0.07098609302192926,
+            "max": 0.3075448159361258,
+            "sum": 1.552431890857406
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 143.5353392477237,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.05649098404683173,
+          "mib_per_second": 1132.9241485144462,
+          "started_epoch": 1791595012.4735768,
+          "ended_epoch": 1791595012.5300732,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.21109540201723576,
+          "mib_per_second": 75.7951137121102,
+          "started_epoch": 1791595012.5334206,
+          "ended_epoch": 1791595012.7499123,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.14711143600288779,
+          "mib_per_second": 13.595136138571444,
+          "fsync_seconds": 0.03536197799257934,
+          "requests_seconds": 0.11174843402113765,
+          "started_epoch": 1791595012.8046498,
+          "ended_epoch": 1791595012.9517667,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011015299241989851,
+            "median": 0.00020120502449572086,
+            "p95": 0.00031779403798282146,
+            "p99": 0.0003796729724854231,
+            "max": 0.0031951909186318517,
+            "sum": 0.11147418327163905
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-zwh5sy8k/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-zwh5sy8k/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26746492204256356,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "5e763eabb461472c337120766c207001609e3fcb11fb918cfc4345c034ee190e"
+    },
+    {
+      "variant": "fsync",
+      "rep": 3,
+      "free_bytes": 104400748544,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595016.2169058,
+          "fsync_seconds": 0.19651388993952423,
+          "close_seconds": 0.00016077107284218073,
+          "seconds": 0.4239244560012594,
+          "ended_epoch": 1791595016.640834,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026896150084212422,
+            "median": 0.0029856440378353,
+            "p95": 0.0045702040661126375,
+            "p99": 0.012240564916282892,
+            "max": 0.012240564916282892,
+            "sum": 0.22048889368306845
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 150.97029457486613,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595018.112242,
+          "fsync_seconds": 0.1839020469924435,
+          "close_seconds": 0.00014467805158346891,
+          "seconds": 1.7387596380431205,
+          "ended_epoch": 1791595019.8510046,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0026341959601268172,
+            "median": 0.0028747174656018615,
+            "p95": 0.005054524983279407,
+            "p99": 0.06938623706810176,
+            "max": 0.3068055909825489,
+            "sum": 1.5324791638413444
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 147.23139092883136,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.07990972802508622,
+          "mib_per_second": 800.9037395285384,
+          "started_epoch": 1791595023.1416848,
+          "ended_epoch": 1791595023.2215981,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23020902497228235,
+          "mib_per_second": 69.50205363115731,
+          "started_epoch": 1791595023.2270093,
+          "ended_epoch": 1791595023.4637628,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.13406182802282274,
+          "mib_per_second": 14.918489696108868,
+          "fsync_seconds": 0.0380120559129864,
+          "requests_seconds": 0.09604817908257246,
+          "started_epoch": 1791595023.5358033,
+          "ended_epoch": 1791595023.6698723,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010267994366586208,
+            "median": 0.0001758274738676846,
+            "p95": 0.00020529795438051224,
+            "p99": 0.00023202993907034397,
+            "max": 0.004895854974165559,
+            "sum": 0.09585097699891776
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-6_a6rnot/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-6_a6rnot/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2674187090015039,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "c3975032cf08ece33d5bb43058ae83a32171d72f94335be54364a9d95dfb933d"
+    },
+    {
+      "variant": "sdk",
+      "rep": 3,
+      "free_bytes": 104400674816,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595026.9596744,
+          "fsync_seconds": 0.17543858289718628,
+          "close_seconds": 0.00014112598728388548,
+          "seconds": 0.37959007208701223,
+          "ended_epoch": 1791595027.3392675,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002640165970660746,
+            "median": 0.0028352735098451376,
+            "p95": 0.003502634004689753,
+            "p99": 0.012166592990979552,
+            "max": 0.012166592990979552,
+            "sum": 0.19757945474702865
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 168.60293433946683,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595028.7388794,
+          "fsync_seconds": 0.1794471809407696,
+          "close_seconds": 0.00014199595898389816,
+          "seconds": 1.796812021988444,
+          "ended_epoch": 1791595030.5356956,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002707173931412399,
+            "median": 0.0029850330320186913,
+            "p95": 0.005411793943494558,
+            "p99": 0.07092207192908973,
+            "max": 0.31690171791706234,
+            "sum": 1.5930841211229563
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 142.47455875584433,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08300937002059072,
+          "mib_per_second": 770.9972980655631,
+          "started_epoch": 1791595033.5361698,
+          "ended_epoch": 1791595033.6191833,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23798734799493104,
+          "mib_per_second": 67.23046470663974,
+          "started_epoch": 1791595033.6245847,
+          "ended_epoch": 1791595033.8693438,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.18207275099121034,
+          "mib_per_second": 10.984620098899649,
+          "fsync_seconds": 0.06205897394102067,
+          "requests_seconds": 0.12001279997639358,
+          "started_epoch": 1791595033.9428287,
+          "ended_epoch": 1791595034.1249068,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010952109005302191,
+            "median": 0.00021070701768621802,
+            "p95": 0.00031655002385377884,
+            "p99": 0.0003572840942069888,
+            "max": 0.006892747012898326,
+            "sum": 0.11973649705760181
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-0nz0af8u/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-0nz0af8u/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.41778042702935636,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "b0d2c6d51e9c38100cf77e4678ca374671edb530d93bf8dee9d05426a62f8e00"
+    },
+    {
+      "variant": "sdk",
+      "rep": 4,
+      "free_bytes": 104400601088,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595038.2984579,
+          "fsync_seconds": 2.906286120065488,
+          "close_seconds": 0.00016547809354960918,
+          "seconds": 3.216957811033353,
+          "ended_epoch": 1791595041.5154192,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002458497998304665,
+            "median": 0.0029388884431682527,
+            "p95": 0.005155786057002842,
+            "p99": 0.0884926849976182,
+            "max": 0.0884926849976182,
+            "sum": 0.3045850668568164
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 19.894572375334285,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595043.0377245,
+          "fsync_seconds": 0.21156184491701424,
+          "close_seconds": 0.00018774298951029778,
+          "seconds": 1.7460125508951023,
+          "ended_epoch": 1791595044.7837586,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0023101079277694225,
+            "median": 0.0027953115641139448,
+            "p95": 0.005330116022378206,
+            "p99": 0.07280104700475931,
+            "max": 0.3189177910098806,
+            "sum": 1.513034292962402
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 146.6197936943582,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08416836697142571,
+          "mib_per_second": 760.3806786666936,
+          "started_epoch": 1791595048.1492736,
+          "ended_epoch": 1791595048.233447,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.23353222105652094,
+          "mib_per_second": 68.51302971219367,
+          "started_epoch": 1791595048.2387815,
+          "ended_epoch": 1791595048.4793937,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.13688063505105674,
+          "mib_per_second": 14.61127061000262,
+          "fsync_seconds": 0.038047594018280506,
+          "requests_seconds": 0.09883201099000871,
+          "started_epoch": 1791595048.5522277,
+          "ended_epoch": 1791595048.6891127,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011756503954529762,
+            "median": 0.00017845648108050227,
+            "p95": 0.00021813204512000084,
+            "p99": 0.0003210140857845545,
+            "max": 0.005062247044406831,
+            "sum": 0.09863322915043682
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-otgm2e1n/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-otgm2e1n/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26734271994791925,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "6a0a0c72649113d4cd380a045100965b53afe8a49f70e00d159b8ebff04eb657"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 4,
+      "free_bytes": 104400523264,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595051.989887,
+          "fsync_seconds": 0.20490965899080038,
+          "close_seconds": 0.00014351890422403812,
+          "seconds": 0.41211218701209873,
+          "ended_epoch": 1791595052.402002,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0027102798921987414,
+            "median": 0.0028641720418818295,
+            "p95": 0.0037826260086148977,
+            "p99": 0.011690724059008062,
+            "max": 0.011690724059008062,
+            "sum": 0.20051866152789444
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 155.2975185325473,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595053.76382,
+          "fsync_seconds": 0.18815556389745325,
+          "close_seconds": 0.00018061301670968533,
+          "seconds": 1.7604725459823385,
+          "ended_epoch": 1791595055.5242963,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002302858978509903,
+            "median": 0.0030022820574231446,
+            "p95": 0.005325673031620681,
+            "p99": 0.06714346003718674,
+            "max": 0.30808307603001595,
+            "sum": 1.54794626228977
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 145.41550255028417,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.0793850909685716,
+          "mib_per_second": 806.1967205572324,
+          "started_epoch": 1791595059.436661,
+          "ended_epoch": 1791595059.5160499,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.24275850201956928,
+          "mib_per_second": 65.90912312809628,
+          "started_epoch": 1791595059.5213943,
+          "ended_epoch": 1791595059.770431,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.13080289703793824,
+          "mib_per_second": 15.290181221444335,
+          "fsync_seconds": 0.004731416003778577,
+          "requests_seconds": 0.12607047997880727,
+          "started_epoch": 1791595059.8386543,
+          "ended_epoch": 1791595059.969461,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00011980102863162756,
+            "median": 0.00024007604224607348,
+            "p95": 0.00033567508216947317,
+            "p99": 0.0004695859970524907,
+            "max": 0.0010276740649715066,
+            "sum": 0.12580791325308383
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-5czftnzk/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-5czftnzk/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2673189740162343,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "90ffab9c46fbce6000c23a43844443f7c9c797c970e5174c57308726d712f28e"
+    },
+    {
+      "variant": "fsync",
+      "rep": 4,
+      "free_bytes": 104400457728,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595064.1972353,
+          "fsync_seconds": 3.3370272730244324,
+          "close_seconds": 0.00020409002900123596,
+          "seconds": 3.6644193689571694,
+          "ended_epoch": 1791595067.8616583,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002764767035841942,
+            "median": 0.0032438255148008466,
+            "p95": 0.0050854209112003446,
+            "p99": 0.0874597909860313,
+            "max": 0.0874597909860313,
+            "sum": 0.3193363632308319
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 17.465249895296044,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595069.3713677,
+          "fsync_seconds": 0.1855558049865067,
+          "close_seconds": 0.00018442003056406975,
+          "seconds": 1.8105424030218273,
+          "ended_epoch": 1791595071.181914,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0028317200485616922,
+            "median": 0.003108282049652189,
+            "p95": 0.005546223954297602,
+            "p99": 0.06999404600355774,
+            "max": 0.3086067440453917,
+            "sum": 1.6008919510059059
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 141.39409249555905,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.06139808101579547,
+          "mib_per_second": 1042.37785515699,
+          "started_epoch": 1791595074.5668578,
+          "ended_epoch": 1791595074.6282601,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.22778364608529955,
+          "mib_per_second": 70.24209277082333,
+          "started_epoch": 1791595074.6316617,
+          "ended_epoch": 1791595074.866047,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.1586100640706718,
+          "mib_per_second": 12.609540332250678,
+          "fsync_seconds": 0.03533818305004388,
+          "requests_seconds": 0.12327084399294108,
+          "started_epoch": 1791595074.9392924,
+          "ended_epoch": 1791595075.0979064,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.0001582930563017726,
+            "median": 0.00021199695765972137,
+            "p95": 0.00037465000059455633,
+            "p99": 0.00041498104110360146,
+            "max": 0.0057405640836805105,
+            "sum": 0.12301903346087784
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-3b4gknxm/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-3b4gknxm/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26741796790156513,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "c4b3ac47990382e479fb108982520ce6547602394087aac8d58644fe4b8d607b"
+    },
+    {
+      "variant": "fsync",
+      "rep": 5,
+      "free_bytes": 104400101376,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595078.3718061,
+          "fsync_seconds": 0.1770728980191052,
+          "close_seconds": 0.0001411399571225047,
+          "seconds": 0.41323495702818036,
+          "ended_epoch": 1791595078.785046,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002726817037910223,
+            "median": 0.0030958124552853405,
+            "p95": 0.004818112007342279,
+            "p99": 0.011883222963660955,
+            "max": 0.011883222963660955,
+            "sum": 0.22899119497742504
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 154.87557117689718,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595080.1335688,
+          "fsync_seconds": 0.17996892100200057,
+          "close_seconds": 0.00017940497491508722,
+          "seconds": 1.822927866014652,
+          "ended_epoch": 1791595081.9565008,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002453580964356661,
+            "median": 0.0030584230553358793,
+            "p95": 0.005538651952520013,
+            "p99": 0.06939968303777277,
+            "max": 0.31275332800578326,
+            "sum": 1.6189500411273912
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 140.4334229415649,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08275494899135083,
+          "mib_per_second": 773.3676448364313,
+          "started_epoch": 1791595085.3282425,
+          "ended_epoch": 1791595085.411002,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.22765121597331017,
+          "mib_per_second": 70.28295426225986,
+          "started_epoch": 1791595085.4163358,
+          "ended_epoch": 1791595085.6516352,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.16068054805509746,
+          "mib_per_second": 12.447057370716701,
+          "fsync_seconds": 0.06318599206861109,
+          "requests_seconds": 0.09749327204190195,
+          "started_epoch": 1791595085.7208269,
+          "ended_epoch": 1791595085.8815124,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010293396189808846,
+            "median": 0.00017549499170854688,
+            "p95": 0.00021436100360006094,
+            "p99": 0.0003413169179111719,
+            "max": 0.0047037480399012566,
+            "sum": 0.09727623220533133
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fsync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-b136t6g5/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-b136t6g5/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.26747928198892623,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "68e3c26d3bfaa6d15819bdf9499a92c31977538f5fb4473ab501356784d106cc"
+    },
+    {
+      "variant": "sdk",
+      "rep": 5,
+      "free_bytes": 104400027648,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595089.1262195,
+          "fsync_seconds": 4.434364274027757,
+          "close_seconds": 0.00016813608817756176,
+          "seconds": 4.678013342083432,
+          "ended_epoch": 1791595093.8042357,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.0026675990084186196,
+            "median": 0.0031406719936057925,
+            "p95": 0.00539955694694072,
+            "p99": 0.013774091028608382,
+            "max": 0.013774091028608382,
+            "sum": 0.2367405453696847
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 13.681021262649184,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595095.272039,
+          "fsync_seconds": 0.21270815201569349,
+          "close_seconds": 0.000186525983735919,
+          "seconds": 2.2979100389638916,
+          "ended_epoch": 1791595097.5699542,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.0027601741021499038,
+            "median": 0.003037114511243999,
+            "p95": 0.0054529469925910234,
+            "p99": 0.2817320130998269,
+            "max": 0.4785919289570302,
+            "sum": 2.060448347358033
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 111.40557970469038,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.08654167992062867,
+          "mib_per_second": 739.5280523638705,
+          "started_epoch": 1791595101.0219634,
+          "ended_epoch": 1791595101.1085086,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.22380926902405918,
+          "mib_per_second": 71.48944308593414,
+          "started_epoch": 1791595101.1137834,
+          "ended_epoch": 1791595101.3440268,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.1448566480539739,
+          "mib_per_second": 13.80675327551964,
+          "fsync_seconds": 0.03584881196729839,
+          "requests_seconds": 0.10900569404475391,
+          "started_epoch": 1791595101.4117894,
+          "ended_epoch": 1791595101.5566504,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010366400238126516,
+            "median": 0.00020151049830019474,
+            "p95": 0.00024138600565493107,
+            "p99": 0.0002873089397326112,
+            "max": 0.005862741963937879,
+            "sum": 0.10880138340871781
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/sdk/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-d_5thfpb/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-d_5thfpb/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2678668570006266,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "0e43386f821d296f90aa0849feb7cce18afa91eb86d1d864092e56e5262ec1ba"
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 5,
+      "free_bytes": 104399929344,
+      "samples": [
+        {
+          "workload": "write_64",
+          "started_epoch": 1791595104.7913046,
+          "fsync_seconds": 0.1993013349128887,
+          "close_seconds": 0.0001968190772458911,
+          "seconds": 0.42287107603624463,
+          "ended_epoch": 1791595105.2141788,
+          "write_latencies_summary": {
+            "count": 64,
+            "min": 0.002724026096984744,
+            "median": 0.003037880000192672,
+            "p95": 0.004455309011973441,
+            "p99": 0.012408650945872068,
+            "max": 0.012408650945872068,
+            "sum": 0.21651173871941864
+          },
+          "wal_bytes_summary": {
+            "count": 64,
+            "min": 354352,
+            "median": 6050252.0,
+            "p95": 11325912,
+            "p99": 11902712,
+            "max": 11902712,
+            "sum": 387805288
+          },
+          "mib_per_second": 151.34636447566942,
+          "validation": {
+            "sha256": "e44aaec70a8704e1c92decf20260673acf2dadd7f7f70a1063f088755ecb99b2",
+            "bytes": 67108864
+          }
+        },
+        {
+          "workload": "write_256",
+          "started_epoch": 1791595106.7115238,
+          "fsync_seconds": 0.18805198895279318,
+          "close_seconds": 0.00016593397594988346,
+          "seconds": 1.7697532509919256,
+          "ended_epoch": 1791595108.4812808,
+          "write_latencies_summary": {
+            "count": 256,
+            "min": 0.002712844987399876,
+            "median": 0.0029902164824306965,
+            "p95": 0.00544236705172807,
+            "p99": 0.06325265998020768,
+            "max": 0.30119099491275847,
+            "sum": 1.5577508993446827
+          },
+          "wal_bytes_summary": {
+            "count": 256,
+            "min": 15165752,
+            "median": 39041152.0,
+            "p95": 61054312,
+            "p99": 62974232,
+            "max": 63365632,
+            "sum": 10023308992
+          },
+          "mib_per_second": 144.65293388019774,
+          "validation": {
+            "sha256": "5e465dde3dc87faeb7f0b356bc3f573100bfe6cad780954a3ecb1adc3caa9e0c",
+            "bytes": 268435456
+          }
+        },
+        {
+          "workload": "read_64",
+          "seconds": 0.05767773406114429,
+          "mib_per_second": 1109.6136323967487,
+          "started_epoch": 1791595111.9559293,
+          "ended_epoch": 1791595112.0136106,
+          "bytes": 67108864
+        },
+        {
+          "workload": "random_read_4k",
+          "seconds": 0.21154685504734516,
+          "mib_per_second": 75.6333626251221,
+          "started_epoch": 1791595112.018963,
+          "ended_epoch": 1791595112.2355232,
+          "requests": 4096,
+          "seed": 4319,
+          "validation": "all requested slices compared"
+        },
+        {
+          "workload": "random_write_4k",
+          "seconds": 0.13324962090700865,
+          "mib_per_second": 15.009423564482383,
+          "fsync_seconds": 0.03539221396204084,
+          "requests_seconds": 0.09785515698604286,
+          "started_epoch": 1791595112.289059,
+          "ended_epoch": 1791595112.4223132,
+          "requests": 512,
+          "seed": 892,
+          "write_latencies_summary": {
+            "count": 512,
+            "min": 0.00010244990698993206,
+            "median": 0.00018253701273351908,
+            "p95": 0.00021609303075820208,
+            "p99": 0.0002779529895633459,
+            "max": 0.003798997960984707,
+            "sum": 0.09769383806269616
+          },
+          "validation": {
+            "bytes": 67108864,
+            "sha256": "6ea063f8be1f925b6a739a7245cd3a2f5310c010b2964e37d979bc00ac1911d6"
+          }
+        }
+      ],
+      "command": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/fdatasync/build/vane-fs-mount",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-ezmzcauk/db.sqlite",
+        "--branch",
+        "main",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/owned-fuse-ezmzcauk/mount",
+        "--durability=fsync"
+      ],
+      "unmount_seconds": 0.2673001859802753,
+      "inspection": {
+        "payload_file": {
+          "size": 402657280,
+          "allocated_bytes": 402661376
+        },
+        "logical_payload_bytes": 406315008,
+        "payload_lengths": [
+          [
+            8,
+            98304
+          ],
+          [
+            4096,
+            894
+          ]
+        ],
+        "quick_check": [
+          [
+            "ok"
+          ]
+        ],
+        "page_size": 4096,
+        "freelist_count": 6,
+        "page_count": 7902,
+        "payloads": [
+          99198,
+          4448256,
+          4096
+        ],
+        "block_versions": 98304,
+        "page_usage": [
+          [
+            "block_payload_references",
+            "internal",
+            18,
+            50580,
+            14154,
+            73728
+          ],
+          [
+            "block_payload_references",
+            "leaf",
+            1255,
+            3913958,
+            925332,
+            5140480
+          ],
+          [
+            "block_payloads",
+            "internal",
+            3,
+            0,
+            7644,
+            12288
+          ],
+          [
+            "block_payloads",
+            "leaf",
+            521,
+            1518510,
+            28190,
+            2134016
+          ],
+          [
+            "block_payloads",
+            "overflow",
+            894,
+            3228234,
+            430014,
+            3661824
+          ],
+          [
+            "block_versions",
+            "internal",
+            100,
+            322977,
+            64360,
+            409600
+          ],
+          [
+            "block_versions",
+            "leaf",
+            3010,
+            10227929,
+            1791066,
+            12328960
+          ],
+          [
+            "block_versions_high",
+            "internal",
+            45,
+            146043,
+            23604,
+            184320
+          ],
+          [
+            "block_versions_high",
+            "leaf",
+            2020,
+            6964223,
+            1004682,
+            8273920
+          ],
+          [
+            "branch_names",
+            "leaf",
+            1,
+            7,
+            4078,
+            4096
+          ],
+          [
+            "branch_parents",
+            "leaf",
+            1,
+            3,
+            4082,
+            4096
+          ],
+          [
+            "branches",
+            "leaf",
+            1,
+            185,
+            3898,
+            4096
+          ],
+          [
+            "dirent_targets",
+            "leaf",
+            1,
+            242,
+            3837,
+            4096
+          ],
+          [
+            "dirent_versions",
+            "leaf",
+            1,
+            344,
+            3735,
+            4096
+          ],
+          [
+            "dirent_versions_high",
+            "leaf",
+            1,
+            236,
+            3843,
+            4096
+          ],
+          [
+            "format",
+            "leaf",
+            1,
+            42,
+            4042,
+            4096
+          ],
+          [
+            "inode_ids",
+            "leaf",
+            1,
+            8,
+            4064,
+            4096
+          ],
+          [
+            "inode_versions",
+            "leaf",
+            1,
+            479,
+            3597,
+            4096
+          ],
+          [
+            "inode_versions_high",
+            "leaf",
+            1,
+            275,
+            3801,
+            4096
+          ],
+          [
+            "mounts",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "open_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "opened_inodes",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "orphans",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "owners",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshot_pins",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "snapshots",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_branches_1",
+            "leaf",
+            1,
+            35,
+            4050,
+            4096
+          ],
+          [
+            "sqlite_autoindex_mounts_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_open_inodes_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_orphans_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_owners_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_pins_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_autoindex_snapshots_1",
+            "leaf",
+            1,
+            0,
+            4088,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "internal",
+            1,
+            0,
+            3977,
+            4096
+          ],
+          [
+            "sqlite_schema",
+            "leaf",
+            2,
+            4710,
+            3329,
+            8192
+          ],
+          [
+            "sqlite_sequence",
+            "leaf",
+            1,
+            13,
+            4071,
+            4096
+          ],
+          [
+            "sync_barrier",
+            "leaf",
+            1,
+            3,
+            4081,
+            4096
+          ]
+        ]
+      },
+      "log_sha256": "a441d1c916c7218c036a31467322ff14ad983c414457816cd4e6b303dd767e29"
+    }
+  ],
+  "complete_raw_report": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/results.json"
+}

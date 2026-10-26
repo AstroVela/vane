@@ -4,7 +4,38 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_release_tests.sh [all|non-ray|shared-ray|owner-ray]
+
+Run the base-installation release gate or one process-isolated phase.
+EOF
+}
+
+phase="${1:-all}"
+if (($# > 1)); then
+  usage >&2
+  exit 2
+fi
+case "$phase" in
+  all | non-ray | shared-ray | owner-ray) ;;
+  -h | --help)
+    usage
+    exit
+    ;;
+  *)
+    printf 'Unknown release-test phase: %s\n' "$phase" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Anchor diagnostics to the caller before entering a disposable test directory.
+if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
+  VANE_TEST_DIAGNOSTICS_DIR="$(python -c 'import os; print(os.path.abspath(os.environ["VANE_TEST_DIAGNOSTICS_DIR"]))')"
+  export VANE_TEST_DIAGNOSTICS_DIR
+fi
 site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-release-tests.XXXXXX")"
 cleanup_test_workdir() {
@@ -22,11 +53,21 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
+  "$project_root/tests/fast/test_mlx_provider.py"
+  "$project_root/tests/fast/test_mlx_image_provider.py"
+  "$project_root/tests/fast/test_mlx_audio_provider.py"
+  "$project_root/tests/fast/test_mlx_video_provider.py"
+  "$project_root/tests/fast/test_mlx_multimodal_provider.py"
+  "$project_root/tests/fast/test_embedding_service_backend.py"
+  "$project_root/tests/fast/test_mlx_service_provider.py"
+  "$project_root/tests/fast/test_litert_provider.py"
+  "$project_root/tests/fast/test_litert_service.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"
   "$project_root/tests/fast/test_ai_image_embedding.py"
   "$project_root/tests/fast/test_ai_video_embedding.py"
   "$project_root/tests/fast/test_ai_audio_embedding.py"
+  "$project_root/tests/fast/test_ai_media_models.py"
   "$project_root/tests/fast/test_clap.py"
   "$project_root/tests/fast/test_cosmos_embed1.py"
   "$project_root/tests/fast/test_datasink.py"
@@ -36,6 +77,10 @@ release_tests=(
   "$project_root/tests/fast/test_milvus_datasink.py"
   "$project_root/tests/fast/test_qdrant_datasink.py"
   "$project_root/tests/fast/test_package_metadata.py"
+  "$project_root/tests/fast/test_python_filesystem_concurrency.py"
+  "$project_root/tests/fast/test_python_callback_entry.py"
+  "$project_root/tests/fast/test_python_parameter_callbacks.py"
+  "$project_root/tests/fast/test_python_binding_callbacks.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
   "$project_root/tests/fast/test_vane_config.py"
@@ -47,6 +92,76 @@ release_tests=(
   "$project_root/tests/fast/test_ray_result_contract.py"
 )
 
+# Keep the local backpressure acceptance cases in the non-Ray process. These
+# use real native plans/subprocesses and small shared-memory budgets, without
+# optional models or GPUs. The full matrices remain in the fast-test shards.
+local_runtime_tests=(
+  "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
+  "$project_root/tests/fast/test_local_query_models.py::test_model_releases_output_before_completion_callback_returns"
+  "$project_root/tests/fast/test_local_task_scheduling.py"
+  "$project_root/tests/fast/test_local_shm_credit_progress.py"
+  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds"
+  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_darwin_auto_capacity_uses_available_vm_without_linux_paths"
+  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_darwin_auto_capacity_rejects_exhausted_vm"
+  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_arena_without_madv_remove_preserves_live_views_and_closes"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_actor_retaining_previous_input_can_receive_the_next_batch[generator-subprocess_task-16MiB-False-False-2]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-2-192KiB-False]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-4-320KiB-True]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_tracks_queued_stream_when_current_input_has_no_views[auto-128KiB]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_waits_for_independent_historical_input_release[fork]"
+  "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_waits_for_independent_historical_input_release[notification]"
+  "$project_root/tests/fast/test_local_query_runtime.py"
+  "$project_root/tests/fast/test_local_query_streaming.py"
+  "$project_root/tests/fast/test_result_delivery_capacity.py"
+  "$project_root/tests/fast/test_local_query_results.py::test_full_result_slot_refuses_before_udf_execution_without_leaking_request"
+  "$project_root/tests/fast/test_local_query_results.py::test_delivery_byte_refusal_never_replays_a_model_call"
+  "$project_root/tests/fast/test_local_query_results.py::test_managed_native_queries_preserve_parameters_and_nested_schema"
+  "$project_root/tests/fast/test_local_query_results.py::test_queued_native_query_does_not_occupy_result_capacity"
+  "$project_root/tests/fast/test_local_query_results.py::test_exported_views_keep_delivery_bytes_after_connection_close"
+  "$project_root/tests/fast/test_local_query_results.py::test_result_cleanup_failure_keeps_runtime_retry_owner"
+  "$project_root/tests/fast/test_local_serving_acceptance.py::test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline[False]"
+  "$project_root/tests/fast/test_local_serving_soak.py"
+  "$project_root/tests/fast/test_udf_worker_metrics.py"
+  "$project_root/tests/fast/test_udf_model_resources.py"
+  "$project_root/tests/fast/test_udf_local_gpu.py"
+  "$project_root/tests/fast/test_udf_local_gpu_admission.py"
+  "$project_root/tests/fast/test_local_query_gpu.py"
+  "$project_root/tests/fast/test_local_gpu_table_udf.py"
+  "$project_root/tests/fast/test_local_runtime_baseline.py"
+  "$project_root/tests/fast/test_udf_data_wait_native.py"
+  "$project_root/tests/fast/test_udf_data_wait_progress.py"
+  "$project_root/tests/fast/test_udf_data_wait_scans.py::test_native_scans_execute_with_byte_wait"
+  "$project_root/tests/fast/test_udf_data_wait.py"
+  "$project_root/tests/fast/test_udf_local_request_cancellation.py::test_cancel_mixed_native_pipeline_and_reuse_registered_model"
+  "$project_root/tests/fast/test_udf_local_request_cancellation.py::test_failed_native_start_retires_query_before_releasing_its_plan"
+  "$project_root/tests/fast/test_udf_process.py::test_native_dispatcher_notification_cannot_cross_the_wait_boundary"
+  "$project_root/tests/fast/test_ray_udf_plan_replay.py::test_execute_native_subprocess_udf_reports_admission_task_stats"
+  "$project_root/tests/fast/test_local_result_delivery_native.py::test_native_managed_results_release_request_slots_and_preserve_exported_views"
+  "$project_root/tests/fast/test_local_result_delivery_native.py::test_queued_managed_request_cannot_reserve_the_ready_requests_result_slot"
+  "$project_root/tests/fast/test_udf_task_admission.py::test_common_admission_reentrant_wakeup_and_exact_input_handoff"
+  "$project_root/tests/fast/test_udf_task_admission.py::test_common_admission_callback_removal_keeps_the_ready_lease"
+  "$project_root/tests/fast/test_udf_task_admission.py::test_common_admission_close_fences_a_late_grant"
+  "$project_root/tests/fast/test_udf_runtime_admission.py"
+  "$project_root/tests/fast/test_udf_data_lease.py::test_shared_owner_keeps_output_through_task_completion_and_forward_transitions"
+  "$project_root/tests/fast/test_udf_data_lease.py::test_shared_owner_concurrent_release_returns_capacity_once"
+  "$project_root/tests/fast/test_udf_data_lease.py::test_shared_owner_keeps_accounting_until_a_failed_release_is_retried"
+  "$project_root/tests/fast/test_operator_byte_budget.py"
+  "$project_root/tests/fast/test_query_resource_manager.py::test_local_envelopes_and_ray_use_the_same_full_reservation_partition"
+  "$project_root/tests/fast/test_query_resource_manager.py::test_common_byte_accounting_preserves_backend_reservation_baselines"
+)
+for shape in unnest_expression sort_payload topn hash_min join_build join_probe; do
+  local_runtime_tests+=(
+    "$project_root/tests/fast/test_udf_data_wait_native_owners.py::test_consumed_native_inputs_release_byte_capacity[$shape-True-True]"
+  )
+done
+for limited in False True; do
+  local_runtime_tests+=(
+    "$project_root/tests/fast/test_udf_data_wait_batching.py::test_byte_pressure_drains_a_short_downstream_batch[2-2-False-$limited]"
+    "$project_root/tests/fast/test_udf_local_request_native.py::test_failed_output_grant_cleanup_retains_native_request[False-request-$limited-default]"
+    "$project_root/tests/fast/test_udf_local_request_native.py::test_failed_output_grant_cleanup_retains_native_request[False-runtime-$limited-byte_wait]"
+  )
+done
+
 pytest_args=(
   -c "$project_root/pyproject.toml"
   --rootdir="$project_root"
@@ -56,18 +171,25 @@ pytest_args=(
 
 # Let the non-Ray process release all Python/native state before a fresh pytest
 # process starts the real Ray runtime.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and not real_ray" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "non-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and not real_ray" \
+    "${release_tests[@]}" \
+    "${local_runtime_tests[@]}"
+fi
 
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and not ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "shared-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and not ray_cluster_owner" \
+    "${release_tests[@]}"
+fi
 
 # Tests which start their own cluster must not share a process with Ray fixtures.
-python -m pytest \
-  "${pytest_args[@]}" \
-  -m "not external_service and real_ray and ray_cluster_owner" \
-  "${release_tests[@]}"
+if [[ "$phase" == "all" || "$phase" == "owner-ray" ]]; then
+  python -m pytest \
+    "${pytest_args[@]}" \
+    -m "not external_service and real_ray and ray_cluster_owner" \
+    "${release_tests[@]}"
+fi

@@ -1,0 +1,85 @@
+{
+  "status": "PASS",
+  "source_sha256": "fd4854990bb7fd9333ec5ebafed6692c782c8c7a802d9e771a3a3a019896fe8f",
+  "control": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/updated",
+  "runs": [
+    {
+      "started_epoch": 1791725447.0626698,
+      "ended_epoch": 1791725452.239342,
+      "returncode": 1,
+      "expected": 1
+    }
+  ],
+  "compile_argv": [
+    "c++",
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG",
+    "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/updated/include",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/background_writeback/test_background.cpp",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/updated/build/python-release/libvane_fs.a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+    "-ldl",
+    "-pthread",
+    "-Wl,--wrap=sync_file_range",
+    "-Wl,--wrap=fdatasync",
+    "-Wl,--wrap=fsync",
+    "-Wl,--wrap=close",
+    "-o",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/foreground-test"
+  ],
+  "binary_sha256": "7b32343ede3367336e53c92ec7cb5ce1ea33c4e71da343cf4afacd6f619bddb3",
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-vane-background-negative-6iq2uymy",
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "940d30cb3282743579fbd2d59a58e637faa0f27ba46ffc8f4b43a9f4428468d9"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "7c7d83d09fe4a4f67030151b7799409cb7590b7ec92591215e4b9f1649625e52"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite-wal",
+          "bytes": 2579152,
+          "sha256": "0c0c2140fd29163ee944bb2ef6a59869449ff4da588529fca7d4f32d6ac79ef1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "8200eeeaa505f6e8123f344a3a8309d5ad74e4927b3fe3f2c80070f57539daeb"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-6iq2uymy/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "removed": true
+    }
+  ]
+}

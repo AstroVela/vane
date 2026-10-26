@@ -35,6 +35,9 @@ def gravitino_http(tmp_path):
             object=b"s3 file contents",
             objects=manager.dict(),
             object_requests=manager.list(),
+            object_paths=manager.list(),
+            object_fault=None,
+            object_blocked=None,
         )
         parent, child = context.Pipe(duplex=False)
         server = context.Process(target=serve_gravitino, args=(state, child), daemon=True)

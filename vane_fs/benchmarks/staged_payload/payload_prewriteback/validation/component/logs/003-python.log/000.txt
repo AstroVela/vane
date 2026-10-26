@@ -1,0 +1,13 @@
+.....................................................s.................. [ 46%]
+............s........................................................... [ 92%]
+...........                                                              [100%]
+=============================== warnings summary ===============================
+tests/test_recovery.py::test_connection_inherited_across_fork_is_rejected
+  /home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/tests/test_recovery.py:172: DeprecationWarning: This process (pid=4134503) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] ../home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/tests/test_recovery.py:123: Isolated external format 1005 has no production v1 migration
+SKIPPED [1] ../home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/tests/test_vane.py:326: could not import 'av': No module named 'av'
+153 passed, 2 skipped, 1 warning in 12.94s

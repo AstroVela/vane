@@ -1,0 +1,218 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -132 +131,0 @@
+-		bool retry = false;
+@@ -147,4 +146,15 @@
+-			int frames = -1, copied = -1, code;
+-			{
+-				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++			int frames = -1, copied = -1, code = SQLITE_OK;
++            bool deferred = false;
++            {
++                std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
++                if (!retry) {
++                    // A retained WAL may already be mostly backfilled. Batch
++                    // fresh work instead of syncing every subsequent small commit.
++                    code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++                    deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
++                               Bytes(frames - copied) < START_BYTES;
++                }
++                // Once work starts, finish it after reader release even if
++                // the remaining portion falls below the batching threshold.
++                if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY))
++                    code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
+@@ -156 +166 @@
+-			retry = code != SQLITE_OK || frames > copied;
++			retry = !deferred && (code != SQLITE_OK || frames > copied);
+@@ -168,0 +179,2 @@
++    // Worker-owned state survives a joined Stop/Start after a failed close.
++    bool retry = false;
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -118,0 +119,9 @@
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_checkpoint_batching_test tests/test_checkpoint_batching.cpp)
++  target_include_directories(vane_fs_checkpoint_batching_test PRIVATE src)
++  target_link_libraries(vane_fs_checkpoint_batching_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  target_link_options(vane_fs_checkpoint_batching_test PRIVATE "LINKER:--wrap=sqlite3_wal_checkpoint_v2")
++  add_test(NAME vane_fs_checkpoint_batching COMMAND vane_fs_checkpoint_batching_test "${CMAKE_CURRENT_BINARY_DIR}/owned-batching-test")
++  set_tests_properties(vane_fs_checkpoint_batching PROPERTIES TIMEOUT 60)
++endif()
+--- /dev/null
++++ b/tests/test_checkpoint_batching.cpp
+@@ -0,0 +1,173 @@
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: Apache-2.0
++
++#include "checkpoint.hpp"
++#include <atomic>
++#include <filesystem>
++#include <iostream>
++
++static const auto foreground = std::this_thread::get_id();
++static std::atomic<bool> hold_first {false}, waiting {false}, fail_probe {false};
++static std::atomic<int> worker_calls {0}, passive_calls {0}, failed_probes {0};
++
++static void Require(bool value, const char *message) {
++	if (!value)
++		throw std::runtime_error(message);
++}
++template <class F>
++static void Wait(F condition) {
++	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++	while (!condition()) {
++		Require(std::chrono::steady_clock::now() < deadline, "Timed out waiting for checkpoint");
++		std::this_thread::sleep_for(std::chrono::milliseconds(1));
++	}
++}
++extern "C" int __real_sqlite3_wal_checkpoint_v2(sqlite3 *, const char *, int, int *, int *);
++extern "C" int __wrap_sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *name, int mode, int *frames, int *copied) {
++	bool background = std::this_thread::get_id() != foreground;
++	if (background && mode == SQLITE_CHECKPOINT_NOOP && fail_probe.exchange(false)) {
++		++failed_probes;
++		return SQLITE_IOERR;
++	}
++	if (background && mode == SQLITE_CHECKPOINT_PASSIVE) {
++		++passive_calls;
++		if (hold_first) {
++			waiting = true;
++			while (hold_first)
++				std::this_thread::sleep_for(std::chrono::milliseconds(1));
++		}
++	}
++	auto code = __real_sqlite3_wal_checkpoint_v2(db, name, mode, frames, copied);
++	if (background)
++		++worker_calls;
++	return code;
++}
++struct Connection {
++	sqlite3 *db = nullptr;
++	explicit Connection(const std::string &path) {
++		Require(sqlite3_open(path.c_str(), &db) == SQLITE_OK, "Opening database");
++		sqlite3_busy_timeout(db, 1000);
++	}
++	~Connection() {
++		sqlite3_close_v2(db);
++	}
++	void SQL(const std::string &sql) {
++		Require(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK, sqlite3_errmsg(db));
++	}
++	bool Progress(int &frames, int &copied) {
++		auto code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++		Require(code == SQLITE_OK || code == SQLITE_BUSY, "Inspecting WAL progress");
++		return code == SQLITE_OK && frames >= 0 && copied >= 0;
++	}
++	bool CaughtUp() {
++		int frames = -1, copied = -1;
++		return Progress(frames, copied) && frames == copied;
++	}
++};
++
++static void CheckBatching(const std::string &path, int page_size, const char *synchronous) {
++	hold_first = true;
++	waiting = false;
++	worker_calls = passive_calls = failed_probes = 0;
++	Connection writer(path), reader(path), progress(path);
++	writer.SQL("PRAGMA page_size=" + std::to_string(page_size) +
++	           "; PRAGMA journal_mode=WAL; PRAGMA synchronous=" + synchronous +
++	           "; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216; "
++	           "CREATE TABLE padding(data BLOB)");
++	progress.SQL("SELECT count(*) FROM padding");
++	vane_fs::Checkpointer worker(writer.db, page_size, 1000);
++	struct Resume {
++		~Resume() {
++			hold_first = false;
++			fail_probe = false;
++		}
++	} resume;
++	sqlite3_wal_hook(writer.db, vane_fs::Checkpointer::OnCommit, &worker);
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(33554432))");
++	Wait([] { return waiting.load(); });
++	// Keep a completed WAL generation alive; subsequent tiny commits must
++	// not each synchronize the database just because its total is large.
++	reader.SQL("BEGIN; SELECT count(*) FROM padding");
++	hold_first = false;
++	Wait([&] { return progress.CaughtUp() && worker_calls > 0; });
++	Require(passive_calls == 1, "Initial checkpoint did not finish as one batch");
++	for (int i = 0; i < 32; ++i) {
++		auto calls = worker_calls.load();
++		worker.BeforeWrite(writer.db);
++		writer.SQL("INSERT INTO padding VALUES(zeroblob(4096))");
++		Wait([&] { return worker_calls > calls; });
++		Require(passive_calls == 1, "Small WAL additions restarted a completed checkpoint");
++	}
++	auto calls = worker_calls.load();
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(8388608))");
++	Wait([&] { return worker_calls > calls; });
++	Require(passive_calls == 1, "Sub-budget work did not remain in the WAL");
++	// Move the reader's pin forward, then cross the batch threshold. A real
++	// checkpoint now starts, but leaves less than one batch behind the pin.
++	reader.SQL("ROLLBACK; BEGIN; SELECT count(*) FROM padding");
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(8388608))");
++	Wait([&] {
++		int frames = -1, copied = -1;
++		return passive_calls > 1 && progress.Progress(frames, copied) && frames > copied &&
++		       int64_t(frames - copied) * (page_size + 24) < vane_fs::Checkpointer::START_BYTES;
++	});
++	worker.Stop();
++	reader.SQL("ROLLBACK");
++	worker.Start();
++	std::cout << "Restarted worker must finish sub-budget partial checkpoint" << std::endl;
++	// Idle retry must finish this sub-budget remainder without another commit.
++	Wait([&] { return progress.CaughtUp(); });
++	worker.BeforeWrite(writer.db);
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(4096))");
++	Require(std::filesystem::file_size(path + "-wal") <= 16777216, "WAL generation did not reset its allocation");
++	calls = passive_calls.load();
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(33554432))");
++	Wait([&] { return passive_calls > calls && progress.CaughtUp(); });
++
++	// A NOOP status failure must be reported and keep maintenance retryable,
++	// including across Stop/Start without any additional foreground writes.
++	worker.Stop();
++	worker.BeforeWrite(writer.db);
++	writer.SQL("INSERT INTO padding VALUES(zeroblob(33554432))");
++	fail_probe = true;
++	worker.Start();
++	Wait([] { return failed_probes > 0; });
++	worker.Stop();
++	bool reported = false;
++	try {
++		worker.CheckError();
++	} catch (const vane_fs::Error &error) {
++		Require(error.code == vane_fs::ErrorCode::Storage, "Wrong status-probe error");
++		reported = true;
++	}
++	Require(reported, "Lost checkpoint status-probe failure");
++	worker.Start();
++	Wait([&] { return progress.CaughtUp(); });
++	sqlite3_wal_hook(writer.db, nullptr, nullptr);
++	std::cout << page_size << ' ' << synchronous
++	          << " batching, partial idle retry, reset and probe-error retry passed\n";
++}
++
++int main(int argc, char **argv) {
++	if (argc != 2)
++		return 2;
++	try {
++		auto root = std::filesystem::path(argv[1]);
++		Require(std::filesystem::create_directory(root), "Test directory must not exist");
++		struct Cleanup {
++			std::filesystem::path path;
++			~Cleanup() {
++				std::filesystem::remove_all(path);
++				std::cout << "Removed owned test data: " << path << '\n';
++			}
++		} cleanup {root};
++		for (int page_size : {4096, 8192})
++			for (const auto *synchronous : {"FULL", "NORMAL"})
++				CheckBatching((root / (std::to_string(page_size) + synchronous + ".sqlite")).string(), page_size,
++				              synchronous);
++		return 0;
++	} catch (const std::exception &error) {
++		std::cerr << error.what() << '\n';
++		return 1;
++	}
++}

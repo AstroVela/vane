@@ -23,6 +23,7 @@ from vane._ray_cxx import require_ray_cxx_attr
 # Avoid importing C++ bindings at module import time (may not be registered yet).
 # Resolve `vane.ray_cxx` attributes lazily at use-time instead.
 from vane.event_loop import set_event_loop
+from vane.execution.admission_ledger import BoundedReplayMap, BoundedSet
 from vane.extensions import _dynamic_extension_snapshot_cache_identity
 from vane.runners.common import PartitionMetadata
 from vane.runners.fte import (
@@ -41,7 +42,6 @@ from vane.runners.fte.debug_memory import (
 from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
 from vane.runners.fte.fte_failures import FteTaskTerminalControlError, _safe_failure_message
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
-from vane.runners.ray.admission_ledger import BoundedReplayMap, BoundedSet
 from vane.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
 from vane.runners.ray.ray_env import build_explicit_session_process_env, scrub_shared_runtime_session_env
 
@@ -265,6 +265,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     s3_session_id: str
     effective_s3_config_identity: str
     use_session_credentials: bool
+    vane_fs_workspaces: tuple[str, ...] = ()
 
     def has_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
@@ -401,6 +402,21 @@ def _worker_snapshot_database_identity(
         seen_distributed_contracts.add(raw_contract)
         distributed_contracts.append(raw_contract)
     distributed_contracts.sort()
+    raw_vane_fs_workspaces = snapshot.get("vane_fs_workspaces", [])
+    if not isinstance(raw_vane_fs_workspaces, list) or any(
+        not isinstance(registration, Mapping) for registration in raw_vane_fs_workspaces
+    ):
+        raise TypeError("query connection snapshot vane_fs_workspaces must be a list of mappings")
+    vane_fs_workspaces = tuple(
+        sorted(
+            json.dumps(
+                {key: value for key, value in registration.items() if key != "snapshots"},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for registration in raw_vane_fs_workspaces
+        )
+    )
     has_httpfs = any(name.lower() == "httpfs" for name, _version in extensions) or any(
         name.lower() == "httpfs" for name, _descriptor in dynamic_extensions
     )
@@ -439,6 +455,7 @@ def _worker_snapshot_database_identity(
         s3_session_id,
         s3_config_identity,
         identity_uses_session_credentials,
+        vane_fs_workspaces,
     )
 
 

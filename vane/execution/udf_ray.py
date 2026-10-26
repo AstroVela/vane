@@ -49,7 +49,7 @@ from vane.execution.udf_ray_actor_runtime import (
     _actor_class as _actor_runtime_class,
 )
 from vane.execution.udf_ray_config import (
-    MAX_ACTOR_TASK_RETRIES,
+    payload_max_task_retries,
 )
 from vane.execution.udf_ray_config import (
     payload_num_cpus as _payload_num_cpus,
@@ -1112,7 +1112,7 @@ def _build_ray_task_executor(payload: dict[str, Any], options: dict[str, Any]) -
     num_gpus = _payload_num_gpus(payload)
     memory_bytes = ray_udf_task_memory_bytes(payload)
     configured_max_retries = options["max_task_retries"]
-    max_retries = MAX_ACTOR_TASK_RETRIES if configured_max_retries is None else configured_max_retries
+    max_retries = payload_max_task_retries(payload) if configured_max_retries is None else configured_max_retries
 
     return RayTaskUDFExecutor(
         payload,

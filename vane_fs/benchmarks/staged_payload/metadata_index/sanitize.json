@@ -1,0 +1,1 @@
+{"status":"PASS","runs":[{"label":"sanitize-tests","argv":["ctest","--test-dir","/home/kaka/astrovela_vane-fs/vane_fs/build/metadata-index-20261012T115012Z/updated/sanitize","--output-on-failure"],"returncode":0,"started_epoch":1791805825.455385,"ended_epoch":1791805866.0246582}]}

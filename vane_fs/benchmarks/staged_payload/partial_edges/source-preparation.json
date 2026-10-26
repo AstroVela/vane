@@ -1,0 +1,10 @@
+{
+  "parent_artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z",
+  "source_revision": "4e83455308faea9d5f6fc45200df20a608ec6f25",
+  "baseline": "cached controls format 1004",
+  "changed_files": [
+    "src/workspace.cpp",
+    "tests/test_core.cpp",
+    "tests/test_workspace.py"
+  ]
+}

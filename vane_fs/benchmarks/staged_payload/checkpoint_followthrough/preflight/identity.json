@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/prepare.py": "13c3e046a4e17520231c373f116069289b5a085cd4d9b50f52a8c71c9aced783",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z/build.json": "b562e64d9d3464a563ae9dc3589286b7af9d8ad0f9ff4feae05eb5d43386b3aa",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/candidates.json": "0e255df6ba40139edbbd67375089a5f4cd1fd0484304e734b2f11a76ee5e58ba",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z-generator/prepare.py": "49a5c39bb9e5b0edeed7b6e0ec377d45f82c651d42ccfca15e3bc29966d940ee",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z-generator/trace.hpp": "ad4e877a0f6d4c81a20485b7faddc644391a6200b80536fc62714aba89104bf6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z-generator/trace.cpp": "4619e246b2a265f40f6eb2b830f880d70b1b7d318926dcf7a37b48ecef01602a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z-generator/test_trace.cpp": "71352f0379155735d1436f24e9f157134ba508f9d55a4789be4b189be4a382cc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-request-costs-20261012T163511Z-generator/validate.py": "e8185b88c2814eb7309e82815ebcdc650b7671df2dfe88fd85081e2b3a3e799b"
+  }
+}

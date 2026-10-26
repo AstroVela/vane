@@ -1,0 +1,31 @@
+{
+  "status": "FROZEN_BEFORE_DIAGNOSTIC_WINDOW",
+  "frozen_epoch": 1791713988.2348926,
+  "parent": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z",
+  "medium": "ext4",
+  "states": [
+    "fresh",
+    "post_gc"
+  ],
+  "orders": [
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ]
+  ],
+  "mounts": 8,
+  "syscall_sequence_unchanged": true,
+  "global_cache_eviction": false,
+  "owned_build_or_correctness_test_overlap": false,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/run_fuse.py": "6e4ee94b5658ce6cd5e4b4bbfa22d0f5108a7e7146be48331c3c261cf69a433b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/block_sync/raw_probe.py": "7289dbd08f43c5d73b1ec1b572f7492c48e7d76f01af3d2eba1fe9ab90bf8775",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/monitor.py": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607"
+  },
+  "prepared_runner_sha256": "e61d325bf28d9be470d83a72f750fc7f2ee8c76f0e12b29542e070fe1d251268"
+}

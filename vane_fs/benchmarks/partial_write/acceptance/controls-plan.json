@@ -1,0 +1,25 @@
+{
+  "recorded_epoch": 1791693925.6635833,
+  "purpose": "Ordinary-file controls bracketing the physical-storage window; no SQLite or FUSE",
+  "orders": [
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      100
+    ]
+  ],
+  "pairs": 3,
+  "per_phase": [
+    "before",
+    "after"
+  ],
+  "bytes": 268435456,
+  "reuse_group_bytes": 67108864,
+  "syncs_per_trial": 12,
+  "filtering": "Keep all results; control stalls alone do not excuse a candidate regression",
+  "binary": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/io-probe",
+  "binary_sha256": "9cd284e1207633272a39df835876540910c1d1e03093a6d41f242971b5d8ad46"
+}

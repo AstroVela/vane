@@ -1,0 +1,86 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -77,6 +77,9 @@
+ 		auto code = error.exchange(SQLITE_OK);
+ 		if (code != SQLITE_OK)
+ 			throw Error(ErrorCode::Storage, std::string("Background WAL checkpoint: ") + sqlite3_errstr(code));
++	}
++	std::unique_lock<std::mutex> BeginWrite() {
++		return std::unique_lock<std::mutex>(begin_mutex);
+ 	}
+ 	void BeforeWrite(sqlite3 *writer, bool external_payload = false) {
+ 		CheckError();
+@@ -221,21 +224,27 @@
+ 					if (lease) {
+ 						code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
+ 						if (code == SQLITE_OK && frames == copied && Bytes(frames) >= START_BYTES) {
+-							// Finish a concurrently appended tail while excluding writers,
+-							// so the next writer can reuse this WAL generation. Never wait
+-							// for a reader/writer lock: an external writer may hold SQLite's
+-							// writer lock while waiting for our checkpoint lease. Real I/O
+-							// is still synchronous, with the same publication lease held.
+-							Check(sqlite3_busy_timeout(db, 0));
+-							int remaining = -1, backfilled = -1;
+-							auto restarted = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_RESTART,
+-							                                          &remaining, &backfilled);
+-							Check(sqlite3_busy_timeout(db, timeout_ms));
+-							if (restarted != SQLITE_BUSY)
+-								code = restarted;
+-							if (remaining >= 0 && backfilled >= 0) {
+-								frames = remaining;
+-								copied = backfilled;
++							// PASSIVE remains concurrent. Only RESTART competes with BEGIN
++							// for SQLite's writer lock. Never wait for the begin gate while
++							// holding a checkpoint lease: an external writer can need it.
++							std::unique_lock<std::mutex> begin(begin_mutex, std::try_to_lock);
++							if (begin.owns_lock()) {
++								// Finish a concurrently appended tail while excluding writers,
++								// so the next writer can reuse this WAL generation. Never wait
++								// for a reader/writer lock: an external writer may hold SQLite's
++								// writer lock while waiting for our checkpoint lease. Real I/O
++								// is still synchronous, with the same publication lease held.
++								Check(sqlite3_busy_timeout(db, 0));
++								int remaining = -1, backfilled = -1;
++								auto restarted = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_RESTART,
++								                                          &remaining, &backfilled);
++								Check(sqlite3_busy_timeout(db, timeout_ms));
++								if (restarted != SQLITE_BUSY)
++									code = restarted;
++								if (remaining >= 0 && backfilled >= 0) {
++									frames = remaining;
++									copied = backfilled;
++								}
+ 							}
+ 						}
+ 					}
+@@ -262,6 +271,7 @@
+ 	std::atomic<bool> warmed {false};
+ 	std::mutex mutex;
+ 	std::mutex checkpoint_mutex;
++	std::mutex begin_mutex;
+ 	std::condition_variable wake;
+ 	bool stopped = false, requested = false;
+ 	std::chrono::steady_clock::time_point clean_deadline {};
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -992,6 +992,11 @@
+ 			else
+ 				database.checkpointer->BeforeWrite(database.db, external_payload);
+ 		}
++		// Acquire before publication/payload guards, and release immediately
++		// after BEGIN, before external writes can request a checkpoint lease.
++		std::unique_lock<std::mutex> begin;
++		if (write && database.checkpointer)
++			begin = database.checkpointer->BeginWrite();
+ 		// Inline NORMAL transactions cannot introduce unpublished external bytes.
+ 		// SQLite serializes them with the WAL-prefix capture and FULL barriers;
+ 		// they need neither the publication gate nor a per-operation fence read.
+@@ -1003,6 +1008,8 @@
+ 		if (restore_normal)
+ 			Exec(database.db, "PRAGMA synchronous=FULL");
+ 		Control(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
++		if (begin.owns_lock())
++			begin.unlock();
+ 		try {
+ 			if (write) {
+ 				{

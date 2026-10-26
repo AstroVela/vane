@@ -1,0 +1,44 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -62,11 +62,16 @@
+ 	static int OnCommit(void *context, sqlite3 *, const char *, int frames) {
+ 		auto &self = *static_cast<Checkpointer *>(context);
+ 		if (self.Bytes(frames) >= START_BYTES) {
++			bool signal;
+ 			{
+ 				std::lock_guard<std::mutex> lock(self.mutex);
++				signal = !self.requested;
++				if (signal)
++					self.ready_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+ 				self.requested = true;
+ 			}
+-			self.wake.notify_one();
++			if (signal)
++				self.wake.notify_one();
+ 		}
+ 		return SQLITE_OK;
+ 	}
+@@ -140,8 +145,14 @@
+ 		for (;;) {
+ 			if (retry)
+ 				wake.wait_for(lock, std::chrono::milliseconds(20), [this] { return stopped; });
+-			else
++			else {
+ 				wake.wait(lock, [this] { return stopped || requested; });
++				// A fixed first-request deadline never slides under continuous commits.
++				// Time spent in an active pass already consumes this batching interval.
++				// No checkpoint/publication lease is held; Stop interrupts this wait.
++				if (!stopped)
++					wake.wait_until(lock, ready_at, [this] { return stopped; });
++			}
+ 			if (stopped) {
+ 				// A failed explicit close may restart this worker without any
+ 				// further commits. Preserve unfinished maintenance across Stop.
+@@ -197,6 +208,7 @@
+ 	std::mutex checkpoint_mutex;
+ 	std::condition_variable wake;
+ 	bool stopped = false, requested = false;
++	std::chrono::steady_clock::time_point ready_at {};
+ 	std::thread worker;
+ };
+ } // namespace vane_fs
