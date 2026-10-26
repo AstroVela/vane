@@ -7,7 +7,7 @@
 #include "duckdb/execution/media_resource.hpp"
 
 namespace duckdb {
-class LogicalType;
+struct LogicalType;
 class Vector;
 
 //! Allocate primitive pixel storage only after admission. References/slices

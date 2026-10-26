@@ -46,8 +46,9 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 
 本批独立分支验证记录：
 
-- 从集成分支创建独立 worktree，完整构建并非 editable 安装到独立虚拟环境；复用已安装的第三方依赖。最终安装包的 SourceID 为 `50dbb9e40364d69497f0d4acc61e85001c2dcacc`，与本批 DuckDB 源码树一致。原生测试使用 CI 相同的 `VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON` 配置。
+- 从集成分支创建独立 worktree，完整构建并非 editable 安装到独立虚拟环境；复用已安装的第三方依赖。首轮安装包的 SourceID 为 `50dbb9e40364d69497f0d4acc61e85001c2dcacc`，与该轮 DuckDB 源码树一致。原生测试使用 CI 相同的 `VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON` 配置。
 - C++ `[media-resource]`：默认关闭时 21 个用例、2262 条断言通过；decoder 容量 1、输出容量 64 bytes 时 21 个用例、2272 条断言通过。`[image],[output-lease],[execution_batch]`：49 个用例、162099 条断言通过。
+- 后续将 `LogicalType` 的前置声明对齐为 `struct`，通过 `-Werror=mismatched-tags` 检查；修正后的源码树 ID 为 `c359c56ea7195a4ed4c9a9a99da0e67a1048a88e`。原生目标已重建，上述两组准入和 49 个回归用例均再次通过。
 - 已安装包的 admission、native_media、视频帧、表达式、索引、固定形状 IMAGE、IMAGE 转 TENSOR 和 UDF process 测试：321 passed、181 skipped。admission 文件的 20 个配置用例通过，4 个真实 codec 用例因缺少匹配的 native_media provider 跳过；其余跳过主要来自可选 provider 和 soundfile。真实视频 adapter 已通过 C++17 语法检查，真实解码仍须由匹配 provider 的 CI 验证。
 - 首轮发现现有 UDF collector 清理测试在 50 ms unregister 超时后立即检查异步交接事件的竞态；改为有超时的事件等待，保留 executor 最终释放和恰好关闭一次的断言，整组复测通过。
 - 完整 release gate 和 provider CI 的结果在[跟踪 issue #1093](https://github.com/AstroVela/vane/issues/1093)关联的本批 PR 中维护。
