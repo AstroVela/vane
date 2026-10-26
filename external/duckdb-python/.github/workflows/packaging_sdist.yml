@@ -1,0 +1,166 @@
+name: Sdist packaging
+on:
+  workflow_call:
+    inputs:
+      testsuite:
+        type: string
+        description: Testsuite to run (none, fast, all)
+        required: true
+        default: all
+      duckdb-python-sha:
+        type: string
+        description: The commit or ref to build against (defaults to current ref)
+        required: false
+      duckdb-sha:
+        type: string
+        description: Override the DuckDB submodule commit or ref to build against
+        required: false
+      set-version:
+        description: Force the package version (vX.Y.Z, optionally -postN or a PEP440 pre-release suffix like -a1/-alpha1/-b2/-rc3)
+        required: false
+        type: string
+      set-duckdb-version:
+        description: Force the version DuckDB is built with. Handed to DuckDB's build verbatim, which validates it.
+        required: false
+        type: string
+    outputs:
+      package-version:
+        description: The version of the DuckDB Python package
+        value: ${{ jobs.build_sdist.outputs.pkg_version }}
+      duckdb-version:
+        description: The version of DuckDB that was packaged
+        value: ${{ jobs.build_sdist.outputs.duckdb_version }}
+
+jobs:
+  build_sdist:
+    name: Build sdist
+    runs-on: ubuntu-24.04
+    outputs:
+      pkg_version: ${{ steps.versioning.outputs.pkg_version }}
+      duckdb_version: ${{ steps.versioning.outputs.duckdb_version }}
+    steps:
+
+      - name: Checkout DuckDB Python
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.duckdb-python-sha }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Checkout DuckDB
+        shell: bash
+        if: ${{ inputs.duckdb-sha }}
+        run: |
+          cd external/duckdb
+          git fetch origin
+          git checkout ${{ inputs.duckdb-sha }}
+
+      # Inputs go through env, never interpolated into the script body.
+      - name: Set the version overrides
+        env:
+          SET_VERSION: ${{ inputs.set-version }}
+          SET_DUCKDB_VERSION: ${{ inputs.set-duckdb-version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SET_VERSION}" ]]; then
+            echo "OVERRIDE_GIT_DESCRIBE=${SET_VERSION}" >> $GITHUB_ENV
+          fi
+          if [[ -n "${SET_DUCKDB_VERSION}" ]]; then
+            echo "OVERRIDE_DUCKDB_GIT_DESCRIBE=${SET_DUCKDB_VERSION}" >> $GITHUB_ENV
+          fi
+
+      - name: Install Astral UV
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.23"
+          # No setup-uv cache: it would save on pull request and feature branch refs and crowd out the ccaches.
+          enable-cache: false
+          python-version: 3.12
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - name: Install sdist
+        run: |
+          cd ${{ runner.temp }}
+          uv venv
+          uv pip install ${{ github.workspace }}/dist/duckdb-*.tar.gz
+
+      - name: Test sdist
+        if: ${{ inputs.testsuite != 'none' }}
+        run: |
+          # install the test requirements
+          uv export --only-group test --no-emit-project --output-file ${{ runner.temp }}/pylock.toml --quiet
+          cd ${{ runner.temp }}
+          uv pip install -r pylock.toml
+          # run tests
+          tests_root="${{ github.workspace }}/tests"
+          tests_dir="${tests_root}${{ inputs.testsuite == 'fast' && '/fast' || '/' }}"
+          uv run --verbose pytest -c ${{ github.workspace }}/pyproject.toml $tests_dir
+
+      # Reads both versions and both commits back out of the installed sdist and
+      # fails if they are not what was asked for. This is the only place that proves
+      # a forced version actually reached the build, and that the commits survived
+      # the sdist, which has no git history to derive them from. Versions have
+      # silently not reached the build before: the env var never crossed into the
+      # manylinux container, and this step itself read a duckdb.duckdb_version
+      # attribute that does not exist and published an empty string for months.
+      - id: versioning
+        env:
+          SET_VERSION: ${{ inputs.set-version }}
+          SET_DUCKDB_VERSION: ${{ inputs.set-duckdb-version }}
+        run: |
+          set -euo pipefail
+          expected_package_commit=$(git -C ${{ github.workspace }} rev-parse HEAD)
+          expected_duckdb_commit=$(git -C ${{ github.workspace }}/external/duckdb rev-parse HEAD)
+          cd ${{ runner.temp }}
+          pkg_version=$( .venv/bin/python -c 'import duckdb; print(duckdb.__version__)' )
+          duckdb_version=$( .venv/bin/python -c 'import duckdb; print(duckdb.__duckdb_version__)' )
+          package_commit=$( .venv/bin/python -c 'import duckdb; print(duckdb.build_info()["package_commit"])' )
+          duckdb_commit=$( .venv/bin/python -c 'import duckdb; print(duckdb.build_info()["duckdb_commit"])' )
+          echo "package version: '${pkg_version}' at '${package_commit}'"
+          echo "duckdb version:  '${duckdb_version}' at '${duckdb_commit}'"
+
+          if [[ -z "${pkg_version}" || -z "${duckdb_version}" ]]; then
+            echo "::error::Version introspection produced an empty string"
+            exit 1
+          fi
+          if [[ "${package_commit}" != "${expected_package_commit}" ]]; then
+            echo "::error::The package reports commit ${package_commit}, the checkout is at ${expected_package_commit}."
+            exit 1
+          fi
+          # DuckDB reports its short source id, and 0123456789 is its placeholder for
+          # a build that could not determine the commit.
+          if [[ "${expected_duckdb_commit}" != "${duckdb_commit}"* || "${duckdb_commit}" == "0123456789" ]]; then
+            echo "::error::DuckDB reports commit ${duckdb_commit}, the submodule is at ${expected_duckdb_commit}. The commit did not reach the build."
+            exit 1
+          fi
+
+          if [[ -n "${SET_DUCKDB_VERSION}" ]]; then
+            if [[ "${SET_DUCKDB_VERSION}" == *-g* ]]; then
+              # A full git describe. DuckDB rewrites those to vX.Y.Z-devN, so there
+              # is nothing to compare against.
+              echo "::notice::set-duckdb-version is a git describe string, skipping the exact match"
+            elif [[ "v${duckdb_version}" != "${SET_DUCKDB_VERSION}" ]]; then
+              echo "::error::DuckDB was asked to build as ${SET_DUCKDB_VERSION} but reports v${duckdb_version}. The override did not reach the build."
+              exit 1
+            fi
+          fi
+
+          if [[ -n "${SET_VERSION}" ]]; then
+            expected=$(PYTHONPATH=${{ github.workspace }} python3 -c \
+              'import os; from duckdb_packaging._versioning import git_tag_to_pep440; print(git_tag_to_pep440(os.environ["SET_VERSION"]))')
+            if [[ "${pkg_version}" != "${expected}" ]]; then
+              echo "::error::The package was asked to build as ${SET_VERSION} (${expected}) but reports ${pkg_version}. The override did not reach the build."
+              exit 1
+            fi
+          fi
+
+          echo "pkg_version=${pkg_version}" >> $GITHUB_OUTPUT
+          echo "duckdb_version=${duckdb_version}" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          compression-level: 0

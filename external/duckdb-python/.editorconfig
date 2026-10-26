@@ -1,0 +1,28 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{py,pyi}]
+indent_style = space
+indent_size = 4
+
+[*.{c,cpp,h,hpp}]
+indent_style = tab
+tab_width = 4
+indent_size = tab
+max_line_length = 120
+x-soft-wrap-text = true
+x-soft-wrap-mode = CharacterWidth
+x-soft-wrap-limit = 120
+x-show-invisibles = false
+x-show-spaces = false
+
+[Makefile]
+indent_style = tab
+tab_width = 4
+indent_size = tab
+x-soft-wrap-text = false

@@ -3,14 +3,6 @@
 
 cmake_minimum_required(VERSION 3.5...3.29)
 
-if(POLICY CMP0048)
-  cmake_policy(SET CMP0048 NEW)
-endif()
-
-if(POLICY CMP0063)
-  cmake_policy(SET CMP0063 NEW)
-endif()
-
 project(RE2 CXX)
 
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
@@ -45,9 +37,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
   add_compile_options(/utf-8)
 elseif(CYGWIN OR MINGW)
   # See https://stackoverflow.com/questions/38139631 for details.
-  add_compile_options(-std=gnu++11)
+  add_compile_options(-std=gnu++17)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-std=c++11)
+  add_compile_options(-std=c++17)
 endif()
 
 add_definitions(-DRE2_ON_VALGRIND)

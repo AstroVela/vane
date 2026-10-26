@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/common/enums/physical_operator_type.hpp"
 
 namespace duckdb {
@@ -49,12 +43,12 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "PERFECT_HASH_GROUP_BY";
 	case PhysicalOperatorType::PARTITIONED_AGGREGATE:
 		return "PARTITIONED_AGGREGATE";
+	case PhysicalOperatorType::LIMITED_DISTINCT:
+		return "LIMITED_DISTINCT";
 	case PhysicalOperatorType::FILTER:
 		return "FILTER";
 	case PhysicalOperatorType::PROJECTION:
 		return "PROJECTION";
-	case PhysicalOperatorType::VLLM_PROJECT:
-		return "VLLM_PROJECT";
 	case PhysicalOperatorType::COPY_TO_FILE:
 		return "COPY_TO_FILE";
 	case PhysicalOperatorType::BATCH_COPY_TO_FILE:
@@ -107,10 +101,6 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "EXPLAIN";
 	case PhysicalOperatorType::EXPLAIN_ANALYZE:
 		return "EXPLAIN_ANALYZE";
-	case PhysicalOperatorType::LOCAL_EXCHANGE:
-		return "LOCAL_EXCHANGE";
-	case PhysicalOperatorType::REPARTITION:
-		return "REPARTITION";
 	case PhysicalOperatorType::EXECUTE:
 		return "EXECUTE";
 	case PhysicalOperatorType::VACUUM:
@@ -141,6 +131,10 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "CREATE_MACRO";
 	case PhysicalOperatorType::CREATE_SECRET:
 		return "CREATE_SECRET";
+	case PhysicalOperatorType::RECURSIVE_KEY_JOIN:
+		return "RECURSIVE_KEY_JOIN";
+	case PhysicalOperatorType::MERGE_ACTION_SOURCE:
+		return "MERGE_ACTION_SOURCE";
 	case PhysicalOperatorType::DROP:
 		return "DROP";
 	case PhysicalOperatorType::PRAGMA:
@@ -161,18 +155,10 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "LOAD";
 	case PhysicalOperatorType::INOUT_FUNCTION:
 		return "INOUT_FUNCTION";
-	case PhysicalOperatorType::STREAMING_UDF:
-		return "STREAMING_UDF";
-	case PhysicalOperatorType::GROUPING_SET_EXPAND:
-		return "GROUPING_SET_EXPAND";
-	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE:
-		return "DISTRIBUTED_RESERVOIR_SAMPLE";
-	case PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE:
-		return "DISTRIBUTED_EXTENSION_WRITE";
-	case PhysicalOperatorType::DATA_SINK:
-		return "DATA_SINK";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
+	case PhysicalOperatorType::CREATE_TRIGGER:
+		return "CREATE_TRIGGER";
 	case PhysicalOperatorType::ATTACH:
 		return "ATTACH";
 	case PhysicalOperatorType::DETACH:
@@ -187,12 +173,16 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "COPY_DATABASE";
 	case PhysicalOperatorType::VERIFY_VECTOR:
 		return "VERIFY_VECTOR";
+	case PhysicalOperatorType::SECURE_VIEW:
+		return "SECURE_VIEW";
 	case PhysicalOperatorType::UPDATE_EXTENSIONS:
 		return "UPDATE_EXTENSIONS";
-	case PhysicalOperatorType::EXCHANGE_SINK:
-		return "EXCHANGE_SINK";
-	case PhysicalOperatorType::EXCHANGE_SOURCE:
-		return "EXCHANGE_SOURCE";
+	case PhysicalOperatorType::CONNECT:
+		return "CONNECT";
+	case PhysicalOperatorType::DISCONNECT:
+		return "DISCONNECT";
+	case PhysicalOperatorType::EXTERNAL_RESOURCE:
+		return "EXTERNAL_RESOURCE";
 	case PhysicalOperatorType::INVALID:
 		break;
 	}

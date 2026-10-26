@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -28,30 +22,42 @@ public:
 public:
 	PhysicalColumnDataScan(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperatorType op_type,
 	                       idx_t estimated_cardinality, optionally_owned_ptr<ColumnDataCollection> collection);
+	PhysicalColumnDataScan(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperatorType op_type,
+	                       idx_t estimated_cardinality, optionally_owned_ptr<ColumnDataCollection> collection,
+	                       vector<column_t> column_ids);
 
 	PhysicalColumnDataScan(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperatorType op_type,
-	                       idx_t estimated_cardinality, idx_t cte_index);
+	                       idx_t estimated_cardinality, TableIndex cte_index);
 
 	//! (optionally owned) column data collection to scan
 	optionally_owned_ptr<ColumnDataCollection> collection;
+	optional_ptr<PhysicalOperator> cte_source;
+	//! Column ids scanned from the underlying collection
+	vector<column_t> column_ids;
 
-	idx_t cte_index;
+	TableIndex cte_index;
 	optional_idx delim_index;
-
-	//! Source node ID for distributed pset routing (analogous to PhysicalTableScan::scan_node_id).
-	//! When set, the distributed translator preserves this ID for the ScanSourceNode,
-	//! enabling key-based worker-side data injection.
-	optional_idx source_node_id;
 
 public:
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context,
+	                                                   const OperatorPartitionInfo &partition_info) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
+	                                       LocalSourceState &lstate,
+	                                       const OperatorPartitionInfo &partition_info) const override;
 
 	bool IsSource() const override {
 		return true;
+	}
+	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override;
+
+	OrderPreservationType SourceOrder() const override {
+		return source_order;
 	}
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -59,11 +65,10 @@ public:
 		return true;
 	}
 
+	OrderPreservationType source_order = OrderPreservationType::INSERTION_ORDER;
+
 public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
-
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb

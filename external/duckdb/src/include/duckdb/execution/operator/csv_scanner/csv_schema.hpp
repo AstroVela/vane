@@ -14,9 +14,9 @@
 namespace duckdb {
 //! Basic CSV Column Info
 struct CSVColumnInfo {
-	CSVColumnInfo(const string &name_p, const LogicalType &type_p) : name(name_p), type(type_p) {
+	CSVColumnInfo(const Identifier &name_p, const LogicalType &type_p) : name(name_p), type(type_p) {
 	}
-	string name;
+	Identifier name;
 	LogicalType type;
 };
 
@@ -25,17 +25,19 @@ struct CSVSchema {
 	explicit CSVSchema(const bool empty = false) : empty(empty) {
 	}
 
-	CSVSchema(const vector<string> &names, const vector<LogicalType> &types, const string &file_path, idx_t rows_read,
-	          const bool empty = false);
+	CSVSchema(const vector<Identifier> &names, const vector<LogicalType> &types, const string &file_path,
+	          idx_t rows_read, const bool empty = false);
 
 	//! Initializes the schema based on names and types
-	void Initialize(const vector<string> &names, const vector<LogicalType> &types, const string &file_path);
+	void Initialize(const vector<Identifier> &names, const vector<LogicalType> &types, const string &file_path);
 
 	//! If the schema is empty
 	bool Empty() const;
-	//! Whether schema discovery identified the source as an empty file. This is
-	//! distinct from having no bound columns and affects later schema matching.
-	bool IsEmptyFile() const;
+
+	//! Whether this schema was determined on a file without any data
+	bool IsEmptyFile() const {
+		return empty;
+	}
 
 	//! If the columns of the schema match
 	bool MatchColumns(const CSVSchema &other) const;
@@ -69,7 +71,7 @@ private:
 	//! If a type can be cast to another
 	static bool CanWeCastIt(LogicalTypeId source, LogicalTypeId destination);
 	vector<CSVColumnInfo> columns;
-	unordered_map<string, idx_t> name_idx_map;
+	identifier_map_t<idx_t> name_idx_map;
 	string file_path;
 	idx_t rows_read = 0;
 	bool empty = false;

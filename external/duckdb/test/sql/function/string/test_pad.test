@@ -2,9 +2,6 @@
 # description: LPAD/RPAD test
 # group: [string]
 
-statement ok
-PRAGMA enable_verification
-
 # test lpad on NULLs
 query TTTTTTT
 select LPAD(NULL, 7, '-'), LPAD('Base', NULL, '-'), LPAD('Base', 7, NULL), LPAD(NULL, NULL, '-'), LPAD(NULL, 7, NULL), LPAD('Base', NULL, NULL), LPAD(NULL, NULL, NULL)
@@ -110,3 +107,38 @@ statement error
 select RPAD('a', 100000000000000000, 0)
 ----
 
+# results larger than the maximum string size
+statement error
+select LPAD('', 1100000000, '😀')
+----
+<REGEX>:.*Out of Range Error.*maximum supported string size.*
+
+statement error
+select RPAD('', 1100000000, '😀')
+----
+<REGEX>:.*Out of Range Error.*maximum supported string size.*
+
+statement error
+select LPAD('😀😀', 1073741824, '😀')
+----
+<REGEX>:.*Out of Range Error.*maximum supported string size.*
+
+statement error
+select RPAD('😀😀', 1073741824, '😀')
+----
+<REGEX>:.*Out of Range Error.*maximum supported string size.*
+
+statement error
+select LPAD('abc', 2147483647, 'xyz😀😀')
+----
+<REGEX>:.*Out of Range Error.*maximum supported string size.*
+
+query I
+select LPAD('ab', 7, 'xy😀')
+----
+xy😀xyab
+
+query I
+select RPAD('ab', 7, 'xy😀')
+----
+abxy😀xy

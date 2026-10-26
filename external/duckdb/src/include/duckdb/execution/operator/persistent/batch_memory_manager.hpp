@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -46,7 +40,7 @@ private:
 public:
 	void SetMemorySize(idx_t size) {
 		// request at most 1/4th of all available memory
-		idx_t total_max_memory = BufferManager::GetBufferManager(context).GetQueryMaxMemory();
+		idx_t total_max_memory = BufferManager::GetBufferManager(context).GetOperatorMemoryLimit();
 		idx_t request_cap = total_max_memory / 4;
 
 		size = MinValue<idx_t>(size, request_cap);
@@ -77,7 +71,7 @@ public:
 		return true;
 #else
 		if (unflushed_memory_usage >= available_memory) {
-			auto guard = Lock();
+			const annotated_lock_guard<annotated_mutex> guard(lock);
 			if (batch_index > min_batch_index) {
 				// exceeded available memory and we are not the minimum batch index- try to increase it
 				IncreaseMemory();
@@ -95,12 +89,12 @@ public:
 		if (min_batch_index >= current_min_batch_index) {
 			return;
 		}
-		auto guard = Lock();
+		const annotated_lock_guard<annotated_mutex> guard(lock);
 		auto new_batch_index = MaxValue<idx_t>(min_batch_index, current_min_batch_index);
 		if (new_batch_index != min_batch_index) {
 			// new batch index! unblock all tasks
 			min_batch_index = new_batch_index;
-			UnblockTasks(guard);
+			UnblockTasks();
 		}
 	}
 
@@ -118,7 +112,7 @@ public:
 
 	void ReduceUnflushedMemory(idx_t memory_reduction) {
 		if (unflushed_memory_usage < memory_reduction) {
-			throw InternalException(std::string("Reducing unflushed memory usage below zero!?"));
+			throw InternalException("Reducing unflushed memory usage below zero!?");
 		} else {
 			unflushed_memory_usage -= memory_reduction;
 		}

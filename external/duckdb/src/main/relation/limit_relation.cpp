@@ -1,17 +1,8 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/main/relation/limit_relation.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/common/to_string.hpp"
-#include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/operator/logical_limit.hpp"
 
 namespace duckdb {
 
@@ -23,26 +14,19 @@ LimitRelation::LimitRelation(shared_ptr<Relation> child_p, int64_t limit, int64_
 
 unique_ptr<QueryNode> LimitRelation::GetQueryNode() {
 	auto child_node = child->GetQueryNode();
-	if (std::any_of(child_node->modifiers.begin(), child_node->modifiers.end(),
-	                [](const unique_ptr<ResultModifier> &modifier) {
-		                return modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-		                       modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
-	                })) {
-		child_node = WrapQueryNode(std::move(child_node), child->GetAlias(), child->Columns());
-	}
 	auto limit_node = make_uniq<LimitModifier>();
 	if (limit >= 0) {
-		limit_node->limit = make_uniq<ConstantExpression>(Value::BIGINT(limit));
+		limit_node->limit = ConstantExpression::Integer(limit);
 	}
 	if (offset > 0) {
-		limit_node->offset = make_uniq<ConstantExpression>(Value::BIGINT(offset));
+		limit_node->offset = ConstantExpression::Integer(offset);
 	}
 
 	child_node->modifiers.push_back(std::move(limit_node));
 	return child_node;
 }
 
-string LimitRelation::GetAlias() {
+Identifier LimitRelation::GetAlias() {
 	return child->GetAlias();
 }
 
@@ -57,35 +41,6 @@ string LimitRelation::ToString(idx_t depth) {
 	}
 	str += "\n";
 	return str + child->ToString(depth + 1);
-}
-
-BoundStatement LimitRelation::Bind(Binder &binder) {
-	if (!RequiresDirectRelationBinding(binder, *child)) {
-		return Relation::Bind(binder);
-	}
-	auto select_node = make_uniq<SelectNode>();
-	select_node->select_list.push_back(make_uniq<StarExpression>());
-	return BindSelectNodeOnChild(binder, *this, std::move(select_node));
-}
-
-BoundStatement LimitRelation::BindAsInput(Binder &binder) {
-	// Bind child directly (NOT through the SQL GetQueryNode() round-trip)
-	// to preserve non-SQL-representable child nodes like LocalExchangeRelation.
-	auto child_ref = BindRelationInput(binder, *child);
-	auto child_bound = binder.Bind(*child_ref);
-
-	BoundLimitNode limit_val_bound;
-	BoundLimitNode offset_val_bound;
-	if (limit >= 0) {
-		limit_val_bound = BoundLimitNode::ConstantValue(limit);
-	}
-	if (offset > 0) {
-		offset_val_bound = BoundLimitNode::ConstantValue(offset);
-	}
-	auto limit_node = make_uniq<LogicalLimit>(std::move(limit_val_bound), std::move(offset_val_bound));
-	limit_node->AddChild(std::move(child_bound.plan));
-	child_bound.plan = std::move(limit_node);
-	return child_bound;
 }
 
 } // namespace duckdb

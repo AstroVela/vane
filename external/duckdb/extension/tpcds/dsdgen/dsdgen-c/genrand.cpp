@@ -55,6 +55,8 @@
 #include "tables.h"
 #include "streams.h"
 
+#include <cstring>
+
 static long Mult = 16807; /* the multiplier */
 static long nQ = 127773;  /* the quotient MAXINT / Mult */
 static long nR = 2836;    /* the remainder MAXINT % Mult */
@@ -365,29 +367,6 @@ void DSNthElementNthElement(HUGE_TYPE N, int nStream) {
 }
 
 /*
- * Routine:
- * Purpose:
- * Algorithm:
- * Data Structures:
- *
- * Params:
- * Returns:
- * Called By:
- * Calls:
- * Assumptions:
- * Side Effects:
- * TODO: None
- */
-int dump_seeds_ds(int tbl) {
-	int i;
-
-	for (i = 0; Streams[i].nColumn != -1; i++)
-		if (Streams[i].nTable == tbl)
-			printf("%04d\t%09d\t%09ld\n", i, Streams[i].nUsed, Streams[i].nSeed);
-	return (0);
-}
-
-/*
  * Routine: gen_charset(char *set, int min, int max)
  * Purpose: generate random characters from set for a random length [min..max]
  * Algorithm:
@@ -514,8 +493,16 @@ int genrand_date(date_t *dest, int dist, date_t *min, date_t *max, date_t *mean,
 // FIXME: allow re-init
 void init_rand(void) {
 	long long i, skip, nSeed; // changed to long long from int
+	static thread_local rng_t initial_streams[MAX_COLUMN];
+	static thread_local bool initial_streams_saved = false;
 
 	if (!InitConstants::init_rand_init) {
+		if (!initial_streams_saved) {
+			memcpy(initial_streams, Streams, sizeof(initial_streams));
+			initial_streams_saved = true;
+		} else {
+			memcpy(Streams, initial_streams, sizeof(initial_streams));
+		}
 		if (is_set("RNGSEED"))
 			nSeed = get_int("RNGSEED");
 		else
@@ -535,6 +522,7 @@ void init_rand(void) {
                 Streams[i].nSeed = nSeed + skip * i;
             }
 			    Streams[i].nUsed = 0;
+			    Streams[i].nTotal = 0;
 		}
 		InitConstants::init_rand_init = 1;
 	}

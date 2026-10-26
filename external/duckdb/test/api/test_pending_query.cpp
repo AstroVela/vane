@@ -3,399 +3,328 @@
 
 #include <thread>
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/operator/helper/physical_batch_collector.hpp"
-#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
-#include "duckdb/main/client_config.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/client_context_state.hpp"
-#include "duckdb/main/prepared_statement_data.hpp"
-#include "duckdb/parallel/task.hpp"
-
-#include <condition_variable>
-#include <mutex>
-#include <stdexcept>
+#include "duckdb/main/query_result_stream.hpp"
 
 using namespace duckdb;
-using namespace std;
 
-namespace {
-
-get_result_collector_t CountingResultCollector(idx_t &calls) {
-	return [&calls](ClientContext &context, PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
-		calls++;
-		return PhysicalResultCollector::GetResultCollector(context, data);
-	};
-}
-
-class FailNextQueryEndState : public ClientContextState {
-public:
-	bool fail_next = false;
-
-	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
-		if (fail_next) {
-			fail_next = false;
-			throw InvalidInputException("injected query teardown failure");
-		}
-	}
-};
-
-struct BlockingExecutorTaskState {
-	std::mutex lock;
-	std::condition_variable cv;
-	bool started = false;
-	bool release = false;
-	bool interrupted = false;
-	bool finished = false;
-};
-
-class BlockingExecutorTask : public Task {
-public:
-	BlockingExecutorTask(Executor &executor_p, duckdb::shared_ptr<BlockingExecutorTaskState> state_p)
-	    : executor(executor_p), state(std::move(state_p)) {
-		executor.RegisterTask();
-	}
-
-	~BlockingExecutorTask() override {
-		executor.UnregisterTask();
-	}
-
-	TaskExecutionResult Execute(TaskExecutionMode) override {
-		std::unique_lock<std::mutex> lock(state->lock);
-		state->started = true;
-		state->cv.notify_all();
-		while (!state->release && !executor.context.IsInterrupted()) {
-			state->cv.wait_for(lock, std::chrono::milliseconds(1));
-		}
-		if (!state->release) {
-			state->interrupted = executor.context.IsInterrupted();
-		}
-		state->finished = true;
-		state->cv.notify_all();
-		return TaskExecutionResult::TASK_FINISHED;
-	}
-
-private:
-	Executor &executor;
-	duckdb::shared_ptr<BlockingExecutorTaskState> state;
-};
-
-} // namespace
-
-TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[api][executor][lifecycle]") {
-	DuckDB db(nullptr);
-	Connection setup(db);
-	REQUIRE_NO_FAIL(setup.Query("SET threads = 2"));
-
-	auto state = make_shared_ptr<BlockingExecutorTaskState>();
-	std::thread executor_task;
-
-	bool finished_before_catch = false;
-	bool interrupted_before_catch = false;
-	string caught_message;
-	try {
-		Connection connection(db);
-		PendingQueryParameters parameters;
-		parameters.get_result_collector = [](ClientContext &,
-		                                     PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
-			return make_uniq<PhysicalBatchCollector>(*data.physical_plan, data);
-		};
-		auto pending = connection.PendingQuery("SELECT 42", parameters);
-		if (pending->HasError()) {
-			pending->ThrowError();
-		}
-
-		auto &executor = connection.context->GetExecutor();
-		duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
-		executor_task = std::thread(
-		    [](duckdb::shared_ptr<Task> task) {
-			    task->Execute(TaskExecutionMode::PROCESS_ALL);
-			    task.reset();
-		    },
-		    std::move(task));
-
-		{
-			std::unique_lock<std::mutex> lock(state->lock);
-			if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
-				state->release = true;
-				state->cv.notify_all();
-				lock.unlock();
-				executor_task.join();
-				throw std::runtime_error("executor task did not start");
-			}
-		}
-		throw std::runtime_error("trigger exception unwinding");
-	} catch (const std::exception &ex) {
-		std::lock_guard<std::mutex> lock(state->lock);
-		finished_before_catch = state->finished;
-		interrupted_before_catch = state->interrupted;
-		caught_message = ex.what();
-		state->release = true;
-		state->cv.notify_all();
-	}
-
-	if (executor_task.joinable()) {
-		executor_task.join();
-	}
-	REQUIRE(caught_message == "trigger exception unwinding");
-	REQUIRE(finished_before_catch);
-	REQUIRE(interrupted_before_catch);
-}
-
-TEST_CASE("Successful query cleanup clears executor cancellation interrupt", "[api][executor][lifecycle]") {
-	DuckDB db(nullptr);
-	Connection setup(db);
-	REQUIRE_NO_FAIL(setup.Query("SET threads = 2"));
-
-	Connection connection(db);
-	auto pending = connection.PendingQuery("SELECT 42");
-	REQUIRE(!pending->HasError());
-
-	auto state = make_shared_ptr<BlockingExecutorTaskState>();
-	auto &executor = connection.context->GetExecutor();
-	duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
-	std::thread executor_task(
-	    [](duckdb::shared_ptr<Task> task) {
-		    task->Execute(TaskExecutionMode::PROCESS_ALL);
-		    task.reset();
-	    },
-	    std::move(task));
-
-	{
-		std::unique_lock<std::mutex> lock(state->lock);
-		if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
-			state->release = true;
-			state->cv.notify_all();
-			lock.unlock();
-			executor_task.join();
-			FAIL("executor task did not start");
-		}
-	}
-
-	auto result = pending->Execute();
-	executor_task.join();
-
-	REQUIRE(CHECK_COLUMN(result, 0, {42}));
-	REQUIRE(state->finished);
-	REQUIRE(state->interrupted);
-	REQUIRE(!connection.context->IsInterrupted());
-}
-
-TEST_CASE("Test Pending Query API", "[api][.]") {
+TEST_CASE("Test Submitted Query API", "[api][.]") {
 	DuckDB db;
 	Connection con(db);
 
-	SECTION("Materialized result") {
-		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000) tbl(i)");
-		REQUIRE(!pending_query->HasError());
-		auto result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(499999500000)}));
+	SECTION("Retained result") {
+		auto handle = con.Submit("SELECT SUM(i) FROM range(1000000) tbl(i)");
+		REQUIRE(!handle->HasError());
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(499999500000)}));
 
-		// cannot fetch twice from the same pending query
-		REQUIRE_THROWS(pending_query->Execute());
-		REQUIRE_THROWS(pending_query->Execute());
+		// the retained result can be read again
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(499999500000)}));
 
 		// query the connection as normal after
-		result = con.Query("SELECT 42");
+		auto result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	}
-	SECTION("Streaming result") {
-		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000) tbl(i)", true);
-		REQUIRE(!pending_query->HasError());
-		auto result = pending_query->Execute();
+	SECTION("Streamed result") {
+		auto stream = OpenStream(con, "SELECT SUM(i) FROM range(1000000) tbl(i)");
+		auto result = DrainStream(*stream);
 		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(499999500000)}));
-
-		// cannot fetch twice from the same pending query
-		REQUIRE_THROWS(pending_query->Execute());
-		REQUIRE_THROWS(pending_query->Execute());
 
 		// query the connection as normal after
 		result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	}
 	SECTION("Execute tasks") {
-		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000) tbl(i)", true);
-		while (pending_query->ExecuteTask() == PendingExecutionResult::RESULT_NOT_READY)
+		auto handle = con.Submit("SELECT SUM(i) FROM range(1000000) tbl(i)");
+		while (handle->ExecuteTask() == QueryResultState::NOT_READY)
 			;
-		REQUIRE(!pending_query->HasError());
-		auto result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(499999500000)}));
-
-		// cannot fetch twice from the same pending query
-		REQUIRE_THROWS(pending_query->Execute());
-
-		// query the connection as normal after
-		result = con.Query("SELECT 42");
-		REQUIRE(CHECK_COLUMN(result, 0, {42}));
-	}
-	SECTION("Create pending query while another pending query exists") {
-		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000) tbl(i)");
-		auto pending_query2 = con.PendingQuery("SELECT SUM(i) FROM range(1000000) tbl(i)", true);
-
-		// first pending query is now closed
-		REQUIRE_THROWS(pending_query->ExecuteTask());
-		REQUIRE_THROWS(pending_query->Execute());
-
-		// we can execute the second one
-		auto result = pending_query2->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(499999500000)}));
-
-		// query the connection as normal after
-		result = con.Query("SELECT 42");
-		REQUIRE(CHECK_COLUMN(result, 0, {42}));
-	}
-	SECTION("Binding error in pending query") {
-		auto pending_query = con.PendingQuery("SELECT XXXSUM(i) FROM range(1000000) tbl(i)");
-		REQUIRE(pending_query->HasError());
-		REQUIRE_THROWS(pending_query->ExecuteTask());
-		REQUIRE_THROWS(pending_query->Execute());
+		REQUIRE(!handle->HasError());
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(499999500000)}));
 
 		// query the connection as normal after
 		auto result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	}
-	SECTION("Runtime error in pending query (materialized)") {
-		// this succeeds initially
-		auto pending_query =
-		    con.PendingQuery("SELECT concat(SUM(i)::varchar, 'hello')::INT FROM range(1000000) tbl(i)");
-		REQUIRE(!pending_query->HasError());
-		// we only encounter the failure later on as we are executing the query
-		auto result = pending_query->Execute();
-		REQUIRE_FAIL(result);
+	SECTION("Submit a query while another submitted query exists") {
+		auto handle = con.Submit("SELECT SUM(i) FROM range(1000000) tbl(i)");
+
+		// the connection has an open result, so the second submission is refused
+		auto handle2 = con.Submit("SELECT SUM(i) FROM range(1000000) tbl(i)");
+		REQUIRE(handle2->HasError());
+		REQUIRE(handle2->GetErrorType() == ExceptionType::RESOURCE_IN_USE);
+
+		// the first handle is untouched
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(499999500000)}));
+
+		// once it has ended, the connection takes the next one
+		handle2 = con.Submit("SELECT SUM(i) FROM range(1000000) tbl(i)");
+		handle2->Complete();
+		REQUIRE(CHECK_COLUMN(handle2, 0, {Value::BIGINT(499999500000)}));
 
 		// query the connection as normal after
-		result = con.Query("SELECT 42");
+		auto result = con.Query("SELECT 42");
+		REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	}
+	SECTION("Binding error in submitted query") {
+		auto handle = con.Submit("SELECT XXXSUM(i) FROM range(1000000) tbl(i)");
+		REQUIRE(handle->HasError());
+		REQUIRE_THROWS(handle->ExecuteTask());
+		REQUIRE_THROWS(handle->Collection());
+
+		// query the connection as normal after
+		auto result = con.Query("SELECT 42");
+		REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	}
+	SECTION("Runtime error in submitted query (retained)") {
+		// this succeeds initially
+		auto handle = con.Submit("SELECT concat(SUM(i)::varchar, 'hello')::INT FROM range(1000000) tbl(i)");
+		REQUIRE(!handle->HasError());
+		// we only encounter the failure later on as we are executing the query
+		handle->Complete();
+		REQUIRE_FAIL(handle);
+
+		// query the connection as normal after
+		auto result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	}
 
-	SECTION("Runtime error in pending query (streaming)") {
+	SECTION("Runtime error in submitted query (streamed)") {
 		// this succeeds initially
-		auto pending_query =
-		    con.PendingQuery("SELECT concat(SUM(i)::varchar, 'hello')::INT FROM range(1000000) tbl(i)", true);
-		REQUIRE(!pending_query->HasError());
-		auto result = pending_query->Execute();
+		auto stream = OpenStream(con, "SELECT concat(SUM(i)::varchar, 'hello')::INT FROM range(1000000) tbl(i)");
+		auto result = DrainStream(*stream);
 		REQUIRE(result->HasError());
 
 		// query the connection as normal after
 		result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	}
-	SECTION("Pending results errors as JSON") {
+	SECTION("Submission errors as JSON") {
 		con.Query("SET errors_as_json = true;");
-		auto pending_query = con.PendingQuery("SELCT 32;");
-		REQUIRE(pending_query->HasError());
-		REQUIRE(duckdb::StringUtil::Contains(pending_query->GetError(), "SYNTAX_ERROR"));
+		auto handle = con.Submit("SELCT 32;");
+		REQUIRE(handle->HasError());
+		REQUIRE(duckdb::StringUtil::Contains(handle->GetError(), "SYNTAX_ERROR"));
 	}
 }
 
-TEST_CASE("Pending query result collector overrides are query-local", "[api][result-collector]") {
-	idx_t connection_collector_calls = 0;
-	idx_t query_collector_calls = 0;
+TEST_CASE("Abandoned submitted query must release the active query", "[api]") {
+	// A query submitted but never executed must not leak the active-query state (executor, plan,
+	// autocommit transaction). We observe the autocommit transaction it opens, which is created and
+	// released together with the active query: abandoning the handle must release it immediately, not
+	// defer it to the next query or context teardown.
 	DuckDB db;
 	Connection con(db);
-	auto &client_config = ClientConfig::GetConfig(*con.context);
-	client_config.get_result_collector = CountingResultCollector(connection_collector_calls);
 
-	auto require_local_query = [&](int value, idx_t expected_connection_calls) {
-		auto result = con.Query("SELECT " + to_string(value));
-		REQUIRE(CHECK_COLUMN(result, 0, {value}));
-		REQUIRE(connection_collector_calls == expected_connection_calls);
-	};
+	REQUIRE(!con.context->transaction.HasActiveTransaction());
 
-	require_local_query(41, 1);
+	SECTION("Abandon via Close()") {
+		auto handle = con.Submit("SELECT 42");
+		REQUIRE(!handle->HasError());
+		REQUIRE(con.context->transaction.HasActiveTransaction());
 
-	PendingQueryParameters parameters;
-	parameters.get_result_collector = CountingResultCollector(query_collector_calls);
-
-	SECTION("success") {
-		auto pending_query = con.PendingQuery("SELECT 42", parameters);
-		REQUIRE(!pending_query->HasError());
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 1);
-
-		auto result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {42}));
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 1);
+		handle->Close();
+		REQUIRE(!con.context->transaction.HasActiveTransaction());
 	}
+	SECTION("Abandon an ATTACH via Close()") {
+		auto handle = con.Submit("ATTACH ':memory:' AS abandoned_db");
+		REQUIRE(!handle->HasError());
+		REQUIRE(con.context->transaction.HasActiveTransaction());
 
-	SECTION("planning failure") {
-		auto pending_query = con.PendingQuery("SELECT missing_column", parameters);
-		REQUIRE(pending_query->HasError());
-		REQUIRE(StringUtil::Contains(pending_query->GetError(), "missing_column"));
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 0);
-
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 0);
+		handle->Close();
+		REQUIRE(!con.context->transaction.HasActiveTransaction());
 	}
+	SECTION("Abandon a prepared submitted query") {
+		auto prepared = con.Prepare("SELECT 42");
+		REQUIRE(!prepared->HasError());
+		auto handle = prepared->Submit();
+		REQUIRE(!handle->HasError());
+		REQUIRE(con.context->transaction.HasActiveTransaction());
 
-	SECTION("collector initialization failure") {
-		parameters.get_result_collector =
-		    [&query_collector_calls](ClientContext &, PreparedStatementData &) -> duckdb::unique_ptr<PhysicalOperator> {
-			query_collector_calls++;
-			throw InvalidInputException("injected result collector failure");
-		};
-
-		auto pending_query = con.PendingQuery("SELECT 42", parameters);
-		REQUIRE(pending_query->HasError());
-		REQUIRE(StringUtil::Contains(pending_query->GetError(), "injected result collector failure"));
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 1);
-
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 1);
+		handle->Close();
+		REQUIRE(!con.context->transaction.HasActiveTransaction());
 	}
+	// the connection must remain usable after abandoning submitted queries
+	auto result = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
 
-	SECTION("execution failure") {
-		auto pending_query = con.PendingQuery(
-		    "SELECT concat(SUM(i)::VARCHAR, 'invalid')::INTEGER FROM range(100000) tbl(i)", parameters);
-		REQUIRE(!pending_query->HasError());
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 1);
+TEST_CASE("Abandoned stream must release the active query", "[api]") {
+	// A stream keeps the active-query state alive to feed it; it is normally released when the stream
+	// is fully consumed. A stream abandoned before being drained must still release that state, not
+	// leak it until the next query or context teardown.
+	DuckDB db;
+	Connection con(db);
 
-		auto result = pending_query->Execute();
-		REQUIRE(result->HasError());
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 1);
+	REQUIRE(!con.context->transaction.HasActiveTransaction());
+
+	SECTION("Abandon via Close() before consuming") {
+		auto stream = OpenStream(con, "SELECT * FROM range(10000)");
+		REQUIRE(!stream->HasError());
+		// the stream is in flight: the active query is still open
+		REQUIRE(con.context->transaction.HasActiveTransaction());
+
+		stream->Close();
+		REQUIRE(!con.context->transaction.HasActiveTransaction());
 	}
+	SECTION("Abandon via Close() after a partial fetch") {
+		auto stream = OpenStream(con, "SELECT * FROM range(10000)");
+		REQUIRE(!stream->HasError());
+		auto chunk = stream->Fetch(); // consume one chunk; the stream is not drained
+		REQUIRE(chunk);
+		REQUIRE(con.context->transaction.HasActiveTransaction());
 
-	SECTION("cancellation") {
-		auto pending_query = con.PendingQuery("SELECT SUM(i) FROM range(1000000000) tbl(i)", parameters);
-		REQUIRE(!pending_query->HasError());
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 1);
-
-		con.Interrupt();
-		auto result = pending_query->Execute();
-		REQUIRE(result->HasError());
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 1);
+		stream->Close();
+		REQUIRE(!con.context->transaction.HasActiveTransaction());
 	}
+	// the connection must remain usable after abandoning streams
+	auto check = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(check, 0, {42}));
+}
 
-	SECTION("teardown failure") {
-		auto state = make_shared_ptr<FailNextQueryEndState>();
-		con.context->registered_state->Insert("fail_query_end", state);
-		auto pending_query = con.PendingQuery("SELECT 42", parameters);
-		REQUIRE(!pending_query->HasError());
-		REQUIRE(connection_collector_calls == 1);
-		REQUIRE(query_collector_calls == 1);
+TEST_CASE("PROBE cancel a streaming producer parked on a full buffer", "[api][.]") {
+	// Force the producer to park on a full buffer (result >> streaming_buffer_size), abandon the
+	// stream mid-flight, then run another query so InitialCleanup -> CleanupInternal -> CancelTasks
+	// runs against the parked producer. If CancelTasks cannot reap a parked result-collector task,
+	// this hangs (busy-spins in `while (executor_tasks > 0) WorkOnTasks()`).
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='16KB'"));
 
-		state->fail_next = true;
-		REQUIRE_THROWS_WITH(pending_query->Execute(), Catch::Matchers::Contains("injected query teardown failure"));
-		require_local_query(43, 2);
-		REQUIRE(query_collector_calls == 1);
+	SECTION("abandon by dropping, then run another query") {
+		auto stream = OpenStream(con, "SELECT * FROM range(10000000)");
+		REQUIRE(!stream->HasError());
+		auto chunk = stream->Fetch(); // ensure the pipeline is actually streaming and re-parks
+		REQUIRE(chunk);
+		stream.reset(); // abandon while the producer is parked on the full buffer
+
+		auto check = con.Query("SELECT 42");
+		REQUIRE(CHECK_COLUMN(check, 0, {42}));
+	}
+	SECTION("abandon via Close(), then run another query") {
+		auto stream = OpenStream(con, "SELECT * FROM range(10000000)");
+		REQUIRE(!stream->HasError());
+		auto chunk = stream->Fetch();
+		REQUIRE(chunk);
+		stream->Close();
+
+		auto check = con.Query("SELECT 42");
+		REQUIRE(CHECK_COLUMN(check, 0, {42}));
 	}
 }
 
-static void parallel_pending_query(Connection *conn, bool *correct, size_t threadnr) {
+TEST_CASE("Interrupt is observed by QueryResult::ExecuteTask", "[api]") {
+	DuckDB db;
+	Connection con(db);
+
+	// Single thread + tiny streaming buffer make the parked-collector READY state reachable fast.
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='16KB'"));
+
+	auto handle = con.Submit("SELECT * FROM range(10000000)");
+	REQUIRE(!handle->HasError());
+
+	QueryResultState state = QueryResultState::NOT_READY;
+	for (idx_t i = 0; i < 1000000; i++) {
+		state = handle->ExecuteTask();
+		if (state == QueryResultState::READY || state == QueryResultState::EXECUTION_ERROR) {
+			break;
+		}
+	}
+	REQUIRE(state == QueryResultState::READY);
+
+	con.Interrupt();
+
+	// Without the fix the parked collector keeps reporting READY and the interrupt is never seen.
+	bool saw_error = false;
+	for (idx_t j = 0; j < 1000; j++) {
+		if (handle->ExecuteTask() == QueryResultState::EXECUTION_ERROR) {
+			saw_error = true;
+			break;
+		}
+	}
+	REQUIRE(saw_error);
+}
+
+TEST_CASE("Stream results from materialized CTE exchanges", "[api]") {
+	DuckDB db;
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='16KB'"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE integers AS SELECT i FROM range(1000000) t(i)"));
+
+	SECTION("Direct batch-indexed exchange") {
+		auto stream = OpenStream(con, "WITH c AS MATERIALIZED (SELECT i FROM integers) SELECT i FROM c");
+		idx_t count = 0;
+		while (auto chunk = stream->Fetch()) {
+			REQUIRE(chunk->GetValue(0, 0).GetValue<int64_t>() == NumericCast<int64_t>(count));
+			count += chunk->size();
+		}
+		REQUIRE(!stream->HasError());
+		REQUIRE(count == 1000000);
+	}
+	SECTION("Buffered unordered exchange") {
+		REQUIRE_NO_FAIL(con.Query("SET preserve_insertion_order=false"));
+		auto stream = OpenStream(con, "WITH c AS MATERIALIZED (SELECT i FROM integers) SELECT i FROM c");
+		idx_t count = 0;
+		while (auto chunk = stream->Fetch()) {
+			count += chunk->size();
+		}
+		REQUIRE(count == 1000000);
+	}
+	SECTION("Buffered batch-indexed exchange") {
+		auto stream = OpenStream(con, "WITH c AS MATERIALIZED ("
+		                              "SELECT i FROM integers WHERE i < 500000 "
+		                              "UNION ALL "
+		                              "SELECT i FROM integers WHERE i >= 500000) "
+		                              "SELECT i FROM c");
+		idx_t count = 0;
+		while (auto chunk = stream->Fetch()) {
+			REQUIRE(chunk->GetValue(0, 0).GetValue<int64_t>() == NumericCast<int64_t>(count));
+			count += chunk->size();
+		}
+		REQUIRE(!stream->HasError());
+		REQUIRE(count == 1000000);
+	}
+	SECTION("Abandon buffered batch-indexed exchange") {
+		auto stream = OpenStream(con, "WITH c AS MATERIALIZED ("
+		                              "SELECT i FROM integers WHERE i < 500000 "
+		                              "UNION ALL "
+		                              "SELECT i FROM integers WHERE i >= 500000) "
+		                              "SELECT i FROM c");
+		REQUIRE(!stream->HasError());
+		REQUIRE(stream->Fetch());
+
+		stream->Close();
+		auto check = con.Query("SELECT 42");
+		REQUIRE(CHECK_COLUMN(check, 0, {42}));
+	}
+	SECTION("Ordered sink pipeline sequencing") {
+		auto stream = OpenStream(con, "WITH c1 AS MATERIALIZED (SELECT i FROM range(10000) t(i)), "
+		                              "c2 AS MATERIALIZED (SELECT i FROM c1), "
+		                              "c3 AS MATERIALIZED (SELECT i + 10000 AS i FROM c1) "
+		                              "SELECT i FROM c2 UNION ALL SELECT i FROM c3");
+		idx_t count = 0;
+		while (auto chunk = stream->Fetch()) {
+			REQUIRE(chunk->GetValue(0, 0).GetValue<int64_t>() == NumericCast<int64_t>(count));
+			count += chunk->size();
+		}
+		REQUIRE(count == 20000);
+	}
+}
+
+static void parallel_submitted_query(Connection *conn, bool *correct, size_t threadnr) {
 	correct[threadnr] = true;
 	for (size_t i = 0; i < 100; i++) {
-		// run pending query and then execute it
-		auto executor = conn->PendingQuery("SELECT * FROM integers ORDER BY i");
+		// submit a query and then run it to completion
+		auto handle = conn->Submit("SELECT * FROM integers ORDER BY i");
 		try {
-			// this will randomly throw an exception if another thread calls pending query first
-			auto result = executor->Execute();
-			if (!CHECK_COLUMN(result, 0, {1, 2, 3, Value()})) {
+			// another thread submitting first cancels this one
+			handle->Complete();
+			if (handle->HasError()) {
+				continue;
+			}
+			if (!CHECK_COLUMN(handle, 0, {1, 2, 3, Value()})) {
 				correct[threadnr] = false;
 			}
 		} catch (...) {
@@ -404,7 +333,7 @@ static void parallel_pending_query(Connection *conn, bool *correct, size_t threa
 	}
 }
 
-TEST_CASE("Test parallel usage of pending query API", "[api][.]") {
+TEST_CASE("Test parallel usage of the submit API", "[api][.]") {
 	auto db = make_uniq<DuckDB>(nullptr);
 	auto conn = make_uniq<Connection>(*db);
 
@@ -412,9 +341,9 @@ TEST_CASE("Test parallel usage of pending query API", "[api][.]") {
 	REQUIRE_NO_FAIL(conn->Query("INSERT INTO integers VALUES (1), (2), (3), (NULL)"));
 
 	bool correct[20];
-	thread threads[20];
+	std::thread threads[20];
 	for (size_t i = 0; i < 20; i++) {
-		threads[i] = thread(parallel_pending_query, conn.get(), correct, i);
+		threads[i] = std::thread(parallel_submitted_query, conn.get(), correct, i);
 	}
 	for (size_t i = 0; i < 20; i++) {
 		threads[i].join();
@@ -422,7 +351,7 @@ TEST_CASE("Test parallel usage of pending query API", "[api][.]") {
 	}
 }
 
-TEST_CASE("Test Pending Query Prepared Statements API", "[api][.]") {
+TEST_CASE("Test Submit Prepared Statements API", "[api][.]") {
 	DuckDB db;
 	Connection con(db);
 
@@ -430,32 +359,24 @@ TEST_CASE("Test Pending Query Prepared Statements API", "[api][.]") {
 		auto prepare = con.Prepare("SELECT SUM(i) FROM range(1000000) tbl(i) WHERE i>=$1");
 		REQUIRE(!prepare->HasError());
 
-		auto pending_query = prepare->PendingQuery(0);
-		REQUIRE(!pending_query->HasError());
+		auto handle = prepare->Submit(0);
+		REQUIRE(!handle->HasError());
 
-		auto result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(499999500000)}));
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(499999500000)}));
 
-		// cannot fetch twice from the same pending query
-		REQUIRE_THROWS(pending_query->Execute());
-		REQUIRE_THROWS(pending_query->Execute());
+		// we can use the prepared statement again
+		handle = prepare->Submit(500000);
+		REQUIRE(!handle->HasError());
 
-		// we can use the prepared query again, however
-		pending_query = prepare->PendingQuery(500000);
-		REQUIRE(!pending_query->HasError());
-
-		result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(374999750000)}));
-
-		// cannot fetch twice from the same pending query
-		REQUIRE_THROWS(pending_query->Execute());
-		REQUIRE_THROWS(pending_query->Execute());
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(374999750000)}));
 	}
 	SECTION("Error during prepare") {
 		auto prepare = con.Prepare("SELECT SUM(i+X) FROM range(1000000) tbl(i) WHERE i>=$1");
 		REQUIRE(prepare->HasError());
 
-		REQUIRE_FAIL(prepare->PendingQuery(0));
+		REQUIRE_FAIL(prepare->Submit(0));
 	}
 	SECTION("Error during execution") {
 		duckdb::vector<Value> parameters;
@@ -463,23 +384,23 @@ TEST_CASE("Test Pending Query Prepared Statements API", "[api][.]") {
 		                            "END)::INT FROM range(1000000) tbl(i) WHERE i>$1");
 		// this succeeds initially
 		parameters = {Value::INTEGER(0)};
-		auto pending_query = prepared->PendingQuery(parameters, true);
-		REQUIRE(!pending_query->HasError());
+		auto handle = prepared->Submit(parameters);
+		REQUIRE(!handle->HasError());
 		// still succeeds...
-		auto result = pending_query->Execute();
-		REQUIRE(result->HasError());
+		handle->Complete();
+		REQUIRE(handle->HasError());
 
 		// query the connection as normal after
-		result = con.Query("SELECT 42");
+		auto result = con.Query("SELECT 42");
 		REQUIRE(CHECK_COLUMN(result, 0, {42}));
 
 		// if we change the parameter this works
 		parameters = {Value::INTEGER(2000000)};
-		pending_query = prepared->PendingQuery(parameters, true);
+		handle = prepared->Submit(parameters);
 
-		result = pending_query->Execute();
-		REQUIRE(!result->HasError());
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(0)}));
+		handle->Complete();
+		REQUIRE(!handle->HasError());
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(0)}));
 	}
 	SECTION("Multiple prepared statements") {
 		auto prepare1 = con.Prepare("SELECT SUM(i) FROM range(1000000) tbl(i) WHERE i>=$1");
@@ -488,32 +409,53 @@ TEST_CASE("Test Pending Query Prepared Statements API", "[api][.]") {
 		REQUIRE(!prepare2->HasError());
 
 		// we can execute from both prepared statements individually
-		auto pending_query = prepare1->PendingQuery(500000);
-		REQUIRE(!pending_query->HasError());
+		auto handle = prepare1->Submit(500000);
+		REQUIRE(!handle->HasError());
 
-		auto result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(374999750000)}));
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(374999750000)}));
 
-		pending_query = prepare2->PendingQuery(500000);
-		REQUIRE(!pending_query->HasError());
+		handle = prepare2->Submit(500000);
+		REQUIRE(!handle->HasError());
 
-		result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(125000250000)}));
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(125000250000)}));
 
-		// we can overwrite pending queries all day long
+		// a result that has ended does not hold the connection, so submission after submission works
 		for (idx_t i = 0; i < 10; i++) {
-			pending_query = prepare1->PendingQuery(500000);
-			pending_query = prepare2->PendingQuery(500000);
+			handle = prepare1->Submit(500000);
+			handle->Complete();
+			handle = prepare2->Submit(500000);
+			handle->Complete();
 		}
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(125000250000)}));
 
-		result = pending_query->Execute();
-		REQUIRE(CHECK_COLUMN(result, 0, {Value::BIGINT(125000250000)}));
+		// a result that is still open does hold it
+		handle = prepare1->Submit(500000);
+		auto handle2 = prepare2->Submit(500000);
+		REQUIRE(handle2->HasError());
+		REQUIRE(handle2->GetErrorType() == ExceptionType::RESOURCE_IN_USE);
 
-		// however, we can't mix and match...
-		pending_query = prepare1->PendingQuery(500000);
-		auto pending_query2 = prepare2->PendingQuery(500000);
-
-		// this result is no longer open
-		REQUIRE_THROWS(pending_query->Execute());
+		handle->Complete();
+		REQUIRE(CHECK_COLUMN(handle, 0, {Value::BIGINT(374999750000)}));
 	}
+}
+
+TEST_CASE("Auto-rollback of a failed statement that expands into several via the submit API", "[api]") {
+	// A statement that expands into several runs in one transaction, and a failure inside it must roll that back so
+	// the connection stays usable without a manual ROLLBACK, on the submit API path too (used by client drivers).
+	DuckDB db;
+	Connection con(db);
+	const char *pivot = "CREATE TEMP TABLE t AS PIVOT (SELECT 'x' AS k, 1 AS v) ON k USING first(does_not_exist)";
+
+	auto handle = con.Submit(string(pivot));
+	if (!handle->HasError()) {
+		handle->Complete();
+	}
+	REQUIRE(handle->HasError());
+	handle.reset();
+
+	// The connection must be usable again WITHOUT a manual ROLLBACK.
+	auto result = con.Query("SELECT 42");
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 }

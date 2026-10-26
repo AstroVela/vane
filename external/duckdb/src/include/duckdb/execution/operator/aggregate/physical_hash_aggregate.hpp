@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -76,7 +70,7 @@ public:
 	                      idx_t estimated_cardinality);
 	PhysicalHashAggregate(PhysicalPlan &physical_plan, ClientContext &context, vector<LogicalType> types,
 	                      vector<unique_ptr<Expression>> expressions, vector<unique_ptr<Expression>> groups,
-	                      vector<GroupingSet> grouping_sets, vector<unsafe_vector<idx_t>> grouping_functions,
+	                      vector<GroupingSet> grouping_sets, vector<unsafe_vector<ProjectionIndex>> grouping_functions,
 	                      idx_t estimated_cardinality, TupleDataValidityType group_validity,
 	                      TupleDataValidityType distinct_validity);
 
@@ -94,7 +88,7 @@ public:
 	unsafe_vector<idx_t> non_distinct_filter;
 	unsafe_vector<idx_t> distinct_filter;
 
-	unordered_map<Expression *, size_t> filter_indexes;
+	reference_map_t<const Expression, size_t> filter_indexes;
 
 public:
 	// Source interface
@@ -136,6 +130,9 @@ public:
 	bool ParallelSink() const override {
 		return true;
 	}
+	PipelineExternalInputSupport GetExternalInputSupport() const override {
+		return PipelineExternalInputSupport::SUPPORTED;
+	}
 
 	bool SinkOrderDependent() const override {
 		return false;
@@ -143,7 +140,6 @@ public:
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-	void SerializeOperatorData(Serializer &serializer) const override;
 	//! Toggle multi-scan capability on a hash table, which prevents the scan of the aggregate from being destructive
 	//! If this is not toggled the GetData method will destroy the hash table as it is scanning it
 	static void SetMultiScan(GlobalSinkState &state);

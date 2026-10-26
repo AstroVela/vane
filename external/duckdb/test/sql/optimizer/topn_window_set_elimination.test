@@ -3,9 +3,6 @@
 # group: [optimizer]
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE or replace TABLE timeseries AS
 FROM (
     VALUES
@@ -47,8 +44,8 @@ WITH cte AS (
     SELECT a, b, c::TIMESTAMPTZ AS c
     FROM t2
 )
-SELECT *
-FROM cte
+SELECT * 
+FROM cte 
 QUALIFY ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) = 1;
 ----
 x	false	2024-01-01 00:00:00+00

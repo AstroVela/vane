@@ -1,11 +1,3 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-#
-# SPDX-FileCopyrightText: 2026 Vane contributors
-#
-# SPDX-License-Identifier: MIT
-#
-# Modified by Vane contributors.
-
 add_library_unity(
   duckdb_planner_operator
   OBJECT
@@ -20,13 +12,13 @@ add_library_unity(
   logical_create_table.cpp
   logical_cross_product.cpp
   logical_cteref.cpp
-  logical_data_sink.cpp
   logical_delete.cpp
   logical_delim_get.cpp
   logical_dependent_join.cpp
   logical_distinct.cpp
   logical_dummy_scan.cpp
   logical_empty_result.cpp
+  logical_explain.cpp
   logical_export.cpp
   logical_expression_get.cpp
   logical_extension_operator.cpp
@@ -42,18 +34,25 @@ add_library_unity(
   logical_pragma.cpp
   logical_prepare.cpp
   logical_projection.cpp
-  logical_repartition.cpp
-  logical_local_exchange.cpp
-  logical_udf_project.cpp
-  logical_vllm_project.cpp
   logical_recursive_cte.cpp
   logical_materialized_cte.cpp
   logical_sample.cpp
+  logical_secure_view.cpp
   logical_set.cpp
   logical_reset.cpp
   logical_set_operation.cpp
-  logical_simple.cpp
+  logical_alter.cpp
+  logical_attach.cpp
+  logical_connect.cpp
+  logical_external_resource.cpp
+  logical_detach.cpp
+  logical_disconnect.cpp
+  logical_drop.cpp
+  logical_load.cpp
+  logical_transaction.cpp
+  logical_update_extensions.cpp
   logical_top_n.cpp
+  logical_trigger.cpp
   logical_unconditional_join.cpp
   logical_unnest.cpp
   logical_update.cpp

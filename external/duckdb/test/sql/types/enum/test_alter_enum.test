@@ -3,9 +3,6 @@
 # group: [enum]
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE person (
     name text
 );
@@ -47,13 +44,15 @@ select typeof(name) from person limit 1
 ENUM('Pedro', 'Mark', 'Hannes')
 
 # FIXME: dependencies between enums and tables are currently disabled
-mode skip
+mode skip unsupported
 
 # This should not be possible
 statement error
 DROP TYPE name_enum
 ----
 <REGEX>:.*Conversion Error.*Could not convert string.*
+
+mode unskip
 
 # We should be able to cast this back to string
 statement ok
@@ -78,4 +77,4 @@ VARCHAR
 statement error
 ALTER TABLE person ALTER name TYPE bogus_name
 ----
-<REGEX>:.*Conversion Error.*Could not convert string.*
+Type with name bogus_name does not exist

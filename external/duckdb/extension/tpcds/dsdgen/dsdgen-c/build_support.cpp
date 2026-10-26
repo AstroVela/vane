@@ -71,9 +71,9 @@
  * TODO:
  */
 void hierarchy_item(int h_level, ds_key_t *id, char **name, ds_key_t kIndex) {
-	static int nLastCategory = -1, nLastClass = -1, nBrandBase;
+	static thread_local int nLastCategory = -1, nLastClass = -1, nBrandBase;
 	int nBrandCount;
-	static char *szClassDistName = NULL;
+	static thread_local char *szClassDistName = NULL;
 	char sTemp[6];
 
 	switch (h_level) {
@@ -102,8 +102,7 @@ void hierarchy_item(int h_level, ds_key_t *id, char **name, ds_key_t kIndex) {
 		*id += (nBrandBase * 1000 + nLastClass) * 1000;
 		break;
 	default:
-		printf("ERROR: Invalid call to hierarchy_item with argument '%d'\n", h_level);
-		exit(1);
+		INTERNAL("Invalid call to hierarchy_item");
 	}
 
 	return;
@@ -152,8 +151,8 @@ int mk_companyname(char *dest, int nTable, int nCompany) {
  *coords?
  */
 int set_locale(int nRegion, decimal_t *longitude, decimal_t *latitude) {
-	static int init = 0;
-	static decimal_t dZero;
+	static thread_local int init = 0;
+	static thread_local decimal_t dZero;
 
 	if (!init) {
 		strtodec(&dZero, "0.00");
@@ -380,7 +379,7 @@ int SetScaleIndex(const char *szName, const char *szValue) {
  * TODO: None
  */
 void setUpdateDateRange(int nTable, date_t *pMinDate, date_t *pMaxDate) {
-	static int nUpdateNumber;
+	static thread_local int nUpdateNumber;
 
 	if (!InitConstants::setUpdateDateRange_init) {
 		nUpdateNumber = get_int("UPDATE");

@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -14,15 +8,27 @@
 
 #pragma once
 
-#include "duckdb/common/value_operations/value_operations.hpp"
-#include "duckdb/execution/join_hashtable.hpp"
-#include "duckdb/execution/mark_join_build_summary.hpp"
-#include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/planner/operator/logical_join.hpp"
 
 namespace duckdb {
+class JoinHashTable;
+
+//! Residual predicate information for hash joins
+struct ResidualPredicateInfo {
+	unordered_map<idx_t, idx_t> build_input_to_layout_map;
+	unordered_map<idx_t, idx_t> probe_input_to_probe_map;
+	vector<LogicalType> probe_types;
+
+	ResidualPredicateInfo() = default;
+	unique_ptr<ResidualPredicateInfo> Copy() const {
+		auto result = make_uniq<ResidualPredicateInfo>();
+		result->build_input_to_layout_map = build_input_to_layout_map;
+		result->probe_input_to_probe_map = probe_input_to_probe_map;
+		result->probe_types = probe_types;
+		return result;
+	}
+};
 
 //! PhysicalHashJoin represents a hash loop join between two tables
 class PhysicalHashJoin : public PhysicalComparisonJoin {
@@ -36,17 +42,15 @@ public:
 
 public:
 	PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left, PhysicalOperator &right,
-	                 vector<JoinCondition> cond, JoinType join_type, const vector<idx_t> &left_projection_map,
-	                 const vector<idx_t> &right_projection_map, vector<LogicalType> delim_types,
+	                 vector<JoinCondition> conds, JoinType join_type,
+	                 const vector<ProjectionIndex> &left_projection_map,
+	                 const vector<ProjectionIndex> &right_projection_map, vector<LogicalType> delim_types,
 	                 idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info);
 	PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left, PhysicalOperator &right,
 	                 vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality);
-	// Deserialization-only constructor: does not attach children or compute column mappings.
-	PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, vector<JoinCondition> cond, JoinType join_type,
-	                 vector<LogicalType> delim_types, idx_t estimated_cardinality, bool skip_child_init);
 
 	//! Initialize HT for this operator
-	unique_ptr<JoinHashTable> InitializeHashTable(ClientContext &context) const;
+	unique_ptr<JoinHashTable> InitializeHashTable(ClientContext &context, idx_t initial_radix_bits) const;
 
 	//! The types of the join keys
 	vector<LogicalType> condition_types;
@@ -61,24 +65,27 @@ public:
 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
 	vector<LogicalType> delim_types;
 
-	//! Join Keys statistics (optional)
-	vector<unique_ptr<BaseStatistics>> join_stats;
-
-	//! Global RHS state for an uncorrelated partitioned MARK join. Invalid for
-	//! ordinary local, gathered, broadcast, and correlated MARK joins.
-	MarkJoinBuildSummary mark_join_build_summary;
+	unique_ptr<ResidualPredicateInfo> residual_info;
+	//! For probe phase (includes predicate columns)
+	JoinProjectionColumns lhs_probe_columns;
+	//! Mapping from lhs_output_columns positions to lhs_probe_columns positions
+	vector<idx_t> lhs_output_in_probe;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-	void SerializeOperatorData(Serializer &serializer) const override;
 
 public:
 	// Operator Interface
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
-	void ConstructEmptyMarkJoinResult(DataChunk &join_keys, DataChunk &input, DataChunk &result) const;
 
 	bool ParallelOperator() const override {
 		return true;
+	}
+	PipelineExternalInputSupport GetExternalInputSupport() const override {
+		return PipelineExternalInputSupport::SUPPORTED;
+	}
+	PipelineExternalInputCost GetExternalInputCost() const override {
+		return PipelineExternalInputCost::SERIALIZED_FANOUT;
 	}
 
 protected:
@@ -109,6 +116,8 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	void SetPreserveBuildForRecursiveReuse(bool preserve) const;
+	bool CanPreserveBuildForRecursiveReuse() const;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	void PrepareFinalize(ClientContext &context, GlobalSinkState &global_state) const override;
@@ -121,6 +130,19 @@ public:
 	bool ParallelSink() const override {
 		return true;
 	}
+
+private:
+	static void ExtractResidualPredicateColumns(unique_ptr<Expression> &predicate, idx_t probe_column_count,
+	                                            vector<idx_t> &probe_column_ids, vector<idx_t> &build_column_ids);
+
+	void InitializeResidualPredicate(const vector<LogicalType> &lhs_input_types, const vector<idx_t> &probe_cols);
+
+	void InitializeBuildSide(const vector<LogicalType> &lhs_input_types, const vector<LogicalType> &rhs_input_types,
+	                         const vector<ProjectionIndex> &right_projection_map, const vector<idx_t> &build_cols);
+	void MapResidualBuildColumns(const vector<LogicalType> &lhs_input_types, const vector<LogicalType> &rhs_input_types,
+	                             const vector<idx_t> &build_cols,
+	                             const unordered_map<idx_t, idx_t> &build_columns_in_conditions,
+	                             unordered_map<idx_t, idx_t> &build_input_to_layout);
 };
 
 } // namespace duckdb

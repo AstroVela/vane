@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -36,13 +30,8 @@ namespace duckdb {
 struct BoundStatement;
 
 class Binder;
-struct DuckDBPyRelation;
-class Expression;
 class LogicalOperator;
-struct PythonReplacementScan;
 class QueryNode;
-class RelationStatement;
-class SelectNode;
 class TableRef;
 
 static string CreateRelationAlias(RelationType type, const string &alias) {
@@ -92,9 +81,11 @@ public:
 	DUCKDB_API virtual unique_ptr<QueryNode> GetQueryNode() = 0;
 	DUCKDB_API virtual string GetQuery();
 	DUCKDB_API virtual BoundStatement Bind(Binder &binder);
-	DUCKDB_API virtual string GetAlias();
+	DUCKDB_API virtual Identifier GetAlias();
 
+	//! Blocking. Runs the relation to completion and returns its handle; throws on error
 	DUCKDB_API unique_ptr<QueryResult> ExecuteOrThrow();
+	//! Blocking. Runs the relation to completion and returns its handle
 	DUCKDB_API unique_ptr<QueryResult> Execute();
 	DUCKDB_API string ToString();
 	DUCKDB_API virtual string ToString(idx_t depth) = 0;
@@ -102,15 +93,16 @@ public:
 	DUCKDB_API void Print();
 	DUCKDB_API void Head(idx_t limit = 10);
 
-	DUCKDB_API shared_ptr<Relation> CreateView(const string &name, bool replace = true, bool temporary = false);
-	DUCKDB_API shared_ptr<Relation> CreateView(const string &schema_name, const string &name, bool replace = true,
-	                                           bool temporary = false);
+	DUCKDB_API shared_ptr<Relation> CreateView(const Identifier &name, bool replace = true, bool temporary = false);
+	DUCKDB_API shared_ptr<Relation> CreateView(const Identifier &schema_name, const Identifier &name,
+	                                           bool replace = true, bool temporary = false);
+	//! Blocking. Runs a query to completion and returns its handle; the second form exposes the relation as a view
 	DUCKDB_API unique_ptr<QueryResult> Query(const string &sql) const;
-	DUCKDB_API unique_ptr<QueryResult> Query(const string &name, const string &sql);
+	DUCKDB_API unique_ptr<QueryResult> Query(const Identifier &name, const string &sql);
 
 	//! Explain the query plan of this relation
 	DUCKDB_API unique_ptr<QueryResult> Explain(ExplainType type = ExplainType::EXPLAIN_STANDARD,
-	                                           ExplainFormat explain_format = ExplainFormat::DEFAULT);
+	                                           const ProfilerPrintFormat &format = ProfilerPrintFormat::Default());
 
 	DUCKDB_API virtual unique_ptr<TableRef> GetTableRef();
 	virtual bool IsReadOnly() {
@@ -135,14 +127,6 @@ public:
 
 	// LIMIT
 	DUCKDB_API shared_ptr<Relation> Limit(int64_t n, int64_t offset = 0);
-
-	// REPARTITION (num_partitions=0 means auto)
-	DUCKDB_API shared_ptr<Relation> Repartition(idx_t num_partitions,
-	                                            vector<unique_ptr<ParsedExpression>> partition_by);
-	DUCKDB_API shared_ptr<Relation> Repartition(idx_t num_partitions, const vector<string> &partition_by);
-
-	// LOCAL_EXCHANGE (num_partitions=0 means auto)
-	DUCKDB_API shared_ptr<Relation> LocalExchange(idx_t num_partitions = 0);
 
 	// ORDER
 	DUCKDB_API shared_ptr<Relation> Order(const string &expression);
@@ -180,52 +164,40 @@ public:
 	DUCKDB_API shared_ptr<Relation> Alias(const string &alias);
 
 	//! Insert the data from this relation into a table
-	DUCKDB_API shared_ptr<Relation> InsertRel(const string &schema_name, const string &table_name);
-	DUCKDB_API shared_ptr<Relation> InsertRel(const string &catalog_name, const string &schema_name,
-	                                          const string &table_name);
-	DUCKDB_API void Insert(const string &table_name);
-	DUCKDB_API void Insert(const string &schema_name, const string &table_name);
-	DUCKDB_API void Insert(const string &catalog_name, const string &schema_name, const string &table_name);
+	DUCKDB_API shared_ptr<Relation> InsertRel(const Identifier &schema_name, const Identifier &table_name);
+	DUCKDB_API shared_ptr<Relation> InsertRel(const Identifier &catalog_name, const Identifier &schema_name,
+	                                          const Identifier &table_name);
+	DUCKDB_API void Insert(const Identifier &table_name);
+	DUCKDB_API void Insert(const Identifier &schema_name, const Identifier &table_name);
+	DUCKDB_API void Insert(const Identifier &catalog_name, const Identifier &schema_name, const Identifier &table_name);
 	//! Insert a row (i.e.,list of values) into a table
 	DUCKDB_API virtual void Insert(const vector<vector<Value>> &values);
 	DUCKDB_API virtual void Insert(vector<vector<unique_ptr<ParsedExpression>>> &&expressions);
 	//! Create a table and insert the data from this relation into that table
-	DUCKDB_API shared_ptr<Relation> CreateRel(const string &schema_name, const string &table_name,
+	DUCKDB_API shared_ptr<Relation> CreateRel(const Identifier &schema_name, const Identifier &table_name,
 	                                          bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
-	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
-	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
-	DUCKDB_API shared_ptr<Relation> CreateRel(const string &catalog_name, const string &schema_name,
-	                                          const string &table_name, bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
-	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
-	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
-	DUCKDB_API void Create(const string &table_name, bool temporary = false,
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	DUCKDB_API shared_ptr<Relation> CreateRel(const Identifier &catalog_name, const Identifier &schema_name,
+	                                          const Identifier &table_name, bool temporary = false,
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	DUCKDB_API void Create(const Identifier &table_name, bool temporary = false,
 	                       OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
-	DUCKDB_API void Create(const string &schema_name, const string &table_name, bool temporary = false,
+	DUCKDB_API void Create(const Identifier &schema_name, const Identifier &table_name, bool temporary = false,
 	                       OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
-	DUCKDB_API void Create(const string &catalog_name, const string &schema_name, const string &table_name,
+	DUCKDB_API void Create(const Identifier &catalog_name, const Identifier &schema_name, const Identifier &table_name,
 	                       bool temporary = false, OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
 
 	//! Write a relation to a CSV file
 	DUCKDB_API shared_ptr<Relation>
-	WriteCSVRel(const string &csv_file,
-	            case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	WriteCSVRel(const string &csv_file, identifier_map_t<vector<Value>> options = identifier_map_t<vector<Value>>());
 	DUCKDB_API void WriteCSV(const string &csv_file,
-	                         case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	                         identifier_map_t<vector<Value>> options = identifier_map_t<vector<Value>>());
 	//! Write a relation to a Parquet file
 	DUCKDB_API shared_ptr<Relation>
 	WriteParquetRel(const string &parquet_file,
-	                case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
-	DUCKDB_API void
-	WriteParquet(const string &parquet_file,
-	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
-	//! Write a relation through any registered COPY TO format
-	DUCKDB_API shared_ptr<Relation>
-	WriteFileRel(const string &file_path, const string &format,
-	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
-	DUCKDB_API void WriteFile(const string &file_path, const string &format,
-	                          case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	                identifier_map_t<vector<Value>> options = identifier_map_t<vector<Value>>());
+	DUCKDB_API void WriteParquet(const string &parquet_file,
+	                             identifier_map_t<vector<Value>> options = identifier_map_t<vector<Value>>());
 
 	//! Update a table, can only be used on a TableRelation
 	DUCKDB_API virtual void Update(const string &update, const string &condition = string());
@@ -247,81 +219,11 @@ public:
 	virtual Relation *ChildRelation() {
 		return nullptr;
 	}
-
 	void AddExternalDependency(shared_ptr<ExternalDependency> dependency);
 	DUCKDB_API vector<shared_ptr<ExternalDependency>> GetAllDependencies();
 
 protected:
-	//! Internal capability hooks used while binding relation trees. These are
-	//! deliberately not part of the exported Relation API.
-	virtual bool ContainsNonSQLRelation() {
-		auto child = ChildRelation();
-		return child && child->ContainsNonSQLRelation();
-	}
-	//! Whether GetQueryNode can represent this relation without losing operators
-	//! or binding scopes in the supplied binding context.
-	virtual bool CanSerializeToQueryNodeInternal(Binder &binder) {
-		if (ContainsNonSQLRelation()) {
-			return false;
-		}
-		auto child = ChildRelation();
-		return !child || child->CanSerializeToQueryNodeInternal(binder);
-	}
-	//! Whether this relation can be bound directly as another relation's input.
-	//! SQL-serializable relations use the default SQL binding path. Relations
-	//! with a non-SQL binding path override this independently of serialization.
-	virtual bool CanBindAsInputInternal(Binder &binder) {
-		return CanSerializeToQueryNodeInternal(binder);
-	}
-	//! Build this relation's table reference after the complete relation tree has
-	//! already been validated for SQL serialization.
-	virtual unique_ptr<TableRef> GetTableRefInternal();
-	static unique_ptr<TableRef> GetTableRefForSerialization(Relation &relation);
-	//! Bind this relation for use as another relation's input. Binding-preserving
-	//! relations override this to keep their child's BindContext aligned with the plan.
-	virtual BoundStatement BindAsInput(Binder &binder);
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
-	static bool ExposesMultiSourceBindings(Relation &child);
-	static bool RequiresDirectRelationBinding(Binder &binder, Relation &child);
-	static bool RequiresSQLMultiSourceBinding(Relation &child);
-	static bool CanSerializeExpressionOnBoundChild(Binder &binder, Relation &child, TableRef &bound_child,
-	                                               const ParsedExpression &expression);
-	static unique_ptr<TableRef> BindRelationInput(Binder &binder, Relation &child);
-	static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, unique_ptr<SelectNode> select_node);
-	//! Bind an ORDER BY through the SELECT binder without replacing the child's output bindings.
-	static BoundStatement BindOrderOnChild(Binder &binder, Relation &child, const vector<OrderByNode> &orders);
-	static unique_ptr<SelectNode> WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
-	                                            const vector<ColumnDefinition> &columns);
-	static unique_ptr<QueryNode> RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
-	                                                           const vector<ColumnDefinition> &columns);
-	static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
-	                                                      unique_ptr<LogicalOperator> child);
-	static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);
-
-	static bool ChildContainsNonSQLRelation(Relation &child) {
-		return child.ContainsNonSQLRelation();
-	}
-	static bool ChildCanSerializeToQueryNode(Relation &child, Binder &binder) {
-		return child.CanSerializeToQueryNodeInternal(binder);
-	}
-	static bool ChildCanBindAsInput(Relation &child, Binder &binder) {
-		return child.CanBindAsInputInternal(binder);
-	}
-	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder);
-
-private:
-	friend class Binder;
-	friend class ClientContext;
-	friend struct DuckDBPyRelation;
-	friend class RelationStatement;
-	friend struct PythonReplacementScan;
-
-	//! Return a freshly validated QueryNode, or nullptr if no faithful
-	//! representation exists. These entry points stay private so serialization
-	//! policy does not become part of the public Relation API.
-	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode();
-	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode(Binder &binder);
-	string GetQuery(Binder &binder);
 
 public:
 	template <class TARGET>

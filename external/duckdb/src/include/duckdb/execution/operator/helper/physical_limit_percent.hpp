@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -43,6 +37,9 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	void SourceFinished(ClientContext &context, GlobalSourceState &gstate) const override;
+
 	bool IsSource() const override {
 		return true;
 	}
@@ -56,8 +53,7 @@ public:
 		return true;
 	}
 
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
 } // namespace duckdb

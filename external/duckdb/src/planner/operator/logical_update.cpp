@@ -4,18 +4,18 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
-LogicalUpdate::LogicalUpdate(ClientContext &context, TableCatalogEntry &table)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(context, table), table(table), table_index(0),
-      return_chunk(false) {
+LogicalUpdate::LogicalUpdate(TableCatalogEntry &table)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), table(table), table_index(0), return_chunk(false) {
 }
 
-LogicalUpdate::LogicalUpdate(ClientContext &context, const LogicalWriteTarget &write_target_p)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(write_target_p),
-      table(write_target_p.Resolve(context)) {
+LogicalUpdate::LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE),
+      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->GetQualifiedName())) {
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }
@@ -26,14 +26,24 @@ idx_t LogicalUpdate::EstimateCardinality(ClientContext &context) {
 
 vector<ColumnBinding> LogicalUpdate::GetColumnBindings() {
 	if (return_chunk) {
-		return GenerateColumnBindings(table_index, table.GetTypes().size());
+		auto column_count = table.GetTypes().size();
+		if (capture_old_rows) {
+			// NEW image followed by OLD image, both in table order.
+			column_count *= 2;
+		}
+		return GenerateColumnBindings(table_index, column_count);
 	}
-	return {ColumnBinding(0, 0)};
+	return {ColumnBinding(table_index, ProjectionIndex(0))};
 }
 
 void LogicalUpdate::ResolveTypes() {
 	if (return_chunk) {
 		types = table.GetTypes();
+		if (capture_old_rows) {
+			// Append the OLD image types (identical to the NEW image).
+			auto old_types = table.GetTypes();
+			types.insert(types.end(), old_types.begin(), old_types.end());
+		}
 	} else {
 		types.emplace_back(LogicalType::BIGINT);
 	}
@@ -42,7 +52,7 @@ void LogicalUpdate::ResolveTypes() {
 string LogicalUpdate::GetName() const {
 #ifdef DEBUG
 	if (DBConfigOptions::debug_print_bindings) {
-		return LogicalOperator::GetName() + StringUtil::Format(" #%llu", table_index);
+		return LogicalOperator::GetName() + StringUtil::Format(" #%llu", table_index.index);
 	}
 #endif
 	return LogicalOperator::GetName();
@@ -73,7 +83,7 @@ void LogicalUpdate::RewriteInPlaceUpdates(LogicalOperator &update_op) {
 	auto rowid_binding = update_op.children.back()->GetColumnBindings().back();
 
 	// We're looking for the GET operator that produces this rowid, and therefore produce this binding.
-	// There might be projections in betweeen though, so we need to traverse through them.
+	// There might be projections in between though, so we need to traverse through them.
 	auto target_binding = rowid_binding;
 	vector<reference<unique_ptr<LogicalOperator>>> stack;
 
@@ -99,7 +109,7 @@ void LogicalUpdate::RewriteInPlaceUpdates(LogicalOperator &update_op) {
 
 				// Update the target binding.
 				target_binding =
-				    proj.expressions[target_binding.column_index]->Cast<BoundColumnRefExpression>().binding;
+				    proj.expressions[target_binding.column_index]->Cast<BoundColumnRefExpression>().Binding();
 
 				// Traverse the child.
 				stack.push_back(proj.children.back());
@@ -164,7 +174,7 @@ void LogicalUpdate::RewriteInPlaceUpdates(LogicalOperator &update_op) {
 			// We do this in backwards order, always adding a column reference to the previously added column,
 			// so that we end up with a chain of column references that all point to the newly added column in the GET.
 
-			auto prev_col_idx = get.GetColumnIds().size() - 1;
+			ProjectionIndex prev_col_idx(get.GetColumnIds().size() - 1);
 			auto prev_tbl_idx = get.GetTableIndex().back();
 
 			for (int64_t i = UnsafeNumericCast<int64_t>(projections.size()) - 1; i >= 0; i--) {
@@ -176,13 +186,13 @@ void LogicalUpdate::RewriteInPlaceUpdates(LogicalOperator &update_op) {
 					    proj.expressions.end() - 1,
 					    make_uniq<BoundColumnRefExpression>(column.Type(), ColumnBinding(prev_tbl_idx, prev_col_idx)));
 
-					prev_col_idx = proj.expressions.size() - 2;
+					prev_col_idx = ProjectionIndex(proj.expressions.size() - 2);
 					prev_tbl_idx = proj.table_index;
 				} else {
 					proj.expressions.push_back(
 					    make_uniq<BoundColumnRefExpression>(column.Type(), ColumnBinding(prev_tbl_idx, prev_col_idx)));
 
-					prev_col_idx = proj.expressions.size() - 1;
+					prev_col_idx = ProjectionIndex(proj.expressions.size() - 1);
 					prev_tbl_idx = proj.table_index;
 				}
 			}

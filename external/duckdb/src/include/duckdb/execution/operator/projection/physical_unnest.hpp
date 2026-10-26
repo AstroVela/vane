@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -40,9 +34,6 @@ public:
 	bool ParallelOperator() const override {
 		return true;
 	}
-
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
 
 public:
 	static unique_ptr<OperatorState> GetState(ExecutionContext &context,

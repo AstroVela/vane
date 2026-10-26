@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -14,11 +8,12 @@
 
 #pragma once
 
+#include "duckdb/common/enums/metric_type.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/extra_operator_info.hpp"
 #include "duckdb/common/column_index.hpp"
@@ -33,14 +28,14 @@ public:
 
 public:
 	//! Table scan that immediately projects out filter columns that are unused in the remainder of the query plan
-	PhysicalTableScan(PhysicalPlan &physical_plan, vector<LogicalType> types, TableFunction function,
+	PhysicalTableScan(PhysicalPlan &physical_plan, vector<LogicalType> types, BoundTableFunction function,
 	                  unique_ptr<FunctionData> bind_data, vector<LogicalType> returned_types,
 	                  vector<ColumnIndex> column_ids, vector<idx_t> projection_ids, vector<string> names,
 	                  unique_ptr<TableFilterSet> table_filters, idx_t estimated_cardinality,
 	                  ExtraOperatorInfo extra_info, vector<Value> parameters, virtual_column_map_t virtual_columns);
 
 	//! The table function
-	TableFunction function;
+	BoundTableFunction function;
 	//! Bind data of the function
 	unique_ptr<FunctionData> bind_data;
 	//! The types of ALL columns that can be returned by the table function
@@ -58,13 +53,6 @@ public:
 	ExtraOperatorInfo extra_info;
 	//! Parameters
 	vector<Value> parameters;
-	//! Runtime-only fence for distributed scans. Worker plan deserialization
-	//! leaves this false; explicit static or FTE split injection sets it before
-	//! executor initialization. Coordinator bind state is never a fallback.
-	bool distributed_scan_splits_applied = false;
-	//! Runtime-only execution fence for an explicit empty extension assignment.
-	//! This may only be true after distributed_scan_splits_applied is set.
-	bool distributed_scan_empty = false;
 	//! Contains a reference to dynamically generated table filters (through e.g. a join up in the tree)
 	shared_ptr<DynamicTableFilterSet> dynamic_filters;
 	//! Virtual columns
@@ -94,18 +82,17 @@ public:
 		return true;
 	}
 	bool ParallelSource() const override;
+	TableFunctionParallelism SourceParallelism() const override;
 
 	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override;
 
 	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
-	InsertionOrderPreservingMap<string> ExtraSourceParams(GlobalSourceState &gstate,
-	                                                      LocalSourceState &lstate) const override;
 	void GetMetrics(ClientContext &context, GlobalSourceState &gstate_p, LocalSourceState &lstate,
-	                const profiler_settings_t &requested_metrics, profiler_metrics_t &metrics) const;
+	                OperatorMetrics &operator_metrics) const;
 
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
+private:
+	string GetFilterInfo(const TableFilterSet &filter_set) const;
 };
 
 } // namespace duckdb

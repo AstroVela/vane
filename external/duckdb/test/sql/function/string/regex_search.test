@@ -3,9 +3,6 @@
 # group: [string]
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE t0 as FROM VALUES('asdf') t(c0);
 
 # null
@@ -28,6 +25,15 @@ SELECT regexp_matches(c0, '.*yu.*') from t0;
 query T
 SELECT regexp_matches(c0, '') from t0;
 ----
+1
+
+# Literal control characters cannot be rewritten to a contains expression
+query T
+SELECT regexp_matches(s, E'a\n')
+FROM (VALUES ('a'), (E'a\n')) values_table(s)
+ORDER BY length(s)
+----
+0
 1
 
 # partial matches okay
@@ -181,7 +187,7 @@ SELECT regexp_matches(v, 'h.*', 'c') FROM test ORDER BY v
 statement error
 SELECT regexp_matches(v, 'h.*', v) FROM test ORDER BY v
 ----
-<REGEX>:.*Invalid Input Error.*must be a constant.*
+<REGEX>:.*Binder Error.*must be a constant expression.*
 
 # throw on invalid options
 statement error
@@ -201,5 +207,15 @@ INSERT INTO regex VALUES ('asdf', '(')
 
 statement error
 SELECT regexp_matches(s, p) FROM regex
+----
+<REGEX>:.*Invalid Input Error.*missing.*
+
+statement error
+SELECT regexp_full_match(s, p) FROM regex
+----
+<REGEX>:.*Invalid Input Error.*missing.*
+
+statement error
+SELECT regexp_full_match(s, p, 'c') FROM regex
 ----
 <REGEX>:.*Invalid Input Error.*missing.*

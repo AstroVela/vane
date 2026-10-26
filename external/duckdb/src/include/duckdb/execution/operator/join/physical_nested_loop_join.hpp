@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -30,15 +24,6 @@ public:
 	PhysicalNestedLoopJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &left,
 	                       PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
 	                       idx_t estimated_cardinality);
-	//! Constructor for deserialization (children added later)
-	PhysicalNestedLoopJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> cond,
-	                       JoinType join_type, idx_t estimated_cardinality, bool skip_child_init);
-
-	// Predicate (join conditions that don't reference both sides)
-	unique_ptr<Expression> predicate;
-
-	//! Serialization
-	void SerializeOperatorData(Serializer &serializer) const override;
 
 public:
 	// Operator Interface
@@ -55,6 +40,7 @@ protected:
 
 public:
 	// Source interface
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override;
@@ -89,6 +75,10 @@ public:
 public:
 	//! Returns a list of the types of the join conditions
 	vector<LogicalType> GetJoinTypes() const;
+
+private:
+	vector<idx_t> mark_projection_map;
+	bool track_unknown;
 
 private:
 	// resolve joins that output max N elements (SEMI, ANTI, MARK)

@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -17,6 +11,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 namespace duckdb {
 
@@ -25,8 +20,9 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INOUT_FUNCTION;
 
 public:
-	PhysicalTableInOutFunction(PhysicalPlan &physical_plan, vector<LogicalType> types, TableFunction function_p,
+	PhysicalTableInOutFunction(PhysicalPlan &physical_plan, vector<LogicalType> types, BoundTableFunction function_p,
 	                           unique_ptr<FunctionData> bind_data_p, vector<ColumnIndex> column_ids_p,
+	                           vector<idx_t> projection_ids_p, unique_ptr<TableFilterSet> table_filters_p,
 	                           idx_t estimated_cardinality, vector<column_t> projected_input);
 
 public:
@@ -36,25 +32,8 @@ public:
 	                          const idx_t &ordinality);
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
-	OperatorResultType ExecuteBatch(ExecutionContext &context, ExecutionBatch &input, ExecutionBatch &output,
-	                                GlobalOperatorState &gstate, OperatorState &state) const override;
 	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate,
 	                                        OperatorState &state) const override;
-	OperatorFinalizeResultType FinalExecuteBatch(ExecutionContext &context, ExecutionBatch &batch,
-	                                             GlobalOperatorState &gstate, OperatorState &state) const override;
-	void SerializeOperatorData(Serializer &serializer) const override;
-	const TableFunction &GetFunction() const {
-		return function;
-	}
-	const FunctionData *GetBindData() const {
-		return bind_data.get();
-	}
-	const vector<ColumnIndex> &GetColumnIds() const {
-		return column_ids;
-	}
-	const vector<column_t> &GetProjectedInput() const {
-		return projected_input;
-	}
 
 	bool ParallelOperator() const override {
 		return true;
@@ -65,8 +44,6 @@ public:
 	}
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-	InsertionOrderPreservingMap<string> ExtraOperatorParams(GlobalOperatorState &gstate,
-	                                                        OperatorState &state) const override;
 
 	//! Information for WITH ORDINALITY
 	optional_idx ordinality_idx;
@@ -75,15 +52,17 @@ public:
 		return function.order_preservation_type;
 	}
 
-	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override;
-
 private:
 	//! The table function
-	TableFunction function;
+	BoundTableFunction function;
 	//! Bind data of the function
 	unique_ptr<FunctionData> bind_data;
 	//! The set of column ids to fetch
 	vector<ColumnIndex> column_ids;
+	//! The projected-out column ids
+	vector<idx_t> projection_ids;
+	//! Filters pushed into the table in-out function
+	unique_ptr<TableFilterSet> table_filters;
 	//! The set of input columns to project out
 	vector<column_t> projected_input;
 };

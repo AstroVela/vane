@@ -1,13 +1,13 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-# SPDX-FileCopyrightText: 2026 Vane contributors
-# SPDX-License-Identifier: MIT
-#
-# Modified by Vane contributors.
-
 import subprocess
 import sys
 from pathlib import Path
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+
+
+def log(message: str):
+    print(message, file=sys.stderr, flush=True)
+
 
 banned_symbols = [
     "std::basic_ofstream",
@@ -46,19 +46,22 @@ def check_object_file(path: Path) -> list[tuple[str, str]]:
 
 all_violations = {}
 
-for obj_file in args.directory.rglob("*.o"):
-    print(obj_file)
-    violations = check_object_file(obj_file)
-    if violations:
-        all_violations[obj_file] = violations
+obj_files = list(args.directory.rglob("*.o"))
+
+log(f"found {len(obj_files)} object files")
+
+with ThreadPoolExecutor() as executor:
+    for obj_file, violations in zip(obj_files, executor.map(check_object_file, obj_files)):
+        if violations:
+            all_violations[obj_file] = violations
 
 if all_violations:
-    print("ERROR: Banned symbols found:\n")
+    log(f"error: Banned symbols found ({len(all_violations)}):\n")
     for path, violations in all_violations.items():
-        print(f"{path}:")
+        log(f"{path}:")
         for symbol, line in violations:
-            print(f"  [{symbol}] {line}")
-        print()
+            log(f"  [{symbol}] {line}")
+        log("")
     sys.exit(1)
 
-print("No banned symbols found.")
+log("No banned symbols found.")

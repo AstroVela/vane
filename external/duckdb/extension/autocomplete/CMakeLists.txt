@@ -4,17 +4,9 @@ project(AutoCompleteExtension)
 
 include_directories(include)
 
-set(AUTOCOMPLETE_EXTENSION_FILES
-    autocomplete_extension.cpp matcher.cpp tokenizer.cpp keyword_helper.cpp
-    keyword_map.cpp)
+set(AUTOCOMPLETE_EXTENSION_FILES autocomplete_extension.cpp)
 
-add_subdirectory(transformer)
-add_subdirectory(parser)
-
-build_static_extension(autocomplete ${AUTOCOMPLETE_EXTENSION_FILES})
-set(PARAMETERS "-warnings")
-build_loadable_extension(autocomplete ${PARAMETERS}
-                         ${AUTOCOMPLETE_EXTENSION_FILES})
+build_extension_library(autocomplete ${AUTOCOMPLETE_EXTENSION_FILES})
 
 install(
   TARGETS autocomplete_extension

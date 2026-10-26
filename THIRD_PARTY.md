@@ -6,20 +6,30 @@ See [COPYLEFT.md](COPYLEFT.md) for the GPL-family inventory, selected dual-licen
 alternatives, generated-parser exception, Python media dependencies, and
 source/relink delivery checks. Original upstream notices remain intact.
 
+The `integration/duckdb-2.0` branch currently contains the unmodified official
+DuckDB v2.0.0 and duckdb-python v2.0.0 source baselines; its earlier Vane Python
+bindings remain in place and the root build does not yet select the new client.
+See [Source provenance](SOURCE_PROVENANCE.md#duckdb-python-client-baseline) for
+the exact revisions. The binary dependency profile, optional extensions, and
+release allowlists below must be requalified as those integrations are migrated;
+this source baseline is not a release artifact.
+
 ## Derived source
 
 | Component | Use in Vane | License | License text |
 | --- | --- | --- | --- |
 | DuckDB and DuckDB Python | Core SQL engine, Python API, and the base for Vane's engine modifications | MIT | `LICENSES/DuckDB-MIT.txt` and `external/duckdb/LICENSE` |
+| Official duckdb-python 2.0 snapshot | Source baseline for the pending Python client migration; not yet built into Vane | MIT | `external/duckdb-python/LICENSE` |
 | DuckDB HTTPFS | Statically linked HTTP/S3 filesystem extension, fetched at the pinned revision in `external/duckdb/.github/config/extensions/httpfs.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
 | ALP and ALP-RD compression algorithms | Compression implementation retained in the DuckDB source tree | MIT | `external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE` and the corresponding `alprd` path |
-| Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `vane/experimental/spark/LICENSE` |
+| Spark-compatible Python API | Compatibility layers retained in the old Vane package and the new upstream client snapshot | Apache-2.0 | `vane/experimental/spark/LICENSE` and `external/duckdb-python/duckdb/experimental/spark/LICENSE` |
 | auditwheel manylinux policy | Architecture- and baseline-specific policy data pinned from auditwheel 6.8.1 | MIT | `LICENSES/auditwheel-LICENSE.txt` |
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
-The query-relation parameter binding changes under `external/duckdb` remain MIT
-licensed. Connection runner dispatch, interruption, and result ownership changes in the
+The historical query-relation parameter binding changes under `external/duckdb`
+remain MIT licensed and are preserved before the pure 2.0 import. Connection
+runner dispatch, interruption, and result ownership changes in the
 inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
 
 ## Vendored native dependencies

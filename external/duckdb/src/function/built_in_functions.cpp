@@ -9,61 +9,13 @@
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_window_function_info.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
-
-namespace {
-// Keep Vane's runner policy at built-in registration. The table functions keep
-// their native bind and execution implementations.
-void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &function) {
-	static const unordered_set<string> client_reads = {"duckdb_databases", "duckdb_extensions", "duckdb_schemas",
-	                                                   "duckdb_sequences", "duckdb_settings",   "duckdb_tables",
-	                                                   "duckdb_variables", "duckdb_views",      "pragma_version"};
-	static const unordered_set<string> client_only = {"checkpoint",
-	                                                  "force_checkpoint",
-	                                                  "duckdb_coordinate_systems",
-	                                                  "duckdb_external_file_cache",
-	                                                  "duckdb_logs",
-	                                                  "duckdb_log_contexts",
-	                                                  "duckdb_table_sample",
-	                                                  "enable_profiling",
-	                                                  "disable_profiling",
-	                                                  "enable_logging",
-	                                                  "disable_logging",
-	                                                  "truncate_duckdb_logs",
-	                                                  "duckdb_approx_database_count",
-	                                                  "duckdb_columns",
-	                                                  "duckdb_connection_count",
-	                                                  "duckdb_constraints",
-	                                                  "duckdb_dependencies",
-	                                                  "duckdb_functions",
-	                                                  "duckdb_indexes",
-	                                                  "duckdb_memory",
-	                                                  "duckdb_prepared_statements",
-	                                                  "duckdb_secret_types",
-	                                                  "duckdb_secrets",
-	                                                  "duckdb_temporary_files",
-	                                                  "duckdb_types",
-	                                                  "pragma_collations",
-	                                                  "pragma_database_size",
-	                                                  "pragma_metadata_info",
-	                                                  "pragma_storage_info",
-	                                                  "pragma_table_info",
-	                                                  "pragma_show",
-	                                                  "pragma_user_agent",
-	                                                  "pragma_platform",
-	                                                  "which_secret"};
-	if (client_reads.count(name)) {
-		function.SetRequiresClientContext();
-		function.SetClientContextRead();
-	} else if (client_only.count(name)) {
-		function.SetRequiresClientContext();
-	}
-}
-} // namespace
 
 BuiltinFunctions::BuiltinFunctions(CatalogTransaction transaction, Catalog &catalog)
     : transaction(transaction), catalog(catalog) {
@@ -74,7 +26,7 @@ BuiltinFunctions::~BuiltinFunctions() {
 
 void BuiltinFunctions::AddCollation(string name, ScalarFunction function, bool combinable,
                                     bool not_required_for_equality) {
-	CreateCollationInfo info(std::move(name), std::move(function), combinable, not_required_for_equality);
+	CreateCollationInfo info(Identifier(std::move(name)), std::move(function), combinable, not_required_for_equality);
 	info.internal = true;
 	catalog.CreateCollation(transaction, info);
 }
@@ -98,7 +50,7 @@ void BuiltinFunctions::AddFunction(PragmaFunction function) {
 }
 
 void BuiltinFunctions::AddFunction(const string &name, PragmaFunctionSet functions) {
-	CreatePragmaFunctionInfo info(name, std::move(functions));
+	CreatePragmaFunctionInfo info(Identifier(name), std::move(functions));
 	info.internal = true;
 	catalog.CreatePragmaFunction(transaction, info);
 }
@@ -111,7 +63,7 @@ void BuiltinFunctions::AddFunction(ScalarFunction function) {
 
 void BuiltinFunctions::AddFunction(const vector<string> &names, ScalarFunction function) { // NOLINT: false positive
 	for (auto &name : names) {
-		function.name = name;
+		function.name = Identifier(name);
 		AddFunction(function);
 	}
 }
@@ -123,16 +75,12 @@ void BuiltinFunctions::AddFunction(ScalarFunctionSet set) {
 }
 
 void BuiltinFunctions::AddFunction(TableFunction function) {
-	ConfigureBuiltinTableRunnerPolicy(function.name, function);
 	CreateTableFunctionInfo info(std::move(function));
 	info.internal = true;
 	catalog.CreateTableFunction(transaction, info);
 }
 
 void BuiltinFunctions::AddFunction(TableFunctionSet set) {
-	for (auto &function : set.functions) {
-		ConfigureBuiltinTableRunnerPolicy(set.name, function);
-	}
 	CreateTableFunctionInfo info(std::move(set));
 	info.internal = true;
 	catalog.CreateTableFunction(transaction, info);
@@ -151,8 +99,11 @@ struct ExtensionFunctionInfo : public ScalarFunctionInfo {
 	string extension;
 };
 
-unique_ptr<FunctionData> BindExtensionFunction(ClientContext &context, ScalarFunction &bound_function,
-                                               vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<Expression> BindExtensionFunction(FunctionBindExpressionInput &input) {
+	auto &context = input.context;
+	auto &arguments = input.children;
+	auto &bound_function = input.bound_function;
+
 	// if this is triggered we are trying to call a method that is present in an extension
 	// but the extension is not loaded
 	// try to autoload the extension
@@ -161,24 +112,23 @@ unique_ptr<FunctionData> BindExtensionFunction(ClientContext &context, ScalarFun
 	auto &extension_name = function_info.extension;
 	auto &db = *context.db;
 
-	if (!ExtensionHelper::CanAutoloadExtension(extension_name)) {
-		throw BinderException("Trying to call function \"%s\" which is present in extension \"%s\" - but the extension "
+	if (!ExtensionHelper::CanAutoloadExtension(db, extension_name)) {
+		throw BinderException("Trying to call function %s which is present in extension \"%s\" - but the extension "
 		                      "is not loaded and could not be auto-loaded",
-		                      bound_function.name, extension_name);
+		                      bound_function.GetName(), extension_name);
 	}
 	// auto-load the extension
 	ExtensionHelper::AutoLoadExtension(db, extension_name);
 
 	// now find the function in the catalog
 	auto &catalog = Catalog::GetSystemCatalog(db);
-	auto &function_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, bound_function.name);
+	auto &function_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(
+	    context, QualifiedName(catalog.GetName(), Identifier::DefaultSchema(), bound_function.GetName()));
+
 	// override the function with the extension function
-	bound_function = function_entry.functions.GetFunctionByArguments(context, bound_function.arguments);
-	// call the original bind (if any)
-	if (!bound_function.HasBindCallback()) {
-		return nullptr;
-	}
-	return bound_function.GetBindCallback()(context, bound_function, arguments);
+	auto func = function_entry.functions.GetFunctionByArguments(context, bound_function.GetArguments());
+	FunctionBinder function_binder(context);
+	return function_binder.BindScalarFunction(std::move(func), std::move(arguments));
 }
 
 void BuiltinFunctions::AddExtensionFunction(ScalarFunctionSet set) {
@@ -207,8 +157,9 @@ void BuiltinFunctions::RegisterExtensionOverloads() {
 			    entry.name);
 		}
 
-		ScalarFunction function(entry.name, std::move(arguments), std::move(return_type), nullptr,
-		                        BindExtensionFunction);
+		ScalarFunction function(entry.name, std::move(arguments), std::move(return_type), nullptr);
+		function.SetBindExpressionCallback(BindExtensionFunction);
+
 		function.SetExtraFunctionInfo<ExtensionFunctionInfo>(entry.extension);
 		if (current_set.name != entry.name) {
 			if (!current_set.name.empty()) {

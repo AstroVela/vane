@@ -1,39 +1,13 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/planner/expression.hpp"
 namespace duckdb {
 
 PhysicalFilter::PhysicalFilter(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality)
-    : CachingPhysicalOperator(physical_plan, PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality) {
-	// If no filter expressions are provided, treat as a constant TRUE predicate.
-	if (select_list.empty()) {
-		expression = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
-		return;
-	}
-
-	if (select_list.size() == 1) {
-		expression = std::move(select_list[0]);
-		return;
-	}
-
-	// Create a conjunction from the select list.
-	auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-	for (auto &expr : select_list) {
-		conjunction->children.push_back(std::move(expr));
-	}
-	expression = std::move(conjunction);
+    : CachingPhysicalOperator(physical_plan, PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
+      expression(BoundConjunctionExpression::Create(ExpressionType::CONJUNCTION_AND, std::move(select_list))) {
 }
 
 class FilterState : public CachingOperatorState {
@@ -49,6 +23,14 @@ public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}
+
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset() override {
+		ResetCachingState();
+	}
 };
 
 unique_ptr<OperatorState> PhysicalFilter::GetOperatorState(ExecutionContext &context) const {
@@ -62,7 +44,7 @@ OperatorResultType PhysicalFilter::ExecuteInternal(ExecutionContext &context, Da
 	if (result_count == input.size()) {
 		// nothing was filtered: skip adding any selection vectors
 		chunk.Reference(input);
-	} else {
+	} else if (result_count > 0) {
 		chunk.Slice(input, state.sel, result_count);
 	}
 	return OperatorResultType::NEED_MORE_INPUT;
@@ -70,14 +52,9 @@ OperatorResultType PhysicalFilter::ExecuteInternal(ExecutionContext &context, Da
 
 InsertionOrderPreservingMap<string> PhysicalFilter::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["__expression__"] = expression->GetName();
+	result["__expression__"] = expression->GetName().GetIdentifierName();
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
-}
-
-void PhysicalFilter::SerializeOperatorData(Serializer &serializer) const {
-	// Serialize filter-specific field: expression
-	serializer.WriteProperty(103, "expression", expression);
 }
 
 } // namespace duckdb

@@ -6,7 +6,21 @@
 #include <vector>
 
 using namespace duckdb;
-using namespace std;
+
+TEST_CASE("Query appender parses with connection settings", "[appender]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE result(value DOUBLE)"));
+	REQUIRE_NO_FAIL(con.Query("SET integer_division = true"));
+
+	duckdb::vector<LogicalType> types {LogicalType::INTEGER};
+	duckdb::vector<Identifier> names {"value"};
+	QueryAppender appender(con, "INSERT INTO result SELECT value / 2 FROM appended_data", types, names);
+	appender.AppendRow(3);
+	appender.Flush();
+	auto result = con.Query("SELECT value FROM result");
+	REQUIRE(CHECK_COLUMN(result, 0, {1.0}));
+}
 
 TEST_CASE("Test UPSERT through the query appender", "[appender]") {
 	duckdb::unique_ptr<QueryResult> result;
@@ -42,13 +56,13 @@ TEST_CASE("Test custom column + table names in the query appender", "[appender]"
 	types.push_back(LogicalType::INTEGER);
 	types.push_back(LogicalType::VARCHAR);
 
-	duckdb::vector<string> column_names;
+	duckdb::vector<duckdb::Identifier> column_names;
 	column_names.push_back("i");
 	column_names.push_back("value");
 
 	QueryAppender appender(
 	    con, "MERGE INTO tbl USING my_appended_data USING (i) WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT",
-	    types, column_names, "my_appended_data");
+	    types, column_names, duckdb::Identifier("my_appended_data"));
 	appender.BeginRow();
 	appender.Append<int32_t>(1);
 	appender.Append("world");

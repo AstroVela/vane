@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -21,7 +15,6 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Physical Operator Types
 //===--------------------------------------------------------------------===//
-// After changing this enum, regenerate enum_util.hpp and enum_util.cpp with scripts/generate_enum_util.py.
 enum class PhysicalOperatorType : uint8_t {
 	INVALID,
 	ORDER_BY,
@@ -35,6 +28,7 @@ enum class PhysicalOperatorType : uint8_t {
 	HASH_GROUP_BY,
 	PERFECT_HASH_GROUP_BY,
 	PARTITIONED_AGGREGATE,
+	LIMITED_DISTINCT,
 	FILTER,
 	PROJECTION,
 	COPY_TO_FILE,
@@ -104,6 +98,7 @@ enum class PhysicalOperatorType : uint8_t {
 	PRAGMA,
 	TRANSACTION,
 	CREATE_TYPE,
+	CREATE_TRIGGER,
 	ATTACH,
 	DETACH,
 
@@ -112,7 +107,6 @@ enum class PhysicalOperatorType : uint8_t {
 	// -----------------------------
 	EXPLAIN,
 	EXPLAIN_ANALYZE,
-	LOCAL_EXCHANGE,
 	EMPTY_RESULT,
 	EXECUTE,
 	PREPARE,
@@ -127,24 +121,20 @@ enum class PhysicalOperatorType : uint8_t {
 	EXTENSION,
 	VERIFY_VECTOR,
 	UPDATE_EXTENSIONS,
+	CONNECT,
+	DISCONNECT,
+	EXTERNAL_RESOURCE,
 
 	// -----------------------------
 	// Secret
 	// -----------------------------
 	CREATE_SECRET,
 
-	// -----------------------------
-	// Exchange
-	// -----------------------------
-	EXCHANGE_SINK,
-	EXCHANGE_SOURCE,
-	VLLM_PROJECT,
-	REPARTITION,
-	STREAMING_UDF,
-	GROUPING_SET_EXPAND,
-	DISTRIBUTED_RESERVOIR_SAMPLE,
-	DISTRIBUTED_EXTENSION_WRITE,
-	DATA_SINK,
+	// Physical-only recursive CTE specialization. Keep appended to preserve existing enum values.
+	RECURSIVE_KEY_JOIN,
+	SECURE_VIEW,
+	//! Source of a MERGE INTO action pipeline. Keep appended to preserve existing enum values.
+	MERGE_ACTION_SOURCE,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

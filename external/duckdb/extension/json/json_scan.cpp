@@ -1,52 +1,23 @@
 #include "json_scan.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "duckdb/common/set.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "json_multi_file_info.hpp"
+#include "json_structure.hpp"
+#include "json_transform.hpp"
+#include "duckdb/common/multi_file/multi_file_list.hpp"
 
 namespace duckdb {
 
-JSONFileSnapshot::JSONFileSnapshot(idx_t ordinal_p, const OpenFileInfo &file) : path(file.path), ordinal(ordinal_p) {
-	if (file.extended_info) {
-		for (const auto &entry : file.extended_info->options) {
-			if (entry.first == ORDINAL_OPTION) {
-				ordinal = entry.second.GetValue<idx_t>();
-				continue;
-			}
-			options.emplace(entry.first, entry.second);
-		}
-	}
-}
-
-OpenFileInfo JSONFileSnapshot::ToOpenFileInfo() const {
-	OpenFileInfo result(path);
-	result.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-	for (const auto &entry : options) {
-		result.extended_info->options.emplace(entry.first, entry.second);
-	}
-	result.extended_info->options[ORDINAL_OPTION] = Value::UBIGINT(ordinal);
-	return result;
-}
-
-bool JSONFileSnapshot::TryGetOrdinal(const OpenFileInfo &file, idx_t &ordinal) {
-	if (!file.extended_info) {
-		return false;
-	}
-	auto entry = file.extended_info->options.find(ORDINAL_OPTION);
-	if (entry == file.extended_info->options.end()) {
-		return false;
-	}
-	ordinal = entry->second.GetValue<idx_t>();
-	return true;
-}
-
 JSONScanData::JSONScanData() {
+}
+
+JSONScanData::~JSONScanData() {
 }
 
 void JSONScanData::InitializeFormats() {
@@ -87,69 +58,21 @@ void JSONScanData::InitializeFormats(bool auto_detect_p) {
 	date_format_map = make_uniq<DateFormatMap>(std::move(candidate_formats));
 }
 
-void JSONScanData::InitializeTransformOptions() {
-	transform_options.strict_cast = !options.ignore_errors;
-	transform_options.error_duplicate_key = !options.ignore_errors;
-	transform_options.error_missing_key = false;
-	transform_options.error_unknown_key = options.auto_detect && !options.ignore_errors;
-	transform_options.delay_error = true;
-	transform_options.date_format_map = date_format_map.get();
-	transform_options.error_message.clear();
-	transform_options.object_index = DConstants::INVALID_INDEX;
-	transform_options.parameters = CastParameters(false, &transform_options.error_message);
-}
-
-static vector<StrpTimeFormat> CopyJSONFormats(const optional_ptr<const DateFormatMap> format_map, LogicalTypeId type) {
-	if (!format_map || !format_map->HasFormats(type)) {
-		return {};
-	}
-	return format_map->GetFormats(type);
-}
-
-static unique_ptr<DateFormatMap> MakeJSONDateFormatMap(vector<StrpTimeFormat> date_formats,
-                                                       vector<StrpTimeFormat> timestamp_formats) {
-	type_id_map_t<vector<StrpTimeFormat>> candidate_formats;
-	if (!date_formats.empty()) {
-		candidate_formats.emplace(LogicalTypeId::DATE, std::move(date_formats));
-	}
-	if (!timestamp_formats.empty()) {
-		candidate_formats.emplace(LogicalTypeId::TIMESTAMP, std::move(timestamp_formats));
-	}
-	return make_uniq<DateFormatMap>(std::move(candidate_formats));
-}
-
-unique_ptr<FunctionData> JSONScanData::Copy() const {
-	auto result = make_uniq<JSONScanData>();
-	result->column_ids = column_ids;
-	result->options = options;
-	result->key_names = key_names;
-	result->date_format_map = MakeJSONDateFormatMap(CopyJSONFormats(date_format_map.get(), LogicalTypeId::DATE),
-	                                                CopyJSONFormats(date_format_map.get(), LogicalTypeId::TIMESTAMP));
-	result->InitializeTransformOptions();
-	result->max_threads = max_threads;
-	result->estimated_cardinality_per_file = estimated_cardinality_per_file;
-	result->distributed_worker = distributed_worker;
-	result->distributed_splits_applied = distributed_splits_applied;
-	result->distributed_assignment_restricted = distributed_assignment_restricted;
-	result->distributed_allowed_files = distributed_allowed_files;
-	result->distributed_split_ids = distributed_split_ids;
-	return std::move(result);
-}
-
-JSONScanGlobalState::JSONScanGlobalState(ClientContext &context, const MultiFileBindData &bind_data_p)
-    : bind_data(bind_data_p), json_data(bind_data.bind_data->Cast<JSONScanData>()),
-      transform_options(json_data.transform_options), allocator(BufferAllocator::Get(context)),
+JSONScanGlobalState::JSONScanGlobalState(ClientContext &context, const JSONScanData &json_data_p,
+                                         idx_t total_file_count)
+    : json_data(json_data_p), transform_options(json_data.transform_options), allocator(BufferAllocator::Get(context)),
       buffer_capacity(json_data.options.maximum_object_size * 2),
       system_threads(TaskScheduler::GetScheduler(context).NumberOfThreads()),
-      enable_parallel_scans(bind_data.file_list->GetTotalFileCount() < system_threads) {
+      enable_parallel_scans(total_file_count < system_threads) {
 }
 
 JSONScanLocalState::JSONScanLocalState(ClientContext &context, JSONScanGlobalState &gstate)
     : scan_state(context, gstate.allocator, gstate.buffer_capacity) {
 }
 
-JSONGlobalTableFunctionState::JSONGlobalTableFunctionState(ClientContext &context, const MultiFileBindData &bind_data)
-    : state(context, bind_data) {
+JSONGlobalTableFunctionState::JSONGlobalTableFunctionState(ClientContext &context, const JSONScanData &json_data,
+                                                           idx_t total_file_count)
+    : state(context, json_data, total_file_count) {
 }
 
 JSONLocalTableFunctionState::JSONLocalTableFunctionState(ClientContext &context, JSONScanGlobalState &gstate)
@@ -188,264 +111,445 @@ void JSONScanLocalState::AddTransformError(idx_t object_index, const string &err
 	scan_state.current_reader->AddTransformError(scan_state, object_index, error_message);
 }
 
-static void ValidateJSONReaderOptions(const JSONReaderOptions &options, const string &function_name) {
-	if (options.type != JSONScanType::READ_JSON && options.type != JSONScanType::READ_JSON_OBJECTS) {
-		throw SerializationException("Cannot serialize %s with invalid JSON scan type", function_name);
-	}
-	switch (options.format) {
-	case JSONFormat::AUTO_DETECT:
-	case JSONFormat::UNSTRUCTURED:
-	case JSONFormat::NEWLINE_DELIMITED:
-	case JSONFormat::ARRAY:
-		break;
-	default:
-		throw SerializationException("Cannot serialize %s with invalid JSON format", function_name);
-	}
-	if (options.record_type != JSONRecordType::RECORDS && options.record_type != JSONRecordType::VALUES) {
-		throw SerializationException("Cannot serialize %s with unresolved JSON record type", function_name);
-	}
-	switch (options.compression) {
-	case FileCompressionType::AUTO_DETECT:
-	case FileCompressionType::UNCOMPRESSED:
-	case FileCompressionType::GZIP:
-	case FileCompressionType::ZSTD:
-		break;
-	default:
-		throw SerializationException("Cannot serialize %s with invalid JSON compression type", function_name);
-	}
-	if (options.maximum_object_size == 0 || options.sample_size == 0 || options.maximum_sample_files == 0) {
-		throw SerializationException("Cannot serialize %s with zero-sized JSON reader limits", function_name);
-	}
-	if (options.maximum_object_size > NumericLimits<idx_t>::Maximum() / 2) {
-		throw SerializationException("Cannot serialize %s with an oversized JSON object limit", function_name);
-	}
-	if (!Value::DoubleIsFinite(options.field_appearance_threshold) || options.field_appearance_threshold < 0 ||
-	    options.field_appearance_threshold > 1) {
-		throw SerializationException("Cannot serialize %s with invalid JSON field appearance threshold", function_name);
-	}
-	if (options.name_list.size() != options.sql_type_list.size()) {
-		throw SerializationException("Cannot serialize %s with mismatched JSON option names and types", function_name);
-	}
-	for (const auto &format : {options.date_format, options.timestamp_format}) {
-		if (format.empty()) {
-			continue;
-		}
-		StrpTimeFormat parsed_format;
-		if (!StrTimeFormat::ParseFormatSpecifier(format, parsed_format).empty()) {
-			throw SerializationException("Cannot serialize %s with an invalid JSON date format", function_name);
-		}
-	}
-}
-
-static void ValidateJSONFormats(const vector<StrpTimeFormat> &formats, const string &function_name) {
-	for (const auto &format : formats) {
-		StrpTimeFormat parsed_format;
-		if (format.format_specifier.empty() ||
-		    !StrTimeFormat::ParseFormatSpecifier(format.format_specifier, parsed_format).empty()) {
-			throw SerializationException("Cannot serialize %s with invalid inferred JSON date formats", function_name);
-		}
-	}
-}
-
-static void ValidateJSONSchema(const vector<LogicalType> &types, const vector<string> &names,
-                               const vector<string> &key_names, const MultiFileOptions &file_options,
-                               const MultiFileReaderBindData &reader_bind, const string &function_name) {
-	if (types.empty() || types.size() != names.size() || key_names.empty() || key_names.size() > names.size()) {
-		throw SerializationException("Cannot serialize %s with an invalid JSON schema", function_name);
-	}
-	if (file_options.mapping != MultiFileColumnMappingMode::BY_NAME || !file_options.custom_options.empty() ||
-	    reader_bind.mapping != MultiFileColumnMappingMode::BY_NAME || !reader_bind.schema.empty()) {
-		throw SerializationException("Cannot serialize %s with non-standard multi-file column mapping state",
-		                             function_name);
-	}
-	if (!reader_bind.filename_idx.IsValid()) {
-		throw SerializationException("Cannot serialize %s without bound filename metadata", function_name);
-	}
-	const auto filename_idx = reader_bind.filename_idx.GetIndex();
-	if (file_options.filename) {
-		if (IsVirtualColumn(filename_idx) || filename_idx >= names.size() ||
-		    names[filename_idx] != file_options.filename_column || types[filename_idx].id() != LogicalTypeId::VARCHAR) {
-			throw SerializationException("Cannot serialize %s with an invalid filename column", function_name);
-		}
-	} else if (filename_idx != MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
-		throw SerializationException("Cannot serialize %s with inconsistent filename metadata", function_name);
-	}
-
-	set<idx_t> hive_indexes;
-	for (const auto &hive_index : reader_bind.hive_partitioning_indexes) {
-		if (!file_options.hive_partitioning || hive_index.value.empty() || hive_index.index >= names.size() ||
-		    !hive_indexes.insert(hive_index.index).second) {
-			throw SerializationException("Cannot serialize %s with invalid hive partition columns", function_name);
-		}
-	}
-	for (idx_t column_idx = key_names.size(); column_idx < names.size(); column_idx++) {
-		if (filename_idx != column_idx && hive_indexes.find(column_idx) == hive_indexes.end()) {
-			throw SerializationException("Cannot serialize %s with incomplete JSON key state", function_name);
-		}
-	}
-}
-
-static void ValidateJSONBindData(const MultiFileBindData &bind_data, const string &function_name) {
-	if (!bind_data.bind_data || !bind_data.file_list || !bind_data.multi_file_reader || !bind_data.interface) {
-		throw SerializationException("Cannot serialize incomplete %s bind data", function_name);
-	}
-
-	auto &json_data = bind_data.bind_data->Cast<JSONScanData>();
-	ValidateJSONReaderOptions(json_data.options, function_name);
-	ValidateJSONSchema(bind_data.types, bind_data.names, json_data.key_names, bind_data.file_options,
-	                   bind_data.reader_bind, function_name);
-	if (!json_data.date_format_map || json_data.transform_options.date_format_map != json_data.date_format_map.get() ||
-	    json_data.transform_options.strict_cast != !json_data.options.ignore_errors ||
-	    json_data.transform_options.error_duplicate_key != !json_data.options.ignore_errors ||
-	    json_data.transform_options.error_missing_key ||
-	    json_data.transform_options.error_unknown_key !=
-	        (json_data.options.auto_detect && !json_data.options.ignore_errors) ||
-	    !json_data.transform_options.delay_error ||
-	    json_data.transform_options.parameters.error_message != &json_data.transform_options.error_message) {
-		throw SerializationException("Cannot serialize %s with inconsistent JSON transform state", function_name);
-	}
-	if ((json_data.max_threads.IsValid() && json_data.max_threads.GetIndex() == 0) ||
-	    (json_data.estimated_cardinality_per_file.IsValid() &&
-	     json_data.estimated_cardinality_per_file.GetIndex() == 0)) {
-		throw SerializationException("Cannot serialize %s with invalid JSON cardinality state", function_name);
-	}
-}
-
-static void ValidateJSONFiles(const vector<JSONFileSnapshot> &files, const string &function_name,
-                              const string &operation) {
-	set<string> identities;
-	for (const auto &file : files) {
-		if (file.path.empty()) {
-			throw SerializationException("Cannot %s %s with an empty JSON file path", operation, function_name);
-		}
-		if (file.options.find(JSONFileSnapshot::ORDINAL_OPTION) != file.options.end()) {
-			throw SerializationException("Cannot %s %s with nested JSON file ordinal metadata", operation,
-			                             function_name);
-		}
-		JSONScanRange range;
-		const bool has_range = JSONScanRange::TryGet(file.ToOpenFileInfo(), range);
-		const auto identity =
-		    std::to_string(file.ordinal) +
-		    (has_range ? ":" + std::to_string(range.start) + ":" + std::to_string(range.end) : ":file");
-		if (!identities.insert(identity).second) {
-			throw SerializationException("Cannot %s %s with duplicate JSON file ordinal %llu", operation, function_name,
-			                             static_cast<unsigned long long>(file.ordinal));
-		}
-	}
-}
-
 void JSONScan::Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                         const TableFunction &function) {
-	if (!bind_data_p) {
-		throw SerializationException("Cannot serialize %s without bind data", function.name);
-	}
-	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
-	ValidateJSONBindData(bind_data, function.name);
-	auto &json_data = bind_data.bind_data->Cast<JSONScanData>();
-
-	SerializedJSONScanData serialized_data;
-	auto files = bind_data.file_list->GetAllFiles();
-	serialized_data.files.reserve(files.size());
-	for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {
-		serialized_data.files.emplace_back(file_idx, files[file_idx]);
-	}
-	ValidateJSONFiles(serialized_data.files, function.name, "serialize");
-	serialized_data.types = bind_data.types;
-	serialized_data.names = bind_data.names;
-	serialized_data.file_options = bind_data.file_options;
-	serialized_data.reader_bind = bind_data.reader_bind;
-	serialized_data.table_columns = bind_data.table_columns;
-	serialized_data.bind_column_ids = bind_data.column_ids;
-	serialized_data.options = json_data.options;
-	serialized_data.key_names = json_data.key_names;
-	serialized_data.date_formats = CopyJSONFormats(json_data.date_format_map.get(), LogicalTypeId::DATE);
-	serialized_data.timestamp_formats = CopyJSONFormats(json_data.date_format_map.get(), LogicalTypeId::TIMESTAMP);
-	ValidateJSONFormats(serialized_data.date_formats, function.name);
-	ValidateJSONFormats(serialized_data.timestamp_formats, function.name);
-	serialized_data.max_threads = json_data.max_threads;
-	serialized_data.estimated_cardinality_per_file = json_data.estimated_cardinality_per_file;
-	serialized_data.reader_column_ids = json_data.column_ids;
-	ValidateJSONDistributedState(json_data, files);
-	serialized_data.distributed_worker = json_data.distributed_worker;
-	serialized_data.distributed_splits_applied = json_data.distributed_splits_applied;
-	serialized_data.distributed_assignment_restricted = json_data.distributed_assignment_restricted;
-	serialized_data.distributed_allowed_files = json_data.distributed_allowed_files;
-	serialized_data.distributed_split_ids = json_data.distributed_split_ids;
-	serializer.WriteProperty(100, "json_data", serialized_data);
+                         const BoundTableFunction &) {
+	throw NotImplementedException("JSONScan Serialize not implemented");
 }
 
-unique_ptr<FunctionData> JSONScan::Deserialize(Deserializer &deserializer, TableFunction &function) {
-	auto &context = deserializer.Get<ClientContext &>();
-	auto serialized_data = deserializer.ReadProperty<SerializedJSONScanData>(100, "json_data");
-	ValidateJSONReaderOptions(serialized_data.options, function.name);
-	ValidateJSONFormats(serialized_data.date_formats, function.name);
-	ValidateJSONFormats(serialized_data.timestamp_formats, function.name);
-	ValidateJSONSchema(serialized_data.types, serialized_data.names, serialized_data.key_names,
-	                   serialized_data.file_options, serialized_data.reader_bind, function.name);
-	ValidateJSONFiles(serialized_data.files, function.name, "deserialize");
-
-	vector<OpenFileInfo> files;
-	files.reserve(serialized_data.files.size());
-	for (const auto &file : serialized_data.files) {
-		files.push_back(file.ToOpenFileInfo());
-	}
-	auto multi_file_reader = MultiFileReader::Create(function);
-	auto file_list = make_shared_ptr<SimpleMultiFileList>(std::move(files));
-	auto interface = make_uniq<JSONMultiFileInfo>();
-	interface->InitializeInterface(context, *multi_file_reader, *file_list);
-
-	auto result = make_uniq<MultiFileBindData>();
-	result->file_list = std::move(file_list);
-	result->multi_file_reader = std::move(multi_file_reader);
-	result->interface = std::move(interface);
-	result->file_options = std::move(serialized_data.file_options);
-	result->reader_bind = std::move(serialized_data.reader_bind);
-	result->types = std::move(serialized_data.types);
-	result->names = std::move(serialized_data.names);
-	result->table_columns = std::move(serialized_data.table_columns);
-	result->column_ids = std::move(serialized_data.bind_column_ids);
-
-	auto reader_options = make_uniq<JSONFileReaderOptions>();
-	reader_options->options = std::move(serialized_data.options);
-	result->bind_data = result->interface->InitializeBindData(*result, std::move(reader_options));
-	auto &json_data = result->bind_data->Cast<JSONScanData>();
-	json_data.key_names = std::move(serialized_data.key_names);
-	json_data.date_format_map =
-	    MakeJSONDateFormatMap(std::move(serialized_data.date_formats), std::move(serialized_data.timestamp_formats));
-	json_data.InitializeTransformOptions();
-	json_data.max_threads = serialized_data.max_threads;
-	json_data.estimated_cardinality_per_file = serialized_data.estimated_cardinality_per_file;
-	json_data.column_ids = std::move(serialized_data.reader_column_ids);
-	json_data.distributed_worker = serialized_data.distributed_worker;
-	json_data.distributed_splits_applied = serialized_data.distributed_splits_applied;
-	json_data.distributed_assignment_restricted = serialized_data.distributed_assignment_restricted;
-	json_data.distributed_allowed_files = std::move(serialized_data.distributed_allowed_files);
-	json_data.distributed_split_ids = std::move(serialized_data.distributed_split_ids);
-	ValidateJSONDistributedState(json_data, result->file_list->GetAllFiles());
-
-	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
-	virtual_column_map_t virtual_columns;
-	MultiFileReader::GetVirtualColumns(context, result->reader_bind, virtual_columns);
-	result->interface->GetVirtualColumns(context, *result, virtual_columns);
-	result->virtual_columns = std::move(virtual_columns);
-	result->interface->FinalizeBindData(*result);
-	ValidateJSONBindData(*result, function.name);
-	return std::move(result);
+unique_ptr<FunctionData> JSONScan::Deserialize(Deserializer &deserializer, BoundTableFunction &) {
+	throw NotImplementedException("JSONScan Deserialize not implemented");
 }
 
 void JSONScan::TableFunctionDefaults(TableFunction &table_function) {
-	table_function.named_parameters["maximum_object_size"] = LogicalType::UINTEGER;
-	table_function.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
-	table_function.named_parameters["format"] = LogicalType::VARCHAR;
-	table_function.named_parameters["compression"] = LogicalType::VARCHAR;
+	table_function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("maximum_object_size", LogicalType::UINTEGER)
+		    .Add("ignore_errors", LogicalType::BOOLEAN)
+		    .Add("format", LogicalType::VARCHAR)
+		    .Add("compression", LogicalType::VARCHAR);
+	});
 
 	table_function.serialize = Serialize;
 	table_function.deserialize = Deserialize;
-	table_function.SetDistributedScanCallbacks(JSONDistributedScanCallbacks());
 
 	table_function.projection_pushdown = true;
 	table_function.filter_pushdown = false;
 	table_function.filter_prune = false;
+}
+
+void JSONScan::AddReadJSONParameters(TableFunction &table_function) {
+	// extends the options TableFunctionDefaults declares
+	table_function.GetSignature().ExtendTypedKwargs([](TypedKwargs &options) {
+		options.Add("columns", LogicalType::ANY)
+		    .Add("auto_detect", LogicalType::BOOLEAN)
+		    .Add("geojson", LogicalType::BOOLEAN)
+		    .Add("sample_size", LogicalType::BIGINT)
+		    .Add("dateformat", LogicalType::VARCHAR)
+		    .Add("date_format", LogicalType::VARCHAR)
+		    .Add("timestampformat", LogicalType::VARCHAR)
+		    .Add("timestamp_format", LogicalType::VARCHAR)
+		    .Add("records", LogicalType::ANY)
+		    .Add("array", LogicalType::BOOLEAN)
+		    .Add("maximum_sample_files", LogicalType::BIGINT);
+	});
+}
+
+void JSONScan::AddAutoDetectParameters(TableFunction &table_function) {
+	table_function.GetSignature().ExtendTypedKwargs([](TypedKwargs &options) {
+		options.Add("maximum_depth", LogicalType::BIGINT)
+		    .Add("field_appearance_threshold", LogicalType::DOUBLE)
+		    .Add("convert_strings_to_integers", LogicalType::BOOLEAN)
+		    .Add("map_inference_threshold", LogicalType::BIGINT);
+	});
+}
+
+bool JSONScan::ParseOption(ClientContext &context, const Identifier &key, const Value &value,
+                           JSONReaderOptions &options) {
+	if (value.IsNull()) {
+		throw BinderException("Cannot use NULL as argument to key %s", key);
+	}
+	if (key == "ignore_errors") {
+		options.ignore_errors = BooleanValue::Get(value);
+		return true;
+	}
+	if (key == "maximum_object_size") {
+		options.maximum_object_size = MaxValue<idx_t>(UIntegerValue::Get(value), options.maximum_object_size);
+		return true;
+	}
+	if (key == "format") {
+		auto arg = StringUtil::Lower(StringValue::Get(value));
+		static const auto FORMAT_OPTIONS =
+		    case_insensitive_map_t<JSONFormat> {{"auto", JSONFormat::AUTO_DETECT},
+		                                        {"unstructured", JSONFormat::UNSTRUCTURED},
+		                                        {"newline_delimited", JSONFormat::NEWLINE_DELIMITED},
+		                                        {"nd", JSONFormat::NEWLINE_DELIMITED},
+		                                        {"array", JSONFormat::ARRAY}};
+		auto lookup = FORMAT_OPTIONS.find(arg);
+		if (lookup == FORMAT_OPTIONS.end()) {
+			vector<string> valid_options;
+			for (auto &pair : FORMAT_OPTIONS) {
+				valid_options.push_back(StringUtil::Format("'%s'", pair.first));
+			}
+			throw BinderException("format must be one of [%s], not '%s'", StringUtil::Join(valid_options, ", "), arg);
+		}
+		options.format = lookup->second;
+		options.format_specified = true;
+		return true;
+	}
+	if (key == "compression") {
+		options.compression = FileCompressionType(StringValue::Get(value));
+		return true;
+	}
+	if (key == "array") {
+		// "array" is a shorthand for the format - a JSON array of values, or newline-delimited values
+		options.format = BooleanValue::Get(value) ? JSONFormat::ARRAY : JSONFormat::NEWLINE_DELIMITED;
+		options.format_specified = true;
+		return true;
+	}
+	if (key == "columns") {
+		auto &child_type = value.type();
+		if (child_type.id() != LogicalTypeId::STRUCT) {
+			throw BinderException("read_json \"columns\" parameter requires a struct as input.");
+		}
+		auto &struct_children = StructValue::GetChildren(value);
+		D_ASSERT(StructType::GetChildCount(child_type) == struct_children.size());
+		for (idx_t i = 0; i < struct_children.size(); i++) {
+			auto &name = StructType::GetChildName(child_type, i);
+			auto &val = struct_children[i];
+			if (val.IsNull()) {
+				throw BinderException("read_json \"columns\" parameter type specification cannot be NULL.");
+			}
+			options.name_list.emplace_back(name);
+			if (val.type().id() != LogicalTypeId::VARCHAR) {
+				throw BinderException("read_json \"columns\" parameter type specification must be VARCHAR.");
+			}
+			options.sql_type_list.emplace_back(TransformStringToLogicalType(StringValue::Get(val), context));
+		}
+		D_ASSERT(options.name_list.size() == options.sql_type_list.size());
+		if (options.name_list.empty()) {
+			throw BinderException("read_json \"columns\" parameter needs at least one column.");
+		}
+		return true;
+	}
+	if (key == "auto_detect") {
+		options.auto_detect = BooleanValue::Get(value);
+		options.auto_detect_specified = true;
+		return true;
+	}
+	if (key == "geojson") {
+		options.geojson = BooleanValue::Get(value);
+		return true;
+	}
+	if (key == "sample_size") {
+		auto arg = BigIntValue::Get(value);
+		if (arg == -1) {
+			options.sample_size = NumericLimits<idx_t>::Maximum();
+		} else if (arg > 0) {
+			options.sample_size = arg;
+		} else {
+			// LCOV_EXCL_START
+			throw BinderException("read_json \"sample_size\" parameter must be positive, or -1 to sample all input "
+			                      "files entirely, up to \"maximum_sample_files\" files.");
+			// LCOV_EXCL_STOP
+		}
+		return true;
+	}
+	if (key == "maximum_depth") {
+		auto arg = BigIntValue::Get(value);
+		if (arg == -1) {
+			options.max_depth = NumericLimits<idx_t>::Maximum();
+		} else {
+			options.max_depth = arg;
+		}
+		return true;
+	}
+	if (key == "field_appearance_threshold") {
+		auto arg = DoubleValue::Get(value);
+		if (arg < 0 || arg > 1) {
+			throw BinderException("read_json_auto \"field_appearance_threshold\" parameter must be between 0 and 1");
+		}
+		options.field_appearance_threshold = arg;
+		return true;
+	}
+	if (key == "map_inference_threshold") {
+		auto arg = BigIntValue::Get(value);
+		if (arg == -1) {
+			options.map_inference_threshold = NumericLimits<idx_t>::Maximum();
+		} else if (arg >= 0) {
+			options.map_inference_threshold = arg;
+		} else {
+			// LCOV_EXCL_START
+			throw BinderException("read_json_auto \"map_inference_threshold\" parameter must be 0 or positive, "
+			                      "or -1 to disable map inference for consistent objects.");
+			// LCOV_EXCL_STOP
+		}
+		return true;
+	}
+	if (key == "dateformat" || key == "date_format") {
+		auto format_string = StringValue::Get(value);
+		if (StringUtil::Lower(format_string) == "iso") {
+			format_string = "%Y-%m-%d";
+		}
+		options.date_format = format_string;
+
+		StrpTimeFormat format;
+		auto error = StrTimeFormat::ParseFormatSpecifier(format_string, format);
+		if (!error.empty()) {
+			throw BinderException("read_json could not parse \"dateformat\": '%s'.", error.c_str());
+		}
+		return true;
+	}
+	if (key == "timestampformat" || key == "timestamp_format") {
+		auto format_string = StringValue::Get(value);
+		if (StringUtil::Lower(format_string) == "iso") {
+			format_string = "%Y-%m-%dT%H:%M:%S.%fZ";
+		}
+		options.timestamp_format = format_string;
+
+		StrpTimeFormat format;
+		auto error = StrTimeFormat::ParseFormatSpecifier(format_string, format);
+		if (!error.empty()) {
+			throw BinderException("read_json could not parse \"timestampformat\": '%s'.", error.c_str());
+		}
+		return true;
+	}
+	if (key == "records") {
+		// records is tri-state: 'auto', 'true' or 'false'. Accept a boolean for the latter two, since
+		// records = false reads more naturally than records = 'false'.
+		string arg;
+		if (value.type().id() == LogicalTypeId::BOOLEAN) {
+			arg = BooleanValue::Get(value) ? "true" : "false";
+		} else if (value.type().id() == LogicalTypeId::VARCHAR) {
+			arg = StringValue::Get(value);
+		} else {
+			throw BinderException("read_json \"records\" parameter must be a string ('auto', 'true' or 'false') or "
+			                      "a boolean, not %s",
+			                      value.type().ToString());
+		}
+		if (arg == "auto") {
+			options.record_type = JSONRecordType::AUTO_DETECT;
+		} else if (arg == "true") {
+			options.record_type = JSONRecordType::RECORDS;
+		} else if (arg == "false") {
+			options.record_type = JSONRecordType::VALUES;
+		} else {
+			throw BinderException("read_json requires \"records\" to be one of ['auto', 'true', 'false'].");
+		}
+		return true;
+	}
+	if (key == "maximum_sample_files") {
+		auto arg = BigIntValue::Get(value);
+		if (arg == -1) {
+			options.maximum_sample_files = NumericLimits<idx_t>::Maximum();
+		} else if (arg > 0) {
+			options.maximum_sample_files = arg;
+		} else {
+			// LCOV_EXCL_START
+			throw BinderException("read_json \"maximum_sample_files\" parameter must be positive, or -1 to remove "
+			                      "the limit on the number of files used to sample \"sample_size\" rows.");
+			// LCOV_EXCL_STOP
+		}
+		return true;
+	}
+	if (key == "convert_strings_to_integers") {
+		options.convert_strings_to_integers = BooleanValue::Get(value);
+		return true;
+	}
+	return false;
+}
+
+void JSONScan::BindSchema(ClientContext &context, JSONScanData &json_data, MultiFileList &files,
+                          vector<shared_ptr<JSONReader>> &sampled_readers, vector<LogicalType> &return_types,
+                          vector<Identifier> &names) {
+	auto &options = json_data.options;
+	names = options.name_list;
+	return_types = options.sql_type_list;
+	if (options.record_type == JSONRecordType::AUTO_DETECT && return_types.size() > 1) {
+		// More than one specified column implies records
+		options.record_type = JSONRecordType::RECORDS;
+	}
+
+	// Specifying column names overrides auto-detect
+	if (!return_types.empty()) {
+		options.auto_detect = false;
+	}
+
+	if (!options.auto_detect) {
+		// Need to specify columns if RECORDS and not auto-detecting
+		if (return_types.empty()) {
+			// LCOV_EXCL_START
+			throw BinderException("When auto_detect=false, read_json requires columns to be specified through the "
+			                      "\"columns\" parameter.");
+			// LCOV_EXCL_STOP
+		}
+		// If we are reading VALUES, we can only have one column
+		if (options.record_type == JSONRecordType::VALUES && return_types.size() != 1) {
+			// LCOV_EXCL_START
+			throw BinderException("read_json requires a single column to be specified through the \"columns\" "
+			                      "parameter when \"records\" is set to 'false'.");
+			// LCOV_EXCL_STOP
+		}
+	}
+
+	// Reading GeoJSON is opt-in, but a .geojson / .geojsonl file name is opt-in enough
+	if (!options.geojson.has_value()) {
+		const auto first_file = files.GetFirstFile().path;
+		options.geojson =
+		    StringUtil::CIEndsWith(first_file, ".geojson") || StringUtil::CIEndsWith(first_file, ".geojsonl");
+	}
+	// COPY ... FROM hardcodes RECORDS because it takes its columns from the target table. For GeoJSON we still
+	// need to know whether those columns live in a Feature's "properties", so let the structure decide.
+	if (options.geojson.value() && !options.auto_detect && !options.name_list.empty() &&
+	    options.record_type == JSONRecordType::RECORDS) {
+		options.record_type = JSONRecordType::AUTO_DETECT;
+	}
+
+	json_data.InitializeFormats();
+
+	if (options.auto_detect || options.record_type == JSONRecordType::AUTO_DETECT) {
+		JSONScan::AutoDetect(context, json_data, files.GetAllFiles(), sampled_readers, return_types, names);
+		D_ASSERT(return_types.size() == names.size());
+	}
+	json_data.key_names = IdentifiersToStrings(names);
+}
+
+void JSONScan::FinalizeBind(JSONScanData &json_data, vector<Identifier> &names) {
+	auto &options = json_data.options;
+	auto &transform_options = json_data.transform_options;
+	transform_options.strict_cast = !options.ignore_errors;
+	transform_options.error_duplicate_key = !options.ignore_errors;
+	transform_options.error_missing_key = false;
+	transform_options.error_unknown_key = options.auto_detect && !options.ignore_errors;
+	transform_options.date_format_map = json_data.date_format_map.get();
+	transform_options.delay_error = true;
+
+	if (!options.auto_detect) {
+		return;
+	}
+	// Note that we can't change json_data.key_names, because the JSON reader gets columns by exact name, not position
+	DeduplicateColumnNames(names);
+}
+
+void JSONScan::DeduplicateColumnNames(vector<Identifier> &names) {
+	identifier_map_t<idx_t> name_collision_count;
+	for (auto &col_name : names) {
+		// Taken from CSV header_detection.cpp
+		while (name_collision_count.find(col_name) != name_collision_count.end()) {
+			name_collision_count[col_name] += 1;
+			col_name = Identifier(col_name + "_" + to_string(name_collision_count[col_name]));
+		}
+		name_collision_count[col_name] = 0;
+	}
+}
+
+//! GeoJSON Features are read as two groups of columns: those taken from the Feature itself, and those taken from
+//! its "properties" object
+static bool TransformGeoJSONFeatures(yyjson_val *values[], yyjson_alc *alc, const idx_t count,
+                                     JSONScanGlobalState &gstate, const vector<Vector *> &result_vectors,
+                                     JSONTransformOptions &transform_options) {
+	D_ASSERT(gstate.feature_columns.size() == gstate.names.size());
+
+	// Group the columns by where they read from, using the JSON key rather than the (deduplicated) column name.
+	// A Feature member and a property of the same name are separate columns, so this cannot be done by name.
+	vector<string> feature_names, property_names;
+	vector<Vector *> feature_vectors, property_vectors;
+	vector<ColumnIndex> feature_indices, property_indices;
+	for (idx_t i = 0; i < gstate.feature_columns.size(); i++) {
+		const auto &feature_column = gstate.feature_columns[i];
+		const auto from_properties = feature_column.from_properties;
+		(from_properties ? property_names : feature_names).push_back(feature_column.key);
+		(from_properties ? property_vectors : feature_vectors).push_back(result_vectors[i]);
+		if (!gstate.column_indices.empty()) {
+			(from_properties ? property_indices : feature_indices).push_back(gstate.column_indices[i]);
+		}
+	}
+
+	// "type", "properties" and "bbox" are consumed by the unnesting, so unknown keys are expected in both groups
+	bool success = true;
+	if (!feature_names.empty()) {
+		success = JSONTransform::TransformObject(values, alc, count, feature_names, feature_vectors, transform_options,
+		                                         feature_indices, false);
+	}
+	if (success && !property_names.empty()) {
+		vector<yyjson_val *> property_values(count);
+		for (idx_t i = 0; i < count; i++) {
+			auto &val = values[i];
+			property_values[i] = val && unsafe_yyjson_is_obj(val) ? yyjson_obj_get(val, "properties") : nullptr;
+		}
+		success = JSONTransform::TransformObject(property_values.data(), alc, count, property_names, property_vectors,
+		                                         transform_options, property_indices, false);
+	}
+	return success;
+}
+
+void ReadJSONFunction(ClientContext &context, JSONReader &json_reader, JSONScanGlobalState &gstate,
+                      JSONScanLocalState &lstate, DataChunk &output) {
+	auto &scan_state = lstate.GetScanState();
+	D_ASSERT(RefersToSameObject(json_reader, *scan_state.current_reader));
+
+	const auto count = lstate.Read();
+	yyjson_val **values = scan_state.values;
+
+	if (!gstate.names.empty()) {
+		vector<Vector *> result_vectors;
+		result_vectors.reserve(gstate.names.size());
+		for (idx_t i = 0; i < gstate.names.size(); i++) {
+			result_vectors.emplace_back(&output.data[i]);
+		}
+
+		D_ASSERT(gstate.json_data.options.record_type != JSONRecordType::AUTO_DETECT);
+		bool success;
+		if (gstate.json_data.options.record_type == JSONRecordType::RECORDS) {
+			success = JSONTransform::TransformObject(values, scan_state.allocator.GetYYAlc(), count, gstate.names,
+			                                         result_vectors, lstate.transform_options, gstate.column_indices,
+			                                         lstate.transform_options.error_unknown_key);
+		} else if (gstate.json_data.options.record_type == JSONRecordType::FEATURES) {
+			success = TransformGeoJSONFeatures(values, scan_state.allocator.GetYYAlc(), count, gstate, result_vectors,
+			                                   lstate.transform_options);
+		} else {
+			D_ASSERT(gstate.json_data.options.record_type == JSONRecordType::VALUES);
+			success = JSONTransform::Transform(values, scan_state.allocator.GetYYAlc(), *result_vectors[0], count,
+			                                   lstate.transform_options, gstate.column_indices[0]);
+		}
+
+		if (!success) {
+			string hint =
+			    gstate.json_data.options.auto_detect
+			        ? "\nTry increasing 'sample_size', reducing 'maximum_depth', specifying 'columns', 'format' or "
+			          "'records' manually, setting 'ignore_errors' to true, or setting 'union_by_name' to true when "
+			          "reading multiple files with a different structure."
+			        : "\nTry setting 'auto_detect' to true, specifying 'format' or 'records' manually, or setting "
+			          "'ignore_errors' to true.";
+			lstate.AddTransformError(lstate.transform_options.object_index,
+			                         lstate.transform_options.error_message + hint);
+			return;
+		}
+	}
+	output.SetChildCardinality(count);
+}
+
+void ReadJSONObjectsFunction(ClientContext &context, JSONReader &json_reader, JSONScanGlobalState &gstate,
+                             JSONScanLocalState &lstate, DataChunk &output) {
+	// Fetch next lines
+	auto &scan_state = lstate.GetScanState();
+	D_ASSERT(RefersToSameObject(json_reader, *scan_state.current_reader));
+
+	const auto count = lstate.Read();
+	const auto units = scan_state.units;
+	const auto objects = scan_state.values;
+
+	if (!gstate.names.empty()) {
+		// Create the strings without copying them
+		auto strings = FlatVector::Writer<string_t>(output.data[0], count);
+		for (idx_t i = 0; i < count; i++) {
+			if (objects[i]) {
+				strings.WriteStringRef(string_t(units[i].pointer, units[i].size));
+			} else {
+				strings.WriteNull();
+			}
+		}
+	}
+
+	output.SetChildCardinality(count);
 }
 
 } // namespace duckdb

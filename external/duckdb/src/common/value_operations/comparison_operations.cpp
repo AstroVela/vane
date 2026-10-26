@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -83,44 +77,14 @@ static bool TemplatedBooleanOperation(const Value &left, const Value &right) {
 	const auto &left_type = left.type();
 	const auto &right_type = right.type();
 	if (left_type != right_type) {
-		Value left_copy = left;
-		Value right_copy = right;
-
-		auto comparison_type = LogicalType::ForceMaxLogicalType(left_type, right_type);
-		if (!left_copy.DefaultTryCastAs(comparison_type) || !right_copy.DefaultTryCastAs(comparison_type)) {
+		auto comparison_type = LogicalType::DefaultForceMaxLogicalType(left_type, right_type);
+		auto left_copy = left.DefaultTryCastAs(comparison_type);
+		auto right_copy = right.DefaultTryCastAs(comparison_type);
+		if (!left_copy || !right_copy) {
 			return false;
 		}
-		D_ASSERT(left_copy.type() == right_copy.type());
-		return TemplatedBooleanOperation<OP>(left_copy, right_copy);
-	}
-	auto left_bytes = ByteSequenceValue::TryGet(left);
-	auto right_bytes = ByteSequenceValue::TryGet(right);
-	if (left_bytes && right_bytes) {
-		auto child = left_type.id() == LogicalTypeId::LIST ? ListType::GetChildType(left_type)
-		                                                   : ArrayType::GetChildType(left_type);
-		if (child != LogicalType::UTINYINT) {
-			auto width = GetTypeIdSize(child.InternalType());
-			auto left_count = left_bytes->size() / width, right_count = right_bytes->size() / width;
-			for (idx_t i = 0; i < MinValue(left_count, right_count); i++) {
-				if (child == LogicalType::USMALLINT) {
-					uint16_t lhs, rhs;
-					memcpy(&lhs, left_bytes->data() + i * width, width);
-					memcpy(&rhs, right_bytes->data() + i * width, width);
-					if (lhs != rhs) {
-						return OP::Operation(lhs, rhs);
-					}
-				} else {
-					float lhs, rhs;
-					memcpy(&lhs, left_bytes->data() + i * width, width);
-					memcpy(&rhs, right_bytes->data() + i * width, width);
-					if (!Equals::Operation(lhs, rhs)) {
-						return OP::Operation(lhs, rhs);
-					}
-				}
-			}
-			return OP::Operation(left_count, right_count);
-		}
-		return OP::Operation(*left_bytes, *right_bytes);
+		D_ASSERT(left_copy->type() == right_copy->type());
+		return TemplatedBooleanOperation<OP>(*left_copy, *right_copy);
 	}
 	switch (left_type.InternalType()) {
 	case PhysicalType::BOOL:
@@ -157,13 +121,13 @@ static bool TemplatedBooleanOperation(const Value &left, const Value &right) {
 		if (left_type.id() == LogicalTypeId::VARIANT) {
 			Vector left_vec(left.type());
 			Vector right_vec(right.type());
-			left_vec.Reference(left);
-			right_vec.Reference(right);
+			left_vec.Reference(left, count_t(1));
+			right_vec.Reference(right, count_t(1));
 
 			RecursiveUnifiedVectorFormat left_format;
 			RecursiveUnifiedVectorFormat right_format;
-			Vector::RecursiveToUnifiedFormat(left_vec, 1, left_format);
-			Vector::RecursiveToUnifiedFormat(right_vec, 1, right_format);
+			Vector::RecursiveToUnifiedFormat(left_vec, left_format);
+			Vector::RecursiveToUnifiedFormat(right_vec, right_format);
 
 			UnifiedVariantVectorData left_variant_data(left_format);
 			UnifiedVariantVectorData right_variant_data(right_format);
@@ -223,7 +187,7 @@ static bool TemplatedBooleanOperation(const Value &left, const Value &right) {
 				return false;
 			}
 		}
-		return true;
+		return ValuePositionComparator::TieBreak<OP>(left_children.size(), right_children.size());
 	}
 	default:
 		throw InternalException("Unimplemented type for value comparison");

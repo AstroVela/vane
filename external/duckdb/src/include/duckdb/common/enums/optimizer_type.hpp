@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -46,7 +40,7 @@ enum class OptimizerType : uint32_t {
 	JOIN_FILTER_PUSHDOWN = 23,
 	EXTENSION = 24,
 	MATERIALIZED_CTE = 25,
-	SUM_REWRITER = 26,
+	AGGREGATE_FUNCTION_REWRITER = 26,
 	LATE_MATERIALIZATION = 27,
 	CTE_INLINING = 28,
 	ROW_GROUP_PRUNER = 29,
@@ -54,8 +48,19 @@ enum class OptimizerType : uint32_t {
 	COMMON_SUBPLAN = 31,
 	JOIN_ELIMINATION = 32,
 	WINDOW_SELF_JOIN = 33,
-	UDF_PROJECT = 34,
-	VLLM_PROJECT = 35
+	PROJECTION_PULLUP = 34,
+	OUTER_JOIN_SIMPLIFICATION = 35,
+	ROW_NUMBER_REWRITER = 36,
+	PARTITIONED_EXECUTION = 37,
+	PARTIAL_AGGREGATE_PUSHDOWN = 38,
+	REMOTE_PUSHDOWN = 39,
+	GROUPING_SETS = 40,
+	TYPE_PUSHDOWN = 41,
+	SCALAR_FN_PUSHDOWN = 42,
+	DISTINCT_AGGREGATE_REWRITE = 43,
+	AGGREGATE_REUSE = 44,
+	PROJECTION_PLACEMENT = 45,
+	REDUNDANT_ORDER_KEYS = 46
 };
 
 string OptimizerTypeToString(OptimizerType type);

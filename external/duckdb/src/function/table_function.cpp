@@ -1,14 +1,8 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/partition_stats.hpp"
+#include "duckdb/common/string_util.hpp"
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
+#include <algorithm>
 
 namespace duckdb {
 
@@ -24,108 +18,136 @@ PartitionStatistics::PartitionStatistics() : row_start(0), count(0), count_type(
 TableFunctionInfo::~TableFunctionInfo() {
 }
 
-void DistributedScanSplit::Validate() const {
-	if (split_id.empty()) {
-		throw SerializationException("distributed extension scan split has an empty split_id");
-	}
+BaseTableFunction::BaseTableFunction(table_function_t function_, table_function_bind_t bind,
+                                     table_function_init_global_t init_global, table_function_init_local_t init_local)
+    : bind(bind), bind_replace(nullptr), bind_operator(nullptr), init_global(init_global), init_local(init_local),
+      function(function_), in_out_function(nullptr), in_out_function_final(nullptr), statistics(nullptr),
+      statistics_extended(nullptr), dependency(nullptr), cardinality(nullptr), get_metrics(nullptr),
+      pushdown_complex_filter(nullptr), pushdown_expression(nullptr), to_string(nullptr), table_scan_progress(nullptr),
+      get_partition_data(nullptr), get_bind_info(nullptr), get_table_entry(nullptr),
+      projection_expression_pushdown(nullptr), get_multi_file_reader(nullptr), supports_pushdown_type(nullptr),
+      supports_pushdown_extract(nullptr), is_repeatable(nullptr), get_partition_info(nullptr),
+      get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
+      serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
+      sampling_pushdown(false), late_materialization(false),
+      return_type(TableFunctionReturnType::TABLE_RETURNING_FUNCTION) {
 }
 
-void DistributedScanSplit::Serialize(Serializer &serializer) const {
-	Validate();
-	serializer.WriteProperty(1, "split_id", split_id);
-	serializer.WriteProperty(2, "payload", payload);
-	serializer.WriteProperty(3, "estimated_cardinality", estimated_cardinality);
-	serializer.WriteProperty(4, "estimated_bytes", estimated_bytes);
-}
-
-DistributedScanSplit DistributedScanSplit::Deserialize(Deserializer &deserializer) {
-	DistributedScanSplit result;
-	result.split_id = deserializer.ReadProperty<string>(1, "split_id");
-	result.payload = deserializer.ReadProperty<string>(2, "payload");
-	result.estimated_cardinality = deserializer.ReadProperty<optional_idx>(3, "estimated_cardinality");
-	result.estimated_bytes = deserializer.ReadProperty<optional_idx>(4, "estimated_bytes");
-	result.Validate();
-	return result;
-}
-
-namespace {
-
-vector<DistributedScanSplit> PlanDistributedSingletonSource(const TableFunctionDistributedScanPlanningInput &input) {
-	DistributedScanSplit split;
-	split.split_id = "0";
-	if (input.estimated_cardinality != DConstants::INVALID_INDEX) {
-		split.estimated_cardinality = optional_idx(input.estimated_cardinality);
-	}
-	split.Validate();
-	return {std::move(split)};
-}
-
-unique_ptr<FunctionData> CreateDistributedSingletonWorkerBind(const TableFunctionDistributedScanInput &input) {
-	if (!input.bind_data) {
-		return nullptr;
-	}
-	return input.bind_data->Copy();
-}
-
-void ApplyDistributedSingletonSource(optional_ptr<FunctionData>, const vector<DistributedScanSplit> &splits) {
-	if (splits.empty()) {
-		return;
-	}
-	if (splits.size() != 1) {
-		throw InvalidInputException("distributed singleton source requires exactly one assigned split");
-	}
-	const auto &split = splits[0];
-	split.Validate();
-	if (split.split_id != "0" || !split.payload.empty()) {
-		throw InvalidInputException("distributed singleton source received an invalid split");
-	}
-}
-
-} // namespace
-
-TableFunctionDistributedScanCallbacks
-MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode bind_data_mode) {
-	TableFunctionDistributedScanCallbacks callbacks;
-	callbacks.protocol_version = DISTRIBUTED_SINGLETON_SOURCE_PROTOCOL_VERSION;
-	callbacks.split_codec = {DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC,
-	                         DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC_VERSION};
-	callbacks.bind_data_mode = bind_data_mode;
-	callbacks.plan_splits = PlanDistributedSingletonSource;
-	callbacks.create_worker_bind = CreateDistributedSingletonWorkerBind;
-	callbacks.apply_splits = ApplyDistributedSingletonSource;
-	return callbacks;
-}
-
-TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, table_function_t function_,
+TableFunction::TableFunction(Identifier name, const vector<LogicalType> &arguments, table_function_t function_,
                              table_function_bind_t bind, table_function_init_global_t init_global,
                              table_function_init_local_t init_local)
-    : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
-      bind_operator(nullptr), init_global(init_global), init_local(init_local), function(function_),
-      poll_function(nullptr), in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
-      in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
-      cardinality(nullptr), rows_scanned(nullptr), get_metrics(nullptr), pushdown_complex_filter(nullptr),
-      pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
-      get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
-      supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
-      get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
-      filter_pushdown(false), filter_prune(false), sampling_pushdown(false), late_materialization(false) {
+    : BaseTableFunction(function_, bind, init_global, init_local),
+      SimpleFunction(std::move(name), arguments, LogicalType::INVALID) {
 }
 
-TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, std::nullptr_t function_,
+TableFunction::TableFunction(Identifier name, const vector<LogicalType> &arguments, std::nullptr_t,
                              table_function_bind_t bind, table_function_init_global_t init_global,
                              table_function_init_local_t init_local)
-    : SimpleNamedParameterFunction(std::move(name), arguments), bind(bind), bind_replace(nullptr),
-      bind_operator(nullptr), init_global(init_global), init_local(init_local), function(nullptr),
-      poll_function(nullptr), in_out_function(nullptr), in_out_function_final(nullptr), in_out_function_batch(nullptr),
-      in_out_function_final_batch(nullptr), statistics(nullptr), statistics_extended(nullptr), dependency(nullptr),
-      cardinality(nullptr), rows_scanned(nullptr), get_metrics(nullptr), pushdown_complex_filter(nullptr),
-      pushdown_expression(nullptr), to_string(nullptr), dynamic_to_string(nullptr), table_scan_progress(nullptr),
-      get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
-      supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
-      get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
-      filter_pushdown(false), filter_prune(false), sampling_pushdown(false), late_materialization(false) {
+    : BaseTableFunction(nullptr, bind, init_global, init_local),
+      SimpleFunction(std::move(name), arguments, LogicalType::INVALID) {
+}
+
+TableFunction::TableFunction(Identifier name, FunctionSignature signature, table_function_t function_,
+                             table_function_bind_t bind, table_function_init_global_t init_global,
+                             table_function_init_local_t init_local)
+    : BaseTableFunction(function_, bind, init_global, init_local),
+      SimpleFunction(std::move(name), std::move(signature)) {
+}
+
+TableFunction::TableFunction(FunctionSignature signature, table_function_t function_, table_function_bind_t bind,
+                             table_function_init_global_t init_global, table_function_init_local_t init_local)
+    : BaseTableFunction(function_, bind, init_global, init_local), SimpleFunction("", std::move(signature)) {
+}
+
+TableFunction::TableFunction(Identifier name, FunctionSignature signature, std::nullptr_t, table_function_bind_t bind,
+                             table_function_init_global_t init_global, table_function_init_local_t init_local)
+    : BaseTableFunction(nullptr, bind, init_global, init_local), SimpleFunction(std::move(name), std::move(signature)) {
+}
+
+BoundTableFunction::BoundTableFunction() : BaseTableFunction(nullptr, nullptr, nullptr, nullptr) {
+}
+
+BoundTableFunction::BoundTableFunction(const TableFunction &function)
+    // the function does not come from a function set - copy it into a definition of its own
+    : BoundTableFunction(make_shared_ptr<const TableFunction>(function)) {
+}
+
+BoundTableFunction::BoundTableFunction(shared_ptr<const TableFunction> function_p)
+    : BaseTableFunction(nullptr, nullptr, nullptr, nullptr) {
+	definition = std::move(function_p);
+	auto &function = *definition;
+	qualified_name = function.GetQualifiedName();
+	extra_info = function.extra_info;
+
+	// the behaviour is taken over one member at a time - the declaration stays behind on the definition
+	bind = function.bind;
+	bind_replace = function.bind_replace;
+	bind_operator = function.bind_operator;
+	init_global = function.init_global;
+	init_local = function.init_local;
+	this->function = function.function;
+	in_out_function = function.in_out_function;
+	in_out_function_final = function.in_out_function_final;
+	statistics = function.statistics;
+	statistics_extended = function.statistics_extended;
+	dependency = function.dependency;
+	cardinality = function.cardinality;
+	get_metrics = function.get_metrics;
+	pushdown_complex_filter = function.pushdown_complex_filter;
+	pushdown_expression = function.pushdown_expression;
+	to_string = function.to_string;
+	to_sql = function.to_sql;
+	table_scan_progress = function.table_scan_progress;
+	get_partition_data = function.get_partition_data;
+	get_bind_info = function.get_bind_info;
+	get_table_entry = function.get_table_entry;
+	projection_expression_pushdown = function.projection_expression_pushdown;
+	get_multi_file_reader = function.get_multi_file_reader;
+	supports_pushdown_type = function.supports_pushdown_type;
+	supports_pushdown_extract = function.supports_pushdown_extract;
+	is_repeatable = function.is_repeatable;
+	get_partition_info = function.get_partition_info;
+	get_partition_stats = function.get_partition_stats;
+	get_virtual_columns = function.get_virtual_columns;
+	get_row_id_columns = function.get_row_id_columns;
+	set_scan_order = function.set_scan_order;
+	set_partitions_to_scan = function.set_partitions_to_scan;
+	serialize = function.serialize;
+	deserialize = function.deserialize;
+	verify_serialization = function.verify_serialization;
+	projection_pushdown = function.projection_pushdown;
+	filter_pushdown = function.filter_pushdown;
+	filter_prune = function.filter_prune;
+	sampling_pushdown = function.sampling_pushdown;
+	late_materialization = function.late_materialization;
+	function_info = function.function_info;
+	BaseTableFunction::return_type = function.return_type;
+	call_return_type = function.call_return_type;
+	order_preservation_type = function.order_preservation_type;
+	global_initialization = function.global_initialization;
+	parallelism = function.parallelism;
+
+	// the parameters a call fills by position - these are the types plan serialization records, so the named
+	// options that follow them take no part
+	auto &signature = function.GetSignature();
+	for (idx_t i = 0; i < signature.GetPositionalParameterCount(); i++) {
+		arguments.push_back(signature.GetParameter(i).GetType());
+	}
+	positional_arguments = arguments.size();
+}
+
+void BoundTableFunction::SetCallArguments(const vector<Value> &parameters,
+                                          const named_argument_map_t &named_parameters) {
+	BoundSimpleFunction::SetCallArguments(GetSignature(), parameters, named_parameters);
+}
+
+bool BoundTableFunction::operator==(const BoundTableFunction &rhs) const {
+	return GetQualifiedName() == rhs.GetQualifiedName() && GetArguments() == rhs.GetArguments() &&
+	       BaseTableFunction::operator==(rhs);
+}
+
+bool BoundTableFunction::operator!=(const BoundTableFunction &rhs) const {
+	return !(*this == rhs);
 }
 
 TableFunction::TableFunction(const vector<LogicalType> &arguments, table_function_t function_,
@@ -142,168 +164,51 @@ TableFunction::TableFunction(const vector<LogicalType> &arguments, std::nullptr_
 TableFunction::TableFunction() : TableFunction("", {}, nullptr, nullptr, nullptr, nullptr) {
 }
 
-bool TableFunction::operator==(const TableFunction &rhs) const {
-	return name == rhs.name && arguments == rhs.arguments && varargs == rhs.varargs && bind == rhs.bind &&
-	       bind_replace == rhs.bind_replace && bind_operator == rhs.bind_operator && init_global == rhs.init_global &&
-	       init_local == rhs.init_local && function == rhs.function && poll_function == rhs.poll_function &&
+bool BaseTableFunction::operator==(const BaseTableFunction &rhs) const {
+	return bind == rhs.bind && bind_replace == rhs.bind_replace && bind_operator == rhs.bind_operator &&
+	       init_global == rhs.init_global && init_local == rhs.init_local && function == rhs.function &&
 	       in_out_function == rhs.in_out_function && in_out_function_final == rhs.in_out_function_final &&
-	       in_out_function_batch == rhs.in_out_function_batch &&
-	       in_out_function_final_batch == rhs.in_out_function_final_batch && statistics == rhs.statistics &&
-	       dependency == rhs.dependency && cardinality == rhs.cardinality &&
+	       statistics == rhs.statistics && dependency == rhs.dependency && cardinality == rhs.cardinality &&
 	       pushdown_complex_filter == rhs.pushdown_complex_filter && pushdown_expression == rhs.pushdown_expression &&
-	       to_string == rhs.to_string && dynamic_to_string == rhs.dynamic_to_string &&
-	       table_scan_progress == rhs.table_scan_progress && get_partition_data == rhs.get_partition_data &&
-	       get_bind_info == rhs.get_bind_info && type_pushdown == rhs.type_pushdown &&
+	       to_string == rhs.to_string && to_sql == rhs.to_sql && table_scan_progress == rhs.table_scan_progress &&
+	       get_partition_data == rhs.get_partition_data && get_bind_info == rhs.get_bind_info &&
+	       get_table_entry == rhs.get_table_entry &&
+	       projection_expression_pushdown == rhs.projection_expression_pushdown &&
 	       get_multi_file_reader == rhs.get_multi_file_reader && supports_pushdown_type == rhs.supports_pushdown_type &&
-	       get_partition_info == rhs.get_partition_info && get_partition_stats == rhs.get_partition_stats &&
-	       get_virtual_columns == rhs.get_virtual_columns && get_row_id_columns == rhs.get_row_id_columns &&
-	       serialize == rhs.serialize && deserialize == rhs.deserialize &&
-	       ((!distributed_scan && !rhs.distributed_scan) ||
-	        (distributed_scan && rhs.distributed_scan && *distributed_scan == *rhs.distributed_scan)) &&
-	       verify_serialization == rhs.verify_serialization && projection_pushdown == rhs.projection_pushdown &&
-	       filter_pushdown == rhs.filter_pushdown && filter_prune == rhs.filter_prune &&
-	       sampling_pushdown == rhs.sampling_pushdown && late_materialization == rhs.late_materialization &&
+	       is_repeatable == rhs.is_repeatable && get_partition_info == rhs.get_partition_info &&
+	       get_partition_stats == rhs.get_partition_stats && get_virtual_columns == rhs.get_virtual_columns &&
+	       get_row_id_columns == rhs.get_row_id_columns && serialize == rhs.serialize &&
+	       deserialize == rhs.deserialize && verify_serialization == rhs.verify_serialization &&
+	       projection_pushdown == rhs.projection_pushdown && filter_pushdown == rhs.filter_pushdown &&
+	       filter_prune == rhs.filter_prune && sampling_pushdown == rhs.sampling_pushdown &&
+	       late_materialization == rhs.late_materialization && return_type == rhs.return_type &&
 	       global_initialization == rhs.global_initialization;
 }
 
-string GetDistributedTableFunctionSignature(const string &function_name, const vector<LogicalType> &arguments,
-                                            const LogicalType &varargs) {
-	return Function::CallToString(string(), string(), function_name, arguments, varargs);
-}
-
-void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &function_name) const {
-	if (!plan_splits || !create_worker_bind || !apply_splits) {
-		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan_splits, "
-		                            "create_worker_bind, and apply_splits",
-		                            function_name);
-	}
-	if (protocol_version == 0) {
-		throw InvalidInputException(
-		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
-	}
-	switch (bind_data_mode) {
-	case TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED:
-	case TableFunctionDistributedBindDataMode::BIND_DATA_OPTIONAL:
-		break;
-	default:
-		throw InvalidInputException("Distributed scan callbacks for table function '%s' have an invalid bind-data mode",
-		                            function_name);
-	}
-	split_codec.Validate("Distributed scan split codec for table function '" + function_name + "'");
-}
-
-void TableFunctionDistributedScanCallbacks::Validate(const TableFunction &function) const {
-	ValidateDefinition(function.name);
-	if (capability.extension_name.empty()) {
-		throw InvalidInputException("Distributed scan capability for table function '%s' was not bound by its loader",
-		                            function.name);
-	}
-	if (capability.capability.kind != DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
-		throw InvalidInputException("Distributed scan capability for table function '%s' must have kind table_function",
-		                            function.name);
-	}
-	if (capability.capability.name != function.name) {
-		throw InvalidInputException("Distributed scan capability name '%s' does not match table function '%s'",
-		                            capability.capability.name, function.name);
-	}
-	// BindCapability freezes the declared catalog overload. Bind callbacks may
-	// subsequently specialize or erase arguments, so the runtime function shape
-	// must not be used to recompute this wire identity.
-	capability.Validate();
-}
-
-void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name,
-                                                           const TableFunction &function) {
-	ValidateDefinition(function.name);
-	DistributedExtensionCapabilityReference bound_capability;
-	bound_capability.extension_name = extension_name;
-	bound_capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	bound_capability.capability.name = function.name;
-	bound_capability.capability.protocol_version = protocol_version;
-	bound_capability.capability.function_signature =
-	    GetDistributedTableFunctionSignature(function.name, function.arguments, function.varargs);
-	if (!capability.extension_name.empty() && capability != bound_capability) {
-		throw InvalidInputException("Distributed scan capability for table function '%s' is already bound to '%s'",
-		                            function.name, capability.CanonicalIdentity());
-	}
-	capability = std::move(bound_capability);
-	Validate(function);
-}
-
-const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallbacks::GetCapability() const {
-	if (capability.extension_name.empty()) {
-		throw InternalException("Distributed scan capability has not been bound by its extension loader");
-	}
-	return capability;
-}
-
-bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
-	return protocol_version == other.protocol_version && capability == other.capability &&
-	       split_codec == other.split_codec && bind_data_mode == other.bind_data_mode &&
-	       plan_splits == other.plan_splits && create_worker_bind == other.create_worker_bind &&
-	       apply_splits == other.apply_splits;
-}
-
-void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
-	callbacks.ValidateDefinition(name);
-	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
-}
-
-void TableFunction::BindDistributedScanCapability(const string &extension_name) {
-	if (!distributed_scan) {
-		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
-	}
-	auto callbacks = *distributed_scan;
-	callbacks.BindCapability(extension_name, *this);
-	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
-}
-
-const TableFunctionDistributedScanCallbacks &TableFunction::GetDistributedScanCallbacks() const {
-	if (!distributed_scan) {
-		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
-	}
-	return *distributed_scan;
+bool TableFunction::operator==(const TableFunction &rhs) const {
+	return name == rhs.name && GetSignature() == rhs.GetSignature() && BaseTableFunction::operator==(rhs);
 }
 
 bool TableFunction::operator!=(const TableFunction &rhs) const {
 	return !(*this == rhs);
 }
 
-bool TableFunction::Equal(const TableFunction &rhs) const {
-	// number of types
-	if (this->arguments.size() != rhs.arguments.size()) {
-		return false;
-	}
-	// argument types
-	for (idx_t i = 0; i < this->arguments.size(); ++i) {
-		if (this->arguments[i] != rhs.arguments[i]) {
-			return false;
+bool TableFunctionInput::HandleBlocked(AsyncResult &blocked_result) {
+	D_ASSERT(blocked_result.GetResultType() == AsyncResultType::BLOCKED);
+	switch (results_execution_mode) {
+	case AsyncResultsExecutionMode::TASK_EXECUTOR:
+		async_result = std::move(blocked_result);
+		return true;
+	case AsyncResultsExecutionMode::SYNCHRONOUS:
+		// run the I/O synchronously, then loop again to resume
+		blocked_result.ExecuteTasksSynchronously();
+		if (blocked_result.GetResultType() != AsyncResultType::HAVE_MORE_OUTPUT) {
+			throw InternalException("Unexpected behaviour from ExecuteTasksSynchronously");
 		}
-	}
-	// varargs
-	if (this->varargs != rhs.varargs) {
 		return false;
+	default:
+		throw InternalException("Unexpected AsyncResultsExecutionMode in HandleBlocked");
 	}
-
-	return true; // they are equal
-}
-
-bool ExtractSourceResultType(AsyncResultType in, SourceResultType &out) {
-	switch (in) {
-	case AsyncResultType::IMPLICIT:
-	case AsyncResultType::INVALID:
-		return false;
-	case AsyncResultType::HAVE_MORE_OUTPUT:
-		out = SourceResultType::HAVE_MORE_OUTPUT;
-		break;
-	case AsyncResultType::FINISHED:
-		out = SourceResultType::FINISHED;
-		break;
-	case AsyncResultType::BLOCKED:
-		out = SourceResultType::BLOCKED;
-		break;
-	}
-	return true;
 }
 
 } // namespace duckdb

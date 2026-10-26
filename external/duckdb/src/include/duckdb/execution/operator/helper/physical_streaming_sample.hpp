@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -30,6 +24,8 @@ public:
 
 	unique_ptr<SampleOptions> sample_options;
 	double percentage;
+	double system_sample_phase;
+	idx_t rows;
 
 public:
 	// Operator interface
@@ -41,11 +37,9 @@ public:
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
-
 private:
-	void SystemSample(DataChunk &input, DataChunk &result, OperatorState &state) const;
+	void SystemSamplePercent(DataChunk &input, DataChunk &result, OperatorState &state) const;
+	void SystemSampleRows(DataChunk &input, DataChunk &result, OperatorState &state) const;
 	void BernoulliSample(DataChunk &input, DataChunk &result, OperatorState &state) const;
 };
 

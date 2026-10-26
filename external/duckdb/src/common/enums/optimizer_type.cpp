@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/common/enums/optimizer_type.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -29,8 +23,6 @@ static const DefaultOptimizerType internal_optimizer_types[] = {
     {"join_order", OptimizerType::JOIN_ORDER},
     {"deliminator", OptimizerType::DELIMINATOR},
     {"unnest_rewriter", OptimizerType::UNNEST_REWRITER},
-    {"vllm_project", OptimizerType::VLLM_PROJECT},
-    {"udf_project", OptimizerType::UDF_PROJECT},
     {"unused_columns", OptimizerType::UNUSED_COLUMNS},
     {"statistics_propagation", OptimizerType::STATISTICS_PROPAGATION},
     {"common_subexpressions", OptimizerType::COMMON_SUBEXPRESSIONS},
@@ -48,12 +40,25 @@ static const DefaultOptimizerType internal_optimizer_types[] = {
     {"join_filter_pushdown", OptimizerType::JOIN_FILTER_PUSHDOWN},
     {"extension", OptimizerType::EXTENSION},
     {"materialized_cte", OptimizerType::MATERIALIZED_CTE},
-    {"sum_rewriter", OptimizerType::SUM_REWRITER},
+    {"aggregate_function_rewriter", OptimizerType::AGGREGATE_FUNCTION_REWRITER},
     {"late_materialization", OptimizerType::LATE_MATERIALIZATION},
     {"cte_inlining", OptimizerType::CTE_INLINING},
     {"common_subplan", OptimizerType::COMMON_SUBPLAN},
     {"join_elimination", OptimizerType::JOIN_ELIMINATION},
     {"window_self_join", OptimizerType::WINDOW_SELF_JOIN},
+    {"projection_pullup", OptimizerType::PROJECTION_PULLUP},
+    {"outer_join_simplification", OptimizerType::OUTER_JOIN_SIMPLIFICATION},
+    {"window_rewriter", OptimizerType::ROW_NUMBER_REWRITER},
+    {"partitioned_execution", OptimizerType::PARTITIONED_EXECUTION},
+    {"partial_aggregate_pushdown", OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN},
+    {"remote_pushdown", OptimizerType::REMOTE_PUSHDOWN},
+    {"grouping_sets", OptimizerType::GROUPING_SETS},
+    {"type_pushdown", OptimizerType::TYPE_PUSHDOWN},
+    {"scalar_fn_pushdown", OptimizerType::SCALAR_FN_PUSHDOWN},
+    {"distinct_aggregate_rewrite", OptimizerType::DISTINCT_AGGREGATE_REWRITE},
+    {"aggregate_reuse", OptimizerType::AGGREGATE_REUSE},
+    {"projection_placement", OptimizerType::PROJECTION_PLACEMENT},
+    {"redundant_order_keys", OptimizerType::REDUNDANT_ORDER_KEYS},
     {nullptr, OptimizerType::INVALID}};
 
 string OptimizerTypeToString(OptimizerType type) {

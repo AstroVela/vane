@@ -13,8 +13,6 @@
 
 namespace duckdb {
 
-struct PositionalJoinDeserializeTag {};
-
 //! PhysicalPositionalJoin represents a cross product between two tables
 class PhysicalPositionalJoin : public PhysicalOperator {
 public:
@@ -23,12 +21,6 @@ public:
 public:
 	PhysicalPositionalJoin(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperator &left,
 	                       PhysicalOperator &right, idx_t estimated_cardinality);
-	PhysicalPositionalJoin(PhysicalPlan &physical_plan, PositionalJoinDeserializeTag, vector<LogicalType> types,
-	                       idx_t estimated_cardinality);
-
-	OrderPreservationType OperatorOrder() const override {
-		return OrderPreservationType::FIXED_ORDER;
-	}
 
 public:
 	// Operator Interface
@@ -40,6 +32,9 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	void SourceFinished(ClientContext &context, GlobalSourceState &gstate) const override;
+
 	bool IsSource() const override {
 		return true;
 	}
@@ -50,10 +45,6 @@ public:
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 
 	bool IsSink() const override {
-		return true;
-	}
-
-	bool SinkOrderDependent() const override {
 		return true;
 	}
 

@@ -2,20 +2,18 @@
 #include "test_helpers.hpp"
 
 using namespace duckdb;
-using namespace std;
 
 TEST_CASE("Test prepared statements API", "[api]") {
 	duckdb::unique_ptr<QueryResult> result;
 	DuckDB db(nullptr);
 	Connection con(db);
-	con.EnableQueryVerification();
 
 	// prepare no statements
 	REQUIRE_FAIL(con.Prepare(""));
 
 	// PrepareAndExecute with no values
 	duckdb::vector<Value> values;
-	REQUIRE_FAIL(con.PendingQuery("", values, false));
+	REQUIRE_FAIL(con.Submit("", values));
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE a (i TINYINT)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO a VALUES (11), (12), (13)"));
@@ -50,24 +48,40 @@ TEST_CASE("Test prepared statements API", "[api]") {
 	REQUIRE(CHECK_COLUMN(result, 0, {1}));
 	result = prepare->Execute(13);
 	REQUIRE(CHECK_COLUMN(result, 0, {1}));
-	REQUIRE(prepare->named_param_map.size() == 1);
+	REQUIRE(prepare->GetParameterCount() == 1);
 }
 
 TEST_CASE("Test type resolution of function with parameter expressions", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	duckdb::unique_ptr<QueryResult> result;
-	con.EnableQueryVerification();
 
 	// can deduce type of prepared parameter here
 	auto prepared = con.Prepare("select 1 + $1");
-	REQUIRE(!prepared->error.HasError());
+	REQUIRE(!prepared->HasError());
 
 	result = prepared->Execute(1);
 	REQUIRE(CHECK_COLUMN(result, 0, {2}));
 
 	// no prepared statement
-	REQUIRE_FAIL(con.SendQuery("SELECT ?"));
+	REQUIRE_FAIL(con.Query("SELECT ?"));
+}
+
+TEST_CASE("Test prepared EXPLAIN ANALYZE", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto prepared = con.Prepare("EXPLAIN ANALYZE SELECT 42");
+	REQUIRE(!prepared->HasError());
+	// run another query between preparing and executing, and execute more than once
+	REQUIRE_NO_FAIL(con.Query("SELECT 1"));
+	for (idx_t i = 0; i < 2; i++) {
+		auto result = prepared->Execute();
+		REQUIRE_NO_FAIL(*result);
+		auto plan = result->Collection().GetValue(1, 0).ToString();
+		REQUIRE(!StringUtil::Contains(plan, "Query profiling is disabled"));
+		REQUIRE(StringUtil::Contains(plan, "Total Time"));
+	}
 }
 
 TEST_CASE("Test prepared statements and dependencies", "[api]") {
@@ -109,6 +123,42 @@ TEST_CASE("Prepared temp table insert is invalidated after drop", "[api]") {
 	auto result = prepared->Execute();
 	REQUIRE(result->HasError());
 	REQUIRE(result->GetError().find("does not exist") != string::npos);
+}
+
+TEST_CASE("Writes to temporary objects register a modification of the temp catalog", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TEMP TABLE t(i INTEGER PRIMARY KEY)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TEMP TABLE audit(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TEMP SEQUENCE s"));
+
+	auto read = con.Prepare("SELECT * FROM t");
+	REQUIRE(!read->HasError());
+	REQUIRE(read->GetStatementProperties().modified_databases.empty());
+
+	vector<string> writes {
+	    "INSERT INTO t VALUES (1)",
+	    "UPDATE t SET i = 2",
+	    "DELETE FROM t",
+	    "INSERT OR REPLACE INTO t VALUES (1)",
+	    "MERGE INTO t USING (SELECT 1 AS i) s ON t.i = s.i WHEN NOT MATCHED THEN INSERT VALUES (s.i)",
+	    "CREATE TEMP TABLE t2(i INTEGER)",
+	    "CREATE TEMP VIEW v AS SELECT 42",
+	    "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH STATEMENT INSERT INTO audit VALUES (1)",
+	    "CREATE INDEX t_i ON t(i)",
+	    "ALTER TABLE t RENAME TO t3",
+	    "COMMENT ON TABLE t IS 'c'",
+	    "DROP TABLE t",
+	    "SELECT nextval('s')",
+	};
+	for (auto &write : writes) {
+		INFO(write);
+		auto prepared = con.Prepare(write);
+		REQUIRE(!prepared->HasError());
+		auto &modified = prepared->GetStatementProperties().modified_databases;
+		REQUIRE(modified.size() == 1);
+		REQUIRE(modified.count(Identifier::TempCatalog()) == 1);
+	}
 }
 
 TEST_CASE("Dropping connection with prepared statement resets dependencies", "[api]") {
@@ -158,6 +208,32 @@ TEST_CASE("Alter table and prepared statements", "[api]") {
 	REQUIRE(CHECK_COLUMN(result, 0, {12}));
 }
 
+TEST_CASE("Test that prepared statements live in the client context", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto prepared_statement_count = [&con]() {
+		auto result = con.Query("SELECT count(*) FROM duckdb_prepared_statements()");
+		return result->Collection().GetValue(0, 0).GetValue<int64_t>();
+	};
+	REQUIRE(prepared_statement_count() == 0);
+
+	auto prepared = con.Prepare("SELECT $1::INTEGER");
+	REQUIRE(!prepared->HasError());
+	// the statement is prepared under a generated name in the client context
+	REQUIRE(prepared_statement_count() == 1);
+	REQUIRE(StringUtil::StartsWith(prepared->GetName(), "duckdb_prepare_internal_"));
+	auto names = con.Query("SELECT name FROM duckdb_prepared_statements()");
+	REQUIRE(CHECK_COLUMN(names, 0, {Value(prepared->GetName())}));
+
+	auto result = prepared->Execute(42);
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	// destroying the prepared statement deallocates it again
+	prepared.reset();
+	REQUIRE(prepared_statement_count() == 0);
+}
+
 TEST_CASE("Test destructors of prepared statements", "[api]") {
 	duckdb::unique_ptr<DuckDB> db;
 	duckdb::unique_ptr<Connection> con;
@@ -174,8 +250,8 @@ TEST_CASE("Test destructors of prepared statements", "[api]") {
 	REQUIRE(CHECK_COLUMN(result, 0, {8}));
 	// now destroy the connection
 	con.reset();
-	// we can still use the prepared statement: the connection is alive until the prepared statement is dropped
-	REQUIRE_NO_FAIL(prepare->Execute(3, 5));
+	// the prepared statement lives in the connection - it can no longer be executed
+	REQUIRE_FAIL(prepare->Execute(3, 5));
 	// destroying the prepared statement is fine
 	prepare.reset();
 
@@ -275,34 +351,33 @@ TEST_CASE("Test prepared statement parameter counting", "[api]") {
 
 	auto p0 = con.Prepare("SELECT 42");
 	REQUIRE(!p0->HasError());
-	REQUIRE(p0->named_param_map.empty());
+	REQUIRE(p0->GetNamedParameterMap().empty());
 
 	auto p1 = con.Prepare("SELECT $1::int");
 	REQUIRE(!p1->HasError());
-	REQUIRE(p1->named_param_map.size() == 1);
+	REQUIRE(p1->GetParameterCount() == 1);
 
 	p1 = con.Prepare("SELECT ?::int");
 	REQUIRE(!p1->HasError());
-	REQUIRE(p1->named_param_map.size() == 1);
+	REQUIRE(p1->GetParameterCount() == 1);
 
 	auto p2 = con.Prepare("SELECT $1::int");
 	REQUIRE(!p2->HasError());
-	REQUIRE(p2->named_param_map.size() == 1);
+	REQUIRE(p2->GetParameterCount() == 1);
 
 	auto p3 = con.Prepare("SELECT ?::int, ?::string");
 	REQUIRE(!p3->HasError());
-	REQUIRE(p3->named_param_map.size() == 2);
+	REQUIRE(p3->GetParameterCount() == 2);
 
 	auto p4 = con.Prepare("SELECT $1::int, $2::string");
 	REQUIRE(!p4->HasError());
-	REQUIRE(p4->named_param_map.size() == 2);
+	REQUIRE(p4->GetParameterCount() == 2);
 }
 
 TEST_CASE("Test ANALYZE", "[api]") {
 	duckdb::unique_ptr<QueryResult> result;
 	DuckDB db(nullptr);
 	Connection con(db);
-	con.EnableQueryVerification();
 
 	// ANALYZE runs without errors, note that ANALYZE is actually just ignored
 	REQUIRE_NO_FAIL(con.Query("ANALYZE"));
@@ -407,7 +482,7 @@ TEST_CASE("PREPARE multiple statements", "[prepared]") {
 	// we can use ExtractStatements to execute the individual statements though
 	auto statements = con.ExtractStatements(query);
 	for (auto &statement : statements) {
-		string stmt = query.substr(statement->stmt_location, statement->stmt_length);
+		string stmt = query.substr(statement->stmt_location.offset, statement->stmt_location.length);
 		prepared = con.Prepare(stmt);
 		REQUIRE(!prepared->HasError());
 
@@ -500,11 +575,10 @@ TEST_CASE("Test prepared statements with SET", "[api]") {
 	duckdb::unique_ptr<QueryResult> result;
 	DuckDB db(nullptr);
 	Connection con(db);
-	con.EnableQueryVerification();
 
 	// create a prepared statement and use it to query
 	auto prepare = con.Prepare("SET default_null_order=$1");
-	REQUIRE(prepare->success);
+	REQUIRE(!prepare->HasError());
 
 	// too many parameters
 	REQUIRE_FAIL(prepare->Execute("xxx", "yyy"));
@@ -519,7 +593,6 @@ TEST_CASE("Test prepared statements with SET", "[api]") {
 TEST_CASE("Test prepared statements that require rebind", "[api]") {
 	DuckDB db(nullptr);
 	Connection con1(db);
-	con1.EnableQueryVerification();
 
 	auto prepared = con1.Prepare("DROP TABLE IF EXISTS t1");
 

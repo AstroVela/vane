@@ -1,13 +1,6 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -33,13 +26,8 @@ vector<const_reference<PhysicalOperator>> PhysicalDelimJoin::GetChildren() const
 InsertionOrderPreservingMap<string> PhysicalDelimJoin::ParamsToString() const {
 	auto result = join.ParamsToString();
 	result["Delim Index"] = StringUtil::Format("%llu", delim_idx.GetIndex());
+	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
-}
-
-void PhysicalDelimJoin::SerializeOperatorData(Serializer &serializer) const {
-	serializer.WriteProperty(103, "delim_idx", delim_idx);
-	serializer.WriteObject(104, "join", [&](Serializer &obj_serializer) { join.Serialize(obj_serializer); });
-	serializer.WriteObject(105, "distinct", [&](Serializer &obj_serializer) { distinct.Serialize(obj_serializer); });
 }
 
 } // namespace duckdb

@@ -3,8 +3,6 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "include/icu-current.hpp"
 #include "include/icu-casts.hpp"
@@ -21,30 +19,29 @@ static void CurrentTimeFunction(DataChunk &input, ExpressionState &state, Vector
 	ICUDateFunc::BindData data(state.GetContext());
 
 	dtime_tz_t result_time(dtime_t(0), 0);
-	ICUToTimeTZ::ToTimeTZ(data.calendar.get(), instant, result_time);
+	ICUToTimeTZ::ToTimeTZ(data.calendar.get(), timestamp_tz_t(instant), result_time);
 	auto val = Value::TIMETZ(result_time);
-	result.Reference(val);
+	result.Reference(val, count_t(input.size()));
 }
 
 static void CurrentDateFunction(DataChunk &input, ExpressionState &state, Vector &result) {
 	D_ASSERT(input.ColumnCount() == 0);
 	auto instant = GetTransactionTimestamp(state);
 
-	auto val = Value::DATE(ICUMakeDate::ToDate(state.GetContext(), instant));
-	result.Reference(val);
+	auto val = Value::DATE(ICUMakeDate::ToDate(state.GetContext(), timestamp_tz_t(instant)));
+	result.Reference(val, count_t(input.size()));
 }
 
 ScalarFunction GetCurrentTimeFun() {
 	ScalarFunction current_time({}, LogicalType::TIME_TZ, CurrentTimeFunction);
 	current_time.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_time.SetRequiresClientContext();
+	current_time.SetFallible();
 	return current_time;
 }
 
 ScalarFunction GetCurrentDateFun() {
 	ScalarFunction current_date({}, LogicalType::DATE, CurrentDateFunction);
 	current_date.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_date.SetRequiresClientContext();
 	return current_date;
 }
 
@@ -58,7 +55,7 @@ void RegisterICUCurrentFunctions(ExtensionLoader &loader) {
 	current_date.AddFunction(GetCurrentDateFun());
 	loader.RegisterFunction(current_date);
 
-	current_date.name = "today";
+	current_date.SetName("today");
 	loader.RegisterFunction(current_date);
 }
 

@@ -154,6 +154,17 @@ select age(timestamp '1992-01-01 01:01:01.400', timestamp '1992-01-01 01:01:02.2
 ----
 -00:00:00.8
 
+# Borrow seconds across a minute boundary in both directions
+query I
+SELECT age(lhs, rhs)
+FROM (VALUES
+	(TIMESTAMP '2020-01-01 00:01:10', TIMESTAMP '2020-01-01 00:00:50'),
+	(TIMESTAMP '2020-01-01 00:00:50', TIMESTAMP '2020-01-01 00:01:10')
+) t(lhs, rhs)
+----
+00:00:20
+-00:00:20
+
 #
 # Infinities
 #
@@ -161,19 +172,19 @@ foreach lspecial infinity -infinity
 
 # Unary
 query I
-SELECT AGE('${lspecial}'::TIMESTAMP);
+SELECT AGE('{lspecial}'::TIMESTAMP);
 ----
 NULL
 
 foreach rspecial infinity -infinity 2004-01-31T12:00:00.000050-08
 
 query I
-SELECT AGE('${lspecial}'::TIMESTAMP, '${rspecial}'::TIMESTAMP);
+SELECT AGE('{lspecial}'::TIMESTAMP, '{rspecial}'::TIMESTAMP);
 ----
 NULL
 
 query I
-SELECT AGE('${rspecial}'::TIMESTAMP, '${lspecial}'::TIMESTAMP);
+SELECT AGE('{rspecial}'::TIMESTAMP, '{lspecial}'::TIMESTAMP);
 ----
 NULL
 

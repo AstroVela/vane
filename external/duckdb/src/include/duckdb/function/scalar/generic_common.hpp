@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -22,9 +16,9 @@
 
 namespace duckdb {
 class BoundFunctionExpression;
+struct SortedAggregateStateOrder;
 
 struct ConstantOrNull {
-	static unique_ptr<FunctionData> Bind(Value value);
 	static bool IsConstantOrNull(BoundFunctionExpression &expr, const Value &val);
 };
 
@@ -35,24 +29,12 @@ struct ExportAggregateFunctionBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override;
 };
 
-DUCKDB_API void ExportStateAggregateSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                              const AggregateFunction &function);
-DUCKDB_API unique_ptr<FunctionData> ExportStateAggregateDeserialize(Deserializer &deserializer,
-                                                                    AggregateFunction &function);
-DUCKDB_API void ExportStateScalarSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                           const ScalarFunction &function);
-DUCKDB_API unique_ptr<FunctionData> ExportStateScalarDeserialize(Deserializer &deserializer, ScalarFunction &function);
-
-namespace distributed {
-
-DUCKDB_API void MergeAggregateSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                        const AggregateFunction &function);
-DUCKDB_API unique_ptr<FunctionData> MergeAggregateDeserialize(Deserializer &deserializer, AggregateFunction &function);
-
-} // namespace distributed
-
 struct ExportAggregateFunction {
 	static unique_ptr<BoundAggregateExpression> Bind(unique_ptr<BoundAggregateExpression> child_aggregate);
+	static void SetStateExport(BoundAggregateExpression &aggregate, LogicalType state_layout);
+	static unique_ptr<ParsedExpression> StateToSQL(const LogicalType &type, unique_ptr<ParsedExpression> value);
+	//! The per-key (column, modifiers) of the AGGREGATE_STATE type of an ordered aggregate
+	static void GetSortedStateOrders(const LogicalType &state_type, vector<SortedAggregateStateOrder> &orders);
 };
 
 } // namespace duckdb

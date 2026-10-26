@@ -22,7 +22,7 @@
 
 namespace duckdb_shell {
 using duckdb::make_uniq;
-using duckdb::MaterializedQueryResult;
+using duckdb::QueryResult;
 using duckdb::string;
 using duckdb::StringUtil;
 using duckdb::unique_ptr;
@@ -38,6 +38,7 @@ using duckdb::optional_ptr;
 using duckdb::SQLIdentifier;
 using duckdb::SQLString;
 using duckdb::unordered_map;
+using duckdb::unordered_set;
 struct ShellState;
 using duckdb::InternalException;
 using duckdb::InvalidInputException;
@@ -64,7 +65,6 @@ enum class RenderMode : uint32_t {
 	EXPLAIN,   /* Like RenderMode::Column, but do not truncate data */
 	DESCRIBE,  /* Special DESCRIBE Renderer */
 	ASCII,     /* Use ASCII unit and record separators (0x1F/0x1E) */
-	PRETTY,    /* Pretty-print schemas */
 	EQP,       /* Converts EXPLAIN QUERY PLAN output into a graph */
 	JSON,      /* Output JSON */
 	MARKDOWN,  /* Markdown formatting */
@@ -120,6 +120,8 @@ struct CommandLineOption {
 	metadata_command_t pre_init_callback;
 	metadata_command_t post_init_callback;
 	const char *description;
+	//! Whether one more argument is consumed when the next one is not an option itself
+	bool optional_argument;
 };
 
 struct MetadataCommand {
@@ -151,6 +153,7 @@ struct ShellTableInfo {
 };
 
 enum class BailOnError { AUTOMATIC, BAIL_ON_ERROR, DONT_BAIL_ON_ERROR };
+enum class AutoFormatMode { NO_AUTO_FORMAT, AUTO_FORMAT_COMPLETE_STATEMENTS };
 
 /*
 ** State information about the database connection is contained in an
@@ -188,7 +191,9 @@ public:
 	string zDbFilename;                       /* name of the database file */
 	FILE *pLog = nullptr;                     /* Write log output here */
 	size_t max_rows = 0;                      /* The maximum number of rows to render in DuckBox mode */
-	size_t max_width = 0; /* The maximum number of characters to render horizontally in DuckBox mode */
+	size_t max_width = 0;      /* The maximum number of characters to render horizontally in DuckBox mode */
+	size_t max_bytes = 0;      /* The maximum number of bytes of rows to render in markdown mode (0 = all) */
+	size_t max_cell_width = 0; /* The maximum number of characters to render per cell in markdown mode (0 = all) */
 	//! The maximum number of rows to analyze in order to determine column widths in DuckBox mode
 	idx_t max_analyze_rows = 0;
 	//! Decimal separator (if any)
@@ -199,14 +204,31 @@ public:
 	LargeNumberRendering large_number_rendering = LargeNumberRendering::DEFAULT;
 	//! The command to execute when `-ui` is passed in
 	string ui_command = "CALL start_ui()";
+	//! The command to execute when `-serve` is passed in - `create_secret_if_not_exists` persists the
+	//! token the server picks, so that `-connect` works without any configuration
+	string serve_command = "CALL quack_serve(create_secret_if_not_exists=true{serve_secret|})";
+	//! The command to execute when `-connect` is passed in - `{type}` is the database type given to
+	//! `-connect`, and decides which extension the connection goes through
+	string connect_command = "CONNECT '{type|quack}:'{connect_secret|}";
+	//! Parameters used to expand placeholders in the serve/connect commands
+	unordered_map<string, string> command_parameters;
+	//! Whether the shell was launched as a client using `-connect` - Ctrl-D then exits instead of disconnecting
+	bool started_as_client = false;
 	idx_t last_changes = 0;
 	idx_t total_changes = 0;
 	bool readStdin = true;
 	string initFile;
 	bool run_init = true;
-	unique_ptr<duckdb::MaterializedQueryResult> last_result;
+	unique_ptr<duckdb::QueryResult> last_result;
+	bool last_result_referenced = false;
+	//! Whether the last EXPLAIN ANALYZE tree folded any operators (so ".last" has a fuller tree to show)
+	bool last_explain_hid_content = false;
+	//! The widest rendered line of the last EXPLAIN tree, in display columns (used for the pager-width decision)
+	idx_t last_explain_width = 0;
 	//! If the following flag is set, then command execution stops at an error
 	BailOnError bail = BailOnError::AUTOMATIC;
+	//! Controls automatic SQL formatting before execution
+	AutoFormatMode auto_format = AutoFormatMode::NO_AUTO_FORMAT;
 	//! Table name when rendering a DESCRIBE statement
 	string describe_table_name;
 
@@ -224,6 +246,21 @@ public:
 	bool stdout_is_console = true;
 	bool stderr_is_console = true;
 
+	//! Whether to render for an AI coding agent: forced on/off from the command line, or auto-detected (DEFAULT)
+	OptionType agent_mode = OptionType::DEFAULT;
+	//! Whether agent mode is active (see DetectAgentMode)
+	bool agent_mode_active = false;
+	//! The name of the detected agent (e.g. "claude-code"), if any
+	string agent_name;
+	//! The environment variable that switched agent mode on (e.g. "CLAUDECODE"), empty when forced with -agent
+	string agent_marker;
+	//! Whether DUCKDB_AGENT_MODE forced agent mode on or off (no -agent / -no-agent was given)
+	bool agent_mode_from_environment = false;
+	//! Whether an output mode was given on the command line (-csv, -json, ...): detected agent mode then stays off
+	bool output_mode_flag = false;
+	//! Whether the exit hint (see PrintExitHint) went out already
+	bool exit_hint_printed = false;
+
 	//! True if an interrupt (Control-C) has been received.
 	atomic<idx_t> seenInterrupt;
 	//! Name of our program
@@ -239,6 +276,8 @@ public:
 	OptionType highlight_results = OptionType::DEFAULT;
 	//! Path to .duckdbrc file
 	string duckdb_rc_path;
+	//! Canonical paths of files currently being processed by .read
+	unordered_set<string> active_read_files;
 	//! Startup text to display
 	StartupText startup_text = StartupText::ALL;
 	//! Whether or not the loading resources message was displayed
@@ -303,6 +342,7 @@ public:
 	bool DisplaySchemas(const vector<string> &args);
 	MetadataResult DisplayEntries(const vector<string> &args, char type);
 	MetadataResult DisplayTables(const vector<string> &args);
+	MetadataResult DisplayManual(const vector<string> &args);
 	void ShowConfiguration();
 	void ClearInterrupt();
 
@@ -338,10 +378,16 @@ public:
 	vector<string> TableColumnList(const char *zTab);
 	SuccessState ExecuteStatement(unique_ptr<duckdb::SQLStatement> statement);
 	static bool UseDescribeRenderMode(const duckdb::SQLStatement &stmt, string &describe_table_name);
+	//! Route EXPLAIN ANALYZE output through the shell's direct-printing renderer when on an interactive console
+	void SetupPrettyExplain(duckdb::SQLStatement &statement);
 	void RenderTableMetadata(vector<ShellTableInfo> &result);
 
 	void PrintDatabaseError(const string &zErr);
+	//! Print an error, either with its location in the query (default) or as JSON (agent mode)
+	void PrintDatabaseError(ErrorData error, const string &query = string());
 	int RunInitialCommand(const char *sql, bool bail);
+	//! Expand `{parameter|default}` placeholders in a command using the parameters set on the command line
+	bool ExpandCommandParameters(const string &command, string &result);
 	void AddError();
 
 	SuccessState ExecuteSQL(const string &zSql);
@@ -365,6 +411,11 @@ public:
 	bool ShouldUsePager(ShellRenderer &renderer, RenderingQueryResult &result);
 	bool ShouldUsePager();
 	bool ShouldUsePager(idx_t line_count);
+	//! Whether to page a block of output based on whether it fits on the screen - either too tall (line_count vs the
+	//! terminal height) or too wide (render_width vs the max render width). Used for tree output.
+	bool ShouldUsePagerForSize(idx_t line_count, idx_t render_width);
+	//! The terminal height in rows, or 0 when it cannot be determined
+	idx_t GetScreenHeight();
 	idx_t GetMaxRenderWidth() const;
 	string GetSystemPager();
 	unique_ptr<PagerState> SetupPager();
@@ -398,6 +449,17 @@ public:
 	static void Sleep(idx_t ms);
 	void PrintUsage();
 	void DetectDarkLightMode();
+	//! Decide whether agent mode is active, from the -agent/-no-agent flags or the environment (see agent_mode)
+	void DetectAgentMode();
+	//! Whether the environment marks the shell as being run by an AI coding agent, which one, and by which variable
+	static bool DetectAgentEnvironment(string &agent_name, string &marker);
+	//! Print how agent mode renders and the engine features an agent should know about; `startup` is the one-line
+	//! form printed before anything runs
+	void PrintAgentHelp(PrintOutput output, bool startup);
+	//! On a failed run through a pipe with no agent detected and no -agent/-no-agent given: point at -agent
+	void PrintExitHint(int rc);
+	//! Print the planner's estimate of what a statement will read and return to stderr (agent mode)
+	void PrintQueryEstimate(const string &sql, const duckdb::SQLStatement &statement);
 #if defined(_WIN32) || defined(WIN32)
 	static std::wstring Win32Utf8ToUnicode(const string &zText);
 	static std::wstring Win32Utf8ToUnicode(const char *) = delete;
@@ -421,6 +483,10 @@ public:
 	SuccessState RenderQuery(ShellRenderer &renderer, const string &query, PagerMode pager_overwrite);
 	SuccessState RenderQueryResult(ShellRenderer &renderer, duckdb::QueryResult &result,
 	                               PagerMode pager_overwrite = PagerMode::PAGER_AUTOMATIC);
+	SuccessState RenderQueryResult(ShellRenderer &renderer, duckdb::QueryResultStream<> &stream,
+	                               PagerMode pager_overwrite = PagerMode::PAGER_AUTOMATIC);
+	SuccessState RenderPreparedResult(ShellRenderer &renderer, RenderingQueryResult &render_result,
+	                                  PagerMode pager_overwrite);
 	bool HighlightErrors() const;
 	bool HighlightResults() const;
 
@@ -434,6 +500,12 @@ public:
 	FILE *OpenOutputFile(const char *zFile, int bTextMode);
 	static void SetPrompt(char prompt[], const string &new_value);
 	static string ModeToString(RenderMode mode);
+	MetadataResult FormatSQL(string &sql);
+	void HighlightSQL(string &sql);
+	// Print a complete SQL statement directly to the output, applying syntax highlighting when appropriate
+	void PrintSQL(const string &sql);
+	string ReadFileContents(FILE *f);
+	string ReadFileContents(const string &filename);
 };
 
 struct PagerState {

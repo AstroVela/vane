@@ -1,11 +1,3 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-#
-# SPDX-FileCopyrightText: 2026 Vane contributors
-#
-# SPDX-License-Identifier: MIT
-#
-# Modified by Vane contributors.
-
 add_definitions(-DDUCKDB)
 
 if(${DISABLE_THREADS})
@@ -25,22 +17,11 @@ if(NOT MSVC)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wimplicit-fallthrough")
   endif()
 endif()
-set(EXIT_TIME_DESTRUCTORS_WARNING FALSE)
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}"
                                                   STREQUAL "AppleClang")
-  set(EXIT_TIME_DESTRUCTORS_WARNING TRUE)
   set(CMAKE_CXX_FLAGS_DEBUG
-      "${CMAKE_CXX_FLAGS_DEBUG} -Wexit-time-destructors -Wimplicit-int-conversion -Wshorten-64-to-32 -Wnarrowing -Wsign-conversion -Wsign-compare -Wconversion -Wtype-limits"
+      "${CMAKE_CXX_FLAGS_DEBUG} -Wimplicit-int-conversion -Wshorten-64-to-32 -Wnarrowing -Wsign-conversion -Wsign-compare -Wconversion -Wtype-limits"
   )
-endif()
-
-set(DUCKDB_SYSTEM_LIBS ${CMAKE_DL_LIBS})
-
-if(MSVC OR MINGW)
-  set(DUCKDB_SYSTEM_LIBS ${DUCKDB_SYSTEM_LIBS} ws2_32 rstrtmgr)
-endif()
-if(MSVC)
-  set(DUCKDB_SYSTEM_LIBS ${DUCKDB_SYSTEM_LIBS} bcrypt)
 endif()
 
 if(MSVC)
@@ -77,12 +58,10 @@ add_subdirectory(main)
 add_subdirectory(parallel)
 add_subdirectory(storage)
 add_subdirectory(transaction)
-add_subdirectory(verification)
 
 set(DUCKDB_LINK_LIBS
     duckdb_fsst
     duckdb_fmt
-    duckdb_pg_query
     duckdb_re2
     duckdb_miniz
     duckdb_utf8proc
@@ -104,6 +83,7 @@ endforeach(LINK_LIB)
 add_library(duckdb_static STATIC ${ALL_OBJECT_FILES} ${LINK_OBJECTS})
 target_link_libraries(duckdb_static PUBLIC ${DUCKDB_SYSTEM_LIBS})
 link_threads(duckdb_static PUBLIC)
+duckdb_make_native_lto_archive(duckdb_static)
 
 #
 # FIXME file(COPY ${CMAKE_SOURCE_DIR}/libduckdb_static.a  DESTINATION
@@ -112,18 +92,17 @@ link_threads(duckdb_static PUBLIC)
 # ${CMAKE_CURRENT_BINARY_DIR}/libduckdb_static.a)
 #
 
-add_library(duckdb SHARED ${ALL_OBJECT_FILES} ${LINK_OBJECTS})
+if(NATIVE_LTO_STATIC_LIBRARIES)
+  add_library(duckdb SHARED)
+  target_link_libraries(duckdb PRIVATE -Wl,--whole-archive duckdb_static
+                                       -Wl,--no-whole-archive)
+else()
+  add_library(duckdb SHARED ${ALL_OBJECT_FILES} ${LINK_OBJECTS})
+endif()
 target_link_libraries(duckdb PUBLIC ${DUCKDB_SYSTEM_LIBS})
 link_extension_libraries(duckdb PRIVATE)
 
 link_threads(duckdb PUBLIC)
-
-if(DUCKDB_DISTRIBUTED_LINK_LIBS)
-  # Static consumers still receive the concrete libraries as link-only
-  # dependencies, without inheriting Arrow's C++20 compile requirement.
-  target_link_libraries(duckdb_static PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
-  target_link_libraries(duckdb PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
-endif()
 
 if(SET_DUCKDB_LIBRARY_VERSION)
   set_target_properties(
@@ -162,6 +141,7 @@ install(
   FILES "${PROJECT_SOURCE_DIR}/src/include/duckdb.hpp"
         "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
         "${PROJECT_SOURCE_DIR}/src/include/duckdb_extension.h"
+        "${PROJECT_SOURCE_DIR}/src/include/duckdb_static_extension.h"
   DESTINATION "${INSTALL_INCLUDE_DIR}")
 
 install(

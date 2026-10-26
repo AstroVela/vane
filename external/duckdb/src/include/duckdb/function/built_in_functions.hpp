@@ -52,7 +52,6 @@ private:
 	void RegisterReadFunctions();
 	void RegisterTableFunctions();
 	void RegisterArrowFunctions();
-	void RegisterTensorFunctions();
 	void RegisterSnifferFunction();
 	void RegisterCopyFunctions();
 

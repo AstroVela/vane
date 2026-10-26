@@ -202,8 +202,7 @@ int strtodt(date_t *dest, char *s) {
 	}
 
 	if (sscanf(s, "%4d-%d-%d", &dest->year, &dest->month, &dest->day) != 3) {
-		fprintf(stderr, "ERROR: Invalid string to date conversion in strtodt\n");
-		nRetCode = -1;
+		INTERNAL("Invalid string to date conversion in strtodt");
 	}
 
 	dest->julian = dttoj(dest);
@@ -226,8 +225,8 @@ int strtodt(date_t *dest, char *s) {
  * TODO: 20000110 Need to handle more than Y4MD-
  */
 char *dttostr(date_t *d) {
-	static char *res;
-	static int init = 0;
+	static thread_local char *res;
+	static thread_local int init = 0;
 
 	if (!init) {
 		res = (char *)malloc(sizeof(char) * 11);
@@ -241,26 +240,6 @@ char *dttostr(date_t *d) {
 	sprintf(res, "%4d-%02d-%02d", d->year, d->month, d->day);
 
 	return (res);
-}
-
-/*
- * Routine: date_init
- * Purpose: set the date handling parameters
- * Algorithm:
- * Data Structures:
- *
- * Params: None
- * Returns: int; 0 on success
- * Called By:
- * Calls:
- * Assumptions:
- * Side Effects:
- * TODO: None
- */
-int date_init(void) {
-	printf("date_init is not yet complete\n");
-	exit(1);
-	return (0);
 }
 
 /*
@@ -387,11 +366,11 @@ int itodt(date_t *dest, int src) {
  * Side Effects:
  * TODO:
  */
-static int doomsday[4] = {3, 2, 0, 5};
-static int known[13] = {0, 3, 0, 0, 4, 9, 6, 11, 8, 5, 10, 7, 12};
+static thread_local int doomsday[4] = {3, 2, 0, 5};
+static thread_local int known[13] = {0, 3, 0, 0, 4, 9, 6, 11, 8, 5, 10, 7, 12};
 int set_dow(date_t *d) {
 
-	static int last_year = -1, dday;
+	static thread_local int last_year = -1, dday;
 	int res, q, r, s;
 
 	if (d->year != last_year) {

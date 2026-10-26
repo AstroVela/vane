@@ -1,198 +1,23 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/render_tree.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/tree_renderer.hpp"
-#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/execution/execution_context.hpp"
-#include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
-#include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
-#include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
-#include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
-#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
-#include "duckdb/execution/operator/aggregate/physical_window.hpp"
-#include "duckdb/execution/operator/aggregate/physical_streaming_window.hpp"
-#include "duckdb/function/function_binder.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
-#include "duckdb/execution/operator/projection/physical_vllm.hpp"
-
-#include "duckdb/execution/operator/projection/physical_pivot.hpp"
-#include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
-#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
-#include "duckdb/execution/operator/projection/physical_unnest.hpp"
-#include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
-#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
-#include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
-#include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
-#include "duckdb/execution/operator/filter/physical_filter.hpp"
-#include "duckdb/execution/operator/helper/physical_limit.hpp"
-#include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
-#include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
-#include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
-#include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
-#include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
-#include "duckdb/execution/operator/exchange/physical_local_exchange.hpp"
-#include "duckdb/execution/operator/exchange/physical_repartition.hpp"
-#include "duckdb/execution/operator/order/physical_order.hpp"
-#include "duckdb/execution/operator/order/physical_top_n.hpp"
-#include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
-#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
-#include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
-#include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
-#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
-#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
-#include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
-#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
-#include "duckdb/execution/operator/join/physical_asof_join.hpp"
-#include "duckdb/execution/operator/join/physical_hash_join.hpp"
-#include "duckdb/execution/operator/join/physical_cross_product.hpp"
-#include "duckdb/execution/operator/join/physical_positional_join.hpp"
-#include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
-#include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
-#include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
-#include "duckdb/planner/operator/logical_any_join.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/function/function_serialization.hpp"
-#include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/function/function_serialization.hpp"
-#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/storage/buffer/buffer_pool.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/serialization_data.hpp"
-#include "duckdb/execution/dynamic_filter_serialization.hpp"
 
 namespace duckdb {
-
-namespace {
-
-struct DynamicFilterSerializationGuard {
-	explicit DynamicFilterSerializationGuard(SerializationData &data_p) : data(data_p) {
-		if (!data.TryGetCustom<DynamicTableFilterSerializationState>()) {
-			data.SetCustom(state);
-			active = true;
-		}
-	}
-
-	~DynamicFilterSerializationGuard() {
-		if (active) {
-			data.UnsetCustom<DynamicTableFilterSerializationState>();
-		}
-	}
-
-	SerializationData &data;
-	DynamicTableFilterSerializationState state;
-	bool active = false;
-};
-
-struct CTESerializationState : public SerializationData::CustomData {
-	static string GetType() {
-		return "cte_state";
-	}
-
-	void Reset() {
-		working_tables.clear();
-		cte_ops.clear();
-	}
-
-	unordered_map<idx_t, shared_ptr<ColumnDataCollection>> working_tables;
-	unordered_map<idx_t, PhysicalCTE *> cte_ops;
-};
-
-static CTESerializationState &GetOrCreateCTEState(SerializationData &data) {
-	auto state_ptr = data.TryGetCustom<CTESerializationState>();
-	if (state_ptr) {
-		return *state_ptr;
-	}
-	static thread_local CTESerializationState state;
-	state.Reset();
-	data.SetCustom(state);
-	return state;
-}
-
-static void GatherDelimScans(PhysicalOperator &op, vector<const_reference<PhysicalOperator>> &delim_scans,
-                             optional_idx delim_idx) {
-	if (op.type == PhysicalOperatorType::DELIM_SCAN) {
-		auto &scan = op.Cast<PhysicalColumnDataScan>();
-		if (!delim_idx.IsValid() || scan.delim_index == delim_idx) {
-			delim_scans.push_back(op);
-		}
-	}
-	for (auto &child : op.children) {
-		GatherDelimScans(child, delim_scans, delim_idx);
-	}
-}
-
-static unique_ptr<DataChunk> MakeEmptyExecutionBatchChunk(ClientContext &context, const vector<LogicalType> &types) {
-	auto chunk = make_uniq<DataChunk>();
-	chunk->Initialize(BufferAllocator::Get(context), types);
-	chunk->SetCardinality(0);
-	return chunk;
-}
-
-static void StoreMaterializedExecutionBatch(ExecutionBatch &batch, unique_ptr<DataChunk> chunk) {
-	batch = ExecutionBatch();
-	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
-	if (chunk) {
-		batch.rows = chunk->size();
-		batch.estimated_bytes = batch.rows ? chunk->GetAllocationSize() : 0;
-	}
-	batch.materialized = std::move(chunk);
-}
-
-static DataChunk &MaterializeExecutionBatch(ClientContext &context, ExecutionBatch &batch,
-                                            const vector<LogicalType> &types, const char *reason) {
-	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
-		if (!batch.materialized) {
-			if (batch.rows > 0) {
-				throw InternalException("materialized ExecutionBatch has %llu rows but no payload", batch.rows);
-			}
-			StoreMaterializedExecutionBatch(batch, MakeEmptyExecutionBatchChunk(context, types));
-		}
-		return *batch.materialized;
-	}
-	if (batch.kind == ExecutionBatchKind::LAZY_DATA_CHUNK) {
-		if (!batch.lazy) {
-			if (batch.rows > 0) {
-				throw InternalException("lazy ExecutionBatch has %llu rows but no payload", batch.rows);
-			}
-			StoreMaterializedExecutionBatch(batch, MakeEmptyExecutionBatchChunk(context, types));
-			return *batch.materialized;
-		}
-		auto barrier = MaterializeExternalBlockBarrier(context, *batch.lazy, reason ? string(reason) : string());
-		// Once a lazy batch has been materialized, the returned DataChunk owns the
-		// materialized Arrow buffers. Drop the original descriptors immediately so
-		// their budget tickets do not artificially hold upstream ref-bundle
-		// backpressure while the downstream operator processes the chunk. Keep the
-		// materialized payload in the batch so a BLOCKED operator can retry it.
-		StoreMaterializedExecutionBatch(batch, std::move(barrier.chunk));
-		if (!batch.materialized) {
-			throw InternalException("materializing lazy ExecutionBatch produced no payload");
-		}
-		return *batch.materialized;
-	}
-	throw InternalException("unsupported ExecutionBatch kind");
-}
-
-} // namespace
 
 PhysicalOperator::PhysicalOperator(PhysicalPlan &physical_plan, PhysicalOperatorType type, vector<LogicalType> types,
                                    idx_t estimated_cardinality)
@@ -204,9 +29,13 @@ string PhysicalOperator::GetName() const {
 	return PhysicalOperatorToString(type);
 }
 
-string PhysicalOperator::ToString(ExplainFormat format) const {
-	auto renderer = TreeRenderer::CreateRenderer(format);
-	stringstream ss;
+string PhysicalOperator::ToString(optional_ptr<ClientContext> context, const ProfilerPrintFormat &format) const {
+	auto renderer = context ? TreeRenderer::CreateRenderer(*context, format) : TreeRenderer::CreateRenderer(format);
+	if (!renderer) {
+		// formats without output (e.g. "no_output") render nothing
+		return string();
+	}
+	StringTreeRenderer ss;
 	auto tree = RenderTree::CreateRenderTree(*this);
 	renderer->ToStream(*tree, ss);
 	return ss.str();
@@ -217,22 +46,6 @@ void PhysicalOperator::Print() const {
 	Printer::Print(ToString());
 }
 // LCOV_EXCL_STOP
-
-vector<reference<PhysicalOperator>> PhysicalOperator::GetInputChildren() {
-	vector<reference<PhysicalOperator>> result;
-	for (auto &child : static_cast<const PhysicalOperator &>(*this).GetInputChildren()) {
-		result.push_back(const_cast<PhysicalOperator &>(child.get()));
-	}
-	return result;
-}
-
-vector<const_reference<PhysicalOperator>> PhysicalOperator::GetInputChildren() const {
-	vector<const_reference<PhysicalOperator>> result;
-	for (auto &child : children) {
-		result.push_back(child.get());
-	}
-	return result;
-}
 
 vector<const_reference<PhysicalOperator>> PhysicalOperator::GetChildren() const {
 	vector<const_reference<PhysicalOperator>> result;
@@ -271,7 +84,7 @@ bool PhysicalOperator::CanSaturateThreads(ClientContext &context) const {
 	// In debug mode we always return true here so that the code that depends on it is well-tested
 	return true;
 #else
-	const auto num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	const auto num_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	return EstimatedThreadCount() >= num_threads;
 #endif
 }
@@ -288,37 +101,18 @@ unique_ptr<GlobalOperatorState> PhysicalOperator::GetGlobalOperatorState(ClientC
 	return make_uniq<GlobalOperatorState>();
 }
 
+bool PhysicalOperator::ResetGlobalOperatorState(ClientContext &context, GlobalOperatorState &state) const {
+	return false;
+}
+
 OperatorResultType PhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                              GlobalOperatorState &gstate, OperatorState &state) const {
 	throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
-OperatorResultType PhysicalOperator::ExecuteBatch(ExecutionContext &context, ExecutionBatch &input,
-                                                  ExecutionBatch &output, GlobalOperatorState &gstate,
-                                                  OperatorState &state) const {
-	auto input_types = children.empty() ? vector<LogicalType>() : children[0].get().GetTypes();
-	auto barrier_reason = GetName();
-	auto &input_chunk = MaterializeExecutionBatch(context.client, input, input_types, barrier_reason.c_str());
-	auto output_chunk = make_uniq<DataChunk>();
-	output_chunk->Initialize(BufferAllocator::Get(context.client), types);
-	auto result = Execute(context, input_chunk, *output_chunk, gstate, state);
-	StoreMaterializedExecutionBatch(output, std::move(output_chunk));
-	return result;
-}
-
 OperatorFinalizeResultType PhysicalOperator::FinalExecute(ExecutionContext &context, DataChunk &chunk,
                                                           GlobalOperatorState &gstate, OperatorState &state) const {
 	throw InternalException("Calling FinalExecute on a node that is not an operator!");
-}
-
-OperatorFinalizeResultType PhysicalOperator::FinalExecuteBatch(ExecutionContext &context, ExecutionBatch &batch,
-                                                               GlobalOperatorState &gstate,
-                                                               OperatorState &state) const {
-	auto chunk = make_uniq<DataChunk>();
-	chunk->Initialize(BufferAllocator::Get(context.client), types);
-	auto result = FinalExecute(context, *chunk, gstate, state);
-	StoreMaterializedExecutionBatch(batch, std::move(chunk));
-	return result;
 }
 
 OperatorFinalResultType PhysicalOperator::OperatorFinalize(Pipeline &pipeline, Event &event, ClientContext &context,
@@ -339,23 +133,16 @@ unique_ptr<GlobalSourceState> PhysicalOperator::GetGlobalSourceState(ClientConte
 	return make_uniq<GlobalSourceState>();
 }
 
+unique_ptr<GlobalSourceState>
+PhysicalOperator::GetGlobalSourceState(ClientContext &context, const OperatorPartitionInfo &partition_info) const {
+	(void)partition_info;
+	return GetGlobalSourceState(context);
+}
+
 // LCOV_EXCL_START
 SourceResultType PhysicalOperator::GetData(ExecutionContext &context, DataChunk &chunk,
                                            OperatorSourceInput &input) const {
 	return GetDataInternal(context, chunk, input);
-}
-
-SourceResultType PhysicalOperator::GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
-                                                OperatorSourceInput &input) const {
-	auto chunk = make_uniq<DataChunk>();
-	if (type == PhysicalOperatorType::EMPTY_RESULT) {
-		chunk->InitializeEmpty(types);
-	} else {
-		chunk->Initialize(BufferAllocator::Get(context.client), types);
-	}
-	auto result = GetData(context, *chunk, input);
-	StoreMaterializedExecutionBatch(batch, std::move(chunk));
-	return result;
 }
 
 SourceResultType PhysicalOperator::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
@@ -369,10 +156,17 @@ OperatorPartitionData PhysicalOperator::GetPartitionData(ExecutionContext &conte
 	throw InternalException("Calling GetPartitionData on a node that does not support it");
 }
 
+TableFunctionParallelism PhysicalOperator::SourceParallelism() const {
+	return TableFunctionParallelism::SELF_MANAGED_PARALLELISM;
+}
+
 ProgressData PhysicalOperator::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
 	ProgressData res;
 	res.SetInvalid();
 	return res;
+}
+
+void PhysicalOperator::SourceFinished(ClientContext &context, GlobalSourceState &gstate) const {
 }
 // LCOV_EXCL_STOP
 
@@ -382,14 +176,6 @@ ProgressData PhysicalOperator::GetProgress(ClientContext &context, GlobalSourceS
 // LCOV_EXCL_START
 SinkResultType PhysicalOperator::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	throw InternalException("Calling Sink on a node that is not a sink!");
-}
-
-SinkResultType PhysicalOperator::SinkBatch(ExecutionContext &context, ExecutionBatch &batch,
-                                           OperatorSinkInput &input) const {
-	auto input_types = children.empty() ? vector<LogicalType>() : children[0].get().GetTypes();
-	auto barrier_reason = GetName();
-	auto &chunk = MaterializeExecutionBatch(context.client, batch, input_types, barrier_reason.c_str());
-	return Sink(context, chunk, input);
 }
 
 // LCOV_EXCL_STOP
@@ -410,6 +196,11 @@ SinkNextBatchType PhysicalOperator::NextBatch(ExecutionContext &context, Operato
 	return SinkNextBatchType::READY;
 }
 
+SinkNextBatchType PhysicalOperator::UpdateMinBatchIndex(ExecutionContext &context,
+                                                        OperatorSinkNextBatchInput &input) const {
+	return SinkNextBatchType::READY;
+}
+
 unique_ptr<LocalSinkState> PhysicalOperator::GetLocalSinkState(ExecutionContext &context) const {
 	return make_uniq<LocalSinkState>();
 }
@@ -421,15 +212,17 @@ unique_ptr<GlobalSinkState> PhysicalOperator::GetGlobalSinkState(ClientContext &
 idx_t PhysicalOperator::GetMaxThreadMemory(ClientContext &context) {
 	// Memory usage per thread should scale with max mem / num threads
 	// We take 1/4th of this, to be conservative
-	auto max_memory = BufferManager::GetBufferManager(context).GetQueryMaxMemory();
-	auto num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	auto max_memory = BufferManager::GetBufferManager(context).GetOperatorMemoryLimit();
+	auto num_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	return (max_memory / num_threads) / 4;
 }
 
 OperatorCachingMode PhysicalOperator::SelectOperatorCachingMode(ExecutionContext &context) {
-	if (!context.client.config.enable_caching_operators) {
+	if (!Settings::Get<EnableCachingOperatorsSetting>(context.client)) {
 		return OperatorCachingMode::NONE;
 	} else if (!context.pipeline) {
+		return OperatorCachingMode::NONE;
+	} else if (context.pipeline->CanStopSourceEarly()) {
 		return OperatorCachingMode::NONE;
 	} else if (!context.pipeline->GetSink()) {
 		return OperatorCachingMode::NONE;
@@ -527,8 +320,10 @@ bool CachingPhysicalOperator::CanCacheType(const LogicalType &type) {
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::ARRAY:
+	case LogicalTypeId::VARIANT:
 		return false;
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		auto &entries = StructType::GetChildTypes(type);
 		for (auto &entry : entries) {
 			if (!CanCacheType(entry.second)) {
@@ -563,10 +358,8 @@ enum class CachingPhysicalOperatorExecuteMode : uint8_t {
 	RETURN_CACHED
 };
 
-static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &chunk,
-                                                              const OperatorResultType child_result,
-                                                              CachingOperatorState &state,
-                                                              ClientContext &client_context) {
+static CachingPhysicalOperatorExecuteMode
+SelectExecutionMode(const DataChunk &chunk, const OperatorResultType child_result, CachingOperatorState &state) {
 	if (state.can_cache_chunk == OperatorCachingMode::NONE) {
 		return CachingPhysicalOperatorExecuteMode::RETURN_CHUNK;
 	}
@@ -601,12 +394,7 @@ static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &c
 		return CachingPhysicalOperatorExecuteMode::RETURN_CHUNK;
 	} else if (chunk.size() <= CachingPhysicalOperator::CACHE_THRESHOLD && !needs_continuation_chunk) {
 		// We have filtered out a significant amount of tuples
-
-		if (!state.cached_chunk) {
-			// Initialize cached_chunk
-			state.cached_chunk = make_uniq<DataChunk>();
-			state.cached_chunk->Initialize(Allocator::Get(client_context), chunk.GetTypes());
-		}
+		// The cache is materialised lazily by AppendToCache on first use
 
 		if (has_space_for_chunk_in_cache) {
 			// We can just append, do and return empty chunk
@@ -625,9 +413,9 @@ static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &c
 		D_ASSERT(state.cached_chunk->size() > 0);
 
 		if (chunk.size() <= CachingPhysicalOperator::CACHE_THRESHOLD) {
-			// We can consider appening
+			// We can consider appending
 			if (chunk.size() + state.cached_chunk->size() <= STANDARD_VECTOR_SIZE) {
-				// Both fit toghether, append then return
+				// Both fit together, append then return
 				return CachingPhysicalOperatorExecuteMode::RETURN_CACHED_PLUS_CHUNK;
 			}
 			if (needs_continuation_chunk) {
@@ -643,6 +431,136 @@ static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &c
 		return CachingPhysicalOperatorExecuteMode::RETURN_CACHED_THEN_CHUNK_VIA_CONTINUATION;
 	}
 	return CachingPhysicalOperatorExecuteMode::RETURN_CHUNK;
+}
+
+//! Only global dictionaries may be accumulated: the cache holds the entry by reference across child Execute calls and
+//! materializes its strings lazily (on rotation/flush), so the child data must outlive the producing chunk. A global
+//! dictionary is wrapped by the producer for its whole lifetime; a non-global (per-chunk) dict points into storage that
+//! is recycled once its chunk is done, so accumulating it by reference would read freed data - fall back to flat
+//! caching. Empty-id dicts (e.g. slice-of-flat) mint a fresh entry per slice and are never global.
+static inline bool IsAccumulableDictionary(const Vector &vector) {
+	return vector.GetVectorType() == VectorType::DICTIONARY_VECTOR && !DictionaryVector::DictionaryId(vector).empty() &&
+	       DictionaryVector::IsGlobalDictionary(vector);
+}
+
+static bool ChunkHasAccumulableDictionary(const DataChunk &chunk) {
+	for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+		if (IsAccumulableDictionary(chunk.data[col_idx])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Switch the empty cache to dictionary mode: pin each accumulable dictionary column's upstream entry and allocate
+//! its sel accumulator. Columns keep a real (resettable) cache so a flushed dict column flattens on the next Reset.
+static void SeedDictCache(CachingOperatorState &state, DataChunk &source) {
+	const idx_t col_count = source.ColumnCount();
+	state.dict_columns.clear();
+	state.dict_columns.resize(col_count);
+	for (idx_t col_idx = 0; col_idx < col_count; col_idx++) {
+		if (!IsAccumulableDictionary(source.data[col_idx])) {
+			continue;
+		}
+		auto &slot = state.dict_columns[col_idx];
+		slot.entry = source.data[col_idx].BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
+		slot.accumulated_sel.Initialize(STANDARD_VECTOR_SIZE);
+	}
+	state.dict_cache_active = true;
+}
+
+//! On identity change, demote just this column to flat (materializing the rows so far) instead of flushing the
+//! whole cache, so sibling columns keep accumulating and the chunk still coalesces.
+static void FlattenDictColumn(CachingOperatorState &state, DataChunk &cache, idx_t col_idx, idx_t base) {
+	auto &slot = state.dict_columns[col_idx];
+	D_ASSERT(slot.entry);
+	FlatVector::SetSize(cache.data[col_idx], 0);
+	if (base > 0) {
+		// materialize into the cache's own slot so the possibly-shared upstream child is never flattened in place
+		cache.data[col_idx].Append(slot.entry->data, slot.accumulated_sel, base, VectorAppendMode::ERROR_ON_NO_SPACE);
+	}
+	slot.entry = nullptr;
+}
+
+//! Append source into the cache (created lazily). On the first append into an empty cache, detect
+//! accumulable dictionary columns; those concatenate their selection indices instead of flattening.
+static void AppendToCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
+	if (!state.cached_chunk) {
+		state.cached_chunk = make_uniq<DataChunk>();
+		state.cached_chunk->Initialize(Allocator::Get(client_context), source.GetTypes());
+	}
+	auto &cache = *state.cached_chunk;
+	if (cache.size() == 0 && !state.dict_cache_active && ChunkHasAccumulableDictionary(source)) {
+		SeedDictCache(state, source);
+	}
+	if (!state.dict_cache_active) {
+		// no dict columns: plain flat append
+		cache.Append(source);
+		return;
+	}
+	const idx_t base = cache.size();
+	const idx_t added = source.size();
+	// accumulated_sel is sized STANDARD_VECTOR_SIZE and the caching state machine guarantees base + added stays
+	// within it. Index accumulation has no overrun guard of its own (unlike the flat Append), so assert it.
+	D_ASSERT(base + added <= STANDARD_VECTOR_SIZE);
+	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
+		auto &slot = state.dict_columns[col_idx];
+		if (slot.entry) {
+			auto &source_col = source.data[col_idx];
+			// Compare the pinned entry by pointer: cheaper than the string id and exact, since pinning keeps the
+			// address stable (no ABA). The type check must come first to guard the Cast against a flat vector.
+			const bool same_dict = source_col.GetVectorType() == VectorType::DICTIONARY_VECTOR &&
+			                       &source_col.Buffer().Cast<DictionaryBuffer>().GetEntry() == slot.entry.get();
+			if (same_dict) {
+				const auto &source_sel = DictionaryVector::SelVector(source_col);
+				for (idx_t row = 0; row < added; row++) {
+					slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
+				}
+				continue;
+			}
+			// A global dictionary wraps the same entry for the producer's lifetime, so a change is a producer bug
+			// that would desync the downstream sink layout -> fail loudly. A non-global dict rotating is normal.
+			if (slot.entry->global_dictionary) {
+				throw InternalException("dict-surviving cache: global dictionary column %llu changed identity "
+				                        "after being seeded for dictionary caching",
+				                        static_cast<uint64_t>(col_idx));
+			}
+			FlattenDictColumn(state, cache, col_idx, base);
+		}
+		// reached by originally-flat and just-demoted columns
+		D_ASSERT(!slot.entry);
+		FlatVector::SetSize(cache.data[col_idx], base);
+		cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
+	}
+	// dict columns are rewrapped on flush, flat columns already sized; this only sets the cardinality
+	cache.SetChildCardinality(base + added);
+}
+
+//! After moving the cache into chunk, re-wrap each dict column as a DICTIONARY_VECTOR over the
+//! pinned upstream entry, carrying its id and global_dictionary flag through unchanged.
+static void RewrapDictColumns(CachingOperatorState &state, DataChunk &chunk, idx_t count) {
+	for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+		auto &slot = state.dict_columns[col_idx];
+		if (!slot.entry) {
+			continue;
+		}
+		chunk.data[col_idx].Dictionary(slot.entry, slot.accumulated_sel, count);
+	}
+}
+
+//! Move the cache into chunk (reconstructing dict columns) and re-initialize an empty cache for the next
+//! batch. With no dict columns this is the plain flat flush.
+static void FlushCacheToChunk(CachingOperatorState &state, DataChunk &chunk, ClientContext &client_context) {
+	if (!state.dict_cache_active) {
+		chunk.Move(*state.cached_chunk);
+		state.cached_chunk->Initialize(Allocator::Get(client_context), chunk.GetTypes());
+		return;
+	}
+	const idx_t count = state.cached_chunk->size();
+	chunk.Move(*state.cached_chunk);
+	RewrapDictColumns(state, chunk, count);
+	state.cached_chunk->Initialize(Allocator::Get(client_context), chunk.GetTypes());
+	state.ResetDictCache();
 }
 
 OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
@@ -675,33 +593,32 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		}
 	}
 
-	const auto execution_mode = SelectExecutionMode(chunk, child_result, state, context.client);
+	const auto execution_mode = SelectExecutionMode(chunk, child_result, state);
 
+	// Appends and flushes MUST route through AppendToCache / FlushCacheToChunk: a raw Append flattens a zero-width
+	// dict placeholder and a raw flush drops the dict. (The continuation case below Moves a fresh chunk in -- a
+	// full replacement, not an append -- so raw dict columns pass through verbatim.)
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {
 		auto tmp = make_uniq<DataChunk>();
 		tmp->Move(chunk);
-		chunk.Move(*state.cached_chunk);
-		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
-		state.cached_chunk->Append(*tmp);
+		FlushCacheToChunk(state, chunk, context.client);
+		AppendToCache(state, *tmp, context.client);
 		break;
 	}
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_PLUS_CHUNK:
-		state.cached_chunk->Append(chunk);
-		chunk.Move(*state.cached_chunk);
-		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+		AppendToCache(state, chunk, context.client);
+		FlushCacheToChunk(state, chunk, context.client);
 		break;
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED:
 		D_ASSERT(chunk.size() == 0);
-		chunk.Move(*state.cached_chunk);
-		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+		FlushCacheToChunk(state, chunk, context.client);
 		break;
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_THEN_CHUNK_VIA_CONTINUATION: {
 		// Swap chunk and *state.cached_chunk
 		auto tmp = make_uniq<DataChunk>();
 		tmp->Move(chunk);
-		chunk.Move(*state.cached_chunk);
-		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+		FlushCacheToChunk(state, chunk, context.client);
 		state.cached_chunk->Move(*tmp);
 
 		// Now chunk holds what was in (*state.cached_chunk), and it's returned directly
@@ -711,12 +628,23 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 	case CachingPhysicalOperatorExecuteMode::APPEND_CHUNK: {
-		state.cached_chunk->Append(chunk);
+		AppendToCache(state, chunk, context.client);
 		chunk.Reset();
 		break;
 	}
 	case CachingPhysicalOperatorExecuteMode::RETURN_CHUNK:
 		break;
+	}
+
+	// A flushed/reset dict column can leave the reused output chunk holding a DICTIONARY_VECTOR over a null cache
+	// slot that Reset cannot flatten; on an empty result that desyncs the chunk, so flatten stale columns to flat.
+	if (chunk.size() == 0) {
+		for (auto &vector : chunk.data) {
+			const auto vector_type = vector.GetVectorType();
+			if (vector_type != VectorType::FLAT_VECTOR && vector_type != VectorType::CONSTANT_VECTOR) {
+				vector.Initialize();
+			}
+		}
 	}
 
 	return child_result;
@@ -727,864 +655,16 @@ OperatorFinalizeResultType CachingPhysicalOperator::FinalExecute(ExecutionContex
                                                                  OperatorState &state_p) const {
 	auto &state = state_p.Cast<CachingOperatorState>();
 	if (state.cached_chunk) {
+		const idx_t count = state.cached_chunk->size();
+		const bool dict_cache_active = state.dict_cache_active;
 		chunk.Move(*state.cached_chunk);
+		if (dict_cache_active) {
+			RewrapDictColumns(state, chunk, count);
+			state.ResetDictCache();
+		}
 		state.cached_chunk.reset();
-	} else {
-		chunk.SetCardinality(0);
 	}
 	return OperatorFinalizeResultType::FINISHED;
-}
-
-void PhysicalOperator::Serialize(Serializer &serializer) const {
-	auto &data = serializer.GetSerializationData();
-	DynamicFilterSerializationGuard guard(data);
-
-	// Write common fields
-	serializer.WriteProperty(100, "type", type);
-	serializer.WriteProperty(101, "types", types);
-	serializer.WriteProperty(102, "estimated_cardinality", estimated_cardinality);
-
-	// Write operator-specific data (virtual call to derived class)
-	SerializeOperatorData(serializer);
-
-	// Write children as a list
-	serializer.WriteList(198, "children", children.size(), [&](Serializer::List &list, idx_t i) {
-		list.WriteObject([&](Serializer &child_serializer) { children[i].get().Serialize(child_serializer); });
-	});
-}
-
-void PhysicalOperator::SerializeOperatorData(Serializer &serializer) const {
-	// Default implementation: no operator-specific data
-}
-
-unique_ptr<PhysicalOperator> PhysicalOperator::Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan) {
-	auto &data = deserializer.GetSerializationData();
-	DynamicFilterSerializationGuard guard(data);
-
-	// Read common fields
-	auto op_type = deserializer.ReadProperty<PhysicalOperatorType>(100, "type");
-	auto types = deserializer.ReadProperty<vector<LogicalType>>(101, "types");
-	auto estimated_cardinality = deserializer.ReadProperty<idx_t>(102, "estimated_cardinality");
-
-	// Dispatch to operator-specific deserialization
-	auto result =
-	    DeserializeOperatorData(deserializer, physical_plan, op_type, std::move(types), estimated_cardinality);
-
-	// Read and deserialize children
-	deserializer.ReadList(198, "children", [&](Deserializer::List &list, idx_t /*i*/) {
-		list.ReadObject([&](Deserializer &child_deserializer) {
-			auto child = Deserialize(child_deserializer, physical_plan);
-			PhysicalOperator *child_ptr = child.get();
-			physical_plan.TakeOwnership(std::move(child));
-			result->children.push_back(*child_ptr);
-		});
-	});
-
-	return result;
-}
-
-unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deserializer &deserializer,
-                                                                       PhysicalPlan &physical_plan,
-                                                                       PhysicalOperatorType op_type,
-                                                                       vector<LogicalType> types,
-                                                                       idx_t estimated_cardinality) {
-	switch (op_type) {
-	case PhysicalOperatorType::PROJECTION: {
-		// Read projection-specific field: select_list
-		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
-		return make_uniq<PhysicalProjection>(physical_plan, std::move(types), std::move(select_list),
-		                                     estimated_cardinality);
-	}
-	case PhysicalOperatorType::VLLM_PROJECT: {
-		unique_ptr<Expression> prompt_expr;
-		string model;
-		Value options;
-		string output_column_name;
-		try {
-			prompt_expr = deserializer.ReadProperty<unique_ptr<Expression>>(103, "prompt_expr");
-		} catch (const std::exception &ex) {
-			throw SerializationException("VLLM_PROJECT deserialize failed reading prompt_expr: %s", ex.what());
-		}
-		try {
-			model = deserializer.ReadProperty<string>(104, "model");
-		} catch (const std::exception &ex) {
-			throw SerializationException("VLLM_PROJECT deserialize failed reading model: %s", ex.what());
-		}
-		try {
-			options = deserializer.ReadProperty<Value>(105, "options");
-		} catch (const std::exception &ex) {
-			throw SerializationException("VLLM_PROJECT deserialize failed reading options: %s", ex.what());
-		}
-		try {
-			output_column_name = deserializer.ReadProperty<string>(106, "output_column_name");
-		} catch (const std::exception &ex) {
-			throw SerializationException("VLLM_PROJECT deserialize failed reading output_column_name: %s", ex.what());
-		}
-		return make_uniq<PhysicalVLLM>(physical_plan, std::move(types), std::move(prompt_expr), std::move(model),
-		                               std::move(options), std::move(output_column_name), estimated_cardinality);
-	}
-	case PhysicalOperatorType::UNNEST: {
-		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
-		return make_uniq<PhysicalUnnest>(physical_plan, std::move(types), std::move(select_list),
-		                                 estimated_cardinality);
-	}
-	case PhysicalOperatorType::GROUPING_SET_EXPAND: {
-		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
-		auto grouping_sets = deserializer.ReadProperty<vector<GroupingSet>>(104, "grouping_sets");
-		auto grouping_functions = deserializer.ReadProperty<vector<vector<idx_t>>>(105, "grouping_functions");
-		auto filter_indexes = deserializer.ReadProperty<vector<idx_t>>(106, "filter_indexes");
-		auto input_column_count = deserializer.ReadProperty<idx_t>(107, "input_column_count");
-		auto emit_empty_grouping_sets = deserializer.ReadProperty<bool>(108, "emit_empty_grouping_sets");
-		return make_uniq<PhysicalGroupingSetExpand>(
-		    physical_plan, std::move(types), std::move(groups), std::move(grouping_sets), std::move(grouping_functions),
-		    std::move(filter_indexes), input_column_count, emit_empty_grouping_sets, estimated_cardinality);
-	}
-	case PhysicalOperatorType::RESERVOIR_SAMPLE: {
-		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
-		return make_uniq<PhysicalReservoirSample>(physical_plan, std::move(types), std::move(options),
-		                                          estimated_cardinality);
-	}
-	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE: {
-		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
-		auto stage = static_cast<DistributedReservoirSampleStage>(deserializer.ReadProperty<uint8_t>(104, "stage"));
-		auto task_index = deserializer.ReadProperty<idx_t>(105, "task_index");
-		return make_uniq<PhysicalDistributedReservoirSample>(physical_plan, std::move(types), std::move(options), stage,
-		                                                     task_index, estimated_cardinality);
-	}
-	case PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE: {
-		DistributedExtensionWriteInfo info;
-		deserializer.ReadObject(103, "distributed_write_info", [&](Deserializer &object) {
-			info = DistributedExtensionWriteInfo::Deserialize(object);
-		});
-		auto query_id = deserializer.ReadProperty<string>(104, "query_id");
-		auto task_attempt_id = deserializer.ReadProperty<string>(105, "task_attempt_id");
-		auto result =
-		    make_uniq<PhysicalDistributedExtensionWrite>(physical_plan, std::move(info), estimated_cardinality);
-		if (!query_id.empty() || !task_attempt_id.empty()) {
-			throw SerializationException("distributed extension write plan must not transport a runtime task context");
-		}
-		return std::move(result);
-	}
-	case PhysicalOperatorType::DATA_SINK: {
-		auto operation_id = deserializer.ReadProperty<string>(103, "operation_id");
-		return make_uniq<PhysicalDataSink>(physical_plan, std::move(types), std::move(operation_id),
-		                                   estimated_cardinality);
-	}
-	case PhysicalOperatorType::STREAMING_SAMPLE: {
-		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
-		return make_uniq<PhysicalStreamingSample>(physical_plan, std::move(types), std::move(options),
-		                                          estimated_cardinality);
-	}
-	case PhysicalOperatorType::FILTER: {
-		// Read filter-specific field: expression
-		auto expression = deserializer.ReadProperty<unique_ptr<Expression>>(103, "expression");
-
-		// Create filter with empty select list (expression is set separately)
-		vector<unique_ptr<Expression>> empty_select_list;
-		auto filter = make_uniq<PhysicalFilter>(physical_plan, std::move(types), std::move(empty_select_list),
-		                                        estimated_cardinality);
-		filter->expression = std::move(expression);
-		return unique_ptr<PhysicalOperator>(std::move(filter));
-	}
-	case PhysicalOperatorType::LIMIT: {
-		auto limit_val = deserializer.ReadProperty<BoundLimitNode>(103, "limit_val");
-		auto offset_val = deserializer.ReadProperty<BoundLimitNode>(104, "offset_val");
-		return make_uniq<PhysicalLimit>(physical_plan, std::move(types), std::move(limit_val), std::move(offset_val),
-		                                estimated_cardinality);
-	}
-	case PhysicalOperatorType::STREAMING_LIMIT: {
-		auto limit_val = deserializer.ReadProperty<BoundLimitNode>(103, "limit_val");
-		auto offset_val = deserializer.ReadProperty<BoundLimitNode>(104, "offset_val");
-		auto parallel = deserializer.ReadProperty<bool>(105, "parallel");
-		return make_uniq<PhysicalStreamingLimit>(physical_plan, std::move(types), std::move(limit_val),
-		                                         std::move(offset_val), estimated_cardinality, parallel);
-	}
-	case PhysicalOperatorType::LIMIT_PERCENT: {
-		auto limit_val = deserializer.ReadProperty<BoundLimitNode>(103, "limit_val");
-		auto offset_val = deserializer.ReadProperty<BoundLimitNode>(104, "offset_val");
-		return make_uniq<PhysicalLimitPercent>(physical_plan, std::move(types), std::move(limit_val),
-		                                       std::move(offset_val), estimated_cardinality);
-	}
-	case PhysicalOperatorType::ORDER_BY: {
-		auto orders = deserializer.ReadProperty<vector<BoundOrderByNode>>(103, "orders");
-		auto projections = deserializer.ReadProperty<vector<idx_t>>(104, "projections");
-		auto is_index_sort = deserializer.ReadProperty<bool>(105, "is_index_sort");
-		return make_uniq<PhysicalOrder>(physical_plan, std::move(types), std::move(orders), std::move(projections),
-		                                estimated_cardinality, is_index_sort);
-	}
-	case PhysicalOperatorType::TOP_N: {
-		auto orders = deserializer.ReadProperty<vector<BoundOrderByNode>>(103, "orders");
-		auto limit = deserializer.ReadProperty<idx_t>(104, "limit");
-		auto offset = deserializer.ReadProperty<idx_t>(105, "offset");
-		return make_uniq<PhysicalTopN>(physical_plan, std::move(types), std::move(orders), limit, offset, nullptr,
-		                               estimated_cardinality);
-	}
-	case PhysicalOperatorType::DUMMY_SCAN: {
-		return make_uniq<PhysicalDummyScan>(physical_plan, std::move(types), estimated_cardinality);
-	}
-	case PhysicalOperatorType::EMPTY_RESULT: {
-		return make_uniq<PhysicalEmptyResult>(physical_plan, std::move(types), estimated_cardinality);
-	}
-	case PhysicalOperatorType::EXPRESSION_SCAN: {
-		auto expressions = deserializer.ReadProperty<vector<vector<unique_ptr<Expression>>>>(103, "expressions");
-		return make_uniq<PhysicalExpressionScan>(physical_plan, std::move(types), std::move(expressions),
-		                                         estimated_cardinality);
-	}
-	case PhysicalOperatorType::INOUT_FUNCTION: {
-		auto entry = FunctionSerializer::DeserializeBase<TableFunction, TableFunctionCatalogEntry>(
-		    deserializer, CatalogType::TABLE_FUNCTION_ENTRY);
-		auto function = std::move(entry.first);
-		auto has_serialize = entry.second;
-		unique_ptr<FunctionData> bind_data;
-		if (has_serialize) {
-			bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
-		} else {
-			throw SerializationException(
-			    "PhysicalTableInOutFunction deserialization requires function serialization for %s", function.name);
-		}
-
-		auto column_ids = deserializer.ReadProperty<vector<ColumnIndex>>(200, "column_ids");
-		auto projected_input = deserializer.ReadProperty<vector<column_t>>(201, "projected_input");
-		auto ordinality_idx = deserializer.ReadPropertyWithDefault<optional_idx>(202, "ordinality_idx");
-
-		auto inout = make_uniq<PhysicalTableInOutFunction>(physical_plan, std::move(types), std::move(function),
-		                                                   std::move(bind_data), std::move(column_ids),
-		                                                   estimated_cardinality, std::move(projected_input));
-		inout->ordinality_idx = ordinality_idx;
-		return unique_ptr<PhysicalOperator>(std::move(inout));
-	}
-	case PhysicalOperatorType::STREAMING_UDF: {
-		auto entry = FunctionSerializer::DeserializeBase<TableFunction, TableFunctionCatalogEntry>(
-		    deserializer, CatalogType::TABLE_FUNCTION_ENTRY);
-		auto function = std::move(entry.first);
-		auto has_serialize = entry.second;
-		unique_ptr<FunctionData> bind_data;
-		if (has_serialize) {
-			bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
-		} else {
-			throw SerializationException("PhysicalStreamingUDF deserialization requires function serialization for %s",
-			                             function.name);
-		}
-
-		auto column_ids = deserializer.ReadProperty<vector<ColumnIndex>>(200, "column_ids");
-		auto projected_input = deserializer.ReadProperty<vector<column_t>>(201, "projected_input");
-		auto ordinality_idx = deserializer.ReadPropertyWithDefault<optional_idx>(202, "ordinality_idx");
-
-		auto streaming =
-		    make_uniq<PhysicalStreamingUDF>(physical_plan, std::move(types), std::move(function), std::move(bind_data),
-		                                    std::move(column_ids), estimated_cardinality, std::move(projected_input));
-		streaming->ordinality_idx = ordinality_idx;
-		return unique_ptr<PhysicalOperator>(std::move(streaming));
-	}
-	case PhysicalOperatorType::CTE: {
-		auto ctename = deserializer.ReadProperty<string>(103, "ctename");
-		auto table_index = deserializer.ReadProperty<idx_t>(104, "table_index");
-		auto working_table_types =
-		    deserializer.ReadPropertyWithDefault<vector<LogicalType>>(105, "working_table_types");
-		auto right_types = types;
-		if (working_table_types.empty()) {
-			working_table_types = right_types;
-		}
-
-		auto cte = make_uniq<PhysicalCTE>(physical_plan, std::move(ctename), table_index, std::move(types),
-		                                  estimated_cardinality);
-
-		auto &context = deserializer.Get<ClientContext &>();
-		auto working_table = make_shared_ptr<ColumnDataCollection>(context, working_table_types);
-		cte->working_table = working_table;
-
-		auto &state = GetOrCreateCTEState(deserializer.GetSerializationData());
-		state.working_tables[table_index] = working_table;
-		state.cte_ops[table_index] = cte.get();
-		return unique_ptr<PhysicalOperator>(std::move(cte));
-	}
-	case PhysicalOperatorType::COLUMN_DATA_SCAN:
-	case PhysicalOperatorType::CHUNK_SCAN:
-	case PhysicalOperatorType::CTE_SCAN:
-	case PhysicalOperatorType::DELIM_SCAN:
-	case PhysicalOperatorType::RECURSIVE_CTE_SCAN:
-	case PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN: {
-		auto cte_index = deserializer.ReadProperty<idx_t>(103, "cte_index");
-		auto delim_index = deserializer.ReadProperty<optional_idx>(104, "delim_index");
-		auto has_collection = deserializer.ReadProperty<bool>(105, "has_collection");
-		auto collection = [&]() {
-			if (!has_collection) {
-				return optionally_owned_ptr<ColumnDataCollection>();
-			}
-			auto owned = deserializer.ReadProperty<unique_ptr<ColumnDataCollection>>(106, "collection");
-			return optionally_owned_ptr<ColumnDataCollection>(std::move(owned));
-		}();
-		auto scan = make_uniq<PhysicalColumnDataScan>(physical_plan, std::move(types), op_type, estimated_cardinality,
-		                                              std::move(collection));
-		scan->cte_index = cte_index;
-		scan->delim_index = delim_index;
-		scan->source_node_id = deserializer.ReadPropertyWithDefault<optional_idx>(107, "source_node_id");
-		if (op_type == PhysicalOperatorType::CTE_SCAN || op_type == PhysicalOperatorType::RECURSIVE_CTE_SCAN ||
-		    op_type == PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN) {
-			auto &state = GetOrCreateCTEState(deserializer.GetSerializationData());
-			auto cte_it = state.cte_ops.find(cte_index);
-			if (cte_it != state.cte_ops.end()) {
-				cte_it->second->cte_scans.push_back(*scan);
-			}
-			if (!scan->collection) {
-				auto table_it = state.working_tables.find(cte_index);
-				if (table_it != state.working_tables.end()) {
-					scan->collection = table_it->second.get();
-				}
-			}
-		}
-		return unique_ptr<PhysicalOperator>(std::move(scan));
-	}
-	case PhysicalOperatorType::TABLE_SCAN: {
-		auto entry = FunctionSerializer::DeserializeBase<TableFunction, TableFunctionCatalogEntry>(
-		    deserializer, CatalogType::TABLE_FUNCTION_ENTRY);
-		auto function = std::move(entry.first);
-		auto has_serialize = entry.second;
-		unique_ptr<FunctionData> bind_data;
-		if (has_serialize) {
-			bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
-		} else {
-			throw SerializationException(
-			    "PhysicalTableScan deserialization requires table function serialization for %s", function.name);
-		}
-
-		auto returned_types = deserializer.ReadProperty<vector<LogicalType>>(200, "returned_types");
-		auto column_ids = deserializer.ReadProperty<vector<ColumnIndex>>(201, "column_ids");
-		auto projection_ids = deserializer.ReadProperty<vector<idx_t>>(202, "projection_ids");
-		auto names = deserializer.ReadProperty<vector<string>>(203, "names");
-
-		unique_ptr<TableFilterSet> table_filters;
-		auto has_table_filters = deserializer.ReadPropertyWithDefault<bool>(204, "has_table_filters");
-		if (has_table_filters) {
-			auto filter_set = deserializer.ReadProperty<TableFilterSet>(205, "table_filters");
-			table_filters = make_uniq<TableFilterSet>(std::move(filter_set));
-		}
-
-		auto extra_info =
-		    deserializer.ReadPropertyWithExplicitDefault<ExtraOperatorInfo>(206, "extra_info", ExtraOperatorInfo {});
-		auto parameters =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<Value>>(207, "parameters", vector<Value>());
-		auto virtual_columns = deserializer.ReadPropertyWithExplicitDefault<virtual_column_map_t>(
-		    208, "virtual_columns", virtual_column_map_t());
-		auto dynamic_filters_id = deserializer.ReadPropertyWithDefault<optional_idx>(209, "dynamic_filters_id");
-
-		auto scan = make_uniq<PhysicalTableScan>(
-		    physical_plan, std::move(types), std::move(function), std::move(bind_data), std::move(returned_types),
-		    std::move(column_ids), std::move(projection_ids), std::move(names), std::move(table_filters),
-		    estimated_cardinality, std::move(extra_info), std::move(parameters), std::move(virtual_columns));
-		if (dynamic_filters_id.IsValid()) {
-			auto &state = deserializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
-			scan->dynamic_filters = state.GetFilters(dynamic_filters_id);
-		}
-		return unique_ptr<PhysicalOperator>(std::move(scan));
-	}
-	case PhysicalOperatorType::CROSS_PRODUCT: {
-		return make_uniq<PhysicalCrossProduct>(physical_plan, CrossProductDeserializeTag {}, std::move(types),
-		                                       estimated_cardinality);
-	}
-	case PhysicalOperatorType::POSITIONAL_JOIN: {
-		return make_uniq<PhysicalPositionalJoin>(physical_plan, PositionalJoinDeserializeTag {}, std::move(types),
-		                                         estimated_cardinality);
-	}
-	case PhysicalOperatorType::POSITIONAL_SCAN: {
-		vector<reference<PhysicalOperator>> child_tables;
-		deserializer.ReadList(103, "child_tables", [&](Deserializer::List &list, idx_t /*i*/) {
-			list.ReadObject([&](Deserializer &child_deserializer) {
-				auto child = PhysicalOperator::Deserialize(child_deserializer, physical_plan);
-				if (!child || child->type != PhysicalOperatorType::TABLE_SCAN) {
-					throw SerializationException("PhysicalPositionalScan deserialization requires TABLE_SCAN children");
-				}
-				auto child_ptr = child.get();
-				physical_plan.TakeOwnership(std::move(child));
-				child_tables.emplace_back(*child_ptr);
-			});
-		});
-		if (child_tables.size() < 2) {
-			throw SerializationException("PhysicalPositionalScan deserialization requires at least two child tables");
-		}
-		return make_uniq<PhysicalPositionalScan>(physical_plan, PositionalScanDeserializeTag {}, std::move(types),
-		                                         std::move(child_tables), estimated_cardinality);
-	}
-	case PhysicalOperatorType::BLOCKWISE_NL_JOIN: {
-		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
-		auto condition = deserializer.ReadProperty<unique_ptr<Expression>>(104, "condition");
-		if (!condition) {
-			throw SerializationException("PhysicalBlockwiseNLJoin deserialization requires a condition");
-		}
-
-		LogicalAnyJoin dummy_join(join_type);
-		dummy_join.types = std::move(types);
-		return make_uniq<PhysicalBlockwiseNLJoin>(physical_plan, dummy_join, std::move(condition), join_type,
-		                                          estimated_cardinality, true);
-	}
-	case PhysicalOperatorType::ASOF_JOIN: {
-		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
-		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
-		auto right_projection_map = deserializer.ReadProperty<vector<column_t>>(105, "right_projection_map");
-
-		LogicalComparisonJoin dummy_join(join_type);
-		dummy_join.types = std::move(types);
-		return make_uniq<PhysicalAsOfJoin>(physical_plan, dummy_join, std::move(conditions), join_type,
-		                                   std::move(right_projection_map), estimated_cardinality, true);
-	}
-	case PhysicalOperatorType::HASH_JOIN: {
-		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
-		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
-		auto condition_types = deserializer.ReadProperty<vector<LogicalType>>(105, "condition_types");
-		auto payload_col_idxs = deserializer.ReadProperty<vector<idx_t>>(106, "payload_col_idxs");
-		auto payload_col_types = deserializer.ReadProperty<vector<LogicalType>>(107, "payload_col_types");
-		auto lhs_col_idxs = deserializer.ReadProperty<vector<idx_t>>(108, "lhs_col_idxs");
-		auto lhs_col_types = deserializer.ReadProperty<vector<LogicalType>>(109, "lhs_col_types");
-		auto rhs_col_idxs = deserializer.ReadProperty<vector<idx_t>>(110, "rhs_col_idxs");
-		auto rhs_col_types = deserializer.ReadProperty<vector<LogicalType>>(111, "rhs_col_types");
-		auto delim_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(112, "delim_types");
-		vector<unique_ptr<BaseStatistics>> join_stats;
-		deserializer.ReadOptionalList(113, "join_stats", [&](Deserializer::List &list, idx_t /*i*/) {
-			list.ReadObject([&](Deserializer &item_deserializer) {
-				auto has_stats = item_deserializer.ReadProperty<bool>(0, "has_stats");
-				if (!has_stats) {
-					join_stats.push_back(nullptr);
-					return;
-				}
-				auto stats_type = item_deserializer.ReadProperty<LogicalType>(1, "type");
-				item_deserializer.Set<const LogicalType &>(stats_type);
-				auto stats = item_deserializer.ReadProperty<BaseStatistics>(2, "stats");
-				item_deserializer.Unset<LogicalType>();
-				join_stats.push_back(make_uniq<BaseStatistics>(std::move(stats)));
-			});
-		});
-		auto filter_pushdown =
-		    deserializer.ReadPropertyWithDefault<unique_ptr<JoinFilterPushdownInfo>>(114, "filter_pushdown");
-		MarkJoinBuildSummary mark_join_build_summary;
-		deserializer.ReadPropertyWithDefault<bool>(115, "mark_join_build_summary_valid", mark_join_build_summary.valid);
-		deserializer.ReadPropertyWithDefault<bool>(116, "mark_join_build_has_rows", mark_join_build_summary.has_rows);
-		deserializer.ReadPropertyWithDefault<bool>(117, "mark_join_build_has_null", mark_join_build_summary.has_null);
-		if (!mark_join_build_summary.IsConsistent() ||
-		    (mark_join_build_summary.valid &&
-		     (join_type != JoinType::MARK || (!delim_types.empty() && delim_types.size() + 1 == conditions.size())))) {
-			throw SerializationException("invalid global MARK join build summary for hash join");
-		}
-
-		LogicalComparisonJoin dummy_join(join_type);
-		dummy_join.types = std::move(types);
-
-		auto join = make_uniq<PhysicalHashJoin>(physical_plan, dummy_join, std::move(conditions), join_type,
-		                                        std::move(delim_types), estimated_cardinality, true);
-		join->condition_types = std::move(condition_types);
-		join->payload_columns.col_idxs = std::move(payload_col_idxs);
-		join->payload_columns.col_types = std::move(payload_col_types);
-		join->lhs_output_columns.col_idxs = std::move(lhs_col_idxs);
-		join->lhs_output_columns.col_types = std::move(lhs_col_types);
-		join->rhs_output_columns.col_idxs = std::move(rhs_col_idxs);
-		join->rhs_output_columns.col_types = std::move(rhs_col_types);
-		join->join_stats = std::move(join_stats);
-		join->filter_pushdown = std::move(filter_pushdown);
-		join->mark_join_build_summary = mark_join_build_summary;
-		return unique_ptr<PhysicalOperator>(std::move(join));
-	}
-	case PhysicalOperatorType::LEFT_DELIM_JOIN:
-	case PhysicalOperatorType::RIGHT_DELIM_JOIN: {
-		auto delim_idx = deserializer.ReadPropertyWithDefault<optional_idx>(103, "delim_idx");
-		unique_ptr<PhysicalOperator> join;
-		unique_ptr<PhysicalOperator> distinct;
-		deserializer.ReadObject(104, "join", [&](Deserializer &child_deserializer) {
-			join = PhysicalOperator::Deserialize(child_deserializer, physical_plan);
-		});
-		deserializer.ReadObject(105, "distinct", [&](Deserializer &child_deserializer) {
-			distinct = PhysicalOperator::Deserialize(child_deserializer, physical_plan);
-		});
-
-		if (!join || !distinct) {
-			throw SerializationException("Delim join deserialization failed: missing join or distinct operator");
-		}
-
-		auto *join_ptr = join.get();
-		auto *distinct_ptr = distinct.get();
-		physical_plan.TakeOwnership(std::move(join));
-		physical_plan.TakeOwnership(std::move(distinct));
-
-		vector<const_reference<PhysicalOperator>> delim_scans;
-		GatherDelimScans(*join_ptr, delim_scans, delim_idx);
-		if (!delim_idx.IsValid() && !delim_scans.empty()) {
-			auto &scan = delim_scans[0].get().Cast<PhysicalColumnDataScan>();
-			delim_idx = scan.delim_index;
-		}
-		if (delim_scans.empty()) {
-			throw SerializationException("Delim join deserialization failed: no DELIM_SCAN nodes found");
-		}
-
-		if (op_type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
-			return make_uniq<PhysicalLeftDelimJoin>(physical_plan, DelimJoinDeserializeTag {}, std::move(types),
-			                                        *join_ptr, *distinct_ptr, delim_scans, estimated_cardinality,
-			                                        delim_idx);
-		}
-		return make_uniq<PhysicalRightDelimJoin>(physical_plan, DelimJoinDeserializeTag {}, std::move(types), *join_ptr,
-		                                         *distinct_ptr, delim_scans, estimated_cardinality, delim_idx);
-	}
-	case PhysicalOperatorType::HASH_GROUP_BY: {
-		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
-		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
-		auto grouping_sets = deserializer.ReadProperty<vector<GroupingSet>>(105, "grouping_sets");
-		auto grouping_functions = deserializer.ReadProperty<vector<unsafe_vector<idx_t>>>(106, "grouping_functions");
-		auto &context = deserializer.Get<ClientContext &>();
-		for (auto &aggregate : aggregates) {
-			auto &bound_aggregate = aggregate->Cast<BoundAggregateExpression>();
-			if (bound_aggregate.order_bys) {
-				FunctionBinder::BindSortedAggregate(context, bound_aggregate, groups, grouping_sets);
-			}
-		}
-		return make_uniq<PhysicalHashAggregate>(
-		    physical_plan, context, std::move(types), std::move(aggregates), std::move(groups),
-		    std::move(grouping_sets), std::move(grouping_functions), estimated_cardinality,
-		    TupleDataValidityType::CAN_HAVE_NULL_VALUES, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-	}
-	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
-		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
-		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
-		auto group_minima = deserializer.ReadProperty<vector<Value>>(105, "group_minima");
-		auto required_bits = deserializer.ReadProperty<vector<idx_t>>(106, "required_bits");
-		auto &context = deserializer.Get<ClientContext &>();
-		for (auto &aggregate : aggregates) {
-			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), groups, nullptr);
-		}
-		return make_uniq<PhysicalPerfectHashAggregate>(physical_plan, context, std::move(types), std::move(aggregates),
-		                                               std::move(groups), std::move(group_minima),
-		                                               std::move(required_bits), estimated_cardinality);
-	}
-	case PhysicalOperatorType::PARTITIONED_AGGREGATE: {
-		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");
-		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
-		auto partitions = deserializer.ReadProperty<vector<column_t>>(105, "partitions");
-		auto &context = deserializer.Get<ClientContext &>();
-		for (auto &aggregate : aggregates) {
-			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), groups, nullptr);
-		}
-		return make_uniq<PhysicalPartitionedAggregate>(physical_plan, context, std::move(types), std::move(aggregates),
-		                                               std::move(groups), std::move(partitions), estimated_cardinality);
-	}
-	case PhysicalOperatorType::UNGROUPED_AGGREGATE: {
-		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "aggregates");
-		auto &context = deserializer.Get<ClientContext &>();
-		for (auto &aggregate : aggregates) {
-			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), {}, nullptr);
-		}
-		auto distinct_validity = deserializer.ReadPropertyWithExplicitDefault<TupleDataValidityType>(
-		    104, "distinct_validity", TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-		return make_uniq<PhysicalUngroupedAggregate>(physical_plan, std::move(types), std::move(aggregates),
-		                                             estimated_cardinality, distinct_validity);
-	}
-	case PhysicalOperatorType::WINDOW: {
-		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
-		return make_uniq<PhysicalWindow>(physical_plan, std::move(types), std::move(select_list),
-		                                 estimated_cardinality);
-	}
-	case PhysicalOperatorType::STREAMING_WINDOW: {
-		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
-		return make_uniq<PhysicalStreamingWindow>(physical_plan, std::move(types), std::move(select_list),
-		                                          estimated_cardinality);
-	}
-	case PhysicalOperatorType::PIVOT: {
-		auto bound_pivot = deserializer.ReadProperty<BoundPivotInfo>(103, "bound_pivot");
-		return make_uniq<PhysicalPivot>(physical_plan, std::move(types), std::move(bound_pivot), estimated_cardinality);
-	}
-	case PhysicalOperatorType::EXCHANGE_SINK: {
-		auto exchange_id = deserializer.ReadProperty<string>(103, "exchange_id");
-		auto node_id = deserializer.ReadProperty<string>(104, "node_id");
-		auto num_partitions = deserializer.ReadProperty<idx_t>(105, "num_partitions");
-		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(106, "repartition_type");
-		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(107, "partition_by");
-		auto local_dirs = deserializer.ReadProperty<vector<string>>(108, "local_dirs");
-		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
-		auto sink_output_location_prefix = deserializer.ReadProperty<string>(109, "sink_output_location_prefix");
-		auto range_boundaries = deserializer.ReadProperty<vector<string>>(110, "range_boundaries");
-		auto range_order_modifiers = deserializer.ReadProperty<vector<string>>(111, "range_order_modifiers");
-		auto sink_query_id = deserializer.ReadProperty<string>(112, "sink_query_id");
-		auto collect_mark_join_build_summary =
-		    deserializer.ReadPropertyWithDefault<bool>(113, "collect_mark_join_build_summary");
-		auto mark_join_build_expressions =
-		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(114, "mark_join_build_expressions");
-		auto preserve_order = deserializer.ReadPropertyWithDefault<bool>(115, "preserve_order");
-		// Create FlightExchangeManager from deserialized config
-		distributed::FlightExchangeConfig flight_config;
-		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
-		flight_config.node_id = node_id;
-		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
-		auto result = make_uniq<PhysicalRemoteExchangeSink>(
-		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
-		    repartition_type, std::move(partition_by), std::move(sink_query_id), std::move(sink_output_location_prefix),
-		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers), preserve_order);
-		if (collect_mark_join_build_summary) {
-			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
-		}
-		return unique_ptr<PhysicalOperator>(std::move(result));
-	}
-	case PhysicalOperatorType::EXCHANGE_SOURCE: {
-		auto exchange_id = deserializer.ReadProperty<string>(103, "exchange_id");
-		auto partition_indices = deserializer.ReadProperty<vector<idx_t>>(104, "partition_indices");
-		auto source_nodes = deserializer.ReadProperty<vector<string>>(105, "source_nodes");
-		auto timeout_seconds = deserializer.ReadProperty<double>(106, "flight_timeout_seconds");
-		auto source_handle_partition_ids =
-		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(107, "source_handle_partition_ids");
-		auto source_handle_node_ids =
-		    deserializer.ReadPropertyWithDefault<vector<string>>(108, "source_handle_node_ids");
-		auto source_handle_paths = deserializer.ReadPropertyWithDefault<vector<string>>(109, "source_handle_paths");
-		auto source_handle_flight_ports =
-		    deserializer.ReadPropertyWithDefault<vector<int>>(110, "source_handle_flight_ports");
-		auto runtime_source_node_id = deserializer.ReadPropertyWithDefault<optional_idx>(111, "runtime_source_node_id");
-		auto source_handle_attempt_ids =
-		    deserializer.ReadPropertyWithDefault<vector<idx_t>>(112, "source_handle_attempt_ids");
-		auto local_dirs = deserializer.ReadPropertyWithDefault<vector<string>>(113, "local_dirs");
-		auto source_handle_flight_server_epochs =
-		    deserializer.ReadProperty<vector<string>>(114, "source_handle_flight_server_epochs");
-		auto source_catalog_handles_explicit = deserializer.ReadProperty<bool>(115, "source_catalog_handles_explicit");
-		if (!source_catalog_handles_explicit) {
-			throw SerializationException("remote exchange source requires explicit catalog handles");
-		}
-		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
-		auto source_handle_task_partition_ids =
-		    deserializer.ReadProperty<vector<idx_t>>(117, "source_handle_task_partition_ids");
-		auto preserve_order = deserializer.ReadPropertyWithDefault<bool>(118, "preserve_order");
-		// Create FlightExchangeManager from deserialized config
-		distributed::FlightExchangeConfig flight_config;
-		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
-		flight_config.flight_timeout_seconds = timeout_seconds;
-		flight_config.expected_types = types;
-		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
-		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
-		std::vector<distributed::ExchangeSourceHandle> source_handles;
-		if (source_handle_partition_ids.size() != source_handle_node_ids.size() ||
-		    source_handle_partition_ids.size() != source_handle_paths.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_ports.size() ||
-		    source_handle_partition_ids.size() != source_handle_attempt_ids.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_server_epochs.size() ||
-		    source_handle_partition_ids.size() != source_handle_flight_hosts.size() ||
-		    source_handle_partition_ids.size() != source_handle_task_partition_ids.size()) {
-			throw SerializationException("remote exchange source handle metadata is inconsistent");
-		}
-		source_handles.reserve(source_handle_partition_ids.size());
-		for (idx_t i = 0; i < source_handle_partition_ids.size(); i++) {
-			distributed::ExchangeSourceHandle sh;
-			sh.partition_id = source_handle_partition_ids[i];
-			sh.source_task_partition_id = source_handle_task_partition_ids[i];
-			sh.attempt_id = source_handle_attempt_ids[i];
-			sh.node_id = source_handle_node_ids[i];
-			sh.flight_host = source_handle_flight_hosts[i];
-			sh.flight_port = source_handle_flight_ports[i];
-			sh.flight_server_epoch = source_handle_flight_server_epochs[i];
-			distributed::ExchangeSourceFile file;
-			file.path = source_handle_paths[i];
-			file.file_size = 0;
-			sh.files.push_back(std::move(file));
-			source_handles.push_back(std::move(sh));
-		}
-		return make_uniq<PhysicalRemoteExchangeSource>(physical_plan, std::move(types), estimated_cardinality,
-		                                               std::move(exchange_id), std::move(partition_indices),
-		                                               std::move(source_handles), std::move(exchange_mgr), source_nodes,
-		                                               runtime_source_node_id, preserve_order);
-	}
-	case PhysicalOperatorType::REPARTITION: {
-		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(103, "repartition_type");
-		bool has_num_partitions = false;
-		deserializer.ReadPropertyWithDefault(104, "has_num_partitions", has_num_partitions);
-		size_t num_partitions = 0;
-		if (has_num_partitions) {
-			num_partitions = deserializer.ReadProperty<idx_t>(105, "num_partitions");
-		}
-		auto partition_by = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(106, "partition_by");
-		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
-
-		std::shared_ptr<RepartitionSpec> spec;
-		switch (repartition_type) {
-		case RepartitionSpec::Type::Hash: {
-			vector<ExprRef> expr_refs;
-			expr_refs.reserve(partition_by.size());
-			for (auto &expr : partition_by) {
-				expr_refs.emplace_back(expr->Copy());
-			}
-			spec = RepartitionSpec::create_hash(num_partitions, std::move(expr_refs));
-			break;
-		}
-		case RepartitionSpec::Type::Random:
-			spec = RepartitionSpec::create_random(num_partitions);
-			break;
-		case RepartitionSpec::Type::IntoPartitions:
-			if (!num_partitions) {
-				num_partitions = 1;
-			}
-			spec = RepartitionSpec::create_into_partitions(num_partitions);
-			break;
-		case RepartitionSpec::Type::Range:
-			throw NotImplementedException("Deserialization not implemented for range repartition");
-		}
-
-		auto repartition =
-		    make_uniq<PhysicalRepartition>(physical_plan, std::move(types), std::move(spec), estimated_cardinality);
-		repartition->partition_by = std::move(partition_by);
-		return unique_ptr<PhysicalOperator>(std::move(repartition));
-	}
-	case PhysicalOperatorType::LOCAL_EXCHANGE: {
-		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(103, "repartition_type");
-		bool has_num_partitions = false;
-		deserializer.ReadPropertyWithDefault(104, "has_num_partitions", has_num_partitions);
-		size_t num_partitions = 0;
-		if (has_num_partitions) {
-			num_partitions = deserializer.ReadProperty<idx_t>(105, "num_partitions");
-		}
-		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(106, "partition_by");
-		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
-
-		std::shared_ptr<RepartitionSpec> spec;
-		switch (repartition_type) {
-		case RepartitionSpec::Type::Hash: {
-			vector<ExprRef> expr_refs;
-			expr_refs.reserve(partition_by.size());
-			for (auto &expr : partition_by) {
-				expr_refs.emplace_back(expr->Copy());
-			}
-			spec = RepartitionSpec::create_hash(num_partitions, std::move(expr_refs));
-			break;
-		}
-		case RepartitionSpec::Type::Random:
-			spec = RepartitionSpec::create_random(num_partitions);
-			break;
-		case RepartitionSpec::Type::IntoPartitions:
-			if (!num_partitions) {
-				throw SerializationException("LOCAL_EXCHANGE deserialize missing num_partitions");
-			}
-			spec = RepartitionSpec::create_into_partitions(num_partitions);
-			break;
-		case RepartitionSpec::Type::Range:
-			throw NotImplementedException("Deserialization not implemented for range repartition");
-		}
-
-		auto repartition =
-		    make_uniq<PhysicalLocalExchange>(physical_plan, std::move(types), std::move(spec), estimated_cardinality);
-		repartition->partition_by = std::move(partition_by);
-		return unique_ptr<PhysicalOperator>(std::move(repartition));
-	}
-	case PhysicalOperatorType::COPY_TO_FILE: {
-		auto &context = deserializer.Get<ClientContext &>();
-		auto name = deserializer.ReadProperty<string>(500, "name");
-		auto catalog_name = deserializer.ReadPropertyWithDefault<string>(505, "catalog_name");
-		auto schema_name = deserializer.ReadPropertyWithDefault<string>(506, "schema_name");
-		auto has_serialize = deserializer.ReadProperty<bool>(503, "has_serialize");
-		if (catalog_name.empty()) {
-			catalog_name = SYSTEM_CATALOG;
-		}
-		if (schema_name.empty()) {
-			schema_name = DEFAULT_SCHEMA;
-		}
-		auto &entry = Catalog::GetEntry(context, CatalogType::COPY_FUNCTION_ENTRY, catalog_name, schema_name, name);
-		auto &copy_entry = entry.Cast<CopyFunctionCatalogEntry>();
-		auto function = copy_entry.function;
-		unique_ptr<FunctionData> bind_data;
-		if (has_serialize) {
-			if (!function.deserialize) {
-				throw SerializationException("Copy function %s is missing deserialize hook", function.name);
-			}
-			deserializer.ReadObject(504, "function_data",
-			                        [&](Deserializer &obj) { bind_data = function.deserialize(obj, function); });
-		} else {
-			throw SerializationException("PhysicalCopyToFile deserialization requires function serialization for %s",
-			                             function.name);
-		}
-
-		auto file_path = deserializer.ReadProperty<string>(200, "file_path");
-		auto use_tmp_file = deserializer.ReadProperty<bool>(201, "use_tmp_file");
-		auto filename_pattern = deserializer.ReadProperty<FilenamePattern>(202, "filename_pattern");
-		auto file_extension = deserializer.ReadProperty<string>(203, "file_extension");
-		auto overwrite_mode = deserializer.ReadProperty<CopyOverwriteMode>(204, "overwrite_mode");
-		auto parallel = deserializer.ReadProperty<bool>(205, "parallel");
-		auto per_thread_output = deserializer.ReadProperty<bool>(206, "per_thread_output");
-		auto file_size_bytes = deserializer.ReadProperty<optional_idx>(207, "file_size_bytes");
-		auto rotate = deserializer.ReadProperty<bool>(208, "rotate");
-		auto return_type = deserializer.ReadProperty<CopyFunctionReturnType>(209, "return_type");
-		auto partition_output = deserializer.ReadProperty<bool>(210, "partition_output");
-		auto write_partition_columns = deserializer.ReadProperty<bool>(211, "write_partition_columns");
-		auto write_empty_file = deserializer.ReadProperty<bool>(212, "write_empty_file");
-		auto hive_file_pattern = deserializer.ReadProperty<bool>(213, "hive_file_pattern");
-		auto partition_columns = deserializer.ReadProperty<vector<idx_t>>(214, "partition_columns");
-		auto names = deserializer.ReadProperty<vector<string>>(215, "names");
-		auto expected_types = deserializer.ReadProperty<vector<LogicalType>>(216, "expected_types");
-
-		auto copy = make_uniq<PhysicalCopyToFile>(physical_plan, std::move(types), std::move(function),
-		                                          std::move(bind_data), estimated_cardinality);
-		copy->file_path = std::move(file_path);
-		copy->use_tmp_file = use_tmp_file;
-		copy->filename_pattern = std::move(filename_pattern);
-		copy->file_extension = std::move(file_extension);
-		copy->overwrite_mode = overwrite_mode;
-		copy->parallel = parallel;
-		copy->per_thread_output = per_thread_output;
-		copy->file_size_bytes = file_size_bytes;
-		copy->rotate = rotate;
-		copy->return_type = return_type;
-		copy->partition_output = partition_output;
-		copy->write_partition_columns = write_partition_columns;
-		copy->write_empty_file = write_empty_file;
-		copy->hive_file_pattern = hive_file_pattern;
-		copy->partition_columns = std::move(partition_columns);
-		copy->names = std::move(names);
-		copy->expected_types = std::move(expected_types);
-		return unique_ptr<PhysicalOperator>(std::move(copy));
-	}
-	case PhysicalOperatorType::BATCH_COPY_TO_FILE: {
-		auto &context = deserializer.Get<ClientContext &>();
-		auto name = deserializer.ReadProperty<string>(500, "name");
-		auto catalog_name = deserializer.ReadPropertyWithDefault<string>(505, "catalog_name");
-		auto schema_name = deserializer.ReadPropertyWithDefault<string>(506, "schema_name");
-		auto has_serialize = deserializer.ReadProperty<bool>(503, "has_serialize");
-		if (catalog_name.empty()) {
-			catalog_name = SYSTEM_CATALOG;
-		}
-		if (schema_name.empty()) {
-			schema_name = DEFAULT_SCHEMA;
-		}
-		auto &entry = Catalog::GetEntry(context, CatalogType::COPY_FUNCTION_ENTRY, catalog_name, schema_name, name);
-		auto &copy_entry = entry.Cast<CopyFunctionCatalogEntry>();
-		auto function = copy_entry.function;
-		unique_ptr<FunctionData> bind_data;
-		if (has_serialize) {
-			if (!function.deserialize) {
-				throw SerializationException("Copy function %s is missing deserialize hook", function.name);
-			}
-			deserializer.ReadObject(504, "function_data",
-			                        [&](Deserializer &obj) { bind_data = function.deserialize(obj, function); });
-		} else {
-			throw SerializationException(
-			    "PhysicalBatchCopyToFile deserialization requires function serialization for %s", function.name);
-		}
-
-		auto file_path = deserializer.ReadProperty<string>(200, "file_path");
-		auto use_tmp_file = deserializer.ReadProperty<bool>(201, "use_tmp_file");
-		auto return_type = deserializer.ReadProperty<CopyFunctionReturnType>(202, "return_type");
-		auto write_empty_file = deserializer.ReadProperty<bool>(203, "write_empty_file");
-
-		auto copy = make_uniq<PhysicalBatchCopyToFile>(physical_plan, std::move(types), std::move(function),
-		                                               std::move(bind_data), estimated_cardinality);
-		copy->file_path = std::move(file_path);
-		copy->use_tmp_file = use_tmp_file;
-		copy->return_type = return_type;
-		copy->write_empty_file = write_empty_file;
-		return unique_ptr<PhysicalOperator>(std::move(copy));
-	}
-	case PhysicalOperatorType::NESTED_LOOP_JOIN: {
-		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
-		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
-		auto predicate = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(105, "predicate");
-
-		LogicalComparisonJoin dummy_join(join_type);
-		dummy_join.types = std::move(types);
-
-		auto join = make_uniq<PhysicalNestedLoopJoin>(physical_plan, dummy_join, std::move(conditions), join_type,
-		                                              estimated_cardinality, true);
-		join->predicate = std::move(predicate);
-		return unique_ptr<PhysicalOperator>(std::move(join));
-	}
-	default:
-		throw NotImplementedException("Deserialization not implemented for operator type: %s",
-		                              PhysicalOperatorToString(op_type));
-	}
 }
 
 } // namespace duckdb

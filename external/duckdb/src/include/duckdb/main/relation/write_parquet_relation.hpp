@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -20,13 +14,12 @@ namespace duckdb {
 
 class WriteParquetRelation : public Relation {
 public:
-	WriteParquetRelation(shared_ptr<Relation> child, string parquet_file,
-	                     case_insensitive_map_t<vector<Value>> options);
+	WriteParquetRelation(shared_ptr<Relation> child, string parquet_file, identifier_map_t<vector<Value>> options);
 
 	shared_ptr<Relation> child;
 	string parquet_file;
 	vector<ColumnDefinition> columns;
-	case_insensitive_map_t<vector<Value>> options;
+	identifier_map_t<vector<Value>> options;
 
 public:
 	BoundStatement Bind(Binder &binder) override;
@@ -35,11 +28,6 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	bool IsReadOnly() override {
-		return false;
-	}
-
-protected:
-	bool CanSerializeToQueryNodeInternal(Binder &) override {
 		return false;
 	}
 };

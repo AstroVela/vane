@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -14,13 +8,11 @@
 
 #pragma once
 
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
-#include "duckdb/optimizer/join_order/join_node.hpp"
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/execution/partition_info.hpp"
 
@@ -40,6 +32,13 @@ public:
 	}
 
 	virtual void Finalize(const PhysicalOperator &op, ExecutionContext &context) {
+	}
+
+	virtual bool SupportsReuse() const {
+		return false;
+	}
+
+	virtual void Reset() {
 	}
 
 	template <class TARGET>
@@ -73,9 +72,6 @@ public:
 	virtual idx_t MaxThreads(idx_t source_max_threads) {
 		return source_max_threads;
 	}
-
-	virtual void PipelineMaxThreadsResolved(idx_t max_threads) {
-	}
 };
 
 class GlobalSinkState : public StateWithBlockableTasks {
@@ -86,6 +82,16 @@ public:
 	}
 
 	SinkFinalizeType state;
+
+	virtual bool SupportsReuse() const {
+		return false;
+	}
+
+	virtual void Reset(ClientContext &context) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		ResetBlocking();
+		state = SinkFinalizeType::READY;
+	}
 
 	template <class TARGET>
 	TARGET &Cast() {
@@ -101,9 +107,6 @@ public:
 	virtual idx_t MaxThreads(idx_t source_max_threads) {
 		return source_max_threads;
 	}
-
-	virtual void PipelineMaxThreadsResolved(idx_t max_threads) {
-	}
 };
 
 class LocalSinkState {
@@ -113,6 +116,13 @@ public:
 
 	//! Source partition info
 	SourcePartitionInfo partition_info;
+
+	virtual bool SupportsReuse() const {
+		return false;
+	}
+
+	virtual void Reset(ExecutionContext &context, GlobalSinkState &gstate) {
+	}
 
 	template <class TARGET>
 	TARGET &Cast() {
@@ -131,13 +141,17 @@ public:
 	virtual ~GlobalSourceState() {
 	}
 
-	// A downstream operator stopped this pipeline before exhausting its source.
-	// Streaming sources with producer pipelines must stop those producers too.
-	virtual void OnConsumerFinished() {
-	}
-
 	virtual idx_t MaxThreads() {
 		return 1;
+	}
+
+	virtual bool SupportsReuse() const {
+		return false;
+	}
+
+	virtual void Reset(ClientContext &context) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		ResetBlocking();
 	}
 
 	template <class TARGET>
@@ -155,6 +169,13 @@ public:
 class LocalSourceState {
 public:
 	virtual ~LocalSourceState() {
+	}
+
+	virtual bool SupportsReuse() const {
+		return false;
+	}
+
+	virtual void Reset(ExecutionContext &context, GlobalSourceState &gstate) {
 	}
 
 	template <class TARGET>
@@ -179,6 +200,7 @@ struct OperatorSourceInput {
 	GlobalSourceState &global_state;
 	LocalSourceState &local_state;
 	InterruptState &interrupt_state;
+	SourceBatchIndexState batch_index_state = SourceBatchIndexState::UNCHANGED;
 };
 
 struct OperatorSinkCombineInput {

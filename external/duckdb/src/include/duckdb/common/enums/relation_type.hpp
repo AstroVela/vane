@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -34,8 +28,6 @@ enum class RelationType : uint8_t {
 	DISTINCT_RELATION,
 	LIMIT_RELATION,
 	ORDER_RELATION,
-	REPARTITION_RELATION,
-	LOCAL_EXCHANGE_RELATION,
 	CREATE_VIEW_RELATION,
 	CREATE_TABLE_RELATION,
 	INSERT_RELATION,
@@ -52,8 +44,6 @@ enum class RelationType : uint8_t {
 	QUERY_RELATION,
 	DELIM_JOIN_RELATION,
 	DELIM_GET_RELATION,
-	UNNEST_RELATION,
-	WRITE_FILE_RELATION,
 	EXTENSION_RELATION = 255
 };
 

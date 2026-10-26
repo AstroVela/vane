@@ -1,15 +1,7 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
-#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
-#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types/interval.hpp"
@@ -74,7 +66,8 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 void SetArrowStructFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                           ClientProperties &options, ClientContext &context, bool map_is_parent = false) {
 	child.format = "+s";
-	auto &child_types = StructType::GetChildTypes(type);
+	auto child_types = TupleType::NamedChildren(type);
+
 	child.n_children = NumericCast<int64_t>(child_types.size());
 	root_holder.nested_children.emplace_back();
 	root_holder.nested_children.back().resize(child_types.size());
@@ -83,10 +76,11 @@ void SetArrowStructFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &chi
 	for (idx_t type_idx = 0; type_idx < child_types.size(); type_idx++) {
 		root_holder.nested_children_ptr.back()[type_idx] = &root_holder.nested_children.back()[type_idx];
 	}
-	child.children = &root_holder.nested_children_ptr.back()[0];
+	child.children = child_types.empty() ? nullptr : &root_holder.nested_children_ptr.back()[0];
 	for (size_t type_idx = 0; type_idx < child_types.size(); type_idx++) {
 		InitializeChild(*child.children[type_idx], root_holder);
-		root_holder.owned_type_names.push_back(AddName(child_types[type_idx].first));
+		auto child_name = child_types[type_idx].first.GetIdentifierName();
+		root_holder.owned_type_names.push_back(AddName(child_name));
 		child.children[type_idx]->name = root_holder.owned_type_names.back().get();
 		SetArrowFormat(root_holder, *child.children[type_idx], child_types[type_idx].second, options, context);
 	}
@@ -111,70 +105,6 @@ void SetArrowMapFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 	SetArrowStructFormat(root_holder, **child.children, ListType::GetChildType(type), options, context, true);
 }
 
-static string SerializeTensorMetadata(const vector<idx_t> &shape) {
-	string result = "{\"shape\":[";
-	for (idx_t i = 0; i < shape.size(); i++) {
-		result += to_string(shape[i]);
-		if (i + 1 < shape.size()) {
-			result += ",";
-		}
-	}
-	result += "]}";
-	return result;
-}
-
-void SetArrowTensorFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
-                          ClientProperties &options, ClientContext &context) {
-	D_ASSERT(TensorType::IsTensor(type));
-	if (TensorType::IsVariableShapeTensor(type)) {
-		auto storage = type.DeepCopy();
-		storage.SetAlias(string());
-		storage.SetExtensionInfo(nullptr);
-		auto tensor_options = options;
-		tensor_options.arrow_offset_size = ArrowOffsetSize::REGULAR;
-		tensor_options.arrow_use_list_view = false;
-		tensor_options.arrow_lossless_conversion = false;
-		SetArrowFormat(root_holder, child, storage, tensor_options, context);
-		string metadata = "{\"uniform_shape\":[";
-		auto shape = TensorType::GetShape(type);
-		for (idx_t i = 0; i < shape.size(); i++) {
-			if (i) {
-				metadata += ",";
-			}
-			metadata += shape[i] == TensorType::VARIABLE_DIMENSION ? "null" : to_string(shape[i]);
-		}
-		metadata += "]}";
-		ArrowSchemaMetadata schema_metadata;
-		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "arrow.variable_shape_tensor");
-		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, metadata);
-		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
-		child.metadata = root_holder.metadata_info.back().get();
-		return;
-	}
-	auto fixed_size = TensorType::GetFlattenedSize(type);
-	auto &child_type = TensorType::GetChildType(type);
-	auto format = "+w:" + to_string(fixed_size);
-	root_holder.extension_format.push_back(AddName(format));
-	child.format = root_holder.extension_format.back().get();
-
-	ArrowSchemaMetadata schema_metadata;
-	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "arrow.fixed_shape_tensor");
-	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY,
-	                          SerializeTensorMetadata(TensorType::GetShape(type)));
-	root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
-	child.metadata = root_holder.metadata_info.back().get();
-
-	child.n_children = 1;
-	root_holder.nested_children.emplace_back();
-	root_holder.nested_children.back().resize(1);
-	root_holder.nested_children_ptr.emplace_back();
-	root_holder.nested_children_ptr.back().push_back(&root_holder.nested_children.back()[0]);
-	InitializeChild(root_holder.nested_children.back()[0], root_holder);
-	child.children = &root_holder.nested_children_ptr.back()[0];
-	child.children[0]->name = "item";
-	SetArrowFormat(root_holder, **child.children, child_type, options, context);
-}
-
 bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                        ClientContext &context) {
 	auto &config = DBConfig::GetConfig(context);
@@ -188,37 +118,6 @@ bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 
 void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                     ClientProperties &options, ClientContext &context) {
-	if (FixedBinaryType::IsFixedBinary(type)) {
-		root_holder.owned_type_names.push_back(AddName("w:" + to_string(FixedBinaryType::Size(type))));
-		child.format = root_holder.owned_type_names.back().get();
-		return;
-	}
-	if (ImageLogicalType::IsImage(type)) {
-		auto storage = type.DeepCopy();
-		storage.SetAlias(string());
-		storage.SetExtensionInfo(nullptr);
-		auto image_options = options;
-		image_options.arrow_offset_size = ArrowOffsetSize::REGULAR;
-		image_options.arrow_use_list_view = false;
-		image_options.arrow_lossless_conversion = false;
-		SetArrowFormat(root_holder, child, storage, image_options, context);
-		auto mode = ImageLogicalType::GetMode(type);
-		auto metadata = string("{\"mode\":") + (mode.empty() ? "null" : "\"" + mode + "\"") + ",\"height\":" +
-		                (ImageLogicalType::IsFixedShape(type) ? to_string(ImageLogicalType::GetHeight(type)) : "null") +
-		                ",\"width\":" +
-		                (ImageLogicalType::IsFixedShape(type) ? to_string(ImageLogicalType::GetWidth(type)) : "null") +
-		                "}";
-		ArrowSchemaMetadata schema_metadata;
-		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "vane.image");
-		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, metadata);
-		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
-		child.metadata = root_holder.metadata_info.back().get();
-		return;
-	}
-	if (TensorType::IsTensor(type)) {
-		SetArrowTensorFormat(root_holder, child, type, options, context);
-		return;
-	}
 	if (type.HasAlias()) {
 		// If it is a json type, we only export it as json if arrow_lossless_conversion = True
 		if (!(type.IsJSONType() && !options.arrow_lossless_conversion)) {
@@ -324,6 +223,12 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 		child.format = root_holder.owned_type_names.back().get();
 		break;
 	}
+	case LogicalTypeId::TIMESTAMP_TZ_NS: {
+		string format = "tsn:" + options.time_zone;
+		root_holder.owned_type_names.push_back(AddName(format));
+		child.format = root_holder.owned_type_names.back().get();
+		break;
+	}
 	case LogicalTypeId::TIMESTAMP_SEC:
 		child.format = "tss:";
 		break;
@@ -369,7 +274,6 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 		break;
 	}
 	case LogicalTypeId::BLOB:
-	case LogicalTypeId::AGGREGATE_STATE:
 		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			// Views are only introduced in arrow format v1.4
 			child.format = "vz";
@@ -421,7 +325,8 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 		SetArrowFormat(root_holder, **child.children, ListType::GetChildType(type), options, context);
 		break;
 	}
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		SetArrowStructFormat(root_holder, child, type, options, context);
 		break;
 	}
@@ -462,7 +367,7 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 		for (size_t type_idx = 0; type_idx < child_types.size(); type_idx++) {
 			InitializeChild(*child.children[type_idx], root_holder);
 
-			root_holder.owned_type_names.push_back(AddName(child_types[type_idx].first));
+			root_holder.owned_type_names.push_back(AddName(child_types[type_idx].first.GetIdentifierName()));
 
 			child.children[type_idx]->name = root_holder.owned_type_names.back().get();
 			SetArrowFormat(root_holder, *child.children[type_idx], child_types[type_idx].second, options, context);

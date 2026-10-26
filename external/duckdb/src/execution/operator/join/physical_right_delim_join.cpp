@@ -1,10 +1,5 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -13,10 +8,26 @@
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include <iostream>
-#include <atomic>
 
 namespace duckdb {
+
+static void RightDelimResetSinkState(const PhysicalOperator &op, ClientContext &context,
+                                     unique_ptr<GlobalSinkState> &state) {
+	if (state && state->SupportsReuse()) {
+		state->Reset(context);
+		return;
+	}
+	state = op.GetGlobalSinkState(context);
+}
+
+static void RightDelimResetLocalSinkState(const PhysicalOperator &op, ExecutionContext &context,
+                                          GlobalSinkState &gstate, unique_ptr<LocalSinkState> &state) {
+	if (state && state->SupportsReuse()) {
+		state->Reset(context, gstate);
+		return;
+	}
+	state = op.GetLocalSinkState(context);
+}
 
 PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlan &physical_plan, PhysicalPlanGenerator &planner,
                                                vector<LogicalType> types, PhysicalOperator &original_join,
@@ -34,35 +45,51 @@ PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlan &physical_plan, Phys
 	join.children[1] = planner.Make<PhysicalDummyScan>(children[0].get().GetTypes(), estimated_cardinality);
 }
 
-PhysicalRightDelimJoin::PhysicalRightDelimJoin(PhysicalPlan &physical_plan, DelimJoinDeserializeTag,
-                                               vector<LogicalType> types, PhysicalOperator &original_join,
-                                               PhysicalOperator &distinct,
-                                               const vector<const_reference<PhysicalOperator>> &delim_scans,
-                                               idx_t estimated_cardinality, optional_idx delim_idx)
-    : PhysicalDelimJoin(physical_plan, PhysicalOperatorType::RIGHT_DELIM_JOIN, std::move(types), original_join,
-                        distinct, delim_scans, estimated_cardinality, delim_idx) {
-	// Deserialization path: join children are already rewritten in the serialized plan.
-}
-
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
 class RightDelimJoinGlobalState : public GlobalSinkState {
 public:
-	std::atomic<idx_t> total_sink_rows {0};
-	std::atomic<idx_t> total_sink_chunks {0};
+	explicit RightDelimJoinGlobalState(const PhysicalRightDelimJoin &op) : op(op) {
+	}
+
+	const PhysicalRightDelimJoin &op;
+
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ClientContext &context) override {
+		RightDelimResetSinkState(op.join, context, op.join.sink_state);
+		RightDelimResetSinkState(op.distinct, context, op.distinct.sink_state);
+		if (op.delim_scans.size() > 1) {
+			PhysicalHashAggregate::SetMultiScan(*op.distinct.sink_state);
+		}
+		GlobalSinkState::Reset(context);
+	}
 };
 
 class RightDelimJoinLocalState : public LocalSinkState {
 public:
+	explicit RightDelimJoinLocalState(const PhysicalRightDelimJoin &op) : op(op) {
+	}
+
+	const PhysicalRightDelimJoin &op;
 	unique_ptr<LocalSinkState> join_state;
 	unique_ptr<LocalSinkState> distinct_state;
+
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ExecutionContext &context, GlobalSinkState &gstate) override {
+		RightDelimResetLocalSinkState(op.join, context, *op.join.sink_state, join_state);
+		RightDelimResetLocalSinkState(op.distinct, context, *op.distinct.sink_state, distinct_state);
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalRightDelimJoin::GetGlobalSinkState(ClientContext &context) const {
-	for (size_t i = 0; i < join.children.size(); i++) {
-	}
-	auto state = make_uniq<RightDelimJoinGlobalState>();
+	auto state = make_uniq<RightDelimJoinGlobalState>(*this);
 	join.sink_state = join.GetGlobalSinkState(context);
 	distinct.sink_state = distinct.GetGlobalSinkState(context);
 	if (delim_scans.size() > 1) {
@@ -72,7 +99,7 @@ unique_ptr<GlobalSinkState> PhysicalRightDelimJoin::GetGlobalSinkState(ClientCon
 }
 
 unique_ptr<LocalSinkState> PhysicalRightDelimJoin::GetLocalSinkState(ExecutionContext &context) const {
-	auto state = make_uniq<RightDelimJoinLocalState>();
+	auto state = make_uniq<RightDelimJoinLocalState>(*this);
 	state->join_state = join.GetLocalSinkState(context);
 	state->distinct_state = distinct.GetLocalSinkState(context);
 	return std::move(state);
@@ -81,10 +108,6 @@ unique_ptr<LocalSinkState> PhysicalRightDelimJoin::GetLocalSinkState(ExecutionCo
 SinkResultType PhysicalRightDelimJoin::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
 	auto &lstate = input.local_state.Cast<RightDelimJoinLocalState>();
-	auto &gstate = input.global_state.Cast<RightDelimJoinGlobalState>();
-	auto chunk_rows = chunk.size();
-	auto prev_total = gstate.total_sink_rows.fetch_add(chunk_rows);
-	auto chunk_count = gstate.total_sink_chunks.fetch_add(1);
 
 	OperatorSinkInput join_sink_input {*join.sink_state, *lstate.join_state, input.interrupt_state};
 	join.Sink(context, chunk, join_sink_input);
@@ -129,9 +152,6 @@ SinkFinalizeType PhysicalRightDelimJoin::Finalize(Pipeline &pipeline, Event &eve
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
 void PhysicalRightDelimJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
-	for (size_t i = 0; i < join.children.size(); i++) {
-	}
-
 	op_state.reset();
 	sink_state.reset();
 
@@ -139,12 +159,17 @@ void PhysicalRightDelimJoin::BuildPipelines(Pipeline &current, MetaPipeline &met
 	child_meta_pipeline.Build(children[0]);
 
 	D_ASSERT(type == PhysicalOperatorType::RIGHT_DELIM_JOIN);
+	// recurse into the actual join
+	// any pipelines in there depend on the main pipeline
+	// any scan of the duplicate eliminated data on the LHS depends on this pipeline
+	// we add an entry to the mapping of (PhysicalOperator*) -> (Pipeline*)
 	auto &state = meta_pipeline.GetState();
 	for (auto &delim_scan : delim_scans) {
 		state.delim_join_dependencies.insert(
 		    make_pair(delim_scan, reference<Pipeline>(*child_meta_pipeline.GetBasePipeline())));
 	}
 
+	// Build join pipelines without building the RHS (already built in the Sink of this op)
 	PhysicalJoin::BuildJoinPipelines(current, meta_pipeline, join, false);
 }
 

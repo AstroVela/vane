@@ -104,6 +104,35 @@ TEST_CASE("Test strcmp() to ensure platform sanity", "[comparison]") {
 	REQUIRE_FALSE(nut != nut);
 }
 
+TEST_CASE("Test common prefix size", "[string_util]") {
+	REQUIRE(StringUtil::GetCommonPrefixSize("", "") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "xyz") == 0);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "abc") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abc", "abcdef") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("abcdef", "abcxyz") == 3);
+	REQUIRE(StringUtil::GetCommonPrefixSize("🦆ab", "🦆ac") == 5);
+}
+
+TEST_CASE("Test next prefix", "[string_util]") {
+	string prefix = "abc";
+	REQUIRE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == "abd");
+
+	prefix = "a";
+	prefix.push_back(static_cast<char>(0xFF));
+	prefix.push_back(static_cast<char>(0xFF));
+	REQUIRE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == "b");
+
+	prefix.assign(2, static_cast<char>(0xFF));
+	REQUIRE_FALSE(StringUtil::FindNextPrefix(prefix));
+	REQUIRE(prefix == string(2, static_cast<char>(0xFF)));
+
+	prefix.clear();
+	REQUIRE_FALSE(StringUtil::FindNextPrefix(prefix));
+}
+
 TEST_CASE("Test join vector items", "[string_util]") {
 	SECTION("Three string items") {
 		duckdb::vector<std::string> str_items = {"abc", "def", "ghi"};
@@ -143,6 +172,21 @@ TEST_CASE("Test join vector items", "[string_util]") {
 		    StringUtil::Join(int_items, int_items.size(), ", ", [](const int &item) { return to_string(item); });
 		REQUIRE(result == "");
 	}
+}
+
+TEST_CASE("Test replace strings", "[string_util]") {
+	REQUIRE(StringUtil::Replace("abcabc", "ab", "x") == "xcxc");
+	REQUIRE(StringUtil::Replace("aaaa", "aa", "b") == "bb");
+	REQUIRE(StringUtil::Replace("xx", "x", "yx") == "yxyx");
+	REQUIRE(StringUtil::Replace("aaa{SNAPSHOT_ID}bbb{SNAPSHOT_ID}", "{SNAPSHOT_ID}", "1") == "aaa1bbb1");
+	REQUIRE(StringUtil::Replace("", "x", "y") == "");
+
+// Replace throws an InternalException if the search string is empty.
+// In CI, when DUCKDB_CRASH_ON_ASSERT is set this fails the test even when
+// surrounded by REQUIRE_THROWS
+#ifndef DUCKDB_CRASH_ON_ASSERT
+	REQUIRE_THROWS(StringUtil::Replace("abc", "", "x"));
+#endif
 }
 
 TEST_CASE("Test SplitWithParentheses", "[string_util]") {
@@ -309,6 +353,26 @@ TEST_CASE("Test split quoted strings", "[string_util]") {
 	}
 }
 
+TEST_CASE("Test RTrim preserves trailing UTF-8", "[string_util]") {
+	string value = "abcé";
+	StringUtil::RTrim(value);
+	REQUIRE(value == "abcé");
+
+	value = "abcé   ";
+	StringUtil::RTrim(value);
+	REQUIRE(value == "abcé");
+}
+
+TEST_CASE("Test custom RTrim preserves UTF-8 paths", "[string_util]") {
+	string path = "/tmp/café";
+	StringUtil::RTrim(path, "/");
+	REQUIRE(path == "/tmp/café");
+
+	path = "/tmp/café///";
+	StringUtil::RTrim(path, "/");
+	REQUIRE(path == "/tmp/café");
+}
+
 TEST_CASE("Test path utilities", "[string_util]") {
 	SECTION("File name") {
 		REQUIRE("bin" == StringUtil::GetFileName("/usr/bin/"));
@@ -368,10 +432,18 @@ TEST_CASE("Test path utilities", "[string_util]") {
 		REQUIRE("/tmp" == StringUtil::GetFilePath("/tmp//test.txt"));
 		REQUIRE("\\tmp" == StringUtil::GetFilePath("\\tmp\\\\test.txt"));
 	}
+
+	SECTION("Replace file name") {
+		REQUIRE("/usr/local/bin/other.cpp" == StringUtil::ReplaceFileName("/usr/local/bin/test.cpp", "other.cpp"));
+		REQUIRE("tmp\\other.txt" == StringUtil::ReplaceFileName("tmp\\test.txt", "other.txt"));
+		REQUIRE("other.txt" == StringUtil::ReplaceFileName("test.txt", "other.txt"));
+		REQUIRE("s3://bucket/other.csv" == StringUtil::ReplaceFileName("s3://bucket/test.csv", "other.csv"));
+		REQUIRE("opfs://other.csv" == StringUtil::ReplaceFileName("opfs://test.csv", "other.csv"));
+	}
 }
 
 TEST_CASE("Test JSON Parsing", "[string_util]") {
-	auto complex_json = StringUtil::ParseJSONMap(R"JSON_LITERAL(
+	auto json_map = StringUtil::ParseJSONMap(R"JSON_LITERAL(
 	{
     "crs": {
         "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
@@ -481,7 +553,7 @@ TEST_CASE("Test JSON Parsing", "[string_util]") {
     "crs_type": "projjson"
 }	)JSON_LITERAL");
 
-	complex_json = StringUtil::ParseJSONMap(R"JSON_LITERAL(
+	json_map = StringUtil::ParseJSONMap(R"JSON_LITERAL(
 	{
 		"int": 42,
 		"signed_int": -42,
@@ -496,4 +568,42 @@ TEST_CASE("Test JSON Parsing", "[string_util]") {
 		"bool_f": false
 	}
 	)JSON_LITERAL");
+}
+
+TEST_CASE("Test CIHash is independent of char signedness", "[string_util]") {
+	// bytes >= 0x80 must be zero-extended before hashing so the result is identical
+	// on platforms where char is signed (x86) and where it is unsigned (ARM)
+	const char high_byte[] = {(char)0xC3, 0};
+	REQUIRE(StringUtil::CIHash(high_byte, 1) == 2242087697ULL);
+
+	const char cafe_utf8[] = "Caf\xC3\xA9";
+	REQUIRE(StringUtil::CIHash(cafe_utf8, strlen(cafe_utf8)) == 2425794034ULL);
+
+	// ASCII is unaffected
+	REQUIRE(StringUtil::CIHash("hello") == StringUtil::CIHash("HeLLo"));
+}
+
+TEST_CASE("Test CILessThan handles embedded NUL bytes", "[string_util]") {
+	const string secret("secret");
+	const string secret_nul("secret\0other", 12);
+	const string secret_nul2("secret\0zzz", 10);
+
+	// a string with content after an embedded NUL is NOT equal to its prefix: exactly one of (a<b, b<a) holds
+	REQUIRE(StringUtil::CILessThan(secret, secret_nul) != StringUtil::CILessThan(secret_nul, secret));
+	// the shorter prefix sorts first
+	REQUIRE(StringUtil::CILessThan(secret, secret_nul));
+	REQUIRE(!StringUtil::CILessThan(secret_nul, secret));
+
+	// equality (neither less than the other) only for genuinely equal strings
+	REQUIRE((!StringUtil::CILessThan(secret, secret) && !StringUtil::CILessThan(secret, secret)));
+	REQUIRE((!StringUtil::CILessThan(secret_nul, secret_nul) && !StringUtil::CILessThan(secret_nul, secret_nul)));
+
+	// strings that differ only after the NUL byte are ordered by that byte (strict weak ordering, no collision)
+	REQUIRE(StringUtil::CILessThan(secret_nul, secret_nul2)); // 'o' < 'z'
+	REQUIRE(!StringUtil::CILessThan(secret_nul2, secret_nul));
+
+	// case-insensitivity is preserved
+	REQUIRE(!StringUtil::CILessThan("Hello", "hello"));
+	REQUIRE(!StringUtil::CILessThan("hello", "Hello"));
+	REQUIRE(StringUtil::CILessThan("abc", "abd"));
 }

@@ -37,10 +37,9 @@ public:
 
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
-	string GetAlias() override;
+	Identifier GetAlias() override;
 
-protected:
-	unique_ptr<TableRef> GetTableRefInternal() override;
+	unique_ptr<TableRef> GetTableRef() override;
 };
 
 } // namespace duckdb

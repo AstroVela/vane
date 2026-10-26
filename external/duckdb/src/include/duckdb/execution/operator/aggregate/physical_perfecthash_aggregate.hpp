@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -16,6 +10,7 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/base_aggregate_hashtable.hpp"
+#include "duckdb/common/reference_map.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -31,9 +26,6 @@ public:
 	                             vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> groups,
 	                             const vector<unique_ptr<BaseStatistics>> &group_stats, vector<idx_t> required_bits,
 	                             idx_t estimated_cardinality);
-	PhysicalPerfectHashAggregate(PhysicalPlan &physical_plan, ClientContext &context, vector<LogicalType> types,
-	                             vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> groups,
-	                             vector<Value> group_minima, vector<idx_t> required_bits, idx_t estimated_cardinality);
 
 	//! The groups
 	vector<unique_ptr<Expression>> groups;
@@ -43,6 +35,8 @@ public:
 public:
 	// Source interface
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	void SourceFinished(ClientContext &context, GlobalSourceState &gstate) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 
@@ -73,6 +67,9 @@ public:
 	bool ParallelSink() const override {
 		return true;
 	}
+	PipelineExternalInputSupport GetExternalInputSupport() const override {
+		return PipelineExternalInputSupport::SUPPORTED;
+	}
 
 	bool SinkOrderDependent() const override {
 		return false;
@@ -90,13 +87,7 @@ public:
 	//! The number of bits we need to completely cover each of the groups
 	vector<idx_t> required_bits;
 
-	unordered_map<Expression *, size_t> filter_indexes;
-
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
-
-private:
-	void Initialize(ClientContext &context);
+	reference_map_t<const Expression, size_t> filter_indexes;
 };
 
 } // namespace duckdb

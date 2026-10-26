@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -27,15 +21,15 @@ namespace duckdb {
 //! The operator will be called again with the same input.
 //! FINISHED means the operator has finished the entire pipeline and no more processing is necessary.
 //! The operator will not be called again, and neither will any other operators in this pipeline.
-//! BLOCKED means the operator does not want to be called right now, e.g. because it is doing async I/O. The operator
-//! has set the interrupt state and the caller is expected to handle it.
+//! BLOCKED means the operator does not want to be called right now. e.g. because its currently doing async I/O. The
+//! operator has set the interrupt state and the caller is expected to handle it. Note that intermediate operators
+//! should currently not emit this state.
 enum class OperatorResultType : uint8_t { NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED, BLOCKED };
 
 //! OperatorFinalizeResultType is used to indicate whether operators have finished flushing their cached results.
 //! FINISHED means the operator has flushed all cached data.
 //! HAVE_MORE_OUTPUT means the operator contains more results.
-//! BLOCKED means the operator is currently blocked, e.g. by some async I/O.
-enum class OperatorFinalizeResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED, BLOCKED };
+enum class OperatorFinalizeResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED };
 
 //! OperatorFinalResultType is used for the final call
 enum class OperatorFinalResultType : uint8_t { FINISHED, BLOCKED };
@@ -43,10 +37,13 @@ enum class OperatorFinalResultType : uint8_t { FINISHED, BLOCKED };
 //! SourceResultType is used to indicate the result of data being pulled out of a source.
 //! There are three possible results:
 //! HAVE_MORE_OUTPUT means the source has more output, this flag should only be set when data is returned, empty results
-//! should only occur for the FINISHED and BLOCKED flags
+//! empty output should only occur for FINISHED and BLOCKED
 //! FINISHED means the source is exhausted
 //! BLOCKED means the source is currently blocked, e.g. by some async I/O
 enum class SourceResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED, BLOCKED };
+
+//! Indicates whether a source advanced its partition batch without returning output
+enum class SourceBatchIndexState : uint8_t { UNCHANGED, ADVANCED };
 
 //! AsyncResultType is used to indicate the result of a AsyncResult, in the context of a wider operation being executed
 enum class AsyncResultType : uint8_t {
@@ -59,8 +56,6 @@ enum class AsyncResultType : uint8_t {
 	BLOCKED // current result is blocked, no subsequent calls on the same state should be attempted (eg: in the context
 	        // of AsyncResult, BLOCKED will be associated with a vector of AsyncTasks to be scheduled)
 };
-
-bool ExtractSourceResultType(AsyncResultType in, SourceResultType &out);
 
 //! The SinkResultType is used to indicate the result of data flowing into a sink
 //! There are three possible results:

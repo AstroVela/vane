@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -16,6 +10,7 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 
 namespace duckdb {
 
@@ -24,7 +19,7 @@ class PhysicalStreamingWindow : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::STREAMING_WINDOW;
 
-	static bool IsStreamingFunction(ClientContext &context, unique_ptr<Expression> &expr);
+	static bool IsStreamingFunction(ClientContext &context, BoundWindowExpression &wexpr);
 
 public:
 	PhysicalStreamingWindow(PhysicalPlan &physical_plan, vector<LogicalType> types,
@@ -52,9 +47,6 @@ public:
 	}
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-
-protected:
-	void SerializeOperatorData(Serializer &serializer) const override;
 
 private:
 	void ExecuteFunctions(ExecutionContext &context, DataChunk &chunk, DataChunk &delayed,

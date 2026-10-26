@@ -2,8 +2,6 @@
 # description: Test analyze and vacuum statements in peg parser
 # group: [transformer]
 
-mode skip
-
 require autocomplete
 
 require skip_reload
@@ -11,16 +9,13 @@ require skip_reload
 require no_extension_autoloading "FIXME: to be reviewed whether this can be lifted"
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 set allow_parser_override_extension=strict;
 
 statement ok
-set extension_directory='__TEST_DIR__/install_extension'
+set extension_directory='{TEST_DIR}/install_extension'
 
 # Check defaults are correct
 statement error
 INSTALL will_never_exist;
 ----
-Failed to download extension "will_never_exist" at URL "http://extensions.duckdb.org"
+<REGEX>:.*Failed to download extension "will_never_exist" at URL "http://extensions\.duckdb\.org(/[^"]*)?".*

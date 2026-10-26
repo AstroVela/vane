@@ -5,9 +5,6 @@
 require parquet
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE bools(b BOOL)
 
 statement ok
@@ -20,15 +17,28 @@ FROM bools
 10000	5000	False	True	2143	7857
 
 statement ok
-COPY bools TO '__TEST_DIR__/bools.parquet' (FORMAT 'parquet');
+COPY bools TO '{TEST_DIR}/bools.parquet' (FORMAT 'parquet');
 
 query IIIIII
 SELECT COUNT(*), COUNT(b), BOOL_AND(b), BOOL_OR(b), SUM(CASE WHEN b THEN 1 ELSE 0 END) true_count, SUM(CASE WHEN b THEN 0 ELSE 1 END) false_count
-FROM '__TEST_DIR__/bools.parquet'
+FROM '{TEST_DIR}/bools.parquet'
 ----
 10000	5000	False	True	2143	7857
 
 query I
-SELECT typeof(b) FROM '__TEST_DIR__/bools.parquet' LIMIT 1
+SELECT typeof(b) FROM '{TEST_DIR}/bools.parquet' LIMIT 1
 ----
 BOOLEAN
+
+# A later no-NULL input chunk uses the packed boolean fast path after statistics are established.
+statement ok
+COPY (
+	SELECT i % 3 = 0 AS b
+	FROM range(2056) t(i)
+) TO '{TEST_DIR}/bools_no_null.parquet' (FORMAT parquet)
+
+query III
+SELECT count(*), count_if(b), count_if(NOT b)
+FROM '{TEST_DIR}/bools_no_null.parquet'
+----
+2056	686	1370

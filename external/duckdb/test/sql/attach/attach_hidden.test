@@ -3,9 +3,6 @@
 # group: [attach]
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 ATTACH ':memory:' AS hidden_db (HIDDEN true);
 
 # hidden database should not appear in duckdb_databases()
@@ -20,6 +17,12 @@ SELECT database_name FROM duckdb_tables() WHERE database_name = 'hidden_db'
 ----
 
 
+# hidden database should not appear in pragma_database_size()
+query I
+SELECT database_name FROM pragma_database_size() WHERE database_name = 'hidden_db'
+----
+
+
 # the catalog is still accessible via qualified names
 statement ok
 CREATE TABLE hidden_db.main.tbl AS SELECT 42 AS i;
@@ -29,12 +32,34 @@ SELECT * FROM hidden_db.main.tbl
 ----
 42
 
+# a missing table is not suggested from the hidden database
+statement error
+SELECT * FROM tbl
+----
+<!REGEX>:.*hidden_db.*
+
+# a table in a database that is shown is suggested
+statement ok
+ATTACH ':memory:' AS shown_db;
+
+statement ok
+CREATE TABLE shown_db.main.shown_tbl AS SELECT 42 AS i;
+
+statement error
+SELECT * FROM shown_tbl
+----
+Did you mean "shown_db.shown_tbl"?
+
+statement ok
+DETACH shown_db;
+
 # hidden database can still be detached
 statement ok
 DETACH hidden_db;
 
-# after detach, the catalog is no longer accessible
+# after detach, the catalog is no longer accessible. "hidden_db" is not an attached database anymore, so
+# "hidden_db.main" is interpreted as a (nested) schema path
 statement error
 SELECT * FROM hidden_db.main.tbl
 ----
-Binder Error: Catalog "hidden_db" does not exist!
+schema "hidden_db.main" does not exist

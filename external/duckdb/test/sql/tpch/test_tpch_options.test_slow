@@ -8,7 +8,7 @@ require tpch
 statement error
 CALL dbgen(sf=0.01, children=-1);
 ----
-Invalid Input Error: Failed to cast value: Type INT32 with value -1 can't be cast because the value is out of range for the destination type UINT32
+Invalid Input Error: Could not cast value -1 to named parameter "children" of type UINTEGER: Type INT32 with value -1 can't be cast because the value is out of range for the destination type UINT32
 
 statement error
 CALL dbgen(sf=0.01, children=2);
@@ -25,13 +25,26 @@ call dbgen(sf=1, catalog=NULL);
 ----
 <REGEX>:.*Cannot use NULL.*
 
+statement error
+CALL dbgen(sf='nan'::DOUBLE);
+----
+<REGEX>:.*DBGen requires a valid scale factor.*
+
+statement error
+CALL dbgen(sf=1e19);
+----
+<REGEX>:.*does not support a scale factor exceeding 100000.*
+
+statement ok
+CALL dbgen(sf=-9223372036854775808);
+
 statement ok
 CALL dbgen(sf=1, children =100, step = 0);
 
 query IIII
-select * from nation
+select n_nationkey, n_name, n_regionkey, n_comment = ' haggle. carefully final deposits detect slyly agai' from nation
 ----
-0	ALGERIA	0	furiously regular requests. platelets affix furious
+0	ALGERIA	0	true
 
 query I
 select count(*) from lineitem
@@ -82,7 +95,7 @@ select n_nationkey, n_name, n_regionkey from nation
 loop i 2 50
 
 statement ok
-CALL dbgen(sf=1, children =100, step = ${i});
+CALL dbgen(sf=1, children =100, step = {i});
 
 endloop
 
@@ -120,7 +133,7 @@ select n_nationkey, n_name, n_regionkey from nation
 loop i 50 110
 
 statement ok
-CALL dbgen(sf=1, children =100, step = ${i});
+CALL dbgen(sf=1, children =100, step = {i});
 
 endloop
 
@@ -130,12 +143,12 @@ CALL dbgen(sf=1, suffix='_og');
 foreach tpch_tbl orders customer lineitem nation part partsupp region supplier
 
 query I
-select count(*) from (SELECT * FROM ${tpch_tbl} EXCEPT SELECT * FROM ${tpch_tbl}_og);
+select count(*) from (SELECT * FROM {tpch_tbl} EXCEPT SELECT * FROM {tpch_tbl}_og);
 ----
 0
 
 query I
-select count (*) from (SELECT * FROM ${tpch_tbl}_og EXCEPT SELECT * FROM ${tpch_tbl});
+select count (*) from (SELECT * FROM {tpch_tbl}_og EXCEPT SELECT * FROM {tpch_tbl});
 ----
 0
 
@@ -150,12 +163,12 @@ CALL dbgen(sf=1, catalog='db1');
 foreach tpch_tbl orders customer lineitem nation part partsupp region supplier
 
 query I
-select count(*) from (SELECT * FROM ${tpch_tbl} EXCEPT SELECT * FROM db1.${tpch_tbl});
+select count(*) from (SELECT * FROM {tpch_tbl} EXCEPT SELECT * FROM db1.{tpch_tbl});
 ----
 0
 
 query I
-select count (*) from (SELECT * FROM db1.${tpch_tbl} EXCEPT SELECT * FROM ${tpch_tbl});
+select count (*) from (SELECT * FROM db1.{tpch_tbl} EXCEPT SELECT * FROM {tpch_tbl});
 ----
 0
 
@@ -170,12 +183,12 @@ CALL dbgen(sf=1, catalog='db1', schema='test_schema');
 foreach tpch_tbl orders customer lineitem nation part partsupp region supplier
 
 query I
-select count(*) from (SELECT * FROM ${tpch_tbl} EXCEPT SELECT * FROM db1.test_schema.${tpch_tbl});
+select count(*) from (SELECT * FROM {tpch_tbl} EXCEPT SELECT * FROM db1.test_schema.{tpch_tbl});
 ----
 0
 
 query I
-select count (*) from (SELECT * FROM db1.test_schema.${tpch_tbl} EXCEPT SELECT * FROM ${tpch_tbl});
+select count (*) from (SELECT * FROM db1.test_schema.{tpch_tbl} EXCEPT SELECT * FROM {tpch_tbl});
 ----
 0
 

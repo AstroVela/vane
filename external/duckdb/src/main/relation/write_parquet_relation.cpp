@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/main/relation/write_parquet_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -13,7 +7,7 @@
 namespace duckdb {
 
 WriteParquetRelation::WriteParquetRelation(shared_ptr<Relation> child_p, string parquet_file_p,
-                                           case_insensitive_map_t<vector<Value>> options_p)
+                                           identifier_map_t<vector<Value>> options_p)
     : Relation(child_p->context, RelationType::WRITE_PARQUET_RELATION), child(std::move(child_p)),
       parquet_file(std::move(parquet_file_p)), options(std::move(options_p)) {
 	TryBindRelation(columns);
@@ -22,7 +16,7 @@ WriteParquetRelation::WriteParquetRelation(shared_ptr<Relation> child_p, string 
 BoundStatement WriteParquetRelation::Bind(Binder &binder) {
 	CopyStatement copy;
 	auto info = make_uniq<CopyInfo>();
-	info->select_relation = child;
+	info->select_statement = child->GetQueryNode();
 	info->is_from = false;
 	info->file_path = parquet_file;
 	info->format = "parquet";

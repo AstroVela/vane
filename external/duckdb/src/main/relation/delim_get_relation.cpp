@@ -14,11 +14,11 @@ DelimGetRelation::DelimGetRelation(const shared_ptr<ClientContext> &context, vec
 unique_ptr<QueryNode> DelimGetRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRefForSerialization(*this);
+	result->from_table = GetTableRef();
 	return std::move(result);
 }
 
-unique_ptr<TableRef> DelimGetRelation::GetTableRefInternal() {
+unique_ptr<TableRef> DelimGetRelation::GetTableRef() {
 	auto delim_get_ref = make_uniq<DelimGetRef>(chunk_types);
 	return std::move(delim_get_ref);
 }

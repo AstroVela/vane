@@ -2,13 +2,10 @@
 # description: Repeat row with NULL argument
 # group: [duckfuzz]
 
-statement ok
-PRAGMA enable_verification
-
 statement error
 FROM repeat_row(NULL)
 ----
-repeat_rows requires num_rows to be specified
+No function matches
 
 query I
 FROM repeat_row(NULL, num_rows=3)

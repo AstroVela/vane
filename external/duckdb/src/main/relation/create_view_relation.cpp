@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/main/relation/create_view_relation.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -11,14 +5,14 @@
 
 namespace duckdb {
 
-CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string view_name_p, bool replace_p,
+CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, Identifier view_name_p, bool replace_p,
                                        bool temporary_p)
     : Relation(child_p->context, RelationType::CREATE_VIEW_RELATION), child(std::move(child_p)),
       view_name(std::move(view_name_p)), replace(replace_p), temporary(temporary_p) {
 	TryBindRelation(columns);
 }
 
-CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string schema_name_p, string view_name_p,
+CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, Identifier schema_name_p, Identifier view_name_p,
                                        bool replace_p, bool temporary_p)
     : Relation(child_p->context, RelationType::CREATE_VIEW_RELATION), child(std::move(child_p)),
       schema_name(std::move(schema_name_p)), view_name(std::move(view_name_p)), replace(replace_p),
@@ -27,21 +21,14 @@ CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string sche
 }
 
 BoundStatement CreateViewRelation::Bind(Binder &binder) {
-	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
-	if (!query_node) {
-		throw NotImplementedException(
-		    "Cannot create a view from a relation that cannot be faithfully represented as a "
-		    "SQL query node; conversion would discard the exchange or lose relation bindings");
-	}
 	auto select = make_uniq<SelectStatement>();
-	select->node = std::move(query_node);
+	select->node = child->GetQueryNode();
 
 	CreateStatement stmt;
 	auto info = make_uniq<CreateViewInfo>();
 	info->query = std::move(select);
-	info->view_name = view_name;
 	info->temporary = temporary;
-	info->schema = schema_name;
+	info->SetQualifiedName(QualifiedName(Identifier(), schema_name, view_name));
 	info->on_conflict = replace ? OnCreateConflict::REPLACE_ON_CONFLICT : OnCreateConflict::ERROR_ON_CONFLICT;
 	stmt.info = std::move(info);
 	return binder.Bind(stmt.Cast<SQLStatement>());

@@ -3,9 +3,6 @@
 # group: [string]
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE filenames (filename VARCHAR);
 
 statement ok
@@ -141,3 +138,8 @@ SELECT regexp_extract(filename, NULL, ['rundate', 'pass']) AS groups
 FROM filenames
 ----
 constant pattern
+
+query I
+SELECT regexp_extract(NULL, '(a)', ['letter']);
+----
+NULL

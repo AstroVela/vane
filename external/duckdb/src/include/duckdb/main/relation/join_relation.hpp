@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -24,13 +18,13 @@ public:
 	DUCKDB_API JoinRelation(shared_ptr<Relation> left, shared_ptr<Relation> right,
 	                        unique_ptr<ParsedExpression> condition, JoinType type,
 	                        JoinRefType join_ref_type = JoinRefType::REGULAR);
-	DUCKDB_API JoinRelation(shared_ptr<Relation> left, shared_ptr<Relation> right, vector<string> using_columns,
+	DUCKDB_API JoinRelation(shared_ptr<Relation> left, shared_ptr<Relation> right, vector<Identifier> using_columns,
 	                        JoinType type, JoinRefType join_ref_type = JoinRefType::REGULAR);
 
 	shared_ptr<Relation> left;
 	shared_ptr<Relation> right;
 	unique_ptr<ParsedExpression> condition;
-	vector<string> using_columns;
+	vector<Identifier> using_columns;
 	JoinType join_type;
 	JoinRefType join_ref_type;
 	vector<ColumnDefinition> columns;
@@ -44,16 +38,7 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 
-protected:
-	bool ContainsNonSQLRelation() override {
-		return ChildContainsNonSQLRelation(*left) || ChildContainsNonSQLRelation(*right);
-	}
-	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
-		return ChildCanSerializeToQueryNode(*left, binder) && ChildCanSerializeToQueryNode(*right, binder);
-	}
-
-	unique_ptr<TableRef> GetTableRefInternal() override;
-	BoundStatement BindAsInput(Binder &binder) override;
+	unique_ptr<TableRef> GetTableRef() override;
 };
 
 } // namespace duckdb

@@ -1,11 +1,6 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/main/relation/insert_relation.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -13,32 +8,27 @@
 
 namespace duckdb {
 
-InsertRelation::InsertRelation(shared_ptr<Relation> child_p, string schema_name, string table_name)
+InsertRelation::InsertRelation(shared_ptr<Relation> child_p, Identifier schema_name, Identifier table_name)
     : Relation(child_p->context, RelationType::INSERT_RELATION), child(std::move(child_p)),
       schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
 	TryBindRelation(columns);
 }
 
-InsertRelation::InsertRelation(shared_ptr<Relation> child_p, string catalog_name, string schema_name, string table_name)
+InsertRelation::InsertRelation(shared_ptr<Relation> child_p, Identifier catalog_name, Identifier schema_name,
+                               Identifier table_name)
     : Relation(child_p->context, RelationType::INSERT_RELATION), child(std::move(child_p)),
       catalog_name(std::move(catalog_name)), schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
 	TryBindRelation(columns);
 }
 
 BoundStatement InsertRelation::Bind(Binder &binder) {
-	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
-	if (!query_node) {
-		throw NotImplementedException("Cannot insert from a relation that cannot be faithfully represented as a SQL "
-		                              "query node; conversion would discard the exchange or lose relation bindings");
-	}
 	InsertStatement stmt;
+	auto &node = *stmt.node;
 	auto select = make_uniq<SelectStatement>();
-	select->node = std::move(query_node);
+	select->node = child->GetQueryNode();
 
-	stmt.catalog = catalog_name;
-	stmt.schema = schema_name;
-	stmt.table = table_name;
-	stmt.select_statement = std::move(select);
+	node.qualified_name = QualifiedName(catalog_name, schema_name, table_name);
+	node.select_statement = std::move(select);
 	return binder.Bind(stmt.Cast<SQLStatement>());
 }
 

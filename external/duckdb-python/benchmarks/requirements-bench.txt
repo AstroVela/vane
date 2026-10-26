@@ -1,0 +1,23 @@
+# Frozen pins for the benchmark suite: freezing the data libs means the only cross-run delta is the binding.
+# Regenerate DELIBERATELY, together with the baseline. Source of truth: the `[dependency-groups] bench` list in
+# pyproject.toml (torch/tensorflow deliberately absent, local-only via importorskip). Regenerate with:
+#   uv pip compile pyproject.toml --group bench \
+#     --python-version 3.13 --python-platform x86_64-unknown-linux-gnu \
+#     --no-annotate --no-header -o benchmarks/requirements-bench.txt
+iniconfig==2.3.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+numpy==2.5.0
+packaging==26.2
+pandas==3.0.3
+pluggy==1.6.0
+polars==1.42.1
+polars-runtime-32==1.42.1
+pyarrow==24.0.0
+pygments==2.20.0
+pytest==9.1.1
+pytest-codspeed==5.0.3
+python-dateutil==2.9.0.post0
+pytz==2026.2
+rich==15.0.0
+six==1.17.0

@@ -20,7 +20,9 @@ CSVFileHandle::CSVFileHandle(ClientContext &context_p, unique_ptr<FileHandle> fi
 
 unique_ptr<FileHandle> CSVFileHandle::OpenFileHandle(FileSystem &fs, Allocator &allocator, const OpenFileInfo &file,
                                                      FileCompressionType compression) {
-	auto file_handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ | compression);
+	FileOpenFlags flags = FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_PARALLEL_ACCESS | std::move(compression);
+	flags.SetCachingMode(CachingMode::CACHE_REMOTE_ONLY);
+	auto file_handle = fs.OpenFile(file, flags);
 	if (file_handle->CanSeek()) {
 		file_handle->Reset();
 	}
@@ -50,14 +52,7 @@ void CSVFileHandle::Seek(const idx_t position) const {
 		}
 		throw InternalException("Trying to seek a compressed CSV File.");
 	}
-	if (has_scan_range) {
-		if (position > scan_read_end - scan_range_start) {
-			throw InternalException("Trying to seek past a CSV split's readable byte range");
-		}
-		file_handle->Seek(scan_range_start + position);
-	} else {
-		file_handle->Seek(position);
-	}
+	file_handle->Seek(position);
 }
 
 bool CSVFileHandle::OnDiskFile() const {
@@ -65,49 +60,10 @@ bool CSVFileHandle::OnDiskFile() const {
 }
 
 void CSVFileHandle::Reset() {
-	if (has_scan_range) {
-		file_handle->Seek(scan_range_start);
-	} else {
-		file_handle->Reset();
-	}
+	file_handle->Reset();
+	encoder.Reset();
 	finished = false;
 	requested_bytes = 0;
-}
-
-void CSVFileHandle::SetScanRange(const idx_t start, const idx_t end, const idx_t overlap) {
-	if (compression_type != FileCompressionType::UNCOMPRESSED) {
-		throw InvalidInputException("CSV byte-range scans require an uncompressed input file");
-	}
-	if (!can_seek || is_pipe) {
-		throw InvalidInputException("CSV byte-range scans require a seekable input file");
-	}
-	if (encoder.encoding_name != "utf-8") {
-		throw InvalidInputException("CSV byte-range scans require UTF-8 input");
-	}
-	if (start >= end || end > file_size) {
-		throw InvalidInputException("CSV byte range [%llu, %llu) is outside file of size %llu", start, end, file_size);
-	}
-	idx_t aligned_start = start;
-	if (start > 0) {
-		char boundary_bytes[2];
-		file_handle->Read(context, boundary_bytes, sizeof(boundary_bytes), start - 1);
-		if (boundary_bytes[0] == '\r' && boundary_bytes[1] == '\n') {
-			// Starting on the LF half of CRLF leaves the strict state machine without the preceding CR. The preceding
-			// scanner owns the extra record that crosses this boundary, so advancing to the following record and
-			// letting ordinary non-first-boundary synchronization skip it preserves the normal parallel CSV ownership
-			// rule.
-			aligned_start++;
-		}
-	}
-	if (aligned_start >= end) {
-		throw InvalidInputException("CSV byte range [%llu, %llu) cannot be aligned to a record boundary", start, end);
-	}
-	has_scan_range = true;
-	scan_range_start = aligned_start;
-	scan_range_end = end;
-	const auto bounded_overlap = MinValue<idx_t>(overlap, file_size);
-	scan_read_end = end > file_size - bounded_overlap ? file_size : end + bounded_overlap;
-	Reset();
 }
 
 bool CSVFileHandle::IsPipe() const {
@@ -115,15 +71,12 @@ bool CSVFileHandle::IsPipe() const {
 }
 
 idx_t CSVFileHandle::FileSize() const {
-	return has_scan_range ? scan_range_end - scan_range_start : file_size;
+	return file_size;
 }
 
-bool CSVFileHandle::HasScanRange() const {
-	return has_scan_range;
-}
-
-idx_t CSVFileHandle::ScanRangeStart() const {
-	return scan_range_start;
+bool CSVFileHandle::HasKnownBufferRanges() const {
+	return compression_type == FileCompressionType::UNCOMPRESSED && can_seek && !is_pipe &&
+	       encoder.encoding_name == "utf-8";
 }
 
 bool CSVFileHandle::FinishedReading() const {
@@ -136,9 +89,7 @@ idx_t CSVFileHandle::Read(void *buffer, idx_t nr_bytes) {
 	// in csv format while logging is enabled
 	if (file_handle->GetFileCompressionType() == FileCompressionType::UNCOMPRESSED && file_handle->CanSeek() &&
 	    encoder.encoding_name == "utf-8") {
-		const auto read_end = has_scan_range ? scan_read_end : file_size;
-		const auto current_position = file_handle->SeekPosition();
-		nr_bytes = current_position >= read_end ? 0 : MinValue<idx_t>(nr_bytes, read_end - current_position);
+		nr_bytes = MinValue<idx_t>(nr_bytes, file_size - file_handle->SeekPosition());
 	}
 
 	requested_bytes += nr_bytes;
@@ -150,10 +101,16 @@ idx_t CSVFileHandle::Read(void *buffer, idx_t nr_bytes) {
 		bytes_read = encoder.Encode(*file_handle, static_cast<char *>(buffer), nr_bytes);
 	}
 	if (!finished) {
-		finished = bytes_read == 0 || (has_scan_range && file_handle->SeekPosition() >= scan_read_end);
+		finished = bytes_read == 0;
 	}
-	uncompressed_bytes_read += static_cast<idx_t>(bytes_read);
+	uncompressed_bytes_read.fetch_add(static_cast<idx_t>(bytes_read), std::memory_order_relaxed);
 	return UnsafeNumericCast<idx_t>(bytes_read);
+}
+
+void CSVFileHandle::ReadAt(void *buffer, idx_t nr_bytes, idx_t position) {
+	D_ASSERT(HasKnownBufferRanges());
+	D_ASSERT(position + nr_bytes <= file_size);
+	file_handle->Read(context, buffer, nr_bytes, position);
 }
 
 string CSVFileHandle::ReadLine() {
@@ -171,8 +128,7 @@ string CSVFileHandle::ReadLine() {
 					throw BinderException(
 					    "Carriage return newlines not supported when reading CSV files in which we cannot seek");
 				}
-				const auto logical_position = file_handle->SeekPosition() - scan_range_start;
-				Seek(logical_position - 1);
+				file_handle->Seek(file_handle->SeekPosition() - 1);
 				return result;
 			}
 		}

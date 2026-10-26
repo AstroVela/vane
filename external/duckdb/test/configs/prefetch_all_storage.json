@@ -1,5 +1,19 @@
 {
   "base_config": "test/configs/force_storage.json",
   "description": "Run tests with debug prefetching enabled",
-  "on_init": "SET storage_block_prefetch='debug_force_always'"
+  "on_init": "SET storage_block_prefetch='debug_force_always'",
+  "skip_tests": [
+    {
+      "reason": "Test expects an out-of-memory error from a specific persistent index loading pattern.",
+      "paths": [
+        "test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test"
+      ]
+    },
+    {
+      "reason": "Forced prefetching reads all blocks of the column at once, which exceeds the memory limit the test relies on.",
+      "paths": [
+        "test/sql/storage/overflow_strings/blob_row_fetch.test"
+      ]
+    }
+  ]
 }

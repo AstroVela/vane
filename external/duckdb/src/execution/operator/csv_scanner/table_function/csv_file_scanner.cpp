@@ -1,38 +1,22 @@
 #include "duckdb/execution/operator/csv_scanner/csv_file_scanner.hpp"
 
-#include "duckdb/execution/operator/csv_scanner/csv_scan_range.hpp"
 #include "duckdb/execution/operator/csv_scanner/sniffer/csv_sniffer.hpp"
 #include "duckdb/execution/operator/csv_scanner/skip_scanner.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 
 namespace duckdb {
 
-static void DetectNewLineFromFileStartForScanRange(ClientContext &context, const OpenFileInfo &file,
-                                                   CSVReaderOptions &options, bool per_file_single_threaded) {
-	CSVScanRange scan_range;
-	if (options.dialect_options.state_machine_options.new_line != NewLineIdentifier::NOT_SET ||
-	    !CSVScanRange::TryGet(file, scan_range)) {
-		return;
-	}
-
-	// A range can begin next to an embedded newline in a quoted field. Detect the convention from the original file
-	// before narrowing the reader so every range uses the same state machine.
-	auto detection_manager =
-	    make_shared_ptr<CSVBufferManager>(context, options, CSVScanRange::Strip(file), per_file_single_threaded);
-	options.dialect_options.state_machine_options.new_line = CSVSniffer::DetectNewLineDelimiter(*detection_manager);
-}
-
 CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, CSVReaderOptions options_p,
-                         const MultiFileOptions &file_options, const vector<string> &names,
+                         const MultiFileOptions &file_options, const vector<Identifier> &names,
                          const vector<LogicalType> &types, CSVSchema &file_schema, bool per_file_single_threaded,
                          shared_ptr<CSVBufferManager> buffer_manager_p, bool fixed_schema)
-    : BaseFileReader(file_p), buffer_manager(std::move(buffer_manager_p)),
-      error_handler(make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue())),
+    : file(file_p), buffer_manager(std::move(buffer_manager_p)),
+      error_handler(
+          make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue(), options_p.store_rejects.GetValue())),
       options(std::move(options_p)) {
-	DetectNewLineFromFileStartForScanRange(context, file, options, per_file_single_threaded);
 	// Initialize Buffer Manager
 	if (!buffer_manager) {
-		buffer_manager = make_shared_ptr<CSVBufferManager>(context, options, file, per_file_single_threaded);
+		buffer_manager = CSVBufferManager::Open(context, options, file, per_file_single_threaded);
 	}
 	// Initialize On Disk and Size of file
 	on_disk_file = buffer_manager->file_handle->OnDiskFile();
@@ -68,10 +52,10 @@ CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, CSV
 
 CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, const CSVReaderOptions &options_p,
                          const MultiFileOptions &file_options)
-    : BaseFileReader(file_p), error_handler(make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue())),
+    : file(file_p), error_handler(make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue(),
+                                                                   options_p.store_rejects.GetValue())),
       options(options_p) {
-	DetectNewLineFromFileStartForScanRange(context, file, options, false);
-	buffer_manager = make_shared_ptr<CSVBufferManager>(context, options, file);
+	buffer_manager = CSVBufferManager::Open(context, options, file);
 	// Initialize On Disk and Size of file
 	on_disk_file = buffer_manager->file_handle->OnDiskFile();
 	file_size = buffer_manager->file_handle->FileSize();
@@ -96,15 +80,7 @@ CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, con
 	SetStart();
 }
 
-CSVUnionData::~CSVUnionData() {
-}
-
 void CSVFileScan::SetStart() {
-	if (buffer_manager->HasScanRange() && buffer_manager->GetScanRangeStart() > 0) {
-		// The ordinary parallel CSV synchronization now skips the partial record at the beginning of this range.
-		start_iterator.first_one = false;
-		return;
-	}
 	idx_t rows_to_skip = options.GetSkipRows() + state_machine->dialect_options.header.GetValue();
 
 	if (rows_to_skip == 0) {
@@ -117,10 +93,10 @@ void CSVFileScan::SetStart() {
 	start_iterator = skip_scanner.GetIterator();
 }
 
-void CSVFileScan::SetNamesAndTypes(const vector<string> &names_p, const vector<LogicalType> &types_p) {
-	names = names_p;
+void CSVFileScan::SetNamesAndTypes(const vector<Identifier> &names_p, const vector<LogicalType> &types_p) {
+	names = IdentifiersToStrings(names_p);
 	types = types_p;
-	columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(names, types);
+	columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(names_p, types);
 }
 
 void CSVFileScan::InitializeFileNamesTypes() {
@@ -180,6 +156,36 @@ void CSVFileScan::InitializeProjection() {
 
 void CSVFileScan::Finish() {
 	buffer_manager.reset();
+}
+
+double CSVFileScan::GetProgressInFile(ClientContext &context) {
+	auto manager = buffer_manager;
+	if (!manager) {
+		// We are done with this file, so it's 100%
+		return 100.0;
+	}
+	if (file_size == 0) {
+		// empty file
+		return 100.0;
+	}
+	auto &file_handle = *manager->file_handle;
+	if (file_handle.compression_type == FileCompressionType::GZIP ||
+	    file_handle.compression_type == FileCompressionType::ZSTD) {
+		// compressed file: the file is decompressed ahead of parsing - the progress is the fraction of the file that
+		// was decompressed, times the fraction of the decompressed bytes that was parsed
+		auto decompressed_fraction = file_handle.GetProgress() / static_cast<double>(file_size);
+		auto decompressed_bytes = file_handle.UncompressedBytesRead();
+		double parsed_fraction = 0;
+		if (decompressed_bytes > 0) {
+			parsed_fraction = MinValue<double>(static_cast<double>(bytes_read.load(std::memory_order_relaxed)) /
+			                                       static_cast<double>(decompressed_bytes),
+			                                   1.0);
+		}
+		auto progress = compressed_progress.Update(
+		    ProgressData {MinValue<double>(decompressed_fraction, 1.0) * parsed_fraction, 1.0, false});
+		return progress.done * 100.0;
+	}
+	return static_cast<double>(bytes_read.load(std::memory_order_relaxed)) / static_cast<double>(file_size) * 100.0;
 }
 
 } // namespace duckdb

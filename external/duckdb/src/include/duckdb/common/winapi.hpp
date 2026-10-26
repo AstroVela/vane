@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -19,14 +13,14 @@
 #ifdef DUCKDB_STATIC_BUILD
 #define DUCKDB_API
 #else
-#if defined(DUCKDB_BUILD_LIBRARY) && !defined(DUCKDB_BUILD_LOADABLE_EXTENSION)
+#ifdef DUCKDB_BUILD_LIBRARY
 #define DUCKDB_API __declspec(dllexport)
 #else
 #define DUCKDB_API __declspec(dllimport)
 #endif
 #endif
 #else
-#define DUCKDB_API __attribute__((visibility("default")))
+#define DUCKDB_API
 #endif
 #endif
 

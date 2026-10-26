@@ -6,9 +6,6 @@ statement ok
 SET default_null_order='nulls_first';
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE dates(d DATE, s VARCHAR);
 
 statement ok
@@ -29,7 +26,7 @@ CREATE TABLE specifiers (specifier VARCHAR);
 foreach specifier era millennium century decade year quarter month day week weekday isodow dayofyear isoyear yearweek
 
 statement ok
-INSERT INTO specifiers VALUES ('${partcode}');
+INSERT INTO specifiers VALUES ('{partcode}');
 
 endloop
 
@@ -282,6 +279,21 @@ select timezone(interval '4 minute', '12:15:37.123456-08'::TIMETZ);
 ----
 20:19:37.123456+00:04
 
+query I
+select timezone(interval '-15 hours -59 minutes -59 seconds', '12:00:00+00'::TIMETZ);
+----
+20:00:01-15:59:59
+
+statement error
+select timezone(interval '16 hours', '12:00:00+00'::TIMETZ);
+----
+Timezone offset out of range
+
+statement error
+select timezone(interval '9223372036854775807 microseconds', '12:00:00+00'::TIMETZ);
+----
+Timezone offset out of range
+
 #  last_day
 query TTT
 SELECT LAST_DAY(DATE '1900-02-12'), LAST_DAY(DATE '1992-02-12'), LAST_DAY(DATE '2000-02-12');
@@ -311,6 +323,11 @@ SELECT LAST_DAY(d::timestamp) FROM dates;
 NULL
 NULL
 NULL
+
+statement error
+SELECT last_day(DATE '5881580-07-10');
+----
+Date out of range: 5881580-8-1
 
 #  monthname
 query T
@@ -421,7 +438,7 @@ date_part('quarter', DATE '1992-12-20')
 foreach partcode era millennium century decade year quarter month day week weekday isodow dayofyear isoyear yearweek julian
 
 query III
-SELECT d, DATE_PART('${partcode}', d) AS p, ${partcode}(d) AS f
+SELECT d, DATE_PART('{partcode}', d) AS p, {partcode}(d) AS f
 FROM dates
 WHERE p IS DISTINCT FROM f;
 ----
@@ -487,9 +504,9 @@ infinity	NULL
 foreach partcode era millennium century decade year quarter month day week weekday isodow doy isoyear yearweek
 
 query III
-SELECT d, DATE_PART('${partcode}', d) AS p, DATE_PART(['${partcode}'], d) AS st
+SELECT d, DATE_PART('{partcode}', d) AS p, DATE_PART(['{partcode}'], d) AS st
 FROM dates
-WHERE p IS DISTINCT FROM st['${partcode}'];
+WHERE p IS DISTINCT FROM st['{partcode}'];
 ----
 
 endloop
@@ -568,23 +585,23 @@ ORDER BY 1;
 ----
 1992-05-05	{'year': 1992, 'month': 5, 'day': 5}
 
-# Invalid parts
+# Zeroed parts
 
 foreach datepart hour minute second millisecond microsecond timezone timezone_hour timezone_minute
 
-statement error
-SELECT d, DATE_PART(['${datepart}'], d) AS parts
+query II
+SELECT d, DATE_PART(['{datepart}'], d) AS parts
 FROM dates
+WHERE parts['{datepart}'] <> 0
 ORDER BY 1;
 ----
-not recognized
 
 endloop
 
-statement error
+query I
 SELECT DATE_PART(['hour', 'minute'], '2023-09-17'::DATE) AS parts
 ----
-not recognized
+{'hour': 0, 'minute': 0}
 
 #
 # Infinities
@@ -598,7 +615,7 @@ foreach special infinity -infinity
 
 # Binary function
 query I
-SELECT DATE_PART(specifier, '${special}'::${datatype}) AS result
+SELECT DATE_PART(specifier, '{special}'::{datatype}) AS result
 FROM specifiers
 WHERE result IS NOT NULL
 ----
@@ -607,7 +624,7 @@ foreach unary year month day decade century millennium quarter dayofweek isodow 
 
 # Unary functions
 query I
-SELECT ${unary}('${special}'::${datatype});
+SELECT {unary}('{special}'::{datatype});
 ----
 NULL
 
@@ -615,7 +632,7 @@ endloop
 
 # Struct entries should be NULL
 query I
-SELECT DATE_PART(['year', 'month', 'day', 'epoch'], '${special}'::${datatype}) AS parts
+SELECT DATE_PART(['year', 'month', 'day', 'epoch'], '{special}'::{datatype}) AS parts
 ----
 {'year': NULL, 'month': NULL, 'day': NULL, 'epoch': NULL}
 

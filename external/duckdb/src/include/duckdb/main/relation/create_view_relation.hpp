@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -20,12 +14,13 @@ namespace duckdb {
 
 class CreateViewRelation : public Relation {
 public:
-	CreateViewRelation(shared_ptr<Relation> child, string view_name, bool replace, bool temporary);
-	CreateViewRelation(shared_ptr<Relation> child, string schema_name, string view_name, bool replace, bool temporary);
+	CreateViewRelation(shared_ptr<Relation> child, Identifier view_name, bool replace, bool temporary);
+	CreateViewRelation(shared_ptr<Relation> child, Identifier schema_name, Identifier view_name, bool replace,
+	                   bool temporary);
 
 	shared_ptr<Relation> child;
-	string schema_name;
-	string view_name;
+	Identifier schema_name;
+	Identifier view_name;
 	bool replace;
 	bool temporary;
 	vector<ColumnDefinition> columns;
@@ -37,11 +32,6 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	bool IsReadOnly() override {
-		return false;
-	}
-
-protected:
-	bool CanSerializeToQueryNodeInternal(Binder &) override {
 		return false;
 	}
 };

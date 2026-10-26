@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -31,15 +25,12 @@ enum class LogicalOperatorType : uint8_t {
 	LOGICAL_LIMIT = 6,
 	LOGICAL_ORDER_BY = 7,
 	LOGICAL_TOP_N = 8,
-	LOGICAL_VLLM_PROJECT = 9,
 	LOGICAL_COPY_TO_FILE = 10,
 	LOGICAL_DISTINCT = 11,
 	LOGICAL_SAMPLE = 12,
-	LOGICAL_UDF_PROJECT = 13,
 	LOGICAL_PIVOT = 14,
 	LOGICAL_COPY_DATABASE = 15,
-	LOGICAL_REPARTITION = 17,
-	LOGICAL_LOCAL_EXCHANGE = 18,
+	LOGICAL_SECURE_VIEW = 16,
 
 	// -----------------------------
 	// Data sources
@@ -78,6 +69,7 @@ enum class LogicalOperatorType : uint8_t {
 	LOGICAL_DELETE = 101,
 	LOGICAL_UPDATE = 102,
 	LOGICAL_MERGE_INTO = 103,
+	LOGICAL_TRIGGER = 104,
 
 	// -----------------------------
 	// Schema
@@ -95,6 +87,7 @@ enum class LogicalOperatorType : uint8_t {
 	LOGICAL_CREATE_TYPE = 135,
 	LOGICAL_ATTACH = 136,
 	LOGICAL_DETACH = 137,
+	LOGICAL_CREATE_TRIGGER = 138,
 
 	// -----------------------------
 	// Explain
@@ -112,6 +105,9 @@ enum class LogicalOperatorType : uint8_t {
 	LOGICAL_LOAD = 180,
 	LOGICAL_RESET = 181,
 	LOGICAL_UPDATE_EXTENSIONS = 182,
+	LOGICAL_CONNECT = 183,
+	LOGICAL_DISCONNECT = 184,
+	LOGICAL_EXTERNAL_RESOURCE = 185,
 
 	// -----------------------------
 	// Secrets

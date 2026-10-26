@@ -1,0 +1,128 @@
+# Instruction-count (Callgrind) perf gate vs a committed benchmarks/baseline.json; no CodSpeed account needed
+# (compare_baseline.py parses the raw callgrind dumps). Rationale in benchmarks/README.md and benchmarks/PLAN.md.
+# workflow_dispatch input `regen`: false compares (report only), true writes baseline.json and uploads it.
+
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      regen:
+        description: "Regenerate benchmarks/baseline.json (upload as artifact) instead of comparing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: codspeed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # ~25 min sweep (BENCH_SCALE=10) + ~10 min cold build, plus margin
+    permissions:
+      contents: read
+    env:
+      PYTHONHASHSEED: "0" # deterministic instruction counts
+      CODSPEED_ENV: "1" # enable pytest-codspeed callgrind hooks
+      # shrink O(rows) benches to fit the timeout; a baseline only compares to a run at the SAME scale (meta.bench_scale)
+      BENCH_SCALE: "10"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # the package version needs only HEAD, but DuckDB's own version script
+          # counts the submodule's commits and a shallow clone would label the
+          # engine v2.0.0-dev1
+          fetch-depth: 0
+
+      - name: Resolve DuckDB submodule SHA
+        id: duckdb_sha
+        # sccache key + compare_baseline.py engine-bump guard
+        run: echo "sha=$(git rev-parse HEAD:external/duckdb)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.23"
+          # No setup-uv cache: since setup-uv v9 it saves unpruned and would crowd out the ccaches.
+          enable-cache: false
+          python-version: "3.13"
+          # The benchmark step runs $VIRTUAL_ENV/bin/python under valgrind; setup-uv v6 and later no longer
+          # activate the venv on their own.
+          activate-environment: true
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: sccache-codspeed-${{ steps.duckdb_sha.outputs.sha }}
+          restore-keys: sccache-codspeed-
+
+      - name: Install sccache
+        run: |
+          curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz --strip-components=1 -C /usr/local/bin sccache-v0.8.2-x86_64-unknown-linux-musl/sccache
+
+      - name: Build the extension (release) + pinned benchmark deps
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: |
+          uv sync --only-group build --no-install-project -p 3.13
+          # pins BEFORE the build: numpy>=2.0 is a build-system.requires (C API headers), absent under
+          # --no-build-isolation and not in the `build` group, so find_package(NumPy) fails otherwise.
+          uv pip install -r benchmarks/requirements-bench.txt
+          # uv pip is additive; uv sync would prune numpy back out before the build. release, no dev group.
+          uv pip install --no-build-isolation --no-deps --reinstall -C cmake.build-type=Release .
+
+      - name: Collect gate node-ids
+        # regen uses these to classify each benchmark. Block scalar so `\` is a real shell continuation; a plain
+        # scalar folds it to a literal `\ `, mangling pytest args into an empty (all-informational) gate list.
+        run: |
+          uv run --no-sync pytest benchmarks/ -m gate --collect-only -q -o addopts= -p no:cacheprovider \
+            | grep '::' > gate_list.txt || true
+          # an empty gate list yields a 0-gate baseline that never catches a regression
+          test -s gate_list.txt || { echo "ERROR: gate_list.txt empty"; exit 1; }
+          echo "collected $(wc -l < gate_list.txt) gate node-ids"
+
+      - name: Run benchmarks under Callgrind (per-benchmark instruction counts)
+        # one sweep; concurrency module excluded (Callgrind serializes threads).
+        run: |
+          mkdir -p profiles
+          # run the venv python directly, NOT `uv run`: valgrind without --trace-children only instruments uv,
+          # leaving pytest un-instrumented (native speed, zero dumps).
+          CODSPEED_PROFILE_FOLDER="$PWD/profiles" valgrind --tool=callgrind --instr-atstart=no \
+            --callgrind-out-file="$PWD/profiles/cg.%p.%n" \
+            "$VIRTUAL_ENV/bin/python" -m pytest benchmarks/ \
+              --ignore=benchmarks/test_concurrency_perf.py \
+              -m "gate or informational" --codspeed -o addopts= -p no:cacheprovider
+
+      - name: Compare against committed baseline (report-only)
+        if: ${{ !inputs.regen }}
+        # report only, never fails; add --enforce once trusted
+        run: |
+          uv run --no-sync python benchmarks/compare_baseline.py compare \
+            --profiles profiles --baseline benchmarks/baseline.json \
+            --submodule-sha "${{ steps.duckdb_sha.outputs.sha }}" \
+            --pins benchmarks/requirements-bench.txt
+
+      - name: Regenerate baseline (upload artifact to commit deliberately)
+        if: ${{ inputs.regen }}
+        run: |
+          uv run --no-sync python benchmarks/compare_baseline.py regen \
+            --profiles profiles --out benchmarks/baseline.json --gate-list gate_list.txt \
+            --git-commit "${{ github.sha }}" --submodule-sha "${{ steps.duckdb_sha.outputs.sha }}" \
+            --pins benchmarks/requirements-bench.txt
+
+      - name: Upload regenerated baseline
+        if: ${{ inputs.regen }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-update
+          path: benchmarks/baseline.json

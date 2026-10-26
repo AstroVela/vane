@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -17,59 +11,44 @@
 #include "duckdb/main/relation.hpp"
 
 namespace duckdb {
+struct TableFunctionInfo;
 
 class TableFunctionRelation : public Relation {
 public:
 	TableFunctionRelation(const shared_ptr<ClientContext> &context, string name, vector<Value> parameters,
 	                      named_parameter_map_t named_parameters, shared_ptr<Relation> input_relation_p = nullptr,
-	                      bool auto_init = true);
+	                      bool auto_init = true, shared_ptr<TableFunctionInfo> bind_info = nullptr);
 	TableFunctionRelation(const shared_ptr<RelationContextWrapper> &context, string name, vector<Value> parameters,
 	                      named_parameter_map_t named_parameters, shared_ptr<Relation> input_relation_p = nullptr,
-	                      bool auto_init = true);
+	                      bool auto_init = true, shared_ptr<TableFunctionInfo> bind_info = nullptr);
 	TableFunctionRelation(const shared_ptr<ClientContext> &context, string name, vector<Value> parameters,
-	                      shared_ptr<Relation> input_relation_p = nullptr, bool auto_init = true);
+	                      shared_ptr<Relation> input_relation_p = nullptr, bool auto_init = true,
+	                      shared_ptr<TableFunctionInfo> bind_info = nullptr);
 	~TableFunctionRelation() override {
 	}
 
-	string name;
+	Identifier name;
 	vector<Value> parameters;
 	named_parameter_map_t named_parameters;
 	vector<ColumnDefinition> columns;
 	shared_ptr<Relation> input_relation;
+	shared_ptr<TableFunctionInfo> bind_info;
 
 public:
 	unique_ptr<QueryNode> GetQueryNode() override;
-	BoundStatement Bind(Binder &binder) override;
+	unique_ptr<TableRef> GetTableRef() override;
 
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
-	string GetAlias() override;
+	Identifier GetAlias() override;
 	void AddNamedParameter(const string &name, Value argument);
 	void RemoveNamedParameterIfExists(const string &name);
 	void SetNamedParameters(named_parameter_map_t &&named_parameters);
 
-protected:
-	bool ContainsNonSQLRelation() override {
-		return input_relation && ChildContainsNonSQLRelation(*input_relation);
-	}
-	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
-		return !input_relation || ChildCanSerializeToQueryNode(*input_relation, binder);
-	}
-	bool CanBindAsInputInternal(Binder &binder) override {
-		return !input_relation || ChildCanBindAsInput(*input_relation, binder);
-	}
-
-	unique_ptr<TableRef> GetTableRefInternal() override;
-
 private:
-	friend class SerializedExpressionScopeChecker;
-
 	void InitializeColumns();
-	void CaptureVirtualColumnNames(const LogicalOperator &plan);
-	BoundStatement BindAsInput(Binder &binder) override;
 
 private:
-	vector<string> virtual_column_names;
 	//! Whether or not to auto initialize the columns on construction
 	bool auto_initialize;
 };

@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 2.8.12...3.29)
 
 project(JSONExtension)
 
+# Before any subdirectory or target, which would otherwise inherit the
+# directory-wide definition
+set_extension_version_sources(json json_extension.cpp)
+
 include_directories(include)
 add_subdirectory(json_functions)
 
@@ -11,9 +15,7 @@ set(JSON_EXTENSION_FILES
     json_common.cpp
     json_enums.cpp
     json_functions.cpp
-    json_multi_file_info.cpp
     json_scan.cpp
-    json_distributed.cpp
     json_serializer.cpp
     json_deserializer.cpp
     serialize_json.cpp
@@ -29,17 +31,21 @@ set(JSON_EXTENSION_FILES
     json_functions/json_structure.cpp
     json_functions/json_transform.cpp
     json_functions/json_create.cpp
+    json_functions/json_geojson.cpp
     json_functions/json_type.cpp
     json_functions/json_valid.cpp
     json_functions/json_value.cpp
     json_functions/json_serialize_sql.cpp
     json_functions/json_serialize_plan.cpp
+    json_functions/json_normalize.cpp
+    json_functions/json_deep_merge.cpp
+    json_functions/json_merge_patch_diff.cpp
+    json_functions/json_modify.cpp
+    json_functions/json_strip_nulls.cpp
     json_functions/read_json.cpp
-    json_functions/read_json_objects.cpp)
+    json_functions/read_single_json_file.cpp)
 
-build_static_extension(json ${JSON_EXTENSION_FILES})
-set(PARAMETERS "-warnings")
-build_loadable_extension(json ${PARAMETERS} ${JSON_EXTENSION_FILES})
+build_extension_library(json ${JSON_EXTENSION_FILES})
 target_link_libraries(json_loadable_extension duckdb_yyjson)
 
 install(

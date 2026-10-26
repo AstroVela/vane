@@ -1,5 +1,5 @@
 include_directories(include)
-add_subdirectory(linenoise)
+
 add_definitions(-DHAVE_LINENOISE=1)
 include_directories(../../third_party/utf8proc/include)
 include_directories(linenoise/include)
@@ -7,29 +7,45 @@ add_definitions(-DUSE_DUCKDB_SHELL_WRAPPER)
 
 include_directories(../../third_party/utf8proc/include)
 
-if(DUCKDB_EXTENSION_AUTOCOMPLETE_SHOULD_LINK)
-  include_directories(../../extension/autocomplete/include)
-  set(ALL_OBJECT_FILES ${ALL_OBJECT_FILES}
-                       ../../extension/autocomplete/autocomplete_extension.cpp)
-  add_definitions(-DSHELL_INLINE_AUTOCOMPLETE)
+if(_DUCKDB_PREBUILT_SHELL_PATH)
+  add_library(duckdb_shell STATIC IMPORTED)
+  set_property(TARGET duckdb_shell PROPERTY IMPORTED_LOCATION
+                                            "${_DUCKDB_PREBUILT_SHELL_PATH}")
+else()
+  add_subdirectory(linenoise)
+  set(SHELL_SOURCES
+      shell_command_line_option.cpp
+      shell_extension.cpp
+      shell_grammar_extension.cpp
+      shell.cpp
+      shell_helpers.cpp
+      shell_manual.cpp
+      shell_metadata_command.cpp
+      shell_prompt.cpp
+      shell_renderer.cpp
+      shell_highlight.cpp
+      shell_profiler_renderer.cpp
+      shell_progress_bar.cpp
+      shell_render_table_metadata.cpp
+      shell_windows.cpp
+      $<TARGET_OBJECTS:duckdb_linenoise>)
+
+  add_library(duckdb_shell STATIC ${SHELL_SOURCES})
+  set_target_properties(
+    duckdb_shell
+    PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/src"
+               ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${PROJECT_BINARY_DIR}/src"
+               ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${PROJECT_BINARY_DIR}/src"
+               ARCHIVE_OUTPUT_DIRECTORY_RELWITHDEBINFO
+               "${PROJECT_BINARY_DIR}/src"
+               ARCHIVE_OUTPUT_DIRECTORY_MINSIZEREL "${PROJECT_BINARY_DIR}/src")
+  duckdb_make_native_lto_archive(duckdb_shell)
 endif()
-set(SHELL_SOURCES
-    ${SHELL_SOURCES}
-    shell_command_line_option.cpp
-    shell_extension.cpp
-    shell.cpp
-    shell_helpers.cpp
-    shell_metadata_command.cpp
-    shell_prompt.cpp
-    shell_renderer.cpp
-    shell_highlight.cpp
-    shell_progress_bar.cpp
-    shell_render_table_metadata.cpp
-    shell_windows.cpp)
 
-add_executable(shell ${SHELL_SOURCES})
+add_executable(shell shell_main.cpp)
 
-target_link_libraries(shell duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+target_link_libraries(shell duckdb_shell duckdb_static
+                      ${DUCKDB_EXTRA_LINK_FLAGS})
 link_threads(shell "")
 if(STATIC_LIBCPP)
   message("Statically linking CLI")
@@ -78,10 +94,32 @@ if(WIN32 AND NOT MINGW)
   set(CMAKE_RC_FLAGS
       "${CMAKE_RC_FLAGS} -D DUCKDB_COPYRIGHT_YEAR=\"${DUCKDB_COPYRIGHT_YEAR}\"")
   target_sources(shell PRIVATE rc/duckdb.rc)
+  # Opt into the Windows Segment Heap to avoid the default NT heap's lock
+  # contention under multi-threaded allocation (see #24027). CMake merges
+  # .manifest sources into the linker manifest via mt.exe.
+  target_sources(shell PRIVATE rc/duckdb.manifest)
 endif()
 
 set_target_properties(shell PROPERTIES OUTPUT_NAME duckdb)
 set_target_properties(shell PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                        ${PROJECT_BINARY_DIR})
+
+if(NOT WIN32)
+  configure_file("${PROJECT_SOURCE_DIR}/scripts/samply_profile_launcher.py.in"
+                 "${PROJECT_BINARY_DIR}/profile" @ONLY)
+  file(
+    CHMOD
+    "${PROJECT_BINARY_DIR}/profile"
+    PERMISSIONS
+    OWNER_READ
+    OWNER_WRITE
+    OWNER_EXECUTE
+    GROUP_READ
+    GROUP_EXECUTE
+    WORLD_READ
+    WORLD_EXECUTE)
+endif()
+
+duckdb_codesign_for_debugging(shell)
 
 install(TARGETS shell RUNTIME DESTINATION "${INSTALL_BIN_DIR}")

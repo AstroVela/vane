@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -15,6 +9,7 @@
 #pragma once
 
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 namespace duckdb {
 
@@ -26,10 +21,6 @@ public:
 
 public:
 	PhysicalLeftDelimJoin(PhysicalPlan &physical_plan, PhysicalPlanGenerator &planner, vector<LogicalType> types,
-	                      PhysicalOperator &original_join, PhysicalOperator &distinct,
-	                      const vector<const_reference<PhysicalOperator>> &delim_scans, idx_t estimated_cardinality,
-	                      optional_idx delim_idx);
-	PhysicalLeftDelimJoin(PhysicalPlan &physical_plan, DelimJoinDeserializeTag, vector<LogicalType> types,
 	                      PhysicalOperator &original_join, PhysicalOperator &distinct,
 	                      const vector<const_reference<PhysicalOperator>> &delim_scans, idx_t estimated_cardinality,
 	                      optional_idx delim_idx);

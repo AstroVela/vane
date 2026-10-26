@@ -8,7 +8,6 @@
 #include <thread>
 
 using namespace duckdb;
-using namespace std;
 
 TEST_CASE("Test that sequence never returns the same value twice even with aborts", "[persistence][.]") {
 	// disabled test for now
@@ -55,7 +54,7 @@ TEST_CASE("Test that sequence never returns the same value twice even with abort
 		// verify that "i" only has unique values from the sequence
 		// i.e. COUNT = COUNT(DISTINCT)
 		auto result = con.Query("SELECT COUNT(i), COUNT(DISTINCT i) FROM a");
-		REQUIRE(CHECK_COLUMN(result, 1, {result->GetValue(0, 0)}));
+		REQUIRE(CHECK_COLUMN(result, 1, {result->Collection().GetValue(0, 0)}));
 	}
 	DeleteDatabase(dbdir);
 }
@@ -96,9 +95,9 @@ TEST_CASE("Test that sequence never returns the same value twice even with abort
 		if (pid == 0) {
 			// child process, connect to the database and start inserting values in separate threads
 			DuckDB db(dbdir);
-			thread write_threads[8];
+			std::thread write_threads[8];
 			for (size_t i = 0; i < 8; i++) {
-				write_threads[i] = thread(write_entries_to_table, &db, i);
+				write_threads[i] = std::thread(write_entries_to_table, &db, i);
 			}
 			while (true)
 				;
@@ -122,7 +121,7 @@ TEST_CASE("Test that sequence never returns the same value twice even with abort
 		// verify that "i" only has unique values from the sequence
 		// i.e. COUNT = COUNT(DISTINCT)
 		auto result = con.Query("SELECT COUNT(i), COUNT(DISTINCT i) FROM a");
-		REQUIRE(CHECK_COLUMN(result, 1, {result->GetValue(0, 0)}));
+		REQUIRE(CHECK_COLUMN(result, 1, {result->Collection().GetValue(0, 0)}));
 	}
 	DeleteDatabase(dbdir);
 }

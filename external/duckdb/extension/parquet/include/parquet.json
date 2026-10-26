@@ -30,6 +30,31 @@
         "name": "identifier",
         "type": "Value",
         "default": "Value()"
+      },
+      {
+        "id": 106,
+        "name": "children",
+        "type": "vector<ParquetColumnDefinition>",
+        "default": "vector<ParquetColumnDefinition>()"
+      }
+    ],
+    "pointer_type": "none"
+  },
+  {
+    "class": "ParquetReaderProjectionExpression",
+    "includes": [
+      "parquet_reader.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "type",
+        "type": "ParquetReaderProjectionExpressionType"
+      },
+      {
+        "id": 101,
+        "name": "return_type",
+        "type": "LogicalType"
       }
     ],
     "pointer_type": "none"
@@ -69,7 +94,7 @@
         "id": 101,
         "name": "file_row_number",
         "type": "bool",
-        "property": "parquet_options.file_row_number"
+        "property": "legacy_file_row_number"
       },
       {
         "id": 102,
@@ -80,7 +105,7 @@
         "id": 103,
         "name": "schema",
         "type": "vector<ParquetColumnDefinition>",
-        "property": "parquet_options.schema"
+        "property": "legacy_schema"
       },
       {
         "id": 104,
@@ -109,6 +134,27 @@
         "type": "bool",
         "default": "false",
         "property": "parquet_options.can_have_nan"
+      },
+      {
+        "id": 108,
+        "name": "prefetch_strategy",
+        "type": "ParquetPrefetchStrategyOption",
+        "default": "ParquetPrefetchStrategyOption::AUTO",
+        "property": "parquet_options.prefetch_strategy"
+      },
+      {
+        "id": 109,
+        "name": "utf8_validation",
+        "type": "StringColumnReader::Utf8ValidationOption",
+        "default": "StringColumnReader::Utf8ValidationOption::STRICT_UTF8",
+        "property": "parquet_options.utf8_validation_option"
+      },
+      {
+        "id": 110,
+        "name": "int96_as",
+        "type": "ParquetInt96AsOption",
+        "default": "ParquetInt96AsOption::TIMESTAMP",
+        "property": "parquet_options.int96_as"
       }
     ],
     "pointer_type": "none"
@@ -146,7 +192,7 @@
       {
         "id": 100,
         "name": "ids",
-        "type": "case_insensitive_map_t<FieldID>",
+        "type": "identifier_map_t<FieldID>",
         "serialize_property": "ids.operator*()",
         "deserialize_property": "ids.operator*()"
       }
@@ -186,7 +232,7 @@
       {
         "id": 100,
         "name": "types",
-        "type": "case_insensitive_map_t<ShreddingType>",
+        "type": "unordered_map<string, ShreddingType>",
         "serialize_property": "types.operator*()",
         "deserialize_property": "types.operator*()"
       }

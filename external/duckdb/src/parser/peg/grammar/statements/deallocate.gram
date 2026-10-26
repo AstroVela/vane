@@ -1,0 +1,2 @@
+DeallocateStatement <- 'DEALLOCATE' DeallocatePrepare? ColIdOrString
+DeallocatePrepare <- 'PREPARE'

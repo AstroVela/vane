@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -32,16 +26,17 @@ public:
 public:
 	PhysicalUngroupedAggregate(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality,
-	                           TupleDataValidityType distinct_validity_p);
+	                           TupleDataValidityType distinct_validity);
 
 	//! The aggregates that have to be computed
 	vector<unique_ptr<Expression>> aggregates;
 	unique_ptr<DistinctAggregateData> distinct_data;
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
-	TupleDataValidityType distinct_validity;
 
 public:
 	// Source interface
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 
@@ -60,7 +55,6 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-	void SerializeOperatorData(Serializer &serializer) const override;
 
 	bool IsSink() const override {
 		return true;
@@ -68,6 +62,9 @@ public:
 
 	bool ParallelSink() const override {
 		return true;
+	}
+	PipelineExternalInputSupport GetExternalInputSupport() const override {
+		return PipelineExternalInputSupport::SUPPORTED;
 	}
 
 	bool SinkOrderDependent() const override;

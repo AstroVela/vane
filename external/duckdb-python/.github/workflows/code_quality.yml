@@ -1,0 +1,56 @@
+name: Code Quality Checks
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        type: string
+        description: Git ref of the DuckDB python package
+        required: false
+  workflow_call:
+    inputs:
+      git_ref:
+        type: string
+        description: Git ref of the DuckDB python package
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run_checks:
+    name: Run linting, formatting and static type checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Astral UV
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.23"
+          # No setup-uv cache: it would save on pull request and feature branch refs and crowd out the ccaches.
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: pre-commit (restore cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: pre-commit (--all-files)
+        run: |
+          uvx --python 3.12 pre-commit run --show-diff-on-failure --color=always --all-files
+
+      # Only a protected branch writes the cache (cache_warm runs this workflow for that); pull request and
+      # merge queue refs restore it and do not each save their own 110 MB copy.
+      - name: pre-commit (save cache)
+        if: ${{ always() && github.ref_protected && github.event_name != 'merge_group' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}

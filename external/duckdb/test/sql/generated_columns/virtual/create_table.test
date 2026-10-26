@@ -2,9 +2,6 @@
 # description: Add a generated column on creation of a table
 # group: [virtual]
 
-statement ok
-PRAGMA enable_verification
-
 # Creating tables with only generated columns is not supported
 statement error
 CREATE TEMP TABLE t0(c0 AS (1));
@@ -56,7 +53,7 @@ CREATE TABLE unit (
     amount_sold INTEGER,
 );
 ----
-<REGEX>:.*Parser Error.*isn't allowed.*
+Parser Error: Expression of generated column "total_profit" contains a subquery, which isn't allowed
 
 statement ok
 CREATE MACRO my_macro() AS (

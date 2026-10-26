@@ -2,59 +2,56 @@
 # description: String to Integer casts with Decimals and Exponents
 # group: [cast]
 
-statement ok
-PRAGMA enable_verification
-
 # Positive numbers (includes unsigned)
 foreach type <integral>
 
 # Positive Number - Positive Exponent
 query I
-select '1e2'::${type};
+select '1e2'::{type};
 ----
 100
 
 query I
-select '1.23e2'::${type};
+select '1.23e2'::{type};
 ----
 123
 
 query I
-select '1.234e2'::${type};
+select '1.234e2'::{type};
 ----
 123
 
 query I
-select '1.235e2'::${type};
+select '1.235e2'::{type};
 ----
 124
 
 # Positive Number - Negative Exponent
 
 query I
-select '1e-2'::${type};
+select '1e-2'::{type};
 ----
 0
 
 query I
-select '123.456e-2'::${type};
+select '123.456e-2'::{type};
 ----
 1
 
 query I
-select '1584.92e-2'::${type};
+select '1584.92e-2'::{type};
 ----
 16
 
 query I
-select '1214.235e-2'::${type};
+select '1214.235e-2'::{type};
 ----
 12
 
 # Out of range
 
 statement error
-select '10e40'::${type};
+select '10e40'::{type};
 ----
 Conversion Error
 
@@ -66,44 +63,44 @@ foreach type <signed>
 # Negative Number - Positive Exponent
 
 query I
-select '-1e2'::${type};
+select '-1e2'::{type};
 ----
 -100
 
 query I
-select '-1.23456e2'::${type};
+select '-1.23456e2'::{type};
 ----
 -123
 
 query I
-select '-0.158492e2'::${type};
+select '-0.158492e2'::{type};
 ----
 -16
 
 query I
-select '-1.235e2'::${type};
+select '-1.235e2'::{type};
 ----
 -124
 
 # Negative Number - Negative Exponent
 
 query I
-select '-100e-2'::${type};
+select '-100e-2'::{type};
 ----
 -1
 
 query I
-select '-50.23456e-2'::${type};
+select '-50.23456e-2'::{type};
 ----
 -1
 
 query I
-select '-1584.92e-2'::${type};
+select '-1584.92e-2'::{type};
 ----
 -16
 
 query I
-select '-1.235e-2'::${type};
+select '-1.235e-2'::{type};
 ----
 0
 
@@ -113,12 +110,12 @@ select '5.5e-1'::bigint;
 1
 
 query I
-select '9.5e-5'::${type};
+select '9.5e-5'::{type};
 ----
 0
 
 statement error
-select '-10e40'::${type};
+select '-10e40'::{type};
 ----
 Conversion Error
 
@@ -296,3 +293,108 @@ select '0e32767'::int;
 ----
 0
 
+# Fractional digits reaching the store type's digit count (#26215)
+foreach type TINYINT SMALLINT INTEGER BIGINT UTINYINT USMALLINT UINTEGER
+
+query I
+select '1.1111111111111111111e0'::{type};
+----
+1
+
+query I
+select '1.5000000000000000000e0'::{type};
+----
+2
+
+query I
+select '0.50000000000000000000e0'::{type};
+----
+1
+
+endloop
+
+query I
+select '0.10000000000000000000e0'::UBIGINT;
+----
+0
+
+query I
+select '0.10000000000000000000e0'::BIGINT;
+----
+0
+
+query I
+select '1.5000000000000000000e0'::UBIGINT;
+----
+2
+
+# Fractional parts with a very long run of leading zeros (#26335)
+foreach type TINYINT SMALLINT INTEGER BIGINT HUGEINT UTINYINT USMALLINT UINTEGER UBIGINT UHUGEINT
+
+query I
+select ('0.' || repeat('0', 32768) || '5e0')::{type};
+----
+0
+
+query I
+select ('0.' || repeat('0', 65536) || '5')::{type};
+----
+0
+
+query I
+select ('0.' || repeat('0', 65536) || '5e0')::{type};
+----
+0
+
+query I
+select ('0.' || repeat('0', 32767) || '5e32767')::{type};
+----
+1
+
+query I
+select ('0.' || repeat('0', 32768) || '5e32767')::{type};
+----
+0
+
+query I
+select ('1.' || repeat('0', 40000) || '9e0')::{type};
+----
+1
+
+endloop
+
+query I
+select ('-0.' || repeat('0', 32768) || '5e0')::INTEGER;
+----
+0
+
+query I
+select ('-0.' || repeat('0', 32767) || '5e32767')::INTEGER;
+----
+-1
+
+# BIGNUM does not support exponents
+query I
+select ('0.' || repeat('0', 65536) || '5')::BIGNUM;
+----
+0
+
+query I
+select ('0.1' || repeat('0', 25) || '1')::BIGNUM;
+----
+0
+
+query I
+select ('0.5' || repeat('0', 65536) || '1')::BIGNUM;
+----
+1
+
+query I
+select ('-1.' || repeat('0', 40000) || '9')::BIGNUM;
+----
+-1
+
+query I
+select ('-2.5' || repeat('0', 40000))::BIGNUM;
+----
+-3

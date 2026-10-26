@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -52,15 +46,21 @@ class LogicalPositionalJoin;
 class LogicalPragma;
 class LogicalPrepare;
 class LogicalProjection;
-class LogicalRepartition;
-class LogicalLocalExchange;
-class LogicalVLLMProject;
-class LogicalUDFProject;
 class LogicalRecursiveCTE;
 class LogicalMaterializedCTE;
 class LogicalSetOperation;
 class LogicalSample;
-class LogicalSimple;
+class LogicalSecureView;
+class LogicalAlter;
+class LogicalAttach;
+class LogicalConnect;
+class LogicalExternalResource;
+class LogicalDetach;
+class LogicalDisconnect;
+class LogicalDrop;
+class LogicalLoad;
+class LogicalTransaction;
+class LogicalUpdateExtensions;
 class LogicalVacuum;
 class LogicalSet;
 class LogicalReset;

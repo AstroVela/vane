@@ -1,15 +1,8 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/function/table/range.hpp"
 #include "duckdb/common/algorithm.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
 
 namespace duckdb {
@@ -50,13 +43,19 @@ struct UnnestLocalState : public LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> UnnestBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
-	if (input.input_table_types.size() != 1 || input.input_table_types[0].id() != LogicalTypeId::LIST) {
-		throw BinderException("UNNEST requires a single list as input");
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.input_table_types.size() != 1 || (input.input_table_types[0].id() != LogicalTypeId::LIST &&
+	                                            input.input_table_types[0].id() != LogicalTypeId::ARRAY)) {
+		throw BinderException("UNNEST requires a single list or array as input");
 	}
-	return_types.push_back(ListType::GetChildType(input.input_table_types[0]));
+	auto &input_type = input.input_table_types[0];
+	if (input_type.id() == LogicalTypeId::LIST) {
+		return_types.push_back(ListType::GetChildType(input_type));
+	} else {
+		return_types.push_back(ArrayType::GetChildType(input_type));
+	}
 	names.push_back("unnest");
-	return make_uniq<UnnestBindData>(input.input_table_types[0]);
+	return make_uniq<UnnestBindData>(input_type);
 }
 
 static unique_ptr<LocalTableFunctionState> UnnestLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
@@ -71,9 +70,14 @@ static unique_ptr<LocalTableFunctionState> UnnestLocalInit(ExecutionContext &con
 static unique_ptr<GlobalTableFunctionState> UnnestInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<UnnestBindData>();
 	auto result = make_uniq<UnnestGlobalState>();
-	auto ref = make_uniq<BoundReferenceExpression>(bind_data.input_type, 0U);
-	auto bound_unnest = make_uniq<BoundUnnestExpression>(ListType::GetChildType(bind_data.input_type));
-	bound_unnest->child = std::move(ref);
+
+	unique_ptr<Expression> child = make_uniq<BoundReferenceExpression>(bind_data.input_type, 0U);
+	if (child->GetReturnType().id() == LogicalTypeId::ARRAY) {
+		child = BoundCastExpression::AddArrayCastToList(context, std::move(child));
+	}
+
+	auto bound_unnest = make_uniq<BoundUnnestExpression>(ListType::GetChildType(child->GetReturnType()));
+	bound_unnest->ChildMutable() = std::move(child);
 	result->select_list.push_back(std::move(bound_unnest));
 	return std::move(result);
 }
@@ -85,33 +89,12 @@ static OperatorResultType UnnestFunction(ExecutionContext &context, TableFunctio
 	return PhysicalUnnest::ExecuteInternal(context, input, output, *lstate.operator_state, state.select_list, false);
 }
 
-static void UnnestSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const TableFunction &) {
-	LogicalType input_type = LogicalType::LIST(LogicalType::ANY);
-	if (bind_data) {
-		input_type = bind_data->Cast<UnnestBindData>().input_type;
-	}
-	serializer.WriteProperty(100, "input_type", input_type);
-}
-
-static unique_ptr<FunctionData> UnnestDeserialize(Deserializer &deserializer, TableFunction &) {
-	auto input_type = LogicalType::LIST(LogicalType::ANY);
-	deserializer.ReadPropertyWithExplicitDefault<LogicalType>(100, "input_type", input_type,
-	                                                          LogicalType::LIST(LogicalType::ANY));
-	return make_uniq<UnnestBindData>(std::move(input_type));
-}
-
-TableFunction UnnestTableFunction::GetFunction() {
-	TableFunction unnest_function("unnest", {LogicalType::ANY}, nullptr, UnnestBind, UnnestInit, UnnestLocalInit);
-	unnest_function.in_out_function = UnnestFunction;
-	unnest_function.serialize = UnnestSerialize;
-	unnest_function.deserialize = UnnestDeserialize;
-	unnest_function.SetDistributedScanCallbacks(MakeDistributedSingletonSourceCallbacks());
-	unnest_function.BindDistributedScanCapability("vane_core");
-	return unnest_function;
-}
-
 void UnnestTableFunction::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(GetFunction());
+	TableFunction unnest_function("unnest", FunctionSignature().AddPositionalOnly("list", LogicalType::ANY), nullptr,
+	                              UnnestBind, UnnestInit, UnnestLocalInit);
+	unnest_function.in_out_function = UnnestFunction;
+	unnest_function.return_type = TableFunctionReturnType::SET_RETURNING_FUNCTION;
+	set.AddFunction(unnest_function);
 }
 
 } // namespace duckdb

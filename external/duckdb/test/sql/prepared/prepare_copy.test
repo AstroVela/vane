@@ -2,13 +2,10 @@
 # group: [prepared]
 
 statement ok
-pragma enable_verification;
-
-statement ok
 PREPARE q1 AS
 	COPY (
 		select $1 as 'col'
-	) to '__TEST_DIR__/res.csv' (
+	) to '{TEST_DIR}/res.csv' (
 		FORMAT csv
 	);
 
@@ -16,7 +13,7 @@ statement ok
 execute q1 (42);
 
 query I
-select i from '__TEST_DIR__/res.csv' tbl(i);
+select i from '{TEST_DIR}/res.csv' tbl(i);
 ----
 42
 
@@ -29,9 +26,49 @@ PREPARE q2 AS
 	);
 
 statement ok
-EXECUTE q2('__TEST_DIR__/res2.csv')
+EXECUTE q2('{TEST_DIR}/res2.csv')
 
 query I
-select i from '__TEST_DIR__/res2.csv' tbl(i);
+select i from '{TEST_DIR}/res2.csv' tbl(i);
 ----
 42
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 2);
+
+statement ok
+PREPARE q3 AS COPY (SELECT * FROM t) TO '{TEST_DIR}/res3.csv' (FORMAT CSV, DELIMITER ?);
+
+statement ok
+EXECUTE q3('|');
+
+query I
+SELECT trim(replace(content, chr(10), ' ')) FROM read_text('{TEST_DIR}/res3.csv');
+----
+a|b 1|2
+
+statement ok
+PREPARE q4 AS COPY t TO '{TEST_DIR}/res4.csv' (FORMAT CSV, HEADER $1, DELIMITER $2);
+
+statement ok
+EXECUTE q4(false, ';');
+
+query I
+SELECT trim(replace(content, chr(10), ' ')) FROM read_text('{TEST_DIR}/res4.csv');
+----
+1;2
+
+statement ok
+PREPARE q5 AS COPY t FROM '{TEST_DIR}/res3.csv' (FORMAT CSV, DELIMITER ?);
+
+statement ok
+EXECUTE q5('|');
+
+query II
+SELECT * FROM t ORDER BY ALL;
+----
+1	2
+1	2

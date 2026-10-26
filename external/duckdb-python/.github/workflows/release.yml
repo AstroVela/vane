@@ -1,0 +1,466 @@
+# Called by DuckDB core when its release artifacts are ready. On main that is
+# Main.yml -> duckdb-workflow-trigger (core_ready), which sends duckdb-version.
+# On release branches it is still InvokeCI -> NotifyExternalRepositories, which
+# sends only duckdb-sha. We also dispatch it by hand for stable releases.
+name: Release
+# One run per branch at a time, queued rather than cancelled. Two dispatches of
+# the same branch would otherwise race each other to PyPI.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+on:
+  workflow_dispatch:
+    inputs:
+      duckdb-python-sha:
+        type: string
+        description: The commit to build against (defaults to latest commit of current ref)
+        required: false
+      duckdb-sha:
+        type: string
+        description: The DuckDB submodule commit or ref to build against
+        required: true
+      duckdb-version:
+        type: string
+        description: >-
+          Build DuckDB with this exact version identifier (vX.Y.Z, or a prerelease like
+          vX.Y.Z-alphaN or vX.Y.Z-rcN). Handed to DuckDB's build verbatim, which is the
+          only thing that validates it. Empty means derive it from the submodule.
+        required: false
+      duckdb-python-version:
+        type: string
+        description: >-
+          Release this version of the Python package (vX.Y.Z, optionally -postN or a
+          PEP440 pre-release suffix like -a1/-alpha1/-b2/-rc3). Setting it makes this a
+          stable release: the submodule pin must equal duckdb-sha and the package goes
+          to the prod index. Requires duckdb-version. Empty means a nightly.
+        required: false
+      pypi-index:
+        type: choice
+        description: Which PyPI to use
+        required: true
+        options:
+          - test
+          - prod
+      nightly-stale-after-days:
+        type: string
+        description: After how many days should nightlies be considered stale
+        required: true
+        default: 3
+      store-s3:
+        type: boolean
+        description: Also store test packages in S3 (always true for prod)
+        default: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Two independent version identifiers reach this workflow. duckdb-version sets
+  # the version DuckDB is built with, and nothing else. duckdb-python-version sets
+  # the version of the package we publish, and setting it is what makes this run a
+  # stable release instead of a nightly.
+  #
+  # A stable release must be built from a commit whose submodule pin equals the
+  # duckdb-sha input. Otherwise the build is dirty and the released artifacts
+  # correspond to no commit in this repository.
+  #
+  # The pin gate is applied per step, not on the job, on purpose: a skipped job
+  # propagates the skip down the needs chain, and the downstream jobs
+  # (workflow_state, submodule_pr) have no !failure() && !cancelled() guard, so
+  # a job-level skip here silently skips the whole nightly (no wheels, no
+  # publish, no bump PR) while the run still reports success. With the gate on
+  # the steps, the job always completes success and the steps no-op on
+  # nightlies (empty duckdb-python-version).
+  verify_release_inputs:
+    name: Verify release inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the version inputs
+        env:
+          DUCKDB_VERSION: ${{ inputs.duckdb-version }}
+          DUCKDB_PYTHON_VERSION: ${{ inputs.duckdb-python-version }}
+        run: |
+          set -euo pipefail
+          version_re='^v([0-9]+\.[0-9]+\.[0-9]+)'
+
+          duckdb_base=""
+          if [[ -n "${DUCKDB_VERSION}" ]]; then
+            if [[ ! "${DUCKDB_VERSION}" =~ ${version_re} ]]; then
+              echo "::error::duckdb-version (${DUCKDB_VERSION}) must start with a vX.Y.Z version"
+              exit 1
+            fi
+            duckdb_base="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ -z "${DUCKDB_PYTHON_VERSION}" ]]; then
+            echo "::notice::Nightly release${DUCKDB_VERSION:+, building DuckDB as ${DUCKDB_VERSION}}"
+            exit 0
+          fi
+
+          if [[ -z "${DUCKDB_VERSION}" ]]; then
+            echo "::error::duckdb-python-version is set but duckdb-version is not. A stable release states the DuckDB version it ships, we never infer that."
+            exit 1
+          fi
+
+          if [[ ! "${DUCKDB_PYTHON_VERSION}" =~ ${version_re} ]]; then
+            echo "::error::duckdb-python-version (${DUCKDB_PYTHON_VERSION}) must start with a vX.Y.Z version"
+            exit 1
+          fi
+          python_base="${BASH_REMATCH[1]}"
+
+          # duckdb-python follows DuckDB's major, minor and patch. Only the suffix
+          # may differ, for example DuckDB v1.5.4 republished as v1.5.4-post1. A
+          # mismatch on the rest is a typo in one of the two inputs.
+          if [[ "${duckdb_base}" != "${python_base}" ]]; then
+            echo "::error::duckdb-version (${DUCKDB_VERSION}) and duckdb-python-version (${DUCKDB_PYTHON_VERSION}) disagree on major.minor.patch: ${duckdb_base} vs ${python_base}"
+            exit 1
+          fi
+
+          echo "::notice::Stable release ${DUCKDB_PYTHON_VERSION}, shipping DuckDB ${DUCKDB_VERSION}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
+
+      # pyproject.toml declares the version this branch releases next. The engine
+      # must be of that line, nightly or stable, and a stable release must be exactly
+      # that version. The build backend enforces the latter as well, this fails
+      # before any build starts.
+      - name: Compare the inputs to release_version in pyproject.toml
+        env:
+          DUCKDB_VERSION: ${{ inputs.duckdb-version }}
+          DUCKDB_PYTHON_VERSION: ${{ inputs.duckdb-python-version }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          declared=$(PYTHONPATH=${{ github.workspace }} python3 -c \
+            'from duckdb_packaging._versioning import release_version; print(release_version())')
+          declared_line=$(cut -d. -f1,2 <<<"${declared}")
+          echo "release_version: ${declared} (line ${declared_line})"
+          if [[ -n "${DUCKDB_VERSION}" ]]; then
+            engine_line=$(sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/' <<<"${DUCKDB_VERSION}")
+            if [[ "${engine_line}" != "${declared_line}" ]]; then
+              echo "::error::duckdb-version (${DUCKDB_VERSION}) is not of line ${declared_line}, which ${BRANCH} declares in pyproject.toml. Wrong branch?"
+              exit 1
+            fi
+          fi
+          if [[ -n "${DUCKDB_PYTHON_VERSION}" ]]; then
+            expected=$(PYTHONPATH=${{ github.workspace }} python3 -c \
+              'import os; from duckdb_packaging._versioning import git_tag_to_pep440; print(git_tag_to_pep440(os.environ["DUCKDB_PYTHON_VERSION"]))')
+            if [[ "${expected}" != "${declared}" ]]; then
+              echo "::error::duckdb-python-version (${DUCKDB_PYTHON_VERSION}) is ${expected}, but pyproject.toml declares release_version = ${declared}. Bump release_version first."
+              exit 1
+            fi
+          fi
+
+      - name: Compare the pin to duckdb-sha
+        if: ${{ inputs.duckdb-python-version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          pin=$(git ls-tree HEAD external/duckdb | awk '{print $3}')
+          resolved=$(gh api repos/duckdb/duckdb/commits/${{ inputs.duckdb-sha }} --jq .sha)
+          echo "submodule pin: ${pin}"
+          echo "duckdb-sha input resolves to: ${resolved}"
+          if [[ "${pin}" != "${resolved}" ]]; then
+            echo "::error::Submodule pin (${pin}) does not match duckdb-sha (${resolved}). Merge the submodule bump PR first, then rerun."
+            exit 1
+          fi
+
+  build_sdist:
+    name: Build an sdist and determine versions
+    needs: [verify_release_inputs]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/packaging_sdist.yml
+    with:
+      testsuite: all
+      duckdb-python-sha: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
+      duckdb-sha: ${{ inputs.duckdb-sha }}
+      set-version: ${{ inputs.duckdb-python-version }}
+      set-duckdb-version: ${{ inputs.duckdb-version }}
+
+  submodule_pr:
+    name: Create or update PR to bump submodule to given SHA
+    needs: build_sdist
+    permissions:
+      contents: write
+    uses: ./.github/workflows/submodule_auto_pr.yml
+    with:
+      duckdb-python-sha: ${{ inputs.duckdb-python-sha }}
+      duckdb-sha: ${{ inputs.duckdb-sha }}
+    secrets:
+      # reusable workflows and secrets are not great: https://github.com/actions/runner/issues/3206
+      DUCKDBLABS_BOT_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
+
+  workflow_state:
+    name: Set state for the release workflow
+    needs: build_sdist
+    outputs:
+      pypi_state: ${{ steps.index_check.outputs.pypi_state }}
+      ci_env: ${{ steps.ci_env_check.outputs.ci_env }}
+      s3_url: ${{ steps.s3_check.outputs.s3_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - id: index_check
+        name: Check version on PyPI
+        run: |
+          set -ex
+          pypi_hostname=${{ inputs.pypi-index == 'test' && 'test.' || '' }}pypi.org
+          # install duckdb
+          curl https://install.duckdb.org | bash
+          # query pypi
+          result=$(cat <<EOF | ${HOME}/.duckdb/cli/latest/duckdb | xargs
+          ---- Output lines
+          .mode line
+          ---- Query that fetches the given version's age, if the version already exists
+          SELECT
+            today() - (file.value->>'upload_time_iso_8601')::DATE     AS age,
+          FROM read_json('https://${pypi_hostname}/pypi/duckdb/json') AS jd
+          CROSS JOIN json_each(jd.releases)                           AS rel(key, value)
+          CROSS JOIN unnest(FROM_JSON(rel.value, '["JSON"]'))         AS file(value)
+          WHERE rel.key='${{ needs.build_sdist.outputs.package-version }}'
+          LIMIT 1;
+          EOF
+          )
+          if [ -z "$result" ]; then
+            pypi_state=VERSION_NOT_FOUND
+          else
+            pypi_state=VERSION_FOUND
+          fi
+          if [[ -z "${{ inputs.duckdb-python-version }}" ]]; then
+            age=${result#age = }
+            if [ "${age}" -ge "${{ inputs.nightly-stale-after-days }}" ]; then
+              echo "::warning title=Stale nightly for ${{ github.ref_name }}::Nightly is ${age} days old (max=${{ inputs.nightly-stale-after-days }})"
+            fi
+          fi
+          echo "pypi_state=${pypi_state}" >> $GITHUB_OUTPUT
+
+      - id: ci_env_check
+        name: Determine CI environment
+        run: |
+          set -eu
+          if [[ test == "${{ inputs.pypi-index }}" ]]; then
+            ci_env=pypi-test
+          elif [[ prod == "${{ inputs.pypi-index }}" ]]; then
+            ci_env=pypi-prod${{ inputs.duckdb-python-version == '' && '-nightly' || '' }}
+          else
+            echo "::error::Invalid value for inputs.pypi-index: ${{ inputs.pypi-index }}"
+            exit 1
+          fi
+          echo "ci_env=${ci_env}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Using CI environment ${ci_env}"
+
+      - id: s3_check
+        name: Generate S3 upload URL
+        if: github.repository_owner == 'duckdb'
+        run: |
+          set -eu
+          should_store=${{ (inputs.pypi-index == 'prod' || inputs.store-s3) && '1' || '0' }}
+          if [[ $should_store == 0 ]]; then
+            echo "::notice::S3 upload disabled in inputs, not generating S3 URL"
+            exit 0
+          fi
+          if [[ VERSION_NOT_FOUND != "${{ steps.index_check.outputs.pypi_state }}" ]]; then
+            echo "::warning::S3 upload disabled because package version already uploaded to PyPI"
+            exit 0
+          fi
+          sha=${{ github.sha }}
+          dsha=${{ inputs.duckdb-sha }}
+          version=${{ needs.build_sdist.outputs.package-version }}
+          s3_url="s3://duckdb-staging/python/${version}/${sha:0:10}-duckdb-${dsha:0:10}/"
+          echo "::notice::Generated S3 URL: ${s3_url}"
+          echo "s3_url=${s3_url}" >> $GITHUB_OUTPUT
+
+  build_wheels:
+    name: Build and test releases
+    needs: workflow_state
+    if: ${{ needs.workflow_state.outputs.pypi_state == 'VERSION_NOT_FOUND' }}
+    uses: ./.github/workflows/packaging_wheels.yml
+    with:
+      minimal: false
+      testsuite: all
+      duckdb-python-sha: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
+      duckdb-sha: ${{ inputs.duckdb-sha }}
+      set-version: ${{ inputs.duckdb-python-version }}
+      set-duckdb-version: ${{ inputs.duckdb-version }}
+
+  # Renders the built artifact set as a matrix in the run summary, so the
+  # maintainer can check completeness at a glance and link one summary from the
+  # release task instead of pasting file listings.
+  artifact_summary:
+    name: Write the artifact matrix to the run summary
+    runs-on: ubuntu-latest
+    needs: [build_sdist, build_wheels]
+    steps:
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{sdist,wheel}*'
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Render the matrix
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import os
+          import re
+
+          wheels, sdists, other = [], [], []
+          for root, _, files in os.walk("artifacts"):
+              for f in files:
+                  if f.endswith(".whl"):
+                      wheels.append(f)
+                  elif f.endswith(".tar.gz"):
+                      sdists.append(f)
+                  else:
+                      other.append(f)
+
+          versions = set()
+          matrix = {}  # platform -> {py tag: cell}
+          pys = set()
+          for f in sorted(wheels):
+              name, version, py, abi, plat = f[: -len(".whl")].split("-", 4)
+              versions.add(version)
+              pys.add(py)
+              # macos rows collapse per arch, the cell shows the deployment target,
+              # so a blank cell always means a missing wheel
+              m = re.match(r"macosx_(\d+_\d+)_(.+)$", plat)
+              if m:
+                  matrix.setdefault(f"macosx_{m.group(2)}", {})[py] = m.group(1)
+              else:
+                  matrix.setdefault(plat, {})[py] = "x"
+          for f in sorted(sdists):
+              versions.add(f[len("duckdb-") : -len(".tar.gz")])
+
+          py_cols = sorted(pys, key=lambda p: int(p[2:]))
+          print("## Artifact matrix")
+          print()
+          print(f"{len(wheels) + len(sdists)} files, {len(wheels)} wheels and {len(sdists)} sdist.")
+          print()
+          for s in sorted(sdists):
+              print(f"sdist: `{s}`")
+          print()
+          print("| platform | " + " | ".join(py_cols) + " |")
+          print("|---|" + "---|" * len(py_cols))
+          for plat in sorted(matrix):
+              row = " | ".join(matrix[plat].get(py, " ") for py in py_cols)
+              print(f"| `{plat}` | {row} |")
+          print()
+          print("A blank cell is a wheel that was not built.")
+          if len(versions) == 1:
+              print(f"All files carry version {versions.pop()}.")
+          else:
+              print(f"WARNING, multiple versions found: {sorted(versions)}")
+          if other:
+              print(f"WARNING, unexpected files: {sorted(other)}")
+          if not sdists:
+              print("WARNING, no sdist found.")
+          EOF
+
+  upload_s3:
+    name: Upload Artifacts to S3
+    runs-on: ubuntu-latest
+    needs: [build_sdist, build_wheels, workflow_state]
+    if: ${{ needs.workflow_state.outputs.s3_url }}
+    steps:
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{sdist,wheel}*'
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Upload Artifacts
+        env:
+          AWS_ENDPOINT_URL: ${{ secrets.S3_DUCKDB_STAGING_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_DUCKDB_STAGING_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DUCKDB_STAGING_KEY }}
+
+        run: |
+          aws s3 cp artifacts ${{ needs.workflow_state.outputs.s3_url }} --recursive
+
+  publish_pypi:
+    name: Publish Artifacts to PyPI
+    runs-on: ubuntu-latest
+    needs: [workflow_state, build_sdist, build_wheels]
+    environment:
+      name: ${{ needs.workflow_state.outputs.ci_env }}
+    permissions:
+      # this is needed for the OIDC flow that is used with trusted publishing on PyPI
+      id-token: write
+    steps:
+      - if: ${{ vars.PYPI_HOST == '' }}
+        run: |
+          echo "Error: PYPI_HOST is not set in CI environment '${{ needs.workflow_state.outputs.ci_env }}'"
+          exit 1
+
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{sdist,wheel}*'
+          path: packages/
+          merge-multiple: true
+
+      - name: Upload artifacts to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: 'https://${{ vars.PYPI_HOST }}/legacy/'
+          packages-dir: packages
+          verbose: 'true'
+
+  # A stable release moves the branch past the version it just shipped, so the
+  # next dev build sorts after it. A PR rather than a push: the bump is reviewed
+  # like any change, and nothing is bumped for a release that did not publish.
+  release_version_pr:
+    name: Create PR to bump release_version past the released version
+    needs: [build_sdist, publish_pypi]
+    if: ${{ inputs.duckdb-python-version != '' && inputs.pypi-index == 'prod' && needs.publish_pypi.result == 'success' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release_version_pr.yml
+    with:
+      duckdb-python-sha: ${{ inputs.duckdb-python-sha != '' && inputs.duckdb-python-sha || github.sha }}
+      released-version: ${{ needs.build_sdist.outputs.package-version }}
+    secrets:
+      DUCKDBLABS_BOT_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
+
+  summary:
+    name: Release summary
+    runs-on: ubuntu-latest
+    needs: [build_sdist, workflow_state, build_wheels, upload_s3, publish_pypi]
+    if: always()
+    steps:
+      - run: |
+          sha=${{ github.sha }}
+          dsha=${{ inputs.duckdb-sha }}
+          pversion=${{ needs.build_sdist.outputs.package-version }}
+          long_pversion="${pversion} (${sha:0:10})"
+          pypi_host=${{ inputs.pypi-index == 'test' && 'test.' || '' }}pypi.org
+          pypi_duckdb_url=https://${pypi_host}/project/duckdb/${pversion}/
+          was_released=${{ needs.publish_pypi.result == 'success' && '1' || '0' }}
+          if [[ $was_released == 1 ]]; then
+            echo "## Version ${long_pversion} successfully released" >> $GITHUB_STEP_SUMMARY
+            echo "* Package URL: [${pypi_duckdb_url}](${pypi_duckdb_url})" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Version ${long_pversion} was not released" >> $GITHUB_STEP_SUMMARY
+            echo "* Package index state before release: ${{ needs.workflow_state.outputs.pypi_state }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "* Package index: ${pypi_host}" >> $GITHUB_STEP_SUMMARY
+          echo "* Vendored DuckDB Version: ${{ needs.build_sdist.outputs.duckdb-version }} (${dsha:0:10})" >> $GITHUB_STEP_SUMMARY
+          echo "* Requested DuckDB Version: ${{ inputs.duckdb-version != '' && inputs.duckdb-version || '(derived from the submodule)' }} (${{ inputs.duckdb-sha }})" >> $GITHUB_STEP_SUMMARY
+          echo "* S3 upload status: ${{ needs.upload_s3.result == 'success' && needs.workflow_state.outputs.s3_url || needs.upload_s3.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "* CI Environment: ${{ needs.workflow_state.outputs.ci_env }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Record client status
+        if: ${{ github.repository_owner == 'duckdb' && inputs.duckdb-version != '' }}
+        uses: duckdb/duckdb-workflow-trigger/dispatch@main
+        with:
+          github_token: ${{ secrets.DUCKDB_RELEASE_DISPATCH_TOKEN }}
+          event: client_ready
+          client: python
+          duckdb_version: ${{ inputs.duckdb-version }}
+          duckdb_commit: ${{ inputs.duckdb-sha }}
+          status: ${{ contains(needs.*.result, 'failure') && 'failure' || contains(needs.*.result, 'cancelled') && 'cancelled' || 'success' }}
+          message: DuckDB Python client ready

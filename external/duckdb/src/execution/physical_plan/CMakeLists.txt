@@ -1,11 +1,3 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-#
-# SPDX-FileCopyrightText: 2026 Vane contributors
-#
-# SPDX-License-Identifier: MIT
-#
-# Modified by Vane contributors.
-
 add_library_unity(
   duckdb_physical_plan
   OBJECT
@@ -41,15 +33,21 @@ add_library_unity(
   plan_pragma.cpp
   plan_prepare.cpp
   plan_projection.cpp
-  plan_repartition.cpp
-  plan_local_exchange.cpp
-  plan_udf_project.cpp
-  plan_vllm_project.cpp
   plan_set_operation.cpp
   plan_set.cpp
   plan_reset.cpp
   plan_sample.cpp
-  plan_simple.cpp
+  plan_secure_view.cpp
+  plan_alter.cpp
+  plan_attach.cpp
+  plan_connect.cpp
+  plan_external_resource.cpp
+  plan_detach.cpp
+  plan_disconnect.cpp
+  plan_drop.cpp
+  plan_load.cpp
+  plan_transaction.cpp
+  plan_update_extensions.cpp
   plan_top_n.cpp
   plan_update.cpp
   plan_window.cpp

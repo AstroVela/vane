@@ -4,6 +4,7 @@
 require parquet
 
 # Verify we can perform partial shredding
+
 statement ok
 COPY (
 	SELECT {

@@ -1,0 +1,8 @@
+# The pristine Python client retains its upstream engine gitlink. Git metadata
+# operations (including actions/checkout cleanup) require this root mapping.
+# Vane builds the sibling external/duckdb subtree; leave this second copy empty.
+[submodule "duckdb-python-upstream-engine"]
+	path = external/duckdb-python/external/duckdb
+	url = https://github.com/duckdb/duckdb.git
+	update = none
+	fetchRecurseSubmodules = false

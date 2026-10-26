@@ -1,11 +1,5 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/common/arrow/arrow_appender.hpp"
-#include "duckdb/common/arrow/appender/fixed_binary.hpp"
+#include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/common/arrow/arrow_buffer.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/array.hpp"
@@ -54,6 +48,14 @@ idx_t ArrowAppender::RowCount() const {
 	return row_count;
 }
 
+idx_t ArrowAppender::ByteSize() const {
+	idx_t bytes = 0;
+	for (auto &data : root_data) {
+		bytes += data->ByteSize();
+	}
+	return bytes;
+}
+
 void ArrowAppender::ReleaseArray(ArrowArray *array) {
 	if (!array || !array->release) {
 		return;
@@ -94,7 +96,16 @@ ArrowArray *ArrowAppender::FinalizeChild(const LogicalType &type, unique_ptr<Arr
 	result->buffers[0] = append_data.GetValidityBuffer().data();
 
 	if (append_data.finalize) {
-		append_data.finalize(append_data, type, result.get());
+		// An extension type's appender tree was initialized (and appended) with the extension's INTERNAL
+		// (storage) type — see InitializeChild — so it must also be finalized with that type: a nested
+		// finalizer (struct/list/map) sizes its child walk from the type it is given, and the LOGICAL
+		// type's shape need not match the storage-built child_data (e.g. a canonical Arrow extension over
+		// struct storage whose logical type has a different child count).
+		if (append_data.extension_data) {
+			append_data.finalize(append_data, append_data.extension_data->GetInternalType(), result.get());
+		} else {
+			append_data.finalize(append_data, type, result.get());
+		}
 	}
 
 	append_data.array = std::move(result);
@@ -143,10 +154,6 @@ static void InitializeAppenderForType(ArrowAppendData &append_data) {
 
 static void InitializeFunctionPointers(ArrowAppendData &append_data, const LogicalType &type) {
 	// handle special logical types
-	if (FixedBinaryType::IsFixedBinary(type)) {
-		InitializeAppenderForType<ArrowFixedBinaryData>(append_data);
-		return;
-	}
 	switch (type.id()) {
 	case LogicalTypeId::SQLNULL:
 		InitializeAppenderForType<ArrowNullData>(append_data);
@@ -179,6 +186,7 @@ static void InitializeFunctionPointers(ArrowAppendData &append_data, const Logic
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_TZ_NS:
 	case LogicalTypeId::BIGINT:
 		InitializeAppenderForType<ArrowScalarData<int64_t>>(append_data);
 		break;
@@ -251,7 +259,6 @@ static void InitializeFunctionPointers(ArrowAppendData &append_data, const Logic
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::BIT:
 	case LogicalTypeId::BIGNUM:
-	case LogicalTypeId::AGGREGATE_STATE:
 		if ((append_data.options.produce_arrow_string_view || type.id() != LogicalTypeId::VARCHAR) &&
 		    append_data.options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			InitializeAppenderForType<ArrowVarcharToStringViewData>(append_data);
@@ -285,6 +292,7 @@ static void InitializeFunctionPointers(ArrowAppendData &append_data, const Logic
 		InitializeAppenderForType<ArrowUnionData>(append_data);
 		break;
 	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE:
 		InitializeAppenderForType<ArrowStructData>(append_data);
 		break;
 	case LogicalTypeId::ARRAY:
@@ -320,11 +328,6 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
                                                            ClientProperties &options,
                                                            const shared_ptr<ArrowTypeExtensionData> &extension_type) {
 	auto result = make_uniq<ArrowAppendData>(options);
-	if (TensorType::IsVariableShapeTensor(type) || ImageLogicalType::IsImage(type)) {
-		result->options.arrow_offset_size = ArrowOffsetSize::REGULAR;
-		result->options.arrow_use_list_view = false;
-		result->options.arrow_lossless_conversion = false;
-	}
 
 	// Resolve the effective extension. An explicit override (from the top-level appender) wins.
 	// Otherwise auto-resolve from DBConfig so nested children use the same extension SetArrowFormat
@@ -350,9 +353,7 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
 
 	const auto byte_count = (capacity + 7) / 8;
 	result->GetValidityBuffer().reserve(byte_count);
-	// Arrow batch limits do not imply that every dense Image/Tensor row exists.
-	// Grow its element buffer as rows are appended.
-	result->initialize(*result, array_type, ArrayVector::UsesDeferredStorage(type) ? 0 : capacity);
+	result->initialize(*result, array_type, capacity);
 	return result;
 }
 
