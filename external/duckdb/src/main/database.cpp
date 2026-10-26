@@ -4,6 +4,7 @@
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
+#include "duckdb/execution/media_resource.hpp"
 #include "duckdb/execution/operator/helper/physical_set.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/common/types/type_manager.hpp"
@@ -80,6 +81,7 @@ DBConfig::~DBConfig() {
 DatabaseInstance::DatabaseInstance() : db_validity(*this) {
 	config.is_user_config = false;
 	create_api_v1 = nullptr;
+	media_decoder_pool = GetNativeMediaDecoderPool();
 }
 
 DatabaseInstance::~DatabaseInstance() {
