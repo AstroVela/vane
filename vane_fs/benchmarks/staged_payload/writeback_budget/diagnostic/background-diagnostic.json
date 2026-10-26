@@ -1,0 +1,199 @@
+{
+  "status": "PASS",
+  "rows": [
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "hint_calls": 0,
+      "retained_full_pauses": 0,
+      "minimum_submission_gap_seconds": null,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3904360,
+        3904362
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "hint_calls": 54,
+      "retained_full_pauses": 141,
+      "minimum_submission_gap_seconds": 0.016081865,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3904711
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3904703,
+        3904705
+      ],
+      "hint_max_seconds": 0.001622987,
+      "maximum_hint_range_bytes": 4194304,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "hint_calls": 54,
+      "retained_full_pauses": 141,
+      "minimum_submission_gap_seconds": 0.016083554,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3905006
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3905001,
+        3905003
+      ],
+      "hint_max_seconds": 0.012980061,
+      "maximum_hint_range_bytes": 4194304,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "hint_calls": 0,
+      "retained_full_pauses": 0,
+      "minimum_submission_gap_seconds": null,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3905298,
+        3905300
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "hint_calls": 0,
+      "retained_full_pauses": 0,
+      "minimum_submission_gap_seconds": null,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3905590,
+        3905592
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "hint_calls": 63,
+      "retained_full_pauses": 143,
+      "minimum_submission_gap_seconds": 0.016061301,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 1,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3905955
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3905951,
+        3905953
+      ],
+      "hint_max_seconds": 0.0019586,
+      "maximum_hint_range_bytes": 4194304,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "hint_calls": 58,
+      "retained_full_pauses": 143,
+      "minimum_submission_gap_seconds": 0.016080436,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 1,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3906318
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3906313,
+        3906316
+      ],
+      "hint_max_seconds": 0.001651784,
+      "maximum_hint_range_bytes": 4194304,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "hint_calls": 0,
+      "retained_full_pauses": 0,
+      "minimum_submission_gap_seconds": null,
+      "hint_starts_during_retained_pauses": 0,
+      "already_active_hints_overlapping_pauses": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3906625,
+        3906627
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    }
+  ],
+  "span_filter_threshold_seconds": 0.001,
+  "scope": "Separate instrumented window; thread separation compares retained markers; short spans below 1 ms are filtered; blocking isolation is independently verified by fault tests; pausing prevents new claims, not an already claimed call or EINTR retry; no throughput adoption inference"
+}

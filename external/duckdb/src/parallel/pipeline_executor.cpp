@@ -602,7 +602,21 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 		} else if (!exhausted_pipeline || next_batch_blocked) {
 			SourceResultType source_result = SourceResultType::BLOCKED;
 			if (!next_batch_blocked) {
-				source_batch = ExecutionBatch();
+				// All outputs from the previous input have reached the sink. Release
+				// consumed views before asking the source for more: it may need their
+				// shared-memory credit to make progress. Blocked retries and operators
+				// with more output take the earlier branches and keep their input.
+				D_ASSERT(in_process_operators.empty());
+				for (auto &batch : intermediate_batches) {
+					*batch = ExecutionBatch();
+				}
+				final_batch = ExecutionBatch();
+				for (auto &state : intermediate_states) {
+					state->ResetBatchInput();
+				}
+				if (local_sink_state) {
+					local_sink_state->ResetBatchInput();
+				}
 				source_result = FetchFromSourceBatch(source_batch);
 				if (source_result == SourceResultType::BLOCKED) {
 					return PipelineExecuteResult::INTERRUPTED;
@@ -678,9 +692,14 @@ void PipelineExecutor::FinishProcessing(int32_t operator_idx) {
 	blocked_on_finalize = false;
 
 	if (pipeline.GetSource()) {
-		auto guard = pipeline.source_state->Lock();
-		pipeline.source_state->PreventBlocking(guard);
-		pipeline.source_state->UnblockTasks(guard);
+		{
+			auto guard = pipeline.source_state->Lock();
+			pipeline.source_state->PreventBlocking(guard);
+			pipeline.source_state->UnblockTasks(guard);
+		}
+		if (!exhausted_source) {
+			pipeline.source_state->OnConsumerFinished();
+		}
 	}
 	if (pipeline.GetSink()) {
 		auto guard = pipeline.GetSink()->sink_state->Lock();

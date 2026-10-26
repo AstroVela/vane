@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "patch_fuzz": 0,
+  "patch_sha256": "6511cd99d2e9bb416ac6c4c0f010570911f5fb7b47d8f8d010b7d4a8bb923626",
+  "patch_stdout": "patching file src/staging.hpp\npatching file src/workspace.cpp\n",
+  "matched_source_files": 35,
+  "modified_source_files": [
+    "src/staging.hpp",
+    "src/workspace.cpp"
+  ],
+  "split_sample_analysis_equals_original": true,
+  "frozen_measurement_input_hashes_match": true,
+  "all_raw_latency_vectors_retained": true,
+  "proof_temporary_directory": "/home/kaka/astrovela_vane-fs/vane_fs/build/writeback-budget-20261011T165013Z/budget-patch-proof-4idkwi_u",
+  "removed": true,
+  "analyzer_sha256": "25f359a22d74f891a980ca1e48b3fc9a5f26c992b677dfdcfca84b0e21d37f25"
+}

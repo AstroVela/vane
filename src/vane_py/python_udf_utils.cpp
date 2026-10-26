@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "vane_python/python_udf_utils.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -271,6 +272,7 @@ static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<
 } // namespace
 
 void ValidateSynchronousUDFCallable(const py::object &udf) {
+	PythonInputCallbackScope callback(nullptr);
 	py::module_::import("vane.execution._udf_validation").attr("validate_synchronous_udf_callable")(udf);
 }
 
@@ -333,6 +335,7 @@ Value BuildPythonUDFPayload(
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
     const Optional<py::object> &output_target_max_bytes, bool flat_map) {
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);
@@ -347,12 +350,10 @@ Value BuildPythonUDFPayload(
 	auto gpus_value = ParseOptionalNonNegativeDouble(gpus, "map_batches(gpus=...)");
 	auto memory_bytes_value = ParseOptionalPositiveIdx(memory_bytes, "memory_bytes");
 	const bool is_ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
-	if (memory_bytes_value.first && !is_ray_backend) {
-		throw InvalidInputException("memory_bytes requires a Ray UDF backend");
-	}
-	if (gpus_value.first && gpus_value.second > 0.0 && execution_backend != "ray_task" &&
-	    execution_backend != "ray_actor") {
-		throw InvalidInputException("GPU resources require a Ray UDF backend");
+	const bool local_gpu_actor =
+	    execution_backend == "subprocess_actor" && gpus_value.first && gpus_value.second == 1.0;
+	if (gpus_value.first && gpus_value.second > 0.0 && !is_ray_backend && !local_gpu_actor) {
+		throw InvalidInputException("local GPU UDFs require an actor with exactly one GPU per replica");
 	}
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	auto output_batch_size_value = ParseOptionalPositiveIdx(output_batch_size, "output_batch_size");
@@ -458,6 +459,7 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
                             const vector<LogicalType> &passthrough_types, const Optional<py::object> &cpus,
                             const Optional<py::object> &gpus, const Optional<py::object> &batch_size,
                             const Optional<py::object> &actor_number) {
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);
@@ -549,13 +551,55 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
                                           bool row_preserving, const Optional<py::object> &gpus,
                                           const Optional<py::object> &actor_number,
                                           const Optional<py::object> &expression_id) {
-	auto payload =
-	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), execution_backend, default_parallelism,
-	                          py::none(), gpus, py::none(), batch_size, py::none(), py::none(), py::none(),
-	                          actor_number, py::none(), py::none(), py::none(), /*flat_map=*/false);
-	const bool ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
-
 	child_list_t<Value> fields;
+	py::object model_cpus = py::none(), model_memory = py::none(), model_batch_bytes = py::none();
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (py::hasattr(udf, "_vane_local_model_binding")) {
+			auto binding = py::cast<py::tuple>(udf.attr("_vane_local_model_binding"));
+			if ((binding.size() != 7 && binding.size() != 8) || !row_preserving || actor_number.is_none()) {
+				throw InvalidInputException("invalid registered local model definition");
+			}
+			const char *names[] = {"local_model_session_id", "local_model_name", "local_model_version",
+			                       "local_model_token"};
+			for (idx_t i = 0; i < 4; i++) {
+				auto value = py::cast<string>(binding[i]);
+				if (value.empty()) {
+					throw InvalidInputException("registered local model identity must not be empty");
+				}
+				fields.emplace_back(names[i], Value(std::move(value)));
+			}
+			auto cpus = ParseOptionalNonNegativeDouble(py::reinterpret_borrow<py::object>(binding[4]), "cpus");
+			auto memory = ParseOptionalPositiveIdx(py::reinterpret_borrow<py::object>(binding[5]), "memory_bytes");
+			if (!cpus.first) {
+				throw InvalidInputException("registered local models require an explicit CPU declaration");
+			}
+			model_cpus = py::float_(cpus.second);
+			auto declared_gpus = binding.size() == 8 ? py::cast<double>(binding[7]) : 0.0;
+			auto requested_gpus = ParseOptionalNonNegativeDouble(gpus, "gpus");
+			if ((declared_gpus != 0.0 && declared_gpus != 1.0) ||
+			    (requested_gpus.first ? requested_gpus.second : 0.0) != declared_gpus) {
+				throw InvalidInputException("registered local model GPU declaration cannot be overridden");
+			}
+			if (memory.first) {
+				model_memory = py::int_(memory.second);
+			}
+			// Registered expressions use the captured session's batch declaration,
+			// including its default, rather than the environment of a later query.
+			auto declared_batch = py::cast<string>(binding[6]);
+			auto batch_bytes = ParsePositiveEnvIdx(declared_batch.c_str(), UDF_TARGET_MAX_BATCH_BYTES_ENV);
+			model_batch_bytes = py::int_(batch_bytes ? batch_bytes : DEFAULT_UDF_TARGET_MAX_BATCH_BYTES);
+		}
+	}
+	// An explicit local registration has a fixed backend even when an
+	// expression is built before its owning query's runner is resolved.
+	const string model_backend = model_cpus.is_none() ? execution_backend : "subprocess_actor";
+	auto payload =
+	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), model_backend, default_parallelism,
+	                          model_cpus, gpus, model_memory, batch_size, py::none(), py::none(), py::none(),
+	                          actor_number, model_batch_bytes, py::none(), py::none(), /*flat_map=*/false);
+	const bool ray_backend = model_backend == "ray_task" || model_backend == "ray_actor";
+
 	fields.emplace_back("payload_version", Value::BIGINT(1));
 	fields.emplace_back("udf_name", Value(name));
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));

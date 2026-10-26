@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: vane_fs/build/checkpoint-batching-20261012T052240Z/updated/venv
+Resolved 1 package in 2ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-batching-20261012T052240Z/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-batching-20261012T052240Z/updated
+Prepared 1 package in 27.42s
+Installed 1 package in 1ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-batching-20261012T052240Z/updated)

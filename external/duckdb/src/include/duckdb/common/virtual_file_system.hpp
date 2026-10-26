@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -59,6 +65,8 @@ public:
 	unique_ptr<FileSystem> ExtractSubSystem(const string &name) override;
 
 	vector<string> ListSubSystems() override;
+	//! Whether a registered subsystem handles this path (without opening it).
+	bool CanHandleFile(const string &path) override;
 
 	FileSystem &GetDefaultFileSystem();
 
@@ -72,6 +80,8 @@ public:
 	string PathSeparator(const string &path) override;
 
 	string CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener) override;
+	FileWriteTarget ResolveWriteTarget(const string &path, const CopyInfo &info,
+	                                   optional_ptr<FileOpener> opener) override;
 
 protected:
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,

@@ -1,0 +1,45 @@
+{
+  "status": "PASS",
+  "binaries": {
+    "baseline-native-probe": {
+      "measured": "99edbbc9fa01e51cb792cd268184cc227eb5bff310ecf9a0e04daaf9d09258dd",
+      "reconstructed": "99edbbc9fa01e51cb792cd268184cc227eb5bff310ecf9a0e04daaf9d09258dd",
+      "identical": true
+    },
+    "baseline-alignment-probe": {
+      "measured": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d",
+      "reconstructed": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d",
+      "identical": true
+    },
+    "updated-native-probe": {
+      "measured": "62f80b1c316b2372d08c8467ef24d824e11007d3b8e002cd50a64ad300794b3b",
+      "reconstructed": "62f80b1c316b2372d08c8467ef24d824e11007d3b8e002cd50a64ad300794b3b",
+      "identical": true
+    },
+    "updated-alignment-probe": {
+      "measured": "86f8ac8845a7bc71c10ec1233a9817073cc794d5cde7d846eef68f768f0a2e64",
+      "reconstructed": "86f8ac8845a7bc71c10ec1233a9817073cc794d5cde7d846eef68f768f0a2e64",
+      "identical": true
+    },
+    "diagnostic/baseline/build/vane-fs-mount": {
+      "measured": "f242c009e8aea24c8602838e5f1a2f4c4640ca522a1a7aa2a1fca8f2d88dc219",
+      "reconstructed": "f242c009e8aea24c8602838e5f1a2f4c4640ca522a1a7aa2a1fca8f2d88dc219",
+      "identical": true
+    },
+    "diagnostic/updated/build/vane-fs-mount": {
+      "measured": "f1f4d563f3626e255005f235e14d3d9dafff3af10bf345ccfbba8658b2924bca",
+      "reconstructed": "f1f4d563f3626e255005f235e14d3d9dafff3af10bf345ccfbba8658b2924bca",
+      "identical": true
+    },
+    "scheduling/baseline/priority-test": {
+      "measured": "e26acd09e14ae049412cda71a4e8edcad43ab88ecece6190c1bb560af4f30459",
+      "reconstructed": "e26acd09e14ae049412cda71a4e8edcad43ab88ecece6190c1bb560af4f30459",
+      "identical": true
+    },
+    "scheduling/updated/priority-test": {
+      "measured": "bd3011d030f4e7a2f900af595c69cf674afa44b2feeb3dcdb7e1017ba0faffb8",
+      "reconstructed": "bd3011d030f4e7a2f900af595c69cf674afa44b2feeb3dcdb7e1017ba0faffb8",
+      "identical": true
+    }
+  }
+}

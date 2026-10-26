@@ -1,0 +1,3 @@
+Using CPython 3.12.13 interpreter at: .venv/bin/python
+Creating virtual environment at: vane_fs/build/background-writeback-20261011T131926Z/updated/venv
+Activate with: source vane_fs/build/background-writeback-20261011T131926Z/updated/venv/bin/activate

@@ -17,12 +17,15 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._errors import DiagnosticError, _diagnostic_message, summarize_error
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
     from vane.ai.protocols import (
         AudioEmbedderDescriptor,
         ImageEmbedderDescriptor,
+        MultimodalEmbedderDescriptor,
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
@@ -62,49 +65,34 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
 
 
 _SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
-    {"anthropic", "cosmos", "google", "openai", "transformers", "typesafe", "vllm"}
+    {
+        "anthropic",
+        "cosmos",
+        "embedding_http",
+        "google",
+        "litert",
+        "mlx",
+        "openai",
+        "qwen3_vl",
+        "transformers",
+        "typesafe",
+        "vllm",
+    }
 )
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
-_MAX_ERROR_TYPE_CHARS = 128
-_SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")
 
 
 class _SafeProviderError(RuntimeError):
     """A bounded, credential-safe summary of an upstream provider error."""
 
 
-def _safe_error_type(original_error: Exception) -> str:
-    try:
-        name = type(original_error).__name__
-    except Exception:
-        return "Exception"
-    name = name[:_MAX_ERROR_TYPE_CHARS]
-    if not name or not name.isascii() or not name.isidentifier():
-        return "Exception"
-    return name
-
-
 def _safe_original_error_summary(original_error: Exception) -> str:
     if isinstance(original_error, _SafeProviderError):
         return str(original_error)
-    error_type = _safe_error_type(original_error)
-    details: list[str] = []
-    for name in _SAFE_ERROR_DETAIL_NAMES:
-        try:
-            value = getattr(original_error, name, None)
-        except Exception:
-            continue
-        # Provider messages and string-valued fields can echo opaque API keys,
-        # tokens, request bodies, or other user data without a recognizable
-        # label.  Preserve only builtin numeric status metadata; never inspect
-        # or stringify arbitrary upstream text on an exception path.
-        if type(value) is not int or not -999_999 <= value <= 999_999:
-            continue
-        details.append(f"{name}={value}")
-    summary = error_type
-    if details:
-        summary += " (" + ", ".join(details) + ")"
-    return summary
+    # Capture the safe cause/cleanup chain before batch wrappers detach the
+    # original exceptions for transport. Keeping only the outer error here
+    # permanently loses initialization failures masked by teardown errors.
+    return summarize_error(original_error)
 
 
 def _safe_provider_execution_error(
@@ -123,8 +111,7 @@ def _safe_provider_execution_error(
             and (function is None or (type(function) is str and function in _SAFE_PROVIDER_IMPORT_FUNCTIONS))
         ):
             return ProviderImportError(extra, function=function)
-    summary = _safe_original_error_summary(original_error)
-    return RuntimeError(f"Provider {provider!r} model {model!r} failed during {operation}; upstream error: {summary}")
+    return DiagnosticError(f"Provider {provider!r} model {model!r} failed during {operation}", original_error)
 
 
 class ProviderCapabilityError(RuntimeError):
@@ -155,6 +142,7 @@ class ProviderCapabilityError(RuntimeError):
         message = f"Provider {provider!r} model {model!r} does not support the requested {capability} capability"
         if self.original_error_summary is not None:
             message += f"; upstream error: {self.original_error_summary}"
+            message = _diagnostic_message(self.original_error_summary, message)
         super().__init__(message)
 
     @classmethod
@@ -209,23 +197,41 @@ def _load_transformers(name: str | None = None) -> Provider:
     return TransformersProvider(name)
 
 
+def _load_qwen3_vl(name: str | None = None) -> Provider:
+    from vane.ai.providers.qwen3_vl import Qwen3VLProvider
+
+    return Qwen3VLProvider(name)
+
+
+def _load_mlx(name: str | None = None) -> Provider:
+    from vane.ai.providers.mlx import MLXProvider
+
+    return MLXProvider(name)
+
+
+def _load_litert(name: str | None = None, **client_options: Any) -> Provider:
+    from vane.ai.providers.litert import LiteRTProvider
+
+    return LiteRTProvider(name, **client_options)
+
+
 def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.openai import OpenAIProvider
 
     return OpenAIProvider(name, **client_options)
 
 
-def _load_vllm(name: str | None = None) -> Provider:
+def _load_vllm(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.vllm import VLLMProvider
 
-    return VLLMProvider(name)
+    return VLLMProvider(name, **client_options)
 
 
-def _load_sglang(name: str | None = None) -> Provider:
+def _load_sglang(name: str | None = None, **client_options: Any) -> Provider:
     try:
         from vane.ai.providers.sglang import SGLangProvider
 
-        return SGLangProvider(name)
+        return SGLangProvider(name, **client_options)
     except ImportError as e:
         raise ProviderImportError("sglang") from e
 
@@ -244,6 +250,9 @@ def _load_google(name: str | None = None, **client_options: Any) -> Provider:
 
 PROVIDERS: dict[str, Callable[..., Provider]] = {
     "transformers": _load_transformers,
+    "qwen3_vl": _load_qwen3_vl,
+    "mlx": _load_mlx,
+    "litert": _load_litert,
     "openai": _load_openai,
     "vllm": _load_vllm,
     "sglang": _load_sglang,
@@ -327,6 +336,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> AudioEmbedderDescriptor:
         raise _not_implemented(self, "embed_audio")
+
+    def get_multimodal_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> MultimodalEmbedderDescriptor:
+        raise _not_implemented(self, "embed_multimodal")
 
     # -- Prompting / chat completion ----------------------------------------
 

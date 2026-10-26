@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -23,6 +29,9 @@ public:
 public:
 	//! Add the given data to the HT
 	void AddChunk(DataChunk &groups, DataChunk &payload);
+	void ResetInput() {
+		filter_set.ResetInput();
+	}
 
 	//! Combines the target perfect aggregate HT into this one
 	void Combine(PerfectAggregateHashTable &other);

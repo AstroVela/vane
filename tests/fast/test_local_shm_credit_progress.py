@@ -1,0 +1,416 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Released inputs cannot become phantom output reservations."""
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+
+import pytest
+
+from vane.execution.ref_bundle import LocalShmBudgetManager
+
+
+def test_repeated_input_slices_do_not_multiply_reserved_bytes():
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+
+    class SharedInput:
+        name = "shared-input"
+        size = 400
+        released = False
+
+        def release_budget(self):
+            if not self.released:
+                self.released = True
+                manager.release_allocation(self.size)
+
+    source = SharedInput()
+    manager.acquire_allocation(500)
+    manager.acquire_allocation(source.size)
+    leases = []
+    for _ in range(10):
+        lease = manager.create_input_lease([source], source.size)
+        leases.append(lease)
+        manager.consume_input_lease(lease)
+        assert manager.snapshot()["usage_bytes"] == 500
+    grant = manager.request_output_grant(700, priority="consumer", input_lease_id=leases[-1])
+    assert manager.snapshot()["usage_bytes"] == 1200
+    manager.release_output_grant(grant)
+    for lease in leases:
+        manager.cancel_input_lease(lease)
+    manager.release_allocation(500)
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_consumed_input_streams_remain_dependencies_after_physical_release(cancel):
+    from vane.execution.ref_bundle import LocalShmBlockRef
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    store = LocalShmStore(4096)
+    store.add_client("stream-dependencies")
+    inputs = []
+    for producer in ("left", "right", "left", None):
+        physical = store.allocate(256, producer_id=producer)
+        inputs.append(LocalShmBlockRef(physical.allocation.identity, 256, allocation_lease=physical))
+    lease = manager.create_input_lease(inputs, 1024)
+    try:
+        manager.consume_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        assert store.snapshot()["live_bytes"] == 0
+        assert manager.consuming_input_producers(lease) == frozenset({"left", "right"})
+        assert manager.consuming_input_producers(None) == frozenset()
+        if cancel:
+            manager.cancel_input_lease(lease)
+        else:
+            manager.finish_consuming(lease)
+        assert manager.consuming_input_producers(lease) == frozenset()
+    finally:
+        manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        store.remove_client("stream-dependencies")
+    assert store.snapshot()["live_allocations"] == 0
+
+
+def test_consumer_escape_admits_one_complete_block_then_waits_for_release():
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    manager.acquire_allocation(900)
+    first = manager.request_output_grant(350, priority="consumer")
+    cancel = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        waiting = threads.submit(manager.request_output_grant, 350, priority="consumer", cancel_event=cancel)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                waiting.result(timeout=0.1)
+            allocation = manager.convert_output_grant_to_allocation(first)
+            with pytest.raises(FutureTimeoutError):
+                waiting.result(timeout=0.1)
+            manager.release_allocation(allocation)
+            second = waiting.result(timeout=5)
+            manager.release_output_grant(second)
+        finally:
+            cancel.set()
+            manager.wake_waiters()
+            manager.release_output_grant(first)
+            manager.release_allocation(900)
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_producer_and_explicit_reservations_do_not_use_consumer_escape(strict):
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    reservation = manager.reserve_task_bytes(10, 10) if strict else None
+    manager.acquire_allocation(900)
+    cancel = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        pending = threads.submit(
+            manager.request_output_grant, 350, priority="consumer" if strict else "producer", cancel_event=cancel
+        )
+        try:
+            with pytest.raises(FutureTimeoutError):
+                pending.result(timeout=0.1)
+            assert manager.snapshot()["usage_bytes"] == (920 if strict else 900)
+        finally:
+            cancel.set()
+            manager.wake_waiters()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                pending.result(timeout=5)
+            if reservation is not None:
+                reservation.release()
+            manager.release_allocation(900)
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_pinned_consumer_can_progress_past_unrelated_inputs_once(monkeypatch):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("consumer-progress")
+
+    def block(size, budget):
+        lease = store.allocate(size)
+        return refs.LocalShmBlockRef(lease.allocation.identity, size, allocation_lease=lease, budget_bytes=budget)
+
+    inputs = [block(1024, manager.acquire_allocation(1024, block=False)) for _ in range(2)]
+    lease = manager.create_input_lease([inputs[0]], 1024)
+    manager.consume_input_lease(lease)
+    output = None
+    cancel = threading.Event()
+    try:
+        # Both upstream inputs remain charged. An unrelated input must not
+        # prevent this consumer from producing the output that drains them.
+        grant = manager.request_output_grant(512, priority="consumer", input_lease_id=lease)
+        output = block(512, manager.convert_output_grant_to_allocation(grant))
+        manager.record_consuming_output(lease, [output])
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            waiting = threads.submit(
+                manager.request_output_grant, 512, priority="consumer", input_lease_id=lease, cancel_event=cancel
+            )
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    waiting.result(timeout=0.1)
+                output.release()
+                next_grant = waiting.result(timeout=5)
+                manager.release_output_grant(next_grant)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        if output is not None:
+            output.release()
+        manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        store.remove_client("consumer-progress")
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("unrelated_pressure", [False, True])
+def test_output_owner_window_waits_for_physical_release_across_invocations(monkeypatch, unrelated_pressure):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("owner-window")
+    if unrelated_pressure:
+        manager.acquire_allocation(1100)
+
+    def output():
+        grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+        owner = manager.output_grant_owner(grant)
+        lease = store.allocate(1100)
+        return refs.LocalShmBlockRef(
+            lease.allocation.identity,
+            1100,
+            allocation_lease=lease,
+            budget_bytes=manager.convert_output_grant_to_allocation(grant),
+            output_owner=owner,
+        )
+
+    first, second = output(), output()
+    held_view = first._allocation_lease.fork()
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant, 1100, priority="consumer", owner_id="source", cancel_event=cancel
+            )
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                first.release()
+                assert len(manager._owned_output_grants["source"]) == 2
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                held_view.release()
+                grant = pending.result(timeout=5)
+                assert len(manager._owned_output_grants["source"]) == 2
+                manager.release_output_grant(grant)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        held_view.release()
+        first.release()
+        second.release()
+        if unrelated_pressure:
+            manager.release_allocation(1100)
+        store.remove_client("owner-window")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
+
+
+def test_input_ack_returns_progress_credit_while_exported_views_keep_byte_charges(monkeypatch):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("consumed-window")
+    inputs, views, leases = [], [], []
+    cancel = threading.Event()
+    try:
+        for _ in range(2):
+            grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+            owner = manager.output_grant_owner(grant)
+            physical = store.allocate(1100)
+            ref = refs.LocalShmBlockRef(
+                physical.allocation.identity,
+                1100,
+                allocation_lease=physical,
+                budget_bytes=manager.convert_output_grant_to_allocation(grant),
+                output_owner=owner,
+            )
+            inputs.append(ref)
+            views.append(physical.fork())
+            leases.append(manager.create_input_lease([ref], 1100))
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant,
+                1100,
+                priority="consumer",
+                owner_id="source",
+                cancel_event=cancel,
+            )
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                manager.consume_input_lease(leases[0])
+                grant = pending.result(timeout=5)
+                # The actor can receive its replacement batch, but both old
+                # physical allocations remain charged through their views.
+                assert manager.snapshot()["allocated_bytes"] == 2200
+                assert len(manager._owned_output_grants["source"]) == 3
+                assert manager._unconsumed_outputs_locked("source") == 2
+                manager.consume_input_lease(leases[0])  # ACK replay cannot create another slot.
+                assert manager._unconsumed_outputs_locked("source") == 2
+                manager.release_output_grant(grant)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        for lease in leases:
+            manager.cancel_input_lease(lease)
+        for ref in inputs:
+            ref.release()
+        for view in views:
+            view.release()
+        store.remove_client("consumed-window")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}
+
+
+@pytest.mark.parametrize("prior_owner", ["source", "intermediate"])
+def test_next_input_bridge_is_bounded_until_physical_release(monkeypatch, prior_owner):
+    from vane.execution import ref_bundle as refs
+    from vane.execution.udf_shm_store import LocalShmStore
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = LocalShmStore(8192)
+    store.add_client("input-bridge")
+    prior = manager.request_output_grant(1100, priority="consumer", owner_id=prior_owner)
+    lease = store.allocate(128)
+    ref = refs.LocalShmBlockRef(lease.allocation.identity, 128, allocation_lease=lease, input_owner_id="source")
+    held = lease.fork()
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(manager.acquire_allocation, 128, input_owner_id="source", cancel_event=cancel)
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                ref.release()
+                assert manager.snapshot()["allocated_bytes"] == 128
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+                held.release()
+                assert pending.result(timeout=5) == 128
+                manager.release_allocation(128, input_owner_id="source")
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+    finally:
+        held.release()
+        ref.release()
+        manager.release_output_grant(prior)
+        store.remove_client("input-bridge")
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_input_allocations == {}
+
+
+@pytest.mark.parametrize("owner_id,outputs,strict", [(None, 1, False), ("source", 2, False), ("source", 1, True)])
+def test_input_bridge_preserves_owner_window_and_strict_reservations(owner_id, outputs, strict):
+    limit = [4000]
+    manager = LocalShmBudgetManager(limit_factory=lambda: limit[0])
+    grants = [manager.request_output_grant(1100, priority="consumer", owner_id="source") for _ in range(outputs)]
+    reservation = manager.reserve_task_bytes(10, 10) if strict else None
+    limit[0] = 1000
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(manager.acquire_allocation, 128, input_owner_id=owner_id, cancel_event=cancel)
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+                with pytest.raises(RuntimeError, match="cancelled"):
+                    pending.result(timeout=5)
+    finally:
+        if reservation is not None:
+            reservation.release()
+        for grant in grants:
+            manager.release_output_grant(grant)
+    assert manager._owned_input_allocations == {}
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_failed_input_creation_returns_the_bridge_allowance(monkeypatch):
+    import pyarrow as pa
+
+    from vane.execution import ref_bundle as refs
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 1000)
+    monkeypatch.setattr(refs, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    grant = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    create = refs._create_shm
+
+    def fail(*args, **kwargs):
+        raise OSError("input allocation failed")
+
+    try:
+        monkeypatch.setattr(refs, "_create_shm", fail)
+        with pytest.raises(OSError, match="input allocation failed"):
+            refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")
+        assert manager._owned_input_allocations == {}
+        monkeypatch.setattr(refs, "_create_shm", create)
+        result = refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")
+        result[1][0].release()
+        assert manager._owned_input_allocations == {}
+    finally:
+        manager.release_output_grant(grant)
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize(
+    "owner_id,priority,strict",
+    [("source", "producer", False), (None, "consumer", False), ("source", "consumer", True)],
+)
+def test_owned_window_preserves_producer_owner_and_explicit_reservation_boundaries(owner_id, priority, strict):
+    limit = [3000]
+    manager = LocalShmBudgetManager(limit_factory=lambda: limit[0])
+    first = manager.request_output_grant(1100, priority="consumer", owner_id="source")
+    reservation = manager.reserve_task_bytes(10, 10) if strict else None
+    limit[0] = 1000
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            pending = threads.submit(
+                manager.request_output_grant, 1100, priority=priority, owner_id=owner_id, cancel_event=cancel
+            )
+            try:
+                with pytest.raises(FutureTimeoutError):
+                    pending.result(timeout=0.05)
+            finally:
+                cancel.set()
+                manager.wake_waiters()
+                with pytest.raises(RuntimeError, match="cancelled"):
+                    pending.result(timeout=5)
+    finally:
+        if reservation is not None:
+            reservation.release()
+        manager.release_output_grant(first)
+    assert manager.snapshot()["usage_bytes"] == 0
+    assert manager._owned_output_grants == {}

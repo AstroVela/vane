@@ -1,0 +1,72 @@
+{
+  "status": "FAIL",
+  "runs": [
+    {
+      "label": "release-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/test_trace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/trace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=sync_file_range",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/release-trace-test"
+      ],
+      "started_epoch": 1791859471.477817,
+      "ended_epoch": 1791859473.446777
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5/db.sqlite.request-costs.json",
+          "bytes": 6739,
+          "sha256": "7739b5ec86653a234d188b27b58e4e47502abd56cf8cdb8fc91bebb74342a343"
+        },
+        {
+          "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5/db.sqlite.payload-copy",
+          "bytes": 4,
+          "sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+        },
+        {
+          "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5/db.sqlite.stage-fence",
+          "bytes": 4,
+          "sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+        },
+        {
+          "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5/db.sqlite-wal",
+          "bytes": 4,
+          "sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+        },
+        {
+          "path": "/dev/shm/owned-vane-sync-trace-6oupe7t5/db.sqlite",
+          "bytes": 4,
+          "sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+        }
+      ]
+    }
+  ],
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/validate.py": "d6eb25e504c7aa2da836fd5781e1c3efde59ef413f78bd9e9766d1e217b0bd95",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/test_trace.cpp": "11554f889c12ceff0c13500667b5ab4200508f465455cfa2c5f56662a9a8a606",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/trace.cpp": "3c563588271c5ce7a02e3f080e78cc79f7114f0c40b227f219fbb497fab96630",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013-generator/trace.hpp": "61470b11b60fff614c30f51ec88f4611b9d05b074c9891154d83aa6de9a8b7b2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/release-trace-test": "099328cbb5050546cce21788d139b60cf407ae2f41b6955dadb33b285577a91b"
+  },
+  "error": "AssertionError()"
+}

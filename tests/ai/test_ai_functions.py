@@ -2433,6 +2433,7 @@ class TestWrapperRetry:
     def test_embed_import_error_rejects_untrusted_install_hint(self, extra, function):
         import cloudpickle
 
+        from vane.ai import DiagnosticError
         from vane.ai.functions import _EmbedTextBatch
         from vane.ai.provider import ProviderImportError
 
@@ -2452,12 +2453,12 @@ class TestWrapperRetry:
             _drive(wrapper, pa.table({"text": ["hello"]}))
 
         error = exc_info.value
-        assert type(error) is RuntimeError
+        assert type(error) is DiagnosticError
         assert error.__cause__ is None
         assert error.__context__ is None
         round_tripped = [serializer.loads(serializer.dumps(error)) for serializer in (pickle, cloudpickle)]
         for visible_error in (error, *round_tripped):
-            assert type(visible_error) is RuntimeError
+            assert type(visible_error) is DiagnosticError
             assert "sk-review-sentinel" not in str(visible_error)
 
     def test_embed_ignore_isolates_without_retrying_nontransient_error(self):

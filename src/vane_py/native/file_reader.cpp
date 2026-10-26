@@ -7,6 +7,7 @@
 #include "file_value.hpp"
 #include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/file.hpp"
+#include "vane_python/vane_fs.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -21,6 +22,16 @@
 namespace duckdb {
 
 namespace {
+
+unique_lock<std::recursive_mutex> LockReaderConnection(const shared_ptr<DuckDBPyConnection> &connection) {
+	D_ASSERT(py::gil_check());
+	if (connection) {
+		// Reject before waiting for either the reader or connection mutex: an
+		// active query can be waiting for this Python input callback to return.
+		return connection->LockForQuery();
+	}
+	return {};
+}
 
 class ReaderContextScope {
 public:
@@ -115,6 +126,8 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 	if (!connection) {
 		connection = DuckDBPyConnection::DefaultConnection();
 	}
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	auto reference = FileReference::FromValue(file.ToValue(), "File.open");
 	auto context = connection->con.GetConnection().context;
 	auto interrupt_generation = connection->InterruptGeneration();
@@ -122,9 +135,11 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
-		RunReaderContextOperation(*context, *connection, interrupt_generation,
-		                          [&](ReaderContextScope &) { resolved = ResolvedFile::Open(*context, reference); });
+		auto connection_guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
+		RunReaderContextOperation(*context, *connection, interrupt_generation, [&](ReaderContextScope &) {
+			VaneFSStandaloneOpenScope snapshot_scope(*context);
+			resolved = ResolvedFile::Open(*context, reference);
+		});
 	}
 	return shared_ptr<PythonFileReaderHandle>(
 	    new PythonFileReaderHandle(std::move(reference.url), buffer_size, std::move(connection), nullptr,
@@ -228,6 +243,8 @@ py::bytes PythonFileReaderHandle::ReadAndCheckInterrupted(int64_t size) {
 }
 
 py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained_interrupt) {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	string result;
 	D_ASSERT(py::gil_check());
 	// Generic reads establish an independent operation generation so a reader can
@@ -263,7 +280,7 @@ py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained
 					}
 				};
 				if (connection) {
-					unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
+					auto connection_guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 					RunReaderContextOperation(*context, *connection, operation_generation,
 					                          [&](ReaderContextScope &) { read(); });
 				} else {
@@ -279,6 +296,8 @@ py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained
 }
 
 int64_t PythonFileReaderHandle::Seek(int64_t offset, int whence) {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	uint64_t result;
 	{
 		D_ASSERT(py::gil_check());
@@ -323,6 +342,8 @@ int64_t PythonFileReaderHandle::Seek(int64_t offset, int whence) {
 }
 
 int64_t PythonFileReaderHandle::Tell() {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	uint64_t result;
 	{
 		D_ASSERT(py::gil_check());
@@ -336,6 +357,8 @@ int64_t PythonFileReaderHandle::Tell() {
 }
 
 int64_t PythonFileReaderHandle::Size() {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	uint64_t result;
 	{
 		D_ASSERT(py::gil_check());
@@ -349,13 +372,15 @@ int64_t PythonFileReaderHandle::Size() {
 }
 
 void PythonFileReaderHandle::CheckInterrupted() {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	D_ASSERT(py::gil_check());
 	py::gil_scoped_release release;
 	unique_lock<mutex> reader_guard(lock);
 	auto datasource_context_guard = LockDataSourceContext();
 	RequireOpen();
 	if (connection) {
-		unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
+		auto connection_guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 		ReaderContextScope(*context, *connection, interrupt_generation).CheckInterrupted();
 	} else if (context->IsInterrupted()) {
 		throw InterruptException();
@@ -363,6 +388,8 @@ void PythonFileReaderHandle::CheckInterrupted() {
 }
 
 py::bytes PythonFileReaderHandle::SourceIdentity() {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	string result;
 	{
 		py::gil_scoped_release release;
@@ -370,7 +397,7 @@ py::bytes PythonFileReaderHandle::SourceIdentity() {
 		auto datasource_context_guard = LockDataSourceContext();
 		RequireOpen();
 		if (connection) {
-			unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
+			auto connection_guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 			RunReaderContextOperation(*context, *connection, interrupt_generation,
 			                          [&](ReaderContextScope &) { result = resolved->SourceIdentity(); });
 		} else {
@@ -387,6 +414,8 @@ py::bytes PythonFileReaderHandle::SourceIdentity() {
 }
 
 py::object PythonFileReaderHandle::GuessMimeType() {
+	auto connection_owner = connection;
+	auto query_lock = LockReaderConnection(connection_owner);
 	string result;
 	bool found;
 	D_ASSERT(py::gil_check());
@@ -399,7 +428,7 @@ py::object PythonFileReaderHandle::GuessMimeType() {
 		auto datasource_context_guard = LockDataSourceContext();
 		RequireOpen();
 		if (connection) {
-			unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
+			auto connection_guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 			RunReaderContextOperation(*context, *connection, interrupt_generation,
 			                          [&](ReaderContextScope &) { found = resolved->GuessMimeType(result); });
 		} else {
@@ -424,6 +453,13 @@ void PythonFileReaderHandle::CloseAndCheckInterrupted() {
 }
 
 void PythonFileReaderHandle::CloseInternal(bool check_interrupted) {
+	// Query-owned DataSource readers have no Python connection and remain
+	// usable for producing input. Explicit connection-bound readers obey the
+	// same callback entry rule as query and binding methods, before any mutation.
+	if (connection) {
+		DuckDBPyConnection::CheckCallbackEntry();
+	}
+	// Control threads must still mark the reader closed before waiting for I/O.
 	// Only one caller owns teardown. Other close calls wait without the GIL for
 	// that owner to finish, then observe the completed close. In particular, a
 	// later closer must not clear the context needed by a checked close.

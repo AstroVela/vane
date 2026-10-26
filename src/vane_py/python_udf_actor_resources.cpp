@@ -2,18 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/physical_plan_traversal.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/execution/operator/helper/physical_execute.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_objects.hpp"
 
@@ -145,17 +148,11 @@ static UDFFunctionData *TryGetMutableUDFBindData(PhysicalOperator &op) {
 }
 
 static void CollectMutableUDFBindDataRecursive(PhysicalOperator &op, vector<UDFFunctionData *> &out) {
-	if (auto *bind_data = TryGetMutableUDFBindData(op)) {
-		out.push_back(bind_data);
-	}
-	if (op.type == PhysicalOperatorType::EXECUTE) {
-		// EXECUTE keeps its prepared plan outside the ordinary children vector.
-		CollectMutableUDFBindDataRecursive(op.Cast<PhysicalExecute>().plan, out);
-		return;
-	}
-	for (auto &child : op.children) {
-		CollectMutableUDFBindDataRecursive(child.get(), out);
-	}
+	VisitPhysicalExecutionGraph(op, [&](PhysicalOperator &node) {
+		if (auto *bind_data = TryGetMutableUDFBindData(node)) {
+			out.push_back(bind_data);
+		}
+	});
 }
 
 static bool PayloadStringField(const Value &payload, const string &name, string &result) {
@@ -254,7 +251,7 @@ static void ApplyHandlesMap(const vector<UDFFunctionData *> &bind_nodes, const p
 			throw InvalidInputException("UDF actor resource helper returned unknown node_id %llu",
 			                            static_cast<unsigned long long>(node_id));
 		}
-		bind_nodes[node_id]->actor_handles = WrapPyObjectForUDFActorHandles(value);
+		ApplyUDFExecutorOptions(*bind_nodes[node_id], value);
 	}
 }
 
@@ -266,12 +263,60 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 
 } // namespace
 
+void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object &options) {
+	if (!pybind11::isinstance<pybind11::dict>(options)) {
+		throw InvalidInputException("UDF executor options must be a dict");
+	}
+	auto values = pybind11::reinterpret_borrow<pybind11::dict>(options);
+	idx_t target = 0;
+	if (values.contains("local_transport_input_target_bytes")) {
+		auto value = values["local_transport_input_target_bytes"];
+		if (!PyLong_CheckExact(value.ptr())) {
+			throw InvalidInputException("Local transport input target must be positive integer bytes");
+		}
+		auto bytes = pybind11::cast<int64_t>(value);
+		if (bytes <= 0) {
+			throw InvalidInputException("Local transport input target must be positive integer bytes");
+		}
+		target = static_cast<idx_t>(bytes);
+	}
+	bind_data.actor_handles = WrapPyObjectForUDFActorHandles(options);
+	bind_data.transport_input_target_bytes = target;
+}
+
 class PythonUDFActorResourceState : public ClientContextState {
 public:
-	void BeginScope() {
+	void EnableAutomaticPreparation() {
+		automatic_preparation = true;
+	}
+
+	void QueryBegin(ClientContext &) override {
+		if (automatic_preparation && scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+			preparation_cancelled = false;
+			preparation_generation++;
+			startup_cancellation.reset();
+		}
+	}
+
+	void EnableLocalRuntimeInputPolicy() {
+		local_runtime_input_policy = true;
+	}
+
+	bool HasLocalRuntimeInputPolicy() const {
+		return local_runtime_input_policy || bool(runtime_query);
+	}
+
+	void BeginScope(const pybind11::object &local_query) {
 		if (scope_depth == 0) {
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
+			preparation_cancelled = false;
+			preparation_generation++;
+			runtime_query = WrapPyObjectForUDFActorHandles(local_query);
+		} else if (runtime_query || !local_query.is_none()) {
+			throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
 		}
 		scope_depth++;
 	}
@@ -281,8 +326,25 @@ public:
 			scope_depth--;
 		}
 		if (scope_depth == 0) {
+			startup_cancellation.reset();
+			runtime_query.reset();
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
+		}
+	}
+
+	void CancelPreparation() {
+		D_ASSERT(PyGILState_Check());
+		if (!Enabled() || runtime_query) {
+			return;
+		}
+		// The native query can reset ClientContext::interrupted while starting.
+		// Remember an interrupt even before the first UDF creates its scope.
+		preparation_cancelled = true;
+		auto cancellation = startup_cancellation;
+		if (cancellation) {
+			auto &scope = *static_cast<pybind11::object *>(cancellation.get());
+			scope.attr("cancel")("query interrupted during UDF preparation");
 		}
 	}
 
@@ -297,8 +359,10 @@ public:
 	}
 
 	RebindQueryInfo OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
-	                                  PreparedStatementMode) override {
-		if (!Enabled()) {
+	                                  PreparedStatementMode mode) override {
+		// Schema discovery through Connection::Prepare must not start actors.
+		// Explicit Python execution scopes retain their existing preparation policy.
+		if (!Enabled() || (scope_depth == 0 && mode != PreparedStatementMode::PREPARE_AND_EXECUTE)) {
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
 		PrepareOnce(context, prepared);
@@ -311,9 +375,10 @@ public:
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
 		if (prepared_statements.find(&info.prepared_statement) == prepared_statements.end() &&
-		    HasLocalActorUDF(info.prepared_statement)) {
+		    HasLocalSubprocessUDF(info.prepared_statement)) {
 			// Cached plans retain their bind data, including handles of pools
-			// closed at the previous QueryEnd. Rebind before a new execution.
+			// closed at the previous QueryEnd, including task progress bindings.
+			// Rebind before a new execution.
 			return RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		PrepareOnce(context, info.prepared_statement);
@@ -323,7 +388,7 @@ public:
 	RebindQueryInfo OnRebindPreparedStatement(ClientContext &, BindPreparedStatementCallbackInfo &info,
 	                                          RebindQueryInfo current_rebind) override {
 		if (Enabled() && current_rebind != RebindQueryInfo::ATTEMPT_TO_REBIND &&
-		    HasLocalActorUDF(info.prepared_statement)) {
+		    HasLocalSubprocessUDF(info.prepared_statement)) {
 			return RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		return RebindQueryInfo::DO_NOT_REBIND;
@@ -333,7 +398,7 @@ public:
 		prepared_statements.clear();
 		const auto capture_errors = capture_cleanup_warnings;
 		capture_cleanup_warnings = false;
-		if (resources.empty()) {
+		if (resources.empty() && !runtime_query) {
 			return;
 		}
 		if (!Py_IsInitialized() || PythonIsFinalizing()) {
@@ -345,7 +410,14 @@ public:
 		// actor callables can therefore release provider state even when the
 		// query itself failed; forced termination is reserved for setup rollback
 		// and context destruction where quiescence is not established here.
+		if (runtime_query) {
+			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
+			query.attr("query_finished")();
+		}
 		ShutdownResources(false, capture_errors);
+		if (scope_depth == 0) {
+			startup_cancellation.reset();
+		}
 	}
 
 	~PythonUDFActorResourceState() override {
@@ -366,7 +438,7 @@ public:
 		}
 		if (!resources.empty()) {
 			// The GIL guard is a local and is destroyed before this state's members.
-			// Never let a still-retained py::object reach member destruction after
+			// Never let a still-retained pybind11::object reach member destruction after
 			// the GIL has been released. Cleanup has already exhausted its bounded
 			// retries, so perform the final DECREF while Python is still usable;
 			// the Python owners' destructors retain their own last-chance cleanup.
@@ -375,7 +447,7 @@ public:
 	}
 
 private:
-	static bool HasLocalActorUDF(PreparedStatementData &prepared) {
+	static bool HasLocalSubprocessUDF(PreparedStatementData &prepared) {
 		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
 			return false;
 		}
@@ -383,7 +455,8 @@ private:
 		CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), bind_nodes);
 		for (auto *bind_data : bind_nodes) {
 			string backend;
-			if (PayloadStringField(bind_data->payload, "execution_backend", backend) && backend == "subprocess_actor") {
+			if (PayloadStringField(bind_data->payload, "execution_backend", backend) &&
+			    (backend == "subprocess_actor" || backend == "subprocess_task")) {
 				return true;
 			}
 		}
@@ -391,7 +464,7 @@ private:
 	}
 
 	bool Enabled() const {
-		return scope_depth > 0;
+		return scope_depth > 0 || automatic_preparation;
 	}
 
 	void PrepareOnce(ClientContext &context, PreparedStatementData &prepared) {
@@ -407,6 +480,47 @@ private:
 	}
 
 	void Prepare(ClientContext &context, PreparedStatementData &prepared) {
+		if (runtime_query) {
+			// The outer entry validates SELECT/Relation. Internal verification
+			// statements may return no rows, but must obey the same read-only policy.
+			if (!prepared.properties.IsReadOnly()) {
+				throw InvalidInputException("local runtime currently supports read-only queries");
+			}
+			PythonGILWrapper gil;
+			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
+			vector<UDFFunctionData *> local_nodes;
+			if (prepared.physical_plan && prepared.physical_plan->HasRoot()) {
+				VisitPhysicalExecutionGraph(prepared.physical_plan->Root(), [&](PhysicalOperator &op) {
+					if (op.type == PhysicalOperatorType::TABLE_SCAN &&
+					    op.Cast<PhysicalTableScan>().function.name == "json_execute_serialized_sql") {
+						// This wrapper executes on its own connection, outside this
+						// request's UDF preparation, budgets and cancellation scope.
+						// Check all owned plans before creating any runtime resources.
+						throw InvalidInputException(
+						    "local runtime does not support the json_execute_serialized_sql table function; "
+						    "execute the inner SQL directly so runtime budgets and cancellation apply");
+					}
+					if (auto *bind_data = TryGetMutableUDFBindData(op)) {
+						local_nodes.push_back(bind_data);
+					}
+				});
+			}
+			pybind11::list nodes;
+			for (idx_t i = 0; i < local_nodes.size(); i++) {
+				auto node = BuildUDFNode(i, *local_nodes[i], context);
+				// Ordinary native plans receive fresh query-owned options on every
+				// execution; no closed admission or pool binding is carried forward.
+				node.attr("pop")("executor_options", pybind11::none());
+				nodes.append(std::move(node));
+			}
+			pybind11::object graph = pybind11::none();
+			if (query.attr("track_graph").cast<bool>()) {
+				graph = CollectNativeLocalResourceGraph(context, prepared);
+			}
+			auto handles = query.attr("prepare")(nodes, graph);
+			ApplyHandlesMap(local_nodes, handles);
+			return;
+		}
 		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
 			return;
 		}
@@ -424,11 +538,15 @@ private:
 			if (!bind_data) {
 				continue;
 			}
+			string model_token;
+			if (PayloadStringField(bind_data->payload, "local_model_token", model_token)) {
+				throw InvalidInputException("registered local models require their owning configured local runtime");
+			}
 			string backend;
 			if (!PayloadStringField(bind_data->payload, "execution_backend", backend)) {
 				continue;
 			}
-			if (backend == "subprocess_actor") {
+			if (backend == "subprocess_actor" || backend == "subprocess_task") {
 				subprocess_nodes.append(BuildUDFNode(node_id, *bind_data, context));
 			} else if (backend == "ray_actor" && !bind_data->actor_handles) {
 				throw InvalidInputException("ray_actor UDF execution requires driver-precreated actor handles from a "
@@ -442,10 +560,22 @@ private:
 
 		try {
 			if (pybind11::len(subprocess_nodes) > 0) {
+				if (!startup_cancellation) {
+					auto scope =
+					    pybind11::module_::import("vane.execution.udf_lifecycle")
+					        .attr("ExecutionCancellationScope")(DirectPlanIdentity(prepared), preparation_generation);
+					startup_cancellation = WrapPyObjectForUDFActorHandles(scope);
+				}
+				auto &scope = *static_cast<pybind11::object *>(startup_cancellation.get());
+				if (preparation_cancelled) {
+					scope.attr("cancel")("query interrupted during UDF preparation");
+				}
 				auto subprocess_module = pybind11::module_::import("vane.execution.udf_subprocess");
 				auto result = pybind11::reinterpret_borrow<pybind11::tuple>(
 				    subprocess_module.attr("ensure_local_subprocess_actor_pools_for_nodes")(
-				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared)));
+				        subprocess_nodes, pybind11::arg("plan_identity") = DirectPlanIdentity(prepared),
+				        pybind11::arg("startup_cancellation") = scope,
+				        pybind11::arg("resource_graph") = CollectNativeLocalResourceGraph(context, prepared)));
 				auto created = result[0];
 				auto handles_map = result[1];
 				AppendCreatedResources(resources, created);
@@ -525,15 +655,60 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	bool automatic_preparation = false;
+	idx_t preparation_generation = 0;
+	bool preparation_cancelled = false;
+	shared_ptr<void> startup_cancellation;
+	bool local_runtime_input_policy = false;
+	shared_ptr<void> runtime_query;
 	bool capture_cleanup_warnings = false;
 	unordered_set<PreparedStatementData *> prepared_statements;
 	vector<pybind11::object> resources;
 	vector<string> cleanup_warnings;
 };
 
-ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context) {
+namespace {
+
+class PythonUDFConnectionCallback : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		// This callback is held by the host database. Its vtable stays in the
+		// Python bridge even when a private engine constructs the connection.
+		auto state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
+		state->EnableAutomaticPreparation();
+	}
+};
+
+} // namespace
+
+void RegisterPythonUDFConnectionCallbacks(DatabaseInstance &db) {
+	ExtensionCallback::Register(db.config, make_shared_ptr<PythonUDFConnectionCallback>());
+}
+
+ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context,
+                                                                                 pybind11::object local_query) {
 	state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
-	state->BeginScope();
+	state->BeginScope(local_query);
+}
+
+void EnableLocalRuntimeInputPolicy(ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
+	state->EnableLocalRuntimeInputPolicy();
+}
+
+bool HasLocalRuntimeInputPolicy(const ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
+	return state && state->HasLocalRuntimeInputPolicy();
+}
+
+void CancelPythonUDFActorResourcePreparation(ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
+	if (state) {
+		state->CancelPreparation();
+	}
 }
 
 ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparation() {

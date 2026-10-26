@@ -71,7 +71,7 @@ inline string NormalizeRunnerType(string runner_type) {
 		throw InvalidInputException("Invalid runner type '%s'. Please use 'local-fast', 'local', or 'ray'.",
 		                            runner_type);
 	}
-	return runner_type;
+	return runner_type == "local-fast" ? "local" : runner_type;
 }
 
 inline string ResolveRunnerTypeFromEnvironment() {
@@ -125,6 +125,8 @@ struct UDFFunctionData : public FunctionData {
 	Value payload;
 	LogicalType return_type;
 	shared_ptr<void> actor_handles;
+	//! Execution-time capacity, supplied with the query's prepared actor resources.
+	idx_t transport_input_target_bytes = 0;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

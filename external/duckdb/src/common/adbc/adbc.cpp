@@ -1223,7 +1223,7 @@ duckdb::unique_ptr<duckdb::ArrowArrayStreamWrapper> stream_produce(uintptr_t fac
 	return res;
 }
 
-void stream_schema(ArrowArrayStream *stream, ArrowSchema &schema) {
+void stream_schema(ArrowArrayStream *stream, ArrowSchema &schema, duckdb::ClientContext &) {
 	stream->get_schema(stream, &schema);
 }
 

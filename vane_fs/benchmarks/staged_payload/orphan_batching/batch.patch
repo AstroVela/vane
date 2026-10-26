@@ -1,0 +1,34 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -1926,8 +1926,29 @@
+ 	for (const auto &entry : orphans) {
+ 		auto view = Branch(db, entry.first);
+ 		auto node = Inode(db, entry.second, view);
+-		for (const auto &block : Visible(db, BLOCKS, view.point, entry.second)) {
+-			Put(db, BLOCKS, block.key, {0}, view, true);
++		// An exact replacement interval needs no splitting. Update all live
++		// blocks together; inherited or future versions still go through Put.
++		bool split;
++		{
++			Statement overlaps(db, "SELECT 1 FROM block_versions WHERE inode=?1 AND low<?2 AND high>?3 "
++			                       "AND (low<>?3 OR high<>?2) LIMIT 1");
++			overlaps.Bind(1, entry.second);
++			overlaps.Bind(2, view.high);
++			overlaps.Bind(3, view.point);
++			split = overlaps.Step();
++		}
++		if (split) {
++			for (const auto &block : Visible(db, BLOCKS, view.point, entry.second)) {
++				Put(db, BLOCKS, block.key, {0}, view, true);
++			}
++		} else {
++			Statement remove_blocks(db, "UPDATE block_versions SET writer=?,deleted=1,payload=NULL "
++			                            "WHERE inode=? AND low=? AND high=? AND deleted=0");
++			remove_blocks.Bind(1, view.writer);
++			remove_blocks.Bind(2, entry.second);
++			remove_blocks.Bind(3, view.point);
++			remove_blocks.Bind(4, view.high);
++			remove_blocks.Step();
+ 		}
+ 		Put(db, INODES, node.key, node.fields, view, true);
+ 		Statement remove(db, "DELETE FROM orphans WHERE branch=? AND inode=?");

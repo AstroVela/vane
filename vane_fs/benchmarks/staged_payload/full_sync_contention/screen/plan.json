@@ -1,0 +1,78 @@
+{
+  "status": "FROZEN_BEFORE_MEASUREMENT",
+  "epoch": 1791883144.5278869,
+  "states": [
+    "cold",
+    "warm",
+    "gc"
+  ],
+  "orders": [
+    [
+      "active",
+      "quiesced"
+    ],
+    [
+      "quiesced",
+      "active"
+    ],
+    [
+      "active",
+      "quiesced"
+    ],
+    [
+      "quiesced",
+      "active"
+    ],
+    [
+      "active",
+      "quiesced"
+    ],
+    [
+      "quiesced",
+      "active"
+    ]
+  ],
+  "diagnostic_only": true,
+  "full_barriers_per_run": 128,
+  "files_per_run": 128,
+  "bytes_per_file": 4096,
+  "warm_clean_padding_bytes": 20971520,
+  "wal_admission_bytes": 67108864,
+  "same_native_binary_for_both_arms": true,
+  "independent_workspaces": true,
+  "preparation_excluded_from_phase": true,
+  "no_owned_build_or_test_overlap": true,
+  "no_cache_eviction_or_affinity_changes": true,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/full_sync_contention/build.py": "2e8d24748dd38960d84653801758c931a4db145ef072419cd6b7c23dc385ff1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/full_sync_contention/probe.cpp": "a336a528e003020ec0cfecf8322217d5467de1791fe9d476fd34212d7e42e2cc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/fixture.hpp": "68a45827818f910bc8737093ed496d8a36b212e8470105c3b2f81dfed45b8ac3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/build.json": "fdf53b565c02f3f80bfb96b4506ab32404810ae1267781b4d1a03d686dbed5f0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/source-proof.json": "4440f671a96bb573011c6e938eef1553db69c62d75faf0eeec3e3bf5e1538aef",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/tests.json": "0ca9ec9e43434aa871b4c024b3e948fe4eb57dfd2275d8786f448ca9dd5e989d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/build/libvane_fs.a": "38f7d10264a555ce1dd51ef37fde5f611234986bc72890ef62f98f1dab0a3b0a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace-generator/trace.hpp": "61470b11b60fff614c30f51ec88f4611b9d05b074c9891154d83aa6de9a8b7b2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace-generator/trace.cpp": "3c563588271c5ce7a02e3f080e78cc79f7114f0c40b227f219fbb497fab96630",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include/sqlite3.h": "a95def1c32bbe6007ff029a15ddb9682496a087efef761520730eb71897d0477",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/staging.hpp": "a8a7ed25155009c2b4fcc2122cac6c31a4f2b8460e0c5ba682c8e7c6e8423baa",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/payload_file.hpp": "881f8e68f550063f6ac3712620abc330ff85a8ab03ea14eea347683d95ef1e57",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/fuse.cpp": "c49f1cc35ec6a6de77ea1f213e9caf11f01c1d422ab868da73ae4c84a2eccde8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/checkpoint.hpp": "1ec679f740446eef676a4287d480efe97aa5613d9e98f37b4f831b2898458eae",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/workspace.cpp": "619bb0a75e62a325d9749cdfc30b7756d38e3cfaf0266637371fd86c93aa845a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/src/request_trace.hpp": "61470b11b60fff614c30f51ec88f4611b9d05b074c9891154d83aa6de9a8b7b2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/trace/diagnostic/updated/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/probe-release": "167f8dde07a5d02a3c2847bfbf6060a08149aff6c77b86614e42b0110798a3dc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/probe-asan": "7c51c999ae962a6fcaf71a4a7e865d1333fb81838384c2beb2097c488322dc31",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/full_sync_contention/run.py": "7a950a5e5f7d2fe604a8f60398d14c1e610bb2bbbce3d26df5c1bdba9a358432",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/request_costs/sample_cpu.py": "34a0df98daf2c4ae3a77212ffe67b0c67d6668b8cc8728b7f3831fdb785a0f7b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/build.json": "ea7a67dfb5a7660b64d966b26ea6ac4904e0e64ab3419ea4c1a366f1627b157b"
+  }
+}

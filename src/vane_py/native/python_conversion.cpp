@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_conversion.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "vane_python/file.hpp"
 #include "vane_python/image.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
@@ -1247,10 +1248,12 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 }
 
 void TransformPythonObject(py::handle ele, Vector &vector, idx_t result_offset, bool nan_as_null) {
+	PythonInputCallbackScope callback(nullptr);
 	TransformPythonObjectInternal<PythonVectorConversion>(ele, vector, result_offset, nan_as_null);
 }
 
 Value TransformPythonValue(py::handle ele, const LogicalType &target_type, bool nan_as_null) {
+	PythonInputCallbackScope callback(nullptr);
 	if (target_type.id() == LogicalTypeId::UNION) {
 		return TransformPythonValueToUnion(ele, target_type, nan_as_null);
 	}

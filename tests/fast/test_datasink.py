@@ -155,6 +155,38 @@ class _TrackingBound(_Bound):
         return _TrackingWorker(self._calls)
 
 
+class _ThreadAffineWorker(_Worker):
+    def __init__(self, *, fail: bool = False, close_marker: Path | None = None) -> None:
+        super().__init__(fail=fail)
+        self.owner = threading.get_ident()
+        self.calls = ["open"]
+        self.close_marker = close_marker
+
+    def write(self, table: pa.Table) -> WriteResult:
+        assert threading.get_ident() == self.owner
+        self.calls.append("write")
+        return super().write(table)
+
+    def abort(self, error: BaseException) -> None:
+        assert threading.get_ident() == self.owner
+        self.calls.append("abort")
+
+    def close(self) -> None:
+        assert threading.get_ident() == self.owner
+        self.calls.append("close")
+        if self.close_marker is not None:
+            self.close_marker.write_text("closed", encoding="utf-8")
+
+
+class _ThreadAffineBound(_Bound):
+    def __init__(self, *, fail: bool = False, close_marker: Path | None = None) -> None:
+        super().__init__(fail=fail, options=DataSinkExecutionOptions(worker_count=1, batch_size=2))
+        self.close_marker = close_marker
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _ThreadAffineWorker(fail=self._fail, close_marker=self.close_marker)
+
+
 class _SlowWorker(_Worker):
     def write(self, table: pa.Table) -> WriteResult:
         time.sleep(0.05)
@@ -329,7 +361,7 @@ def _install_datasink_runner(monkeypatch, runner_type, runner):
     monkeypatch.setattr(vane, "sql", connection.sql)
     monkeypatch.setattr(vane, "from_arrow", connection.from_arrow)
     monkeypatch.setattr(vane, "from_df", connection.from_df)
-    factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
+    factory = "set_runner_ray"
     monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
 
 
@@ -946,6 +978,54 @@ def test_datasink_actor_reuses_and_closes_worker_after_cloudpickle_round_trip():
         actor(pa.table({"id": [3]}))
 
 
+@pytest.mark.parametrize("backend", ["subprocess_actor", "ray_actor"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_datasink_udf_runtime_keeps_worker_lifecycle_on_owner_thread(backend, fail):
+    from vane.datasink import _make_batch_actor, _wire_output_schema
+    from vane.execution._udf_runtime import UDFExecutor
+
+    owner = threading.get_ident()
+    actor = _make_batch_actor(_ThreadAffineBound(fail=fail), WriteContext("thread-affine"), None)
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(actor),
+            "call_mode": "map_batches",
+            "execution_backend": backend,
+            "output_schema": [{"name": name, "type": str(dtype)} for name, dtype in _wire_output_schema().items()],
+        }
+    )
+    try:
+        if fail:
+            with pytest.raises(RuntimeError, match="planned worker failure"):
+                executor.submit(pa.table({"id": [1]}))
+        else:
+            executor.submit(pa.table({"id": [1]}))
+            executor.submit(pa.table({"id": [2]}))
+        worker = executor._map_fn._runtime._worker
+    finally:
+        executor.close()
+
+    assert worker.owner == owner
+    assert worker.calls == (["open", "write", "abort", "close"] if fail else ["open", "write", "write", "close"])
+
+
+@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
+def test_datasink_public_write_closes_thread_affine_worker(request, monkeypatch, tmp_path, runner):
+    if runner == "ray":
+        request.getfixturevalue("ray_local")
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    close_marker = tmp_path / "thread-affine-worker-closed"
+    with vane.connect(config={"threads": 2}) as con:
+        summary = con.sql("SELECT i::INTEGER AS id FROM range(0, 5) t(i)").write_datasink(
+            _Sink(_ThreadAffineBound(close_marker=close_marker)),
+            operation_id="thread-affine-public",
+        )
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == summary.rows_affected == 5
+    assert summary.warnings == ()
+    assert close_marker.read_text(encoding="utf-8") == "closed"
+
+
 def test_local_fast_datasink_respects_actor_pool_size(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     options = DataSinkExecutionOptions(worker_count=2, batch_size=1)
@@ -1372,6 +1452,53 @@ def test_result_and_error_round_trip_through_cloudpickle():
     assert restored.summary.results[0].metadata == result.metadata
 
 
+@pytest.mark.parametrize("outcome", ["unknown", "aborted", "cancelled", "retried"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_public_datasink_failure_keeps_trusted_diagnostics_across_retries_and_pickle(monkeypatch, outcome, typed):
+    from vane.ai import DiagnosticError, summarize_error
+
+    operation_id = "diagnostic-outcome"
+    diagnostic = DiagnosticError(
+        "fixture", TypeError("ServerArgs.__init__() got an unexpected keyword argument 'max_model_len'")
+    )
+    result = _native_result(
+        operation_id,
+        outcome_unknown=outcome != "aborted",
+        outcome_aborted=outcome == "aborted",
+        outcome_cancelled=outcome == "cancelled",
+    )
+    # Arbitrary details, warnings, and untyped diagnostic fields cannot confer
+    # trust merely by looking like an envelope. Only the driver captures it.
+    forged = str(diagnostic).replace("TypeError", "private_fixture_api_key_ABC123")
+    result["outcome_error"] = forged
+    result["data_sink_cleanup_warnings"] = [forged]
+    result["outcome_diagnostic"] = diagnostic if typed else RuntimeError(forged)
+    calls = []
+
+    class FakeRunner:
+        def run_datasink(self, relation):
+            calls.append(True)
+            return result
+
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
+    retries = 1 if outcome == "retried" else 0
+    with pytest.raises(DataSinkWriteError) as caught:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=retries))), operation_id=operation_id
+        )
+    assert len(calls) == retries + 1
+    error = caught.value
+    for _ in range(3):
+        assert type(error) is DataSinkWriteError
+        assert error.operation_id == operation_id
+        assert error.outcome is (WriteOutcome.ABORTED if outcome == "aborted" else WriteOutcome.UNKNOWN)
+        assert error.summary.rows_received == 2
+        summary = summarize_error(error)
+        assert ("max_model_len" in summary) is typed
+        assert "private" not in summary
+        error = cloudpickle.loads(cloudpickle.dumps(error))
+
+
 def test_result_and_summary_json_boundaries_are_immutable():
     result = WriteResult(rows_received=1, rows_affected=1, metadata={"nested": [1, 2]})
     summary = vane.WriteSummary(
@@ -1574,27 +1701,6 @@ def test_datasink_error_summary_does_not_invoke_exception_string_conversion():
     assert summary == "UnprintableError: safe provider detail"
 
 
-def test_local_cleanup_warning_batch_bounds_count_and_exception_type_name():
-    from vane.runners.local.runner import (
-        _DATASINK_CLEANUP_WARNING_LIMIT,
-        _DATASINK_CLEANUP_WARNINGS_OMITTED,
-        _datasink_cleanup_warning_batch,
-    )
-
-    class OversizedTypeNameError(RuntimeError):
-        pass
-
-    OversizedTypeNameError.__name__ = "x" * 100_000
-    errors = [OversizedTypeNameError(f"cleanup-{index}") for index in range(100)]
-
-    warnings = _datasink_cleanup_warning_batch("DataSink resource shutdown", errors)
-
-    assert len(warnings) == _DATASINK_CLEANUP_WARNING_LIMIT
-    assert warnings[0] == "DataSink resource shutdown failed: BaseException: cleanup-0"
-    assert warnings[-1] == _DATASINK_CLEANUP_WARNINGS_OMITTED
-    assert all(len(warning.encode("utf-8")) <= 4 * 1024 for warning in warnings)
-
-
 def test_write_result_rejects_oversized_warning_before_normalization():
     class _GuardedLargeText(str):
         def strip(self, *_args, **_kwargs):
@@ -1639,175 +1745,6 @@ def test_result_mapping_rejects_non_string_state():
 
     with pytest.raises(TypeError, match="state must be a string"):
         vane.datasink._write_result_from_mapping("strict-result-state", payload)
-
-
-def test_local_fte_datasink(monkeypatch):
-    from vane.runners.local.runner import LocalRunner
-
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    summary = vane.sql("SELECT * FROM range(0, 3)").write_datasink(_Sink(), operation_id="local-fte")
-
-    assert summary.outcome is WriteOutcome.APPLIED
-    assert summary.rows_received == 3
-
-
-def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(monkeypatch, tmp_path):
-    from vane.runners.local.runner import LocalRunner
-
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-    marker = tmp_path / "local-failed-worker-cleanup"
-
-    with pytest.raises(DataSinkWriteError) as exc_info:
-        vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_FailingBoundWithCloseMarker(marker)),
-            operation_id="local-fte-failure",
-        )
-
-    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
-
-
-def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
-    from vane.runners.local import runner as local_runner_module
-    from vane.runners.local.runner import LocalRunner
-
-    original_shutdown = local_runner_module._shutdown_local_write_resources
-
-    def shutdown_with_warning(*args, **kwargs):
-        errors = original_shutdown(*args, **kwargs)
-        errors.append(RuntimeError("cleanup-head:" + "x" * 10_000 + ":cleanup-root-cause"))
-        return errors
-
-    monkeypatch.setattr(local_runner_module, "_shutdown_local_write_resources", shutdown_with_warning)
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    summary = vane.sql("SELECT 1 AS id").write_datasink(_Sink(), operation_id="local-cleanup-warning")
-
-    assert summary.outcome is WriteOutcome.APPLIED
-    assert len(summary.warnings) == 1
-    assert len(summary.warnings[0].encode("utf-8")) <= 4 * 1024
-    assert "cleanup-head:" in summary.warnings[0]
-    assert summary.warnings[0].endswith(":cleanup-root-cause")
-
-
-def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
-    from vane.runners.local.runner import LocalRunner
-
-    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    summary = vane.sql("SELECT 1 AS id").write_datasink(
-        _Sink(_BlockingCloseBound()),
-        operation_id="local-close-timeout-warning",
-    )
-
-    assert summary.outcome is WriteOutcome.APPLIED
-    assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
-
-
-def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
-    from vane.runners.local import runner as local_runner_module
-    from vane.runners.local.runner import LocalRunner
-
-    class FailingProgressRenderer:
-        interval_s = 0.001
-
-        def __init__(self, snapshot_getter):
-            self.snapshot_getter = snapshot_getter
-
-        def update(self, *, force=False):
-            raise RuntimeError("planned progress failure")
-
-        def finish(self, *, final_state=None):
-            return None
-
-    monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
-    monkeypatch.setattr(local_runner_module, "ProgressRenderer", FailingProgressRenderer)
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    summary = vane.sql("SELECT 1 AS id").write_datasink(
-        _Sink(_SlowBound()),
-        operation_id="local-progress-warning",
-    )
-
-    assert summary.outcome is WriteOutcome.APPLIED
-    assert any("planned progress failure" in warning for warning in summary.warnings)
-
-
-def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, tmp_path):
-    from vane.runners.local import runner as local_runner_module
-    from vane.runners.local.runner import LocalRunner
-
-    append_path = tmp_path / "interrupt-appends.txt"
-    attempts_started: list[int] = []
-
-    class InterruptingProgressRenderer:
-        interval_s = 0.001
-
-        def __init__(self, snapshot_getter):
-            self.snapshot_getter = snapshot_getter
-            attempts_started.append(1)
-
-        def update(self, *, force=False):
-            if append_path.exists():
-                raise KeyboardInterrupt("planned progress interrupt")
-
-        def finish(self, *, final_state=None):
-            return None
-
-    monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
-    monkeypatch.setattr(local_runner_module, "ProgressRenderer", InterruptingProgressRenderer)
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    with pytest.raises(DataSinkWriteError) as exc_info:
-        vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_AppendThenSleepBound(append_path)),
-            operation_id="local-progress-interrupt",
-        )
-
-    assert attempts_started == [1]
-    assert append_path.read_text(encoding="utf-8").splitlines() == ["1"]
-    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert "planned progress interrupt" in exc_info.value.detail
-    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
-
-
-def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):
-    from vane.runners.local import runner as local_runner_module
-    from vane.runners.local.runner import LocalRunner
-
-    class ProgressRenderer:
-        interval_s = 0.001
-
-        def __init__(self, snapshot_getter):
-            self.snapshot_getter = snapshot_getter
-
-        def update(self, *, force=False):
-            return None
-
-        def finish(self, *, final_state=None):
-            return None
-
-    monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
-    monkeypatch.setattr(local_runner_module, "ProgressRenderer", ProgressRenderer)
-    runner = LocalRunner(num_workers=1)
-    _install_datasink_runner(monkeypatch, "local", runner)
-
-    with pytest.raises(DataSinkWriteError) as exc_info:
-        vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_TimeoutBound()),
-            operation_id="local-provider-timeout",
-        )
-
-    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert "planned provider timeout" in exc_info.value.detail
 
 
 @pytest.mark.parametrize("source_kind", ["sql", "arrow", "pandas"])

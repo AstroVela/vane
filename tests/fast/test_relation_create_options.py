@@ -23,8 +23,9 @@ def test_create_preserves_qualified_catalog_target(monkeypatch):
     ).fetchall() == [("target_catalog",)]
 
 
-def test_create_passes_structured_options_to_native_catalog(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_create_passes_structured_options_to_native_catalog(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
     con = vane.connect()
     source = con.sql("SELECT 1 AS id, 'north' AS region")
 
@@ -77,19 +78,12 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
         con.table("ray_target")
 
 
-def test_create_rejects_local_fte_runner(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    con = vane.connect()
-
-    with pytest.raises(
-        vane.InvalidInputException,
-        match="CTAS requires a ray or local-fast connection",
-    ):
-        con.sql("SELECT 1 AS id").create("local_fte_target", properties={"format-version": 2})
-
-    assert con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'local_fte_target'"
-    ).fetchone() == (0,)
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_create_uses_native_local_runner(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as con:
+        con.sql("SELECT 1 AS id").create("local_target")
+        assert con.table("local_target").fetchall() == [(1,)]
 
 
 def test_ray_create_rejects_explicit_transaction(monkeypatch):

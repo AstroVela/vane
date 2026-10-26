@@ -1,0 +1,51 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -95,6 +95,18 @@
+ 		// Busy timeouts bound SQLite lock contention, not disk write/sync time.
+ 		// Turning a slow local sync into Busy can cause otherwise valid FUSE
+ 		// writes to fail halfway through their requests.
++		// Announce before acquiring the checkpoint mutex. A worker that wins
++		// that mutex must yield to admission already waiting for it. Keep the
++		// claim through RESTART and release it even if admission throws.
++		struct ForegroundAdmission {
++			std::atomic<unsigned> &waiters;
++			explicit ForegroundAdmission(std::atomic<unsigned> &waiters) : waiters(waiters) {
++				++waiters;
++			}
++			~ForegroundAdmission() {
++				--waiters;
++			}
++		} priority(admission_waiters);
+ 		std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+ 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+ 		for (;;) {
+@@ -145,9 +157,20 @@
+ 			requested = false;
+ 			lock.unlock();
+ 			int frames = -1, copied = -1, code;
++			bool yielded = false;
+ 			{
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++				if (admission_waiters.load() != 0)
++					yielded = true;
++				else
++					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++			}
++			if (yielded) {
++				// Reuse the existing retry wait, retaining pending maintenance
++				// across Stop/Start without spinning on a contended mutex.
++				retry = true;
++				lock.lock();
++				continue;
+ 			}
+ 			if (code != SQLITE_OK && code != SQLITE_BUSY) {
+ 				int expected = SQLITE_OK;
+@@ -162,6 +185,7 @@
+ 	const int page_size, timeout_ms;
+ 	const std::string wal_path;
+ 	std::atomic<int> error {SQLITE_OK};
++	std::atomic<unsigned> admission_waiters {0};
+ 	std::mutex mutex;
+ 	std::mutex checkpoint_mutex;
+ 	std::condition_variable wake;

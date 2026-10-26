@@ -1,0 +1,26 @@
+{
+  "status": "PASS",
+  "source_commit": "5f13479740e5d94c36370aa0ebf12a47d8f65e9a",
+  "snapshots_verified": 6,
+  "normalized_AST_checks": 6,
+  "helper_after_sha256": {
+    "vane_fs/benchmarks/lookup_reads/run.py": "6952e5edb33c72ef6e85149ec610e9d469bec09be5a3b6e67b3a1d7a0c7d748d",
+    "vane_fs/benchmarks/performance_closeout/shipping.py": "9f11c4796b6db2e8634e2bf148278c1c5f17d6439d28684f60247994b9fa811d",
+    "vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py": "483dc6d0dd5700e43a47d67517aed50edf8c98fab1b791a27fef89a887dfff36",
+    "vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py": "b5f825ac596f9fbf28b9c6f4c7b637d732436f357c94259ddefb706c1476a595",
+    "vane_fs/benchmarks/staged_payload/paced_request_waits/run.py": "66da6a341b9f220d23c62d491338d2f735ebcda198e9bb97efa59a7b95d65067",
+    "vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py": "21b86a9bad0c8aa0c5cd66d4fe24bc50c8830f64094efb4dd2dad82ad4ec8875"
+  },
+  "identity_resolution": {
+    "frozen_live": 448,
+    "frozen_snapshot": 1,
+    "published_live": 306,
+    "published_snapshot": 1
+  },
+  "default_native_live_identities": 11,
+  "original_published_streams": 296,
+  "removed_cleanup_paths": 59,
+  "native_policy_changed": false,
+  "performance_runs": 0,
+  "historical_reports_modified": false
+}

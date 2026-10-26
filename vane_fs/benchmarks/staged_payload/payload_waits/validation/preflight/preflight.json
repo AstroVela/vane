@@ -1,0 +1,281 @@
+{
+  "status": "PASS",
+  "role": "Publication-only recorder build/test preflight; extended to checkpoint hold before any diagnostic window.",
+  "measurement_started": false,
+  "source_copies": {
+    "prepare.py.frozen.txt": "4dd7f309281fde3ac0d4e324e1a3f556b603281a0ca218a273d335d60c2d3b4d",
+    "test_hold.cpp.frozen.txt": "b6b4bbcad81c8191b20792fa5eb0dd001c80b7074635bd7244f112d164ff4aa2"
+  },
+  "commands": [
+    {
+      "label": "baseline-venv",
+      "argv": [
+        "uv",
+        "venv",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/baseline/venv"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307171.3169143,
+      "ended_epoch": 1792307171.3493016,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/baseline-venv.log",
+      "log_sha256": "6d2b18cf234003e8622c2e17c65f1fcfb503abe164a2d376a60772412f42a105"
+    },
+    {
+      "label": "baseline-install",
+      "argv": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/baseline/venv/bin/python",
+        ".",
+        "--no-build-isolation",
+        "-Ccmake.define.unofficial-sqlite3_DIR=/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/share/unofficial-sqlite3",
+        "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+        "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+        "-Ccmake.define.VANE_FS_BUILD_TESTS=OFF"
+      ],
+      "cwd": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/baseline",
+      "started_epoch": 1792307171.3501487,
+      "ended_epoch": 1792307191.9201965,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/baseline-install.log",
+      "log_sha256": "68883354ecabad318ba1ece0b03f32a3fa7103b6d0f3d61ed5111dd0baf0b383"
+    },
+    {
+      "label": "updated-venv",
+      "argv": [
+        "uv",
+        "venv",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/venv"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307192.0078046,
+      "ended_epoch": 1792307192.0401704,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/updated-venv.log",
+      "log_sha256": "d535272bc486d830f7f8de0125606040918d5b771f38867f7722641b8b19c4d4"
+    },
+    {
+      "label": "updated-install",
+      "argv": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/venv/bin/python",
+        ".",
+        "--no-build-isolation",
+        "-Ccmake.define.unofficial-sqlite3_DIR=/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/share/unofficial-sqlite3",
+        "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+        "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+        "-Ccmake.define.VANE_FS_BUILD_TESTS=OFF"
+      ],
+      "cwd": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated",
+      "started_epoch": 1792307192.0420966,
+      "ended_epoch": 1792307212.759647,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/updated-install.log",
+      "log_sha256": "f903129bc7615518bd19ce11da40244f1b2187fe00e50b8e827cd2df131846cf"
+    },
+    {
+      "label": "release-compile",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O1",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_waits/test_hold.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src/workspace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src/wait_trace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=flock",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_exec",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/trace-test-release"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307212.8321059,
+      "ended_epoch": 1792307222.070232,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/release-compile.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "release-trace",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/trace-test-release",
+        "/dev/shm/owned-payload-wait-uk0zldzn/test"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307222.0723953,
+      "ended_epoch": 1792307222.0889907,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/release-trace.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "asan-compile",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O1",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_waits/test_hold.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src/workspace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/diagnostic/updated/src/wait_trace.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=flock",
+        "-Wl,--wrap=pread",
+        "-Wl,--wrap=pread64",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_exec",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/trace-test-asan"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307222.1152143,
+      "ended_epoch": 1792307247.3435955,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/asan-compile.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "asan-trace",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/trace-test-asan",
+        "/dev/shm/owned-payload-wait-cx5700hd/test"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792307247.3450468,
+      "ended_epoch": 1792307247.4095786,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-waits-20261018/asan-trace.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-payload-wait-uk0zldzn",
+      "files": {
+        "test.waits.json": {
+          "bytes": 4022,
+          "sha256": "719c89529b5673664deb4563fc1b8a6f72a4d80060e3e0a865344bdf5a2e9809"
+        },
+        "test.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "2a35cabbd46f9743db7ade3f83af85d3e16ae5756654200b975c633ae44b0173"
+        },
+        "test.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "5acc1cc3b2ec1d811ace81c6c178e55853712d90dd949ef4f069d938b0744948"
+        },
+        "test.sqlite-wal": {
+          "bytes": 201912,
+          "sha256": "570248994fe64d600ec156880c99beb49c98d39428088b6d9816f8a065848b1e"
+        },
+        "test.sqlite.payload": {
+          "bytes": 1052672,
+          "sha256": "ffc1bb6ed8d4f5dc3ff8cba6152f760ff1847fa5f7d8902d01d361aee2641bae"
+        },
+        "test.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "test.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/dev/shm/owned-payload-wait-cx5700hd",
+      "files": {
+        "test.waits.json": {
+          "bytes": 4040,
+          "sha256": "ca4a81a6990b2cc7816d0fbf5dd5dd5acdc055429dce5d5855720ce233f53adb"
+        },
+        "test.sqlite.stage-checkpoint": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-fence": {
+          "bytes": 8192,
+          "sha256": "2f906c58ff5db71bbcf2bfc53c96b3cfea1d08a04901c43f3bb5cbd31647c8f6"
+        },
+        "test.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "1db39d50d3c3abca55dfefdfb8769eece860de39b02f4af7073c762034d9fdfb"
+        },
+        "test.sqlite-wal": {
+          "bytes": 201912,
+          "sha256": "e1e9045822e451de64d6b400bd3ce650ca4a82f1d774e23fb8bb853ff19ce608"
+        },
+        "test.sqlite.payload": {
+          "bytes": 1052672,
+          "sha256": "19cc64288f56322f7a96347ceddbf6166607dc6ac182e16dea08bf1967f08d3a"
+        },
+        "test.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "test.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "test.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    }
+  ]
+}

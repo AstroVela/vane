@@ -1,0 +1,7 @@
+PASS threshold below WAL budget, background/explicit resets and reopen
+PASS shared owner budget and cross-connection reset
+PASS no rollback wake; abandoned-byte conservative accounting and GC
+PASS asynchronous failure kind=1, latch, retry and reopen
+PASS asynchronous failure kind=2, latch, retry and reopen
+PASS asynchronous failure kind=3, latch, retry and reopen
+PASS six payload scheduling cases

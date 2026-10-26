@@ -760,9 +760,17 @@ def test_streaming_udf_waits_for_tail_events_without_source_finalize_spin():
         timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    source_calls = [int(value) for value in re.findall(r"source_calls=(\d+)", result.stderr)]
-    assert source_calls
-    assert max(source_calls) <= 8, result.stderr[-4000:]
+    states = re.findall(r"completed_batches=(\d+).*?source_calls=(\d+)", result.stderr)
+    assert states
+    calls_by_completion = {}
+    for completed, calls in states:
+        calls_by_completion.setdefault(int(completed), []).append(int(calls))
+    assert max(calls_by_completion) == 2
+    # Concurrent batches can each wake admission, output and terminal paths.
+    # A source/finalize spin repeats calls without any batch completing; bound
+    # that interval instead of assuming a fixed total for a serial worker.
+    for calls in calls_by_completion.values():
+        assert max(calls) - min(calls) <= 8, result.stderr[-4000:]
 
 
 def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap():
@@ -846,13 +854,13 @@ def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_in
     assert "execution_width" not in plan
 
 
-def test_map_batches_subprocess_task_streaming_width_resolves_from_pipeline(tmp_path):
+def test_map_batches_subprocess_task_pipeline_width_does_not_set_worker_count(tmp_path):
     log = _run_udf_width_probe(tmp_path)
     assert "streaming_ctor_unresolved udf_name=ident initial_config_width=1" in log
     assert "streaming_ctor_initial_resolve" not in log
     assert "streaming_resolve_commit udf_name=ident width=4 operator_width_resolved=true" in log
-    assert "payload_udf_worker_slots=4" in log
-    assert "executor_init mode=task backend='subprocess_task' pool_size=4" in log
+    assert "udf_worker_slots" not in log
+    assert "executor_init mode=task backend='subprocess_task'" in log
 
 
 @pytest.mark.timeout(60)
@@ -1068,7 +1076,8 @@ def test_map_batches_lazy_ref_submit_uses_byte_threshold_before_user_batch_size(
 def test_map_batches_subprocess_actor_uses_actor_pool_size(tmp_path):
     log = _run_udf_actor_width_probe(tmp_path)
     assert "streaming_resolve_commit udf_name=Ident width=4 operator_width_resolved=true" in log
-    assert "payload_udf_worker_slots=2" in log
+    assert "udf_worker_slots" not in log
+    assert "executor_init mode=actor backend='subprocess_actor' pool_size=2" in log
 
 
 @pytest.mark.timeout(30)
@@ -1216,27 +1225,44 @@ def test_map_batches_accepts_ray_actor_memory_bytes():
     assert payload["memory_bytes"] == 1073741824
 
 
-def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
+@pytest.mark.parametrize("backend", ["ray_task", "subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("memory_bytes", [0, -1, 1.5, True])
+def test_map_batches_rejects_invalid_memory_bytes(backend, memory_bytes):
     import vane
 
     def identity(table):
         return table
 
-    con = vane.connect()
-    with pytest.raises(Exception, match="memory_bytes"):
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as con, pytest.raises(Exception, match="memory_bytes must be a positive integer"):
         con.sql("select 1 as x").map_batches(
-            identity,
+            Identity if backend == "subprocess_actor" else identity,
             schema={"x": vane.sqltypes.INTEGER},
-            execution_backend="ray_task",
-            memory_bytes=0,
+            execution_backend=backend,
+            actor_number=1 if backend == "subprocess_actor" else None,
+            memory_bytes=memory_bytes,
         )
-    with pytest.raises(Exception, match="Ray UDF backend"):
-        con.sql("select 1 as x").map_batches(
+
+
+def test_map_batches_preserves_heap_declarations_for_subprocess_tasks():
+    import vane
+
+    def identity(table):
+        return table
+
+    with vane.connect() as con:
+        relation = con.sql("select 1 as x").map_batches(
             identity,
             schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             memory_bytes=536870912,
         )
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "local-task-memory")
+        payload = logical.to_physical_plan(con).collect_udf_nodes(conn=con)[0]["payload"]
+        assert payload["memory_bytes"] == 536870912
 
 
 def test_map_batches_rejects_invalid_byte_batching_params():
@@ -1324,6 +1350,34 @@ def test_local_shm_ref_bundle_result_has_block_metadata():
     finally:
         for ref in refs:
             ref.release()
+
+
+@pytest.mark.parametrize("backend", ["local", "ray"])
+@pytest.mark.parametrize("duplicate_names", [False, True])
+@pytest.mark.parametrize("null_first_block", [False, True])
+def test_ref_bundle_concatenates_repeated_source_columns_with_logical_names(backend, duplicate_names, null_first_block):
+    import pyarrow as pa
+
+    if backend == "local":
+        from vane.execution.ref_bundle import _apply_ref_bundle_slices as apply_slices
+    else:
+        from vane.execution.udf_ray_ref_bundle import apply_ref_bundle_slices as apply_slices
+
+    blocks = [
+        pa.table({"path": ["a", "b"], "page": [None, None] if null_first_block else [0, 1]}),
+        pa.table({"path": ["c", "d"], "page": [2, 3]}),
+    ]
+    names = ["path", "page", "path", "page"] if duplicate_names else ["path", "page", "#0", "#1"]
+    result = apply_slices(
+        blocks,
+        [None, {"start": 1, "end": 2}],
+        [{"column_ids": [0, 1, 0, 1]}] * 2,
+        names=names,
+    )
+
+    assert result.column_names == names
+    pages = [None, None, 3] if null_first_block else [0, 1, 3]
+    assert [column.to_pylist() for column in result.columns] == [["a", "b", "d"], pages, ["a", "b", "d"], pages]
 
 
 def test_map_batches_rejects_invalid_target_max_batch_bytes_env(monkeypatch):
@@ -2097,8 +2151,8 @@ def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
         execution_backend="subprocess_task",
     )
 
-    assert rel.fetchall() == [(idx,) for idx in range(25)]
-    assert seen_path.read_text(encoding="utf-8").splitlines() == ["10", "10", "5"]
+    assert sorted(rel.fetchall()) == [(idx,) for idx in range(25)]
+    assert sorted(int(size) for size in seen_path.read_text(encoding="utf-8").splitlines()) == [5, 10, 10]
 
 
 def test_map_batches_basic():
@@ -2429,6 +2483,108 @@ def test_map_batches_tensor_through_local_exchange():
     assert out.fetchall() == [(1, 10.0), (3, 18.0), (5, 26.0), (7, 34.0)]
 
 
+def test_map_batches_numpy_batch_format_end_to_end():
+    import numpy as np
+
+    import vane
+
+    def add_columns(batch):
+        assert set(batch) == {"x", "label"}
+        assert all(isinstance(column, np.ndarray) for column in batch.values())
+        assert batch["label"].tolist() == [f"item-{value}" for value in batch["x"]]
+        return {"x": batch["x"], "score": batch["x"] * 3}
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x, ('item-' || i)::VARCHAR as label from range(4) t(i)")
+        .map_batches(
+            add_columns,
+            schema={"x": vane.sqltypes.BIGINT, "score": vane.sqltypes.BIGINT},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(0, 0), (1, 3), (2, 6), (3, 9)]
+
+
+def test_map_batches_pandas_batch_format_end_to_end():
+    pd = pytest.importorskip("pandas")
+
+    import vane
+
+    def transform(frame):
+        assert isinstance(frame, pd.DataFrame)
+        return pd.DataFrame({"x": frame["x"], "label": frame["label"].str.upper()})
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x, ('item-' || i)::VARCHAR as label from range(3) t(i)")
+        .map_batches(
+            transform,
+            schema={"x": vane.sqltypes.BIGINT, "label": vane.sqltypes.VARCHAR},
+            batch_format="pandas",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(0, "ITEM-0"), (1, "ITEM-1"), (2, "ITEM-2")]
+
+
+def test_map_batches_numpy_tensor_round_trip_end_to_end():
+    import numpy as np
+
+    import vane
+
+    tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, (2, 2))
+
+    def build_tensor(batch):
+        values = batch["x"].astype(np.float32)
+        tensors = np.stack([np.array([[x, x + 1], [x + 2, x + 3]], dtype=np.float32) for x in values])
+        return {"x": batch["x"], "embedding": tensors}
+
+    def reduce_tensor(batch):
+        assert batch["embedding"].shape == (2, 2, 2)
+        return {"x": batch["x"], "total": batch["embedding"].sum(axis=(1, 2), dtype=np.float32)}
+
+    con = vane.connect()
+    out = (
+        con.sql("select i::BIGINT as x from range(1, 5) t(i)")
+        .map_batches(
+            build_tensor,
+            schema={"x": vane.sqltypes.BIGINT, "embedding": tensor_type},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .map_batches(
+            reduce_tensor,
+            schema={"x": vane.sqltypes.BIGINT, "total": vane.sqltypes.FLOAT},
+            batch_format="numpy",
+            batch_size=2,
+            execution_backend="subprocess_task",
+        )
+        .order("x")
+    )
+    assert out.fetchall() == [(1, 10.0), (2, 14.0), (3, 18.0), (4, 22.0)]
+
+
+def test_map_batches_rejects_unknown_batch_format():
+    import pyarrow as pa
+
+    import vane
+
+    con = vane.connect()
+    with pytest.raises(vane.InvalidInputException, match="batch_format must be one of"):
+        con.sql("select 1::BIGINT as x").map_batches(
+            lambda table: pa.table({"x": table.column("x")}),
+            schema={"x": vane.sqltypes.BIGINT},
+            batch_format="polars",
+        )
+
+
 def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
     """Large tensor intermediates should not force STANDARD_VECTOR_SIZE capacity."""
     pytest.importorskip("pyarrow")
@@ -2521,8 +2677,9 @@ def test_map_batches_tensor_nulls_through_local_exchange():
         embedding = embedding.combine_chunks() if hasattr(embedding, "combine_chunks") else embedding
         assert embedding.type.extension_name == "arrow.fixed_shape_tensor"
         validity = embedding.is_valid().to_numpy(zero_copy_only=False)
-        tensor = embedding.to_numpy_ndarray().reshape((len(embedding), -1))
-        sums = [float(values.sum()) if is_valid else None for is_valid, values in zip(validity, tensor, strict=False)]
+        tensor = embedding.drop_null().to_numpy_ndarray().reshape((-1, 4))
+        valid_sums = iter(tensor.sum(axis=1))
+        sums = [float(next(valid_sums)) if is_valid else None for is_valid in validity]
         return pa.table(
             {
                 "x": pa.array(xs, type=pa.int64()),

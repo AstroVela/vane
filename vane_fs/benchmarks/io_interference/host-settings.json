@@ -1,0 +1,23 @@
+{
+  "uname": {
+    "system": "Linux",
+    "node": "ubuntu",
+    "release": "6.11.0-24-generic",
+    "version": "#24~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Mar 25 20:14:34 UTC 2",
+    "machine": "x86_64",
+    "processor": "x86_64"
+  },
+  "files": {
+    "/sys/block/sda/queue/wbt_lat_usec": "2000",
+    "/sys/block/sda/queue/scheduler": "none [mq-deadline]",
+    "/sys/block/sda/queue/rotational": "0",
+    "/sys/block/sda/queue/nr_requests": "64",
+    "/sys/block/sda/queue/write_cache": "write back",
+    "/sys/block/sda/device/model": "Fanxiang S103Pro",
+    "/sys/block/sda/device/vendor": "ATA",
+    "/proc/self/cgroup": "0::/user.slice/user-1002.slice/session-4.scope",
+    "/proc/sys/vm/dirty_background_bytes": "1610612736",
+    "/proc/sys/vm/dirty_bytes": "4294967296"
+  },
+  "mount": "{\n   \"filesystems\": [\n      {\n         \"source\": \"/dev/sda2\",\n         \"fstype\": \"ext4\",\n         \"options\": \"rw,relatime\"\n      }\n   ]\n}\n"
+}

@@ -16,6 +16,7 @@ import pytest
 import vane
 import vane.runners.fte.fte_scheduler as fte_scheduler_mod
 from vane._ray_errors import RemoteRayException
+from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
 ray = pytest.importorskip("ray")
 
@@ -31,6 +32,12 @@ import vane.runners.ray.fragment_worker_transitions as worker_transitions_mod
 import vane.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import vane.runners.ray.worker as worker_mod
 import vane.runners.ray.worker_handle as worker_handle_mod
+from vane.execution.query_resource_spec import (
+    QueryAllocation,
+    QueryResourceGraph,
+    ResourceUnitSpec,
+    ResourceVector,
+)
 from vane.runners.common import QueryDeadlineExceeded
 from vane.runners.fte import (
     AssignmentResult,
@@ -54,12 +61,6 @@ from vane.runners.fte.fte_events import (
     WorkerReservationCompleted,
 )
 from vane.runners.ray.fragment_worker_context import fragment_id_for_task
-from vane.runners.ray.query_resource_graph import (
-    QueryAllocation,
-    QueryResourceGraph,
-    ResourceUnitSpec,
-    ResourceVector,
-)
 from vane.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
 from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
@@ -309,6 +310,7 @@ class _FakeFteTaskHandle:
         self.task_id = FteTaskAttemptId.coerce(task_id)
         self.worker_handle = worker_handle
         self.worker_id = worker_handle.worker_id
+        self.status_completion = Future()
 
 
 class _FakeTask:
@@ -3702,6 +3704,281 @@ def test_fte_drop_query_remote_failure_retains_retryable_local_query_registry(mo
     assert worker_handle_mod._FTE_SCHEDULERS.get("query-dead") is None
 
 
+@pytest.mark.parametrize("death_stage", ["interrupt", "prepare", "cleanup"])
+def test_dead_actor_query_teardown_releases_only_its_closed_query(monkeypatch, death_stage):
+    query_id, keep_query = "query-terminal-actor-death", "query-keep-actor-death"
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1", keep_query + ":node:2"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id, keep_query + ":node:2": keep_query}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[keep_query] = [object()]
+
+    class PendingRef:
+        def future(self):
+            return Future()
+
+    for owner in (query_id, keep_query):
+        task_key = str(
+            FteTaskAttemptId.coerce({"query_id": owner, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0})
+        )
+        if death_stage == "interrupt" or owner == keep_query:
+            handle._fte_control_tails_by_task[task_key] = PendingRef()
+            handle._fte_control_query_by_task[task_key] = owner
+            handle._fte_control_operation_by_task[task_key] = "fte_ack_task_result"
+
+    dead = False
+    original = task_control_mod.resolve_object_refs_blocking
+    calls = []
+    target = {"interrupt": "fte_interrupt_query", "prepare": "fte_prepare_drop_query", "cleanup": "fte_cleanup_query"}[
+        death_stage
+    ]
+    submit = handle._submit_tracked_fte_drop_ref
+
+    def submitting(owner, operation):
+        nonlocal dead
+        calls.append(operation)
+        if operation == target:
+            dead = True
+        return submit(owner, operation)
+
+    def resolve(*args, **kwargs):
+        if dead:
+            raise ray.exceptions.ActorDiedError()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(handle, "_submit_tracked_fte_drop_ref", submitting)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", resolve)
+    result = handle.fte_drop_query(query_id)
+    assert result["flight_shuffle_cleanup_errors"] == 0
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._has_fte_control_state_for_query(keep_query) is True
+    assert handle._registered_fragment_ids == {keep_query + ":node:2"}
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert keep_query in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert "fte_cleanup_query" in calls
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    ("death_stage", "flush_before_drop"),
+    [("interrupt", True), ("interrupt", False), ("prepare", False), ("cleanup", False)],
+)
+def test_terminal_control_failure_survives_worker_death(death_stage, flush_before_drop):
+    class _FailedRef:
+        def __init__(self, error):
+            self._future = Future()
+            self._future.set_exception(error)
+
+        def future(self):
+            return self._future
+
+    class _FailedMethod:
+        def __init__(self, error):
+            self.ref = _FailedRef(error)
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.ref
+
+    query_id = f"query-terminal-control-before-{death_stage}-death"
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    actor = _FakeActor()
+    actor.fte_ack_task_result = _FailedMethod(RuntimeError("result acknowledgement failed"))
+    actor.fte_cleanup_query = _FailedMethod(ray.exceptions.ActorDiedError())
+    if death_stage != "cleanup":
+        target = "fte_interrupt_query" if death_stage == "interrupt" else "fte_prepare_drop_query"
+        setattr(actor, target, _FailedMethod(ray.exceptions.ActorDiedError()))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    handle.enqueue_fte_ack_task_result(task_id)
+    if flush_before_drop:
+        # An earlier barrier may record the failure before a teardown retry
+        # discovers that its interrupt target has died.
+        with pytest.raises(task_control_mod.FteControlBarrierTerminalError, match="result acknowledgement failed"):
+            handle.close_and_flush_fte_controls(query_id)
+
+    with pytest.raises(RuntimeError, match="terminal control failure.*result acknowledgement failed") as error:
+        handle.fte_drop_query(query_id)
+
+    assert isinstance(error.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert actor.fte_cleanup_query.calls == [(query_id,)]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    assert handle._registered_fragment_ids == set()
+    assert query_id not in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize("outcome", ["ack-error", "timeout-error", "rejected-ack", "child-death", "target-death"])
+def test_dead_actor_teardown_collects_completed_controls_without_waiting(outcome):
+    query_id = f"query-dead-actor-completed-control-{outcome}"
+    pending_timeouts = []
+
+    class _PendingFuture(Future):
+        def result(self, timeout=None):
+            pending_timeouts.append(timeout)
+            assert timeout == 0
+            return super().result(timeout=timeout)
+
+    pending_future = _PendingFuture()
+    completed_future = Future()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+
+    def remote_method(future):
+        ref = SimpleNamespace(future=lambda: future)
+        return SimpleNamespace(remote=lambda *_args: ref)
+
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 1, "attempt_id": 0}
+    if outcome == "rejected-ack":
+        completed_future.set_result(
+            {
+                "task_id": task_id,
+                "state": "FINISHED",
+                "_fte_control_operation": "fte_ack_task_result",
+                "_fte_control_applied": False,
+            }
+        )
+    else:
+        error = {
+            "ack-error": RuntimeError("completed ACK failed"),
+            "timeout-error": TimeoutError("completed ACK timed out"),
+            "child-death": ray.exceptions.RayTaskError(
+                "fte_ack_task_result", "child actor failed during ACK", ray.exceptions.ActorDiedError()
+            ).as_instanceof_cause(),
+            "target-death": ray.exceptions.ActorDiedError(),
+        }[outcome]
+        completed_future.set_exception(error)
+
+    actor = _FakeActor()
+    actor.fte_interrupt_query = remote_method(dead_future)
+    actor.fte_cleanup_query = remote_method(dead_future)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    actor.fte_ack_task_result = remote_method(pending_future)
+    handle.enqueue_fte_ack_task_result({**task_id, "partition_id": 0})
+    actor.fte_ack_task_result = remote_method(completed_future)
+    handle.enqueue_fte_ack_task_result(task_id)
+    assert query_id not in handle._fte_prepare_terminal_errors
+
+    if outcome == "target-death":
+        assert handle.fte_drop_query(query_id)["flight_shuffle_cleanup_errors"] == 0
+    else:
+        with pytest.raises(RuntimeError, match="terminal control failure") as error_info:
+            handle.fte_drop_query(query_id)
+        assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert pending_timeouts == [0]
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("completed ACK failed"),
+        ray.exceptions.RayTaskError(
+            "fte_ack_task_result", "completed ACK failed", ray.exceptions.GetTimeoutError("completed ACK failed")
+        ).as_instanceof_cause(),
+    ],
+    ids=["application-error", "nested-get-timeout"],
+)
+def test_dead_actor_teardown_observes_ready_object_before_future_bridge(monkeypatch, error):
+    query_id = "query-dead-actor-ready-object"
+
+    class _ReadyObjectRef:
+        def future(self):
+            return Future()
+
+    ref = _ReadyObjectRef()
+    dead_future = Future()
+    dead_future.set_exception(ray.exceptions.ActorDiedError())
+    dead_ref = SimpleNamespace(future=lambda: dead_future)
+    actor = _FakeActor()
+    actor.fte_ack_task_result = SimpleNamespace(remote=lambda *_args: ref)
+    actor.fte_interrupt_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    actor.fte_cleanup_query = SimpleNamespace(remote=lambda *_args: dead_ref)
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task_id = {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    handle.enqueue_fte_ack_task_result(task_id)
+
+    def get_completed(candidate, *, timeout):
+        assert candidate is ref
+        assert timeout == 0
+        raise error
+
+    monkeypatch.setattr(ray, "ObjectRef", _ReadyObjectRef)
+    monkeypatch.setattr(ray, "get", get_completed)
+
+    with pytest.raises(RuntimeError, match="completed ACK failed") as error_info:
+        handle.fte_drop_query(query_id)
+    assert isinstance(error_info.value.__cause__, task_control_mod.FteControlBarrierTerminalError)
+    assert handle._has_fte_control_state_for_query(query_id) is False
+    assert handle._has_fte_teardown_state_for_query(query_id) is False
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("unavailable"),
+        RuntimeError("ActorDiedError"),
+        ray.exceptions.RayActorError(error_msg="unavailable"),
+    ],
+)
+def test_unconfirmed_worker_loss_cannot_release_query_controls(monkeypatch, error):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-unconfirmed-actor-loss"
+    original = task_control_mod.resolve_object_refs_blocking
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", fail)
+    with pytest.raises(RuntimeError):
+        handle.fte_drop_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    monkeypatch.setattr(task_control_mod, "resolve_object_refs_blocking", original)
+    handle.fte_drop_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
+def test_child_actor_death_does_not_confirm_rpc_target_death():
+    child_error = ray.exceptions.ActorDiedError()
+    wrapper = ray.exceptions.RayTaskError("fte_interrupt_query", "remote traceback", child_error).as_instanceof_cause()
+    assert not _ProductionRayWorkerActorHandle._rpc_target_is_dead(wrapper)
+    assert _ProductionRayWorkerActorHandle._rpc_target_is_dead(child_error)
+
+
+def test_dead_actor_teardown_keeps_ownership_until_local_operations_join(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    query_id = "query-dead-actor-local-operation"
+    handle._registered_fragment_ids = {query_id + ":node:1"}
+    handle._fragment_query_ids = {query_id + ":node:1": query_id}
+    worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY[query_id] = [object()]
+    original = task_control_mod.quiesce_fte_registry_for_query
+
+    def pending(owner):
+        raise TimeoutError("local operation has not joined")
+
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", pending)
+    with pytest.raises(TimeoutError, match="has not joined"):
+        handle._drop_dead_actor_query(query_id)
+    assert handle._has_fte_teardown_state_for_query(query_id)
+    assert query_id in worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY
+    assert handle._registered_fragment_ids == {query_id + ":node:1"}
+    monkeypatch.setattr(task_control_mod, "quiesce_fte_registry_for_query", original)
+    handle._drop_dead_actor_query(query_id)
+    assert not handle._has_fte_teardown_state_for_query(query_id)
+    worker_handle_mod.open_fte_registry_for_query(query_id)
+
+
 def test_worker_flight_shuffle_cleanup_helper_uses_cxx_binding(monkeypatch):
     calls = []
 
@@ -4758,6 +5035,61 @@ def test_fte_wait_task_status_async_times_out_and_cancels_remote_wait(monkeypatc
         asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
 
     assert cancelled == [(pending_ref, False)]
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_async_status_cancel_keeps_loop_responsive_and_waits_for_repeated_cancellation(monkeypatch, timed_out):
+    wait_started = asyncio.Event()
+    cancel_started = threading.Event()
+    release_cancel = threading.Event()
+    cancel_on_loop = []
+
+    class _PendingRef:
+        def __await__(self):
+            async def wait():
+                wait_started.set()
+                await asyncio.Event().wait()
+
+            return wait().__await__()
+
+    pending = _PendingRef()
+    actor = SimpleNamespace(fte_wait_task_status=SimpleNamespace(remote=lambda *_args: pending))
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+
+    def cancel(ref, *, force):
+        assert ref is pending and not force
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            cancel_on_loop.append(False)
+        else:
+            cancel_on_loop.append(True)
+        cancel_started.set()
+        assert release_cancel.wait(2.0)
+
+    monkeypatch.setattr(ray, "cancel", cancel)
+    if timed_out:
+        monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.01")
+
+    async def exercise():
+        wait = asyncio.create_task(handle.fte_wait_task_status_async({}, -1, None))
+        await wait_started.wait()
+        if not timed_out:
+            wait.cancel()
+        try:
+            entered = await asyncio.wait_for(asyncio.to_thread(cancel_started.wait, 1.0), timeout=1.5)
+            assert entered
+            assert cancel_on_loop == [False]
+            wait.cancel()
+            await asyncio.sleep(0)
+            assert not wait.done()
+        finally:
+            release_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await wait
+        assert cancel_on_loop == [False]
+
+    asyncio.run(exercise())
 
 
 def test_fte_wait_task_status_async_rechecks_query_deadline_after_submission(monkeypatch):
@@ -8406,7 +8738,7 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
 
 
 def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch):
-    from vane.runners.ray.query_resource_manager import TaskGrant
+    from vane.execution.query_resource_policy import TaskGrant
 
     query_id = "query-aggregate-soft-denial"
     fragment_id = _install_manual_test_fragment(query_id, "8")
@@ -12165,7 +12497,59 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
     assert handle.fte_registry_stats()["status_watcher_count"] == 0
 
 
-def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
+@pytest.mark.parametrize("close_at", ["before_registration", "after_operation_token", "during_replacement"])
+def test_status_observation_skipped_by_query_close_settles_result_completion(monkeypatch, close_at):
+    query_id = "query-status-close-registration"
+    attempt = FteTaskAttemptId.coerce(
+        {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    )
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1 << 60)
+    completion = Future()
+    if close_at == "before_registration":
+        worker_handle_mod.close_fte_registry_for_query(query_id)
+    elif close_at == "after_operation_token":
+        original = handle._start_fte_attempt_status_watcher_while_registry_open
+
+        def close_then_register(*args):
+            worker_handle_mod.close_fte_registry_for_query(query_id)
+            return original(*args)
+
+        monkeypatch.setattr(handle, "_start_fte_attempt_status_watcher_while_registry_open", close_then_register)
+    else:
+        previous = SimpleNamespace(
+            stop=lambda: worker_handle_mod.close_fte_registry_for_query(query_id),
+            join=lambda _timeout: None,
+            is_alive=lambda: False,
+            shutdown_timeout_s=lambda: 1.0,
+        )
+        worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt)] = previous
+
+    _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER(handle, query_id, attempt, handle, completion)
+
+    with pytest.raises(InterruptedError, match="query closed before"):
+        completion.result(timeout=0)
+
+
+def test_failed_status_observation_start_settles_result_and_removes_registration(monkeypatch):
+    query_id = "query-status-start-error"
+    attempt = FteTaskAttemptId.coerce(
+        {"query_id": query_id, "fragment_execution_id": 0, "partition_id": 0, "attempt_id": 0}
+    )
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1 << 60)
+    completion = Future()
+
+    def fail_start(_self):
+        raise RuntimeError("status runtime unavailable")
+
+    monkeypatch.setattr(FteAttemptStatusWatcher, "start", fail_start)
+    with pytest.raises(RuntimeError, match="status runtime unavailable"):
+        _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER(handle, query_id, attempt, handle, completion)
+    with pytest.raises(RuntimeError, match="status runtime unavailable"):
+        completion.result(timeout=0)
+    assert str(attempt) not in worker_handle_mod._FTE_STATUS_WATCHERS
+
+
+def test_fte_status_handler_preserves_observer_until_it_receives_the_terminal_payload(monkeypatch):
     from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-fte-live-status"
@@ -12232,7 +12616,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
                 {"state": "FINISHED", "task_stats": {"processed_input_rows": 10}},
             )
         )
-        assert watcher.stop_count == 1
+        assert watcher.stop_count == 0
         assert [status["state"] for status in fragment_execution.statuses] == [
             "RUNNING",
             "FINISHED",
@@ -12243,9 +12627,8 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
         worker_handle_mod._FTE_FRAGMENT_EXECUTIONS.pop((query_id, fragment_id), None)
 
 
-def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
+def test_fte_status_watcher_registry_is_dropped_after_async_wait_settles():
     from vane.runners.fte.fte_scheduler import (
-        FteAttemptStatusWatcher,
         FteSchedulerRegistry,
     )
 
@@ -12256,9 +12639,9 @@ def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
         worker_incarnation_id = "incarnation-slow-watcher-drop"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, min_version, timeout_s):
+        async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
             entered.set()
-            time.sleep(0.25)
+            await asyncio.sleep(0.25)
             return {
                 "state": "RUNNING",
                 "task_id": task_id,
@@ -12280,7 +12663,6 @@ def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
         attempt_id=attempt_id,
         worker=_SlowWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
     worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt_id)] = watcher
 
@@ -12364,7 +12746,6 @@ def test_worker_pressure_drop_uses_exact_query_identity():
 
 def test_fte_status_watcher_rejects_mismatched_status_identity():
     from vane.runners.fte.fte_scheduler import (
-        FteAttemptStatusWatcher,
         FteEventHandlers,
         FteSchedulerRegistry,
     )
@@ -12374,7 +12755,7 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
         worker_incarnation_id = "incarnation-mismatched-watcher-status"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, _task_id, _min_version, _timeout_s):
+        async def fte_wait_task_status_async(self, _task_id, _min_version, _timeout_s):
             return {
                 "state": "FINISHED",
                 "task_id_string": "query-fte-watcher-identity.0.99.0",
@@ -12404,7 +12785,6 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
         attempt_id=attempt_id,
         worker=_MismatchedWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
 
     watcher.start()
@@ -12417,8 +12797,8 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
 
 
 def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monkeypatch):
-    from vane.runners.fte.fte_scheduler import FteAttemptStatusWatcher
     from vane.runners.ray import fragment_worker_events as worker_events_mod
+    from vane.runners.ray.fte_status_observation import FteAttemptStatusWatcher
 
     query_id = "query-fte-close-terminal-race"
     fragment_id = f"{query_id}:node:7"
@@ -12441,7 +12821,7 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
         worker_incarnation_id = "incarnation-close-terminal-race"
         manager_instance_id = "manager-a"
 
-        def fte_wait_task_status(self, task_id, _min_version, _timeout_s):
+        async def fte_wait_task_status_async(self, task_id, _min_version, _timeout_s):
             return {
                 "state": "FAILED",
                 "task_id": task_id,
@@ -12484,7 +12864,6 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
         attempt_id=attempt_id,
         worker=_TerminalWorker(),
         wait_timeout_s=1.0,
-        poll_interval_s=0.001,
     )
 
     def unregister(exited_watcher):
@@ -12871,7 +13250,7 @@ def test_fte_attempt_handle_registered_before_status_watcher_start(monkeypatch):
     )
     observed_registered_ids = []
 
-    def assert_registered_before_start(_self, query_id, attempt_id, _worker_handle):
+    def assert_registered_before_start(_self, query_id, attempt_id, _worker_handle, _completion):
         stored = worker_handle_mod._FTE_RESULT_HANDLES_BY_QUERY.get(str(query_id), [])
         stored_ids = [str(task_handle.task_id) for task_handle in stored]
         observed_registered_ids.append(stored_ids)

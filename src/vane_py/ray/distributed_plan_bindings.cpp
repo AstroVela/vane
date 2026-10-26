@@ -42,10 +42,11 @@ struct PyPhysicalPlanWrapper {
 	std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> plan_;
 	py::object arrow_schema_;        // Arrow schema for type information
 	py::object udf_registrations_;   // Connection-local Python UDF registrations captured from the source relation
-	py::object udf_actor_handles_;   // Node-id keyed actor handles for UDF worker execution
+	py::object udf_actor_handles_;   // Resource-unit keyed executor options survive fragment extraction
 	py::object memory_source_refs_;  // Query-owned Ray ObjectRefs for Python in-memory scans
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
-	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
+	shared_ptr<VaneFSQueryPins> vane_fs_query_pins_ = CreateVaneFSQueryPins();
+	string serialized_root_; // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
 
 	PyPhysicalPlanWrapper(const PyPhysicalPlanWrapper &) = default;
 	PyPhysicalPlanWrapper(PyPhysicalPlanWrapper &&) = default;
@@ -72,6 +73,10 @@ struct PyPhysicalPlanWrapper {
 		}
 		ConnectionSnapshotApplyOptions options;
 		options.apply_session_config = apply_session_config;
+		options.vane_fs_query_pins = LookupQueryVaneFSPins(resource_query_id_);
+		if (!options.vane_fs_query_pins) {
+			options.vane_fs_query_pins = vane_fs_query_pins_;
+		}
 		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, options);
 	}
 
@@ -91,7 +96,7 @@ struct PyPhysicalPlanWrapper {
 			return;
 		}
 		if (!py::isinstance<py::dict>(udf_actor_handles_)) {
-			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by node_id");
+			throw duckdb::InternalException("udf_actor_handles must be a dict keyed by resource_unit_id");
 		}
 		auto handles_map = udf_actor_handles_.cast<py::dict>();
 		if (handles_map.empty()) {
@@ -99,22 +104,21 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		auto physical_plan = plan_->physical_plan();
-		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> inject = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
-				py::str key(std::to_string(node_counter++));
+				auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+				if (resource_unit_id.empty()) {
+					throw InternalException("Distributed UDF executor options require resource_unit_id");
+				}
+				py::str key(resource_unit_id);
 				if (handles_map.contains(key)) {
 					py::object handles_obj = handles_map[key];
-					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
+					ApplyUDFExecutorOptions(*bind_data, handles_obj);
 				}
 			}
-			for (auto &child : op.GetInputChildren()) {
-				inject(child.get());
-			}
-		};
-		inject(physical_plan->Root());
+		});
 	}
 
 	void ensure_plan_identity() {
@@ -273,6 +277,7 @@ struct PyPhysicalPlanWrapper {
 		result.udf_actor_handles_ = udf_actor_handles_;
 		result.memory_source_refs_ = memory_source_refs_;
 		result.connection_snapshot_ = connection_snapshot_;
+		result.vane_fs_query_pins_ = vane_fs_query_pins_;
 		result.serialized_root_ = serialize_root_for_clone();
 		result.ensure_plan_identity();
 		if (!conn_obj.is_none()) {
@@ -520,7 +525,31 @@ struct PyPhysicalPlanWrapper {
 		return original_payloads;
 	}
 
+	py::dict collect_local_resource_graph_metadata(py::object conn_obj) {
+		if (!IsInitialized() || !plan_ || !has_root() || idx().empty()) {
+			throw InternalException("Native resource metadata requires an initialized physical plan and query ID");
+		}
+		if (plan_->query_id() != idx()) {
+			throw InvalidInputException("Native resource metadata query ownership mismatch");
+		}
+		optional_ptr<ClientContext> context = client_context_.get();
+		if (!conn_obj.is_none()) {
+			context = ExtractPyConnectionWrapper(conn_obj).con.GetConnection().context.get();
+		}
+		if (!context) {
+			throw InvalidInputException("Native resource metadata requires its execution context");
+		}
+		return CollectNativeResourceGraph(plan_->physical_plan()->Root(), idx(), *context);
+	}
+
 	py::dict collect_query_resource_graph_metadata(py::object conn_obj) {
+		// Preserve the original Ray metadata schema for existing callers.
+		auto result = collect_resource_graph_metadata(conn_obj);
+		result.attr("pop")("udf_node_ids");
+		return result;
+	}
+
+	py::dict collect_resource_graph_metadata(py::object conn_obj) {
 		if (!IsInitialized() || !plan_ || !has_root()) {
 			throw duckdb::InternalException(
 			    "DistributedPhysicalPlan must have a root before query resource graph metadata collection");
@@ -537,13 +566,8 @@ struct PyPhysicalPlanWrapper {
 
 		vector<UDFFunctionData *> physical_udfs;
 		auto physical_plan = plan_->physical_plan();
-		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
-			CollectMutableUDFBindData(op, physical_udfs);
-			for (auto &child : op.GetInputChildren()) {
-				collect_physical_udfs(child.get());
-			}
-		};
-		collect_physical_udfs(physical_plan->Root());
+		VisitPhysicalExecutionGraph(physical_plan->Root(),
+		                            [&](PhysicalOperator &op) { CollectMutableUDFBindData(op, physical_udfs); });
 		auto unidentified_payloads = EnsureStableUDFOperatorIdentities(physical_udfs, query_id);
 		struct UDFIdentityRollback {
 			const vector<UDFFunctionData *> &bind_data;
@@ -629,6 +653,7 @@ struct PyPhysicalPlanWrapper {
 		vector<PendingUDFResourceUnitAnnotation> pending_annotations;
 		pending_annotations.reserve(physical_udfs.size());
 		std::unordered_map<duckdb::distributed::NodeID, idx_t> udf_by_node;
+		py::dict udf_node_ids;
 		for (auto *bind_data : physical_udfs) {
 			auto identity = UDFOperatorIdentityOrEmpty(bind_data->payload);
 			if (identity.empty()) {
@@ -690,6 +715,9 @@ struct PyPhysicalPlanWrapper {
 			auto annotated_payload = UDFPayloadWithStringField(bind_data->payload, "query_id", query_id);
 			annotated_payload = UDFPayloadWithStringField(annotated_payload, "resource_unit_id", resource_unit_id);
 			auto annotation_index = pending_annotations.size();
+			// Match collect_udf_nodes/set_udf_actor_handles traversal identities,
+			// independently of the pipeline DAG's order and node numbering.
+			udf_node_ids[py::str(std::to_string(node_id))] = py::str(std::to_string(annotation_index));
 			pending_annotations.push_back(PendingUDFResourceUnitAnnotation {bind_data, std::move(annotated_payload)});
 			if (!udf_by_node.emplace(node_id, annotation_index).second) {
 				throw duckdb::InternalException("duplicate pipeline UDF node identity: %llu",
@@ -745,6 +773,7 @@ struct PyPhysicalPlanWrapper {
 		py::list terminals;
 		terminals.append(py::str(std::to_string(pipeline_root->node_id())));
 		result[py::str("terminal_node_ids")] = std::move(terminals);
+		result[py::str("udf_node_ids")] = std::move(udf_node_ids);
 		for (auto &pending : pending_annotations) {
 			pending.bind_data->payload = std::move(pending.payload);
 		}
@@ -952,7 +981,7 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> collect = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
@@ -976,11 +1005,7 @@ struct PyPhysicalPlanWrapper {
 				}
 				result.append(meta);
 			}
-			for (auto &child : op.GetInputChildren()) {
-				collect(child.get());
-			}
-		};
-		collect(physical_plan->Root());
+		});
 		return result;
 	}
 
@@ -1059,6 +1084,26 @@ struct PyPhysicalPlanWrapper {
 	}
 
 	// ── Inject actor handles into UDF nodes ─────────────────────
+	// Local runtime owners bind only to the current native plan. They must not
+	// become worker replay state or add per-query IDs to reusable model payloads.
+	void set_local_udf_executor_options(py::dict options_map, py::object) {
+		if (!IsInitialized() || !has_root() || options_map.empty()) {
+			return;
+		}
+		idx_t node_counter = 0;
+		VisitPhysicalExecutionGraph(plan_->physical_plan()->Root(), [&](PhysicalOperator &op) {
+			vector<UDFFunctionData *> bind_nodes;
+			CollectMutableUDFBindData(op, bind_nodes);
+			for (auto *bind_data : bind_nodes) {
+				py::str key(std::to_string(node_counter++));
+				if (options_map.contains(key)) {
+					ApplyUDFExecutorOptions(*bind_data, options_map[key]);
+				}
+			}
+		});
+		udf_actor_handles_ = py::none();
+	}
+
 	// Takes a dict {node_id: executor_options} and injects actor handles into
 	// the corresponding UDF bind data for worker execution.
 	void set_udf_actor_handles(py::dict handles_map, py::object) {
@@ -1067,16 +1112,16 @@ struct PyPhysicalPlanWrapper {
 		if (handles_map.empty())
 			return;
 
-		if (!handles_map.empty()) {
-			udf_actor_handles_ = handles_map;
-		}
+		// Physical UDF ordinals are local to a plan. Fragment extraction can
+		// remove earlier UDFs, so replay must use the planner's stable unit ID.
+		py::dict by_resource;
 
 		auto physical_plan = plan_->physical_plan();
 		if (!physical_plan || !physical_plan->HasRoot())
 			return;
 
 		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> inject = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
@@ -1084,15 +1129,20 @@ struct PyPhysicalPlanWrapper {
 				py::str key(std::to_string(node_id));
 
 				if (handles_map.contains(key)) {
+					auto resource_unit_id = UDFPayloadStringOrDefault(bind_data->payload, "resource_unit_id");
+					if (resource_unit_id.empty()) {
+						throw InternalException("Describe query resources before binding distributed UDF executors");
+					}
+					if (by_resource.contains(py::str(resource_unit_id))) {
+						throw InternalException("Duplicate distributed UDF resource_unit_id");
+					}
 					py::object handles_obj = handles_map[key];
-					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
+					by_resource[py::str(resource_unit_id)] = handles_obj;
+					ApplyUDFExecutorOptions(*bind_data, handles_obj);
 				}
 			}
-			for (auto &child : op.GetInputChildren()) {
-				inject(child.get());
-			}
-		};
-		inject(physical_plan->Root());
+		});
+		udf_actor_handles_ = std::move(by_resource);
 	}
 };
 
@@ -1114,6 +1164,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;
 	snapshot_options.apply_attached_databases = !shares_source_database;
+	snapshot_options.vane_fs_query_pins = vane_fs_query_pins_;
 	if (!shares_source_database && SnapshotHasDynamicExtensions(connection_snapshot_)) {
 		PrepareConnectionSnapshotExtensions(planning_conn, connection_snapshot_);
 	}
@@ -1172,7 +1223,10 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
+	// Preflight can retain its temporary Python copy in a traceback. Attach
+	// binding pins only to the returned plan, after validation succeeds.
 	validate_serialization(py::cast(plan_wrapper));
+	plan_wrapper.vane_fs_query_pins_ = vane_fs_query_pins_;
 	return plan_wrapper;
 }
 
@@ -1515,15 +1569,17 @@ public:
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query_streaming(const string &query_id, double timeout_s,
-	                         duckdb::distributed::MaterializedOutputCallback on_output) override {
+	                         duckdb::distributed::MaterializedOutputCallback on_output,
+	                         bool preserve_task_order = true) override {
 		const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
-		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true, preserve_task_order);
 	}
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
-	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs,
+	    bool preserve_task_order = true) {
 		if (query_id.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
@@ -1633,9 +1689,9 @@ public:
 					              0.0,
 					              std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
 					        : -1.0;
-					auto stream_res =
-					    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
-					                       task_contexts.empty() ? nullptr : &task_contexts, true, on_output, true);
+					auto stream_res = DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+					                                     task_contexts.empty() ? nullptr : &task_contexts, true,
+					                                     on_output, true, preserve_task_order);
 					if (stream_res.is_err()) {
 						return stream_res;
 					}
@@ -1667,10 +1723,11 @@ public:
 				return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
 				                                 ::vane::CaptureError(coverage_res.error()));
 			}
-			auto drain_res = DrainResultHandles(
-			    query_id, remaining_timeout_s, selected_attempt_task_ids,
-			    task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
-			    stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
+			auto drain_res =
+			    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+			                       task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
+			                       stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {},
+			                       false, preserve_task_order);
 			if (drain_res.is_err()) {
 				return drain_res;
 			}
@@ -2465,7 +2522,7 @@ private:
 	                   const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	                       *task_context_filter,
 	                   bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output = {},
-	                   bool selected_only = false) {
+	                   bool selected_only = false, bool preserve_task_order = true) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		{
 			lock_guard<mutex> guard(mutex_);
@@ -2545,7 +2602,7 @@ private:
 			}
 		}
 		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
-		if (on_output) {
+		if (on_output && preserve_task_order) {
 			std::stable_sort(pending.begin(), pending.end(),
 			                 [](const std::unique_ptr<PythonTaskResultHandle> &lhs,
 			                    const std::unique_ptr<PythonTaskResultHandle> &rhs) {
@@ -2591,7 +2648,7 @@ private:
 				auto polled = handle->poll();
 				if (!polled.first) {
 					still_pending.push_back(std::move(handle));
-					if (on_output) {
+					if (on_output && preserve_task_order) {
 						for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
 							still_pending.push_back(std::move(pending[pending_index]));
 						}
@@ -2664,6 +2721,12 @@ private:
 				}
 			}
 			if (still_pending.empty()) {
+				break;
+			}
+			if (selected_only && !preserve_task_order) {
+				// Refresh selected attempts between readiness sweeps. Waiting on
+				// a lagging handle here would hide newly completed sibling tasks.
+				StorePythonTaskResultHandles(query_id, std::move(still_pending));
 				break;
 			}
 			if (std::chrono::steady_clock::now() >= deadline) {
@@ -3481,7 +3544,8 @@ struct PyPhysicalPlanWrapperRunner {
 	    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>>
 	        *fte_exchange_source_queue_map = nullptr,
 	    const CopyOutputInfo *copy_output_info = nullptr, py::object dynamic_filter_domains_obj = py::none(),
-	    py::object native_progress_callback = py::none(), py::object runtime_context_obj = py::none()) {
+	    py::object native_progress_callback = py::none(), py::object runtime_context_obj = py::none(),
+	    py::object native_execution_started = py::none()) {
 		using namespace duckdb;
 
 		// Extract DuckDB connection from Python object
@@ -3781,16 +3845,24 @@ struct PyPhysicalPlanWrapperRunner {
 				if (!pending || pending->HasError()) {
 					throw InvalidInputException(pending ? pending->GetError() : "Failed to start pending query");
 				}
+				// Query initialization resets ClientContext::interrupted. Publish
+				// the actual execution connection only after that boundary so an
+				// already requested cancellation cannot be cleared by startup.
+				if (!native_execution_started.is_none()) {
+					py::gil_scoped_acquire acquire;
+					native_execution_started(conn_obj);
+				}
 
-				auto &executor = context.GetExecutor();
-				stable_pipeline_snapshots = executor.GetPipelinesProgressSnapshots();
+				stable_pipeline_snapshots = pending->GetPipelinesProgressSnapshots();
 				if (stable_pipeline_snapshots.empty()) {
 					throw InternalException("native executor produced no pipeline topology after initialization");
 				}
 				auto last_native_progress = std::chrono::steady_clock::now();
 				bool native_progress_callback_failed = false;
 				auto emit_native_progress = [&](bool force) {
-					auto snapshots = executor.GetPipelinesProgressSnapshots();
+					// ExecuteTask retires the executor on failure. Snapshot through
+					// the pending result so cleanup cannot race the progress thread.
+					auto snapshots = pending->GetPipelinesProgressSnapshots();
 					if (!snapshots.empty()) {
 						stable_pipeline_snapshots = snapshots;
 					}
@@ -3878,6 +3950,15 @@ struct PyPhysicalPlanWrapperRunner {
 				emit_native_progress(true);
 				query_result = pending->Execute();
 			} catch (const std::exception &ex) {
+				// PendingQueryResult destruction does not end its active query.
+				// Retire the executor while the borrowed physical plan is still
+				// alive; PhysicalPlanGuard releases that borrow on unwind. In
+				// particular, a failing startup callback may leave scheduled tasks
+				// and result-collector references into the caller's plan.
+				{
+					py::gil_scoped_release release;
+					context.CancelTransaction();
+				}
 				throw py::value_error(string("Execution failed: ") + ex.what());
 			}
 
@@ -4053,6 +4134,9 @@ struct PyPhysicalPlanWrapperRunner {
 		Executor executor(context);
 
 		executor.Initialize(root_op);
+		if (!native_execution_started.is_none()) {
+			native_execution_started(conn_obj);
+		}
 		// Executor::ExecuteTask clears its pipeline list when it transitions to
 		// EXECUTION_FINISHED. Keep the last non-empty snapshot so short-lived
 		// sink-only plans still publish their terminal counters instead of an
@@ -4200,6 +4284,7 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	topology_plan.udf_actor_handles_ = plan.udf_actor_handles_;
 	topology_plan.memory_source_refs_ = plan.memory_source_refs_;
 	topology_plan.connection_snapshot_ = plan.connection_snapshot_;
+	topology_plan.vane_fs_query_pins_ = plan.vane_fs_query_pins_;
 	topology_plan.serialized_root_ = plan.serialize_root_for_clone();
 	topology_plan.worker_connection_ = exec_conn;
 	topology_plan.materialize_deferred_root(exec_conn);

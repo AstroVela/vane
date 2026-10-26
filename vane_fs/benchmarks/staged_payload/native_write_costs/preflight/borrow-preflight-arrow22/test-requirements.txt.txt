@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+# Isolated experiment only; versions observed in the host test environment.
+pytest==9.0.2
+pytest-timeout==2.4.0
+fsspec==2026.2.0
+numpy==2.3.5
+pyarrow==22.0.0

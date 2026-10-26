@@ -15,6 +15,7 @@
 
 #pragma once
 #include "vane_python/pybind11/pybind_wrapper.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 namespace duckdb {
 
@@ -26,6 +27,7 @@ public:
 		if (!obj) {
 			return;
 		}
+		PythonInputCallbackScope callback(nullptr);
 		PythonGILWrapper acquire;
 		obj = py::object();
 	}

@@ -1,0 +1,1 @@
+partial PASS passive=2 restart=1 success=1 busy=0 partial=1 bad_timeout=0

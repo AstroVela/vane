@@ -11,6 +11,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/common/vector.hpp"
 
 namespace duckdb {
@@ -124,16 +125,30 @@ static PythonTypeObject GetTypeObjectType(const py::handle &type_object) {
 	return PythonTypeObject::INVALID;
 }
 
-static LogicalType FromString(const string &type_str, shared_ptr<DuckDBPyConnection> pycon) {
-	if (!pycon) {
-		pycon = DuckDBPyConnection::DefaultConnection();
-	}
-	auto &connection = pycon->con.GetConnection();
-
+static LogicalType ParseTypeString(const string &type_str, Connection &connection) {
 	LogicalType type;
 	connection.context->RunFunctionInTransaction(
 	    [&]() { type = TransformStringToLogicalType(type_str, *connection.context); });
 	return type;
+}
+
+static LogicalType FromString(const string &type_str, shared_ptr<DuckDBPyConnection> pycon) {
+	if (!pycon) {
+		pycon = PythonInputCallbackScope::IsActive() ? DuckDBPyConnection::default_connection.GetIfOpen()
+		                                             : DuckDBPyConnection::DefaultConnection();
+	}
+	if (pycon) {
+		return ParseTypeString(type_str, pycon->con.GetConnection());
+	}
+	// Implicit conversion can run inside an input callback scope. If the default
+	// catalog is closed, parse with a private native context instead of entering
+	// Connect() or disabling the callback guard. No Python hooks are installed on
+	// this context, and no query execution or worker pool is needed for parsing.
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	DuckDB database(nullptr, &config);
+	Connection connection(database);
+	return ParseTypeString(type_str, connection);
 }
 
 static bool FromNumpyType(const py::object &type, LogicalType &result) {

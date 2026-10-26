@@ -4,14 +4,23 @@
 #include "catch.hpp"
 
 #include "duckdb/execution/executor.hpp"
+#include "duckdb/common/dl.hpp"
+#include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/exchange/physical_local_exchange.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/udf_executor.hpp"
+#include "duckdb/execution/vllm_executor.hpp"
+#include "duckdb/function/table/datasource_scan.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 using namespace duckdb;
 
@@ -19,8 +28,19 @@ namespace {
 
 class RetryBlockingSink : public PhysicalOperator {
 public:
-	explicit RetryBlockingSink(PhysicalPlan &physical_plan)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::RESULT_COLLECTOR, {}, 3) {
+	explicit RetryBlockingSink(PhysicalPlan &physical_plan,
+	                           PhysicalOperatorType type = PhysicalOperatorType::RESULT_COLLECTOR)
+	    : PhysicalOperator(physical_plan, type, {}, 3) {
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+
+	SinkResultType SinkBatch(ExecutionContext &context, ExecutionBatch &batch,
+	                         OperatorSinkInput &input) const override {
+		batch_calls++;
+		return PhysicalOperator::SinkBatch(context, batch, input);
 	}
 
 	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &) const override {
@@ -39,6 +59,7 @@ public:
 	}
 
 	mutable idx_t sink_calls = 0;
+	mutable idx_t batch_calls = 0;
 	mutable idx_t accepted_calls = 0;
 	mutable idx_t accepted_rows = 0;
 	mutable vector<int64_t> accepted_values;
@@ -146,9 +167,9 @@ private:
 
 class MaterializedCountingSink : public PhysicalOperator {
 public:
-	explicit MaterializedCountingSink(PhysicalPlan &physical_plan, bool requires_batch_p = false)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::RESULT_COLLECTOR, {}, 3),
-	      requires_batch(requires_batch_p) {
+	explicit MaterializedCountingSink(PhysicalPlan &physical_plan, bool requires_batch_p = false,
+	                                  PhysicalOperatorType type = PhysicalOperatorType::RESULT_COLLECTOR)
+	    : PhysicalOperator(physical_plan, type, {}, 3), requires_batch(requires_batch_p) {
 	}
 
 	bool IsSink() const override {
@@ -157,6 +178,9 @@ public:
 
 	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &) const override {
 		sink_calls++;
+		if (fail_consume) {
+			throw InvalidInputException("test sink failure");
+		}
 		for (idx_t row = 0; row < chunk.size(); row++) {
 			values.push_back(chunk.GetValue(0, row).GetValue<int64_t>());
 		}
@@ -177,6 +201,7 @@ public:
 	mutable idx_t sink_calls = 0;
 	mutable idx_t batch_calls = 0;
 	mutable vector<int64_t> values;
+	bool fail_consume = false;
 
 private:
 	bool requires_batch;
@@ -248,8 +273,10 @@ private:
 
 class LazyBatchSource : public PhysicalOperator {
 public:
-	explicit LazyBatchSource(PhysicalPlan &physical_plan)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::TABLE_SCAN, {LogicalType::BIGINT}, 3) {
+	explicit LazyBatchSource(PhysicalPlan &physical_plan, shared_ptr<void> ownership_token_p = nullptr,
+	                         shared_ptr<ExternalBlockBackendInterface> materializer_p = nullptr)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::TABLE_SCAN, {LogicalType::BIGINT}, 3),
+	      ownership_token(std::move(ownership_token_p)), materializer(std::move(materializer_p)) {
 	}
 
 	bool IsSource() const override {
@@ -269,8 +296,12 @@ public:
 		}
 
 		ExternalBlockDescriptor block;
+		block.materializer = materializer;
 		block.metadata.num_rows = 3;
 		block.metadata.size_bytes = 24;
+		if (ownership_token) {
+			block.ownership_tokens.push_back(std::move(ownership_token));
+		}
 		auto lazy = make_uniq<LazyDataChunk>();
 		lazy->logical_types = types;
 		lazy->names = {"value"};
@@ -296,6 +327,42 @@ protected:
 
 private:
 	mutable bool emitted = false;
+	mutable shared_ptr<void> ownership_token;
+	shared_ptr<ExternalBlockBackendInterface> materializer;
+};
+
+struct BatchBackendGuard {
+	BatchBackendGuard() : previous(GetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE)) {
+	}
+	~BatchBackendGuard() {
+		SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, std::move(previous));
+	}
+
+	shared_ptr<ExternalBlockBackendInterface> previous;
+};
+
+class CountingBatchBackend : public ExternalBlockBackendInterface {
+public:
+	bool CanMaterialize(const ExternalBlockDescriptor &) override {
+		return true;
+	}
+
+	unique_ptr<DataChunk> Materialize(ClientContext &context, const LazyDataChunk &chunk) override {
+		materialize_calls++;
+		if (fail_materialize) {
+			throw InvalidInputException("test batch materialization failure");
+		}
+		auto result = make_uniq<DataChunk>();
+		result->Initialize(context, chunk.logical_types);
+		result->SetCardinality(chunk.cardinality);
+		for (idx_t row = 0; row < chunk.cardinality; row++) {
+			result->SetValue(0, row, Value::BIGINT(NumericCast<int64_t>((row + 1) * 11)));
+		}
+		return result;
+	}
+
+	idx_t materialize_calls = 0;
+	bool fail_materialize = false;
 };
 
 class LazyBatchSink : public PhysicalOperator {
@@ -326,6 +393,57 @@ public:
 	mutable idx_t accepted_rows = 0;
 };
 
+class LazyExtensionSink : public LazyBatchSink {
+public:
+	LazyExtensionSink(PhysicalPlan &physical_plan, bool required_p)
+	    : LazyBatchSink(physical_plan), required(required_p) {
+		type = PhysicalOperatorType::EXTENSION;
+	}
+
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return required && role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                                      : ExecutionBatchRequirement::BATCH_OPTIONAL;
+	}
+
+private:
+	bool required;
+};
+
+class LazyExtensionOperator : public PhysicalOperator {
+public:
+	LazyExtensionOperator(PhysicalPlan &plan, bool required_p)
+	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 3), required(required_p) {
+	}
+
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return required && role == PipelineOperatorRole::INTERMEDIATE ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                                              : ExecutionBatchRequirement::BATCH_OPTIONAL;
+	}
+
+	OperatorResultType Execute(ExecutionContext &, DataChunk &, DataChunk &, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		throw InternalException("lazy extension callback was bypassed");
+	}
+
+	OperatorResultType ExecuteBatch(ExecutionContext &, ExecutionBatch &input, ExecutionBatch &output,
+	                                GlobalOperatorState &, OperatorState &) const override {
+		batch_calls++;
+		REQUIRE(input.kind == ExecutionBatchKind::LAZY_DATA_CHUNK);
+		REQUIRE(input.lazy);
+		output = ExecutionBatch();
+		output.kind = input.kind;
+		output.rows = input.rows;
+		output.estimated_bytes = input.estimated_bytes;
+		output.lazy = make_uniq<LazyDataChunk>(*input.lazy);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	mutable idx_t batch_calls = 0;
+
+private:
+	bool required;
+};
+
 static void RequireRetryablePayload(const ExecutionBatch &batch, const DataChunk *expected_payload) {
 	REQUIRE(batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK);
 	REQUIRE(batch.rows == 3);
@@ -335,6 +453,23 @@ static void RequireRetryablePayload(const ExecutionBatch &batch, const DataChunk
 	REQUIRE(batch.materialized->GetValue(0, 0).GetValue<int64_t>() == 11);
 	REQUIRE(batch.materialized->GetValue(0, 1).GetValue<int64_t>() == 22);
 	REQUIRE(batch.materialized->GetValue(0, 2).GetValue<int64_t>() == 33);
+}
+
+static ExecutionBatch MakeLazyExecutionBatch(shared_ptr<ExternalBlockBackendInterface> materializer) {
+	ExecutionBatch batch;
+	batch.kind = ExecutionBatchKind::LAZY_DATA_CHUNK;
+	batch.lazy = make_uniq<LazyDataChunk>();
+	batch.lazy->logical_types = {LogicalType::BIGINT};
+	batch.lazy->names = {"value"};
+	ExternalBlockDescriptor block;
+	block.materializer = std::move(materializer);
+	block.metadata.num_rows = 3;
+	block.metadata.size_bytes = 24;
+	batch.lazy->blocks.push_back(std::move(block));
+	batch.lazy->RecomputeCardinality();
+	batch.rows = 3;
+	batch.estimated_bytes = 24;
+	return batch;
 }
 
 static void VerifyStreamingBackpressure(idx_t threads) {
@@ -515,6 +650,171 @@ TEST_CASE("Batch-required sources preserve lazy payloads through the pipeline", 
 	REQUIRE(sink.accepted_rows == 3);
 }
 
+TEST_CASE("Ordinary extension sinks preserve their optional batch callback", "[execution_batch][pipeline][extension]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	BatchBackendGuard backend_guard;
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	idx_t released = 0;
+	auto token = shared_ptr<void>(new int(1), [&released](void *ptr) {
+		delete static_cast<int *>(ptr);
+		released++;
+	});
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	LazyBatchSource source(physical_plan, std::move(token), backend);
+	MaterializedCountingSink sink(physical_plan, false, PhysicalOperatorType::EXTENSION);
+
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+	REQUIRE(backend->materialize_calls == 1);
+	REQUIRE(sink.batch_calls == 1);
+	REQUIRE(sink.sink_calls == 1);
+	REQUIRE(sink.values == vector<int64_t> {11, 22, 33});
+	REQUIRE(released == 1);
+}
+
+TEST_CASE("Optional and required extension sinks retain their lazy callback",
+          "[execution_batch][pipeline][extension]") {
+	bool required = false;
+	SECTION("optional") {
+	}
+	SECTION("required") {
+		required = true;
+	}
+	DuckDB db(nullptr);
+	Connection con(db);
+	BatchBackendGuard backend_guard;
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, nullptr);
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	LazyBatchSource source(physical_plan);
+	LazyExtensionSink sink(physical_plan, required);
+
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+	REQUIRE(sink.data_calls == 0);
+	REQUIRE(sink.batch_calls == 1);
+	REQUIRE(sink.accepted_rows == 3);
+}
+
+TEST_CASE("Optional and required extension intermediates retain their lazy callback",
+          "[execution_batch][pipeline][extension]") {
+	bool required = false;
+	SECTION("optional") {
+	}
+	SECTION("required") {
+		required = true;
+	}
+	DuckDB db(nullptr);
+	Connection con(db);
+	BatchBackendGuard guard;
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, nullptr);
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan plan(Allocator::DefaultAllocator());
+	LazyBatchSource source(plan);
+	LazyExtensionOperator op(plan, required);
+	LazyExtensionSink sink(plan, false);
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.AddPipelineOperator(pipeline, op);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+	REQUIRE(op.batch_calls == 1);
+	REQUIRE(sink.data_calls == 0);
+	REQUIRE(sink.accepted_rows == 3);
+}
+
+TEST_CASE("Extension sink retries reuse the bound materialized payload", "[execution_batch][pipeline][extension]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	BatchBackendGuard backend_guard;
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	Executor executor(*con.context);
+	Pipeline pipeline(executor);
+	PipelineBuildState build_state;
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	LazyBatchSource source(physical_plan, nullptr, backend);
+	RetryBlockingSink sink(physical_plan, PhysicalOperatorType::EXTENSION);
+
+	build_state.SetPipelineSource(pipeline, source);
+	build_state.SetPipelineSink(pipeline, sink, 0);
+	pipeline.Ready();
+	pipeline.Reset();
+	PipelineExecutor pipeline_executor(*con.context, pipeline);
+	for (idx_t retry = 0; retry < 2; retry++) {
+		REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::INTERRUPTED);
+		REQUIRE(backend->materialize_calls == 1);
+		REQUIRE(sink.accepted_calls == 0);
+	}
+	REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+	REQUIRE(backend->materialize_calls == 1);
+	REQUIRE(sink.batch_calls == 3);
+	REQUIRE(sink.sink_calls == 3);
+	REQUIRE(sink.accepted_calls == 1);
+	REQUIRE(sink.accepted_values == vector<int64_t> {11, 22, 33});
+}
+
+TEST_CASE("Extension materialization and sink failures release descriptor ownership once",
+          "[execution_batch][pipeline][extension]") {
+	bool fail_materialize = false;
+	SECTION("reader throws before replacing the input") {
+		fail_materialize = true;
+	}
+	SECTION("sink throws after materialization") {
+	}
+	DuckDB db(nullptr);
+	Connection con(db);
+	BatchBackendGuard backend_guard;
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	backend->fail_materialize = fail_materialize;
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	idx_t released = 0;
+	{
+		auto token = shared_ptr<void>(new int(1), [&released](void *ptr) {
+			delete static_cast<int *>(ptr);
+			released++;
+		});
+		Executor executor(*con.context);
+		Pipeline pipeline(executor);
+		PipelineBuildState build_state;
+		PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+		LazyBatchSource source(physical_plan, std::move(token), backend);
+		MaterializedCountingSink sink(physical_plan, false, PhysicalOperatorType::EXTENSION);
+		sink.fail_consume = !fail_materialize;
+		build_state.SetPipelineSource(pipeline, source);
+		build_state.SetPipelineSink(pipeline, sink, 0);
+		pipeline.Ready();
+		pipeline.Reset();
+		PipelineExecutor pipeline_executor(*con.context, pipeline);
+		REQUIRE_THROWS_AS(pipeline_executor.Execute(), InvalidInputException);
+		REQUIRE(backend->materialize_calls == 1);
+		REQUIRE(sink.batch_calls == 1);
+		REQUIRE(sink.sink_calls == (fail_materialize ? 0 : 1));
+		REQUIRE(sink.values.empty());
+		REQUIRE(released == (fail_materialize ? 0 : 1));
+	}
+	REQUIRE(released == 1);
+}
+
 TEST_CASE("Intermediate and sink requirements select ExecutionBatch", "[execution_batch][pipeline]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -684,6 +984,259 @@ TEST_CASE("ExecutionBatch payload remains stable while an operator has more outp
 		REQUIRE(multi_output.observed_values[call] == vector<int64_t> {11, 22, 33});
 	}
 }
+
+TEST_CASE("Lazy ExecutionBatch materializes once while an intermediate has more output",
+          "[execution_batch][operator]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ThreadContext thread(*con.context);
+	ExecutionContext context(*con.context, thread, nullptr);
+	PhysicalPlan plan(Allocator::DefaultAllocator());
+	MultiOutputOperator op(plan);
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	auto batch = MakeLazyExecutionBatch(backend);
+	ExecutionBatch output;
+	GlobalOperatorState global_state;
+	OperatorState local_state;
+	const DataChunk *payload = nullptr;
+	for (idx_t call = 0; call < 3; call++) {
+		auto result = op.ExecuteBatch(context, batch, output, global_state, local_state);
+		REQUIRE(result == (call < 2 ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::NEED_MORE_INPUT));
+		if (!payload) {
+			payload = batch.materialized.get();
+		}
+		RequireRetryablePayload(batch, payload);
+		REQUIRE(backend->materialize_calls == 1);
+	}
+}
+
+TEST_CASE("Hash local exchange retains the materialized batch across budget blocking",
+          "[execution_batch][local_exchange]") {
+	DBConfig config;
+	config.options.local_exchange_buffer_bytes = 1;
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	ThreadContext thread(*con.context);
+	ExecutionContext context(*con.context, thread, nullptr);
+	PhysicalPlan plan(Allocator::DefaultAllocator());
+	auto spec = std::make_shared<HashRepartitionSpec>(HashRepartitionConfig::create(1, {}));
+	PhysicalLocalExchange exchange(plan, {LogicalType::BIGINT}, spec, 6);
+	exchange.partition_by.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+	auto global_sink = exchange.GetGlobalSinkState(*con.context);
+	auto local_sink = exchange.GetLocalSinkState(context);
+	auto global_source = exchange.GetGlobalSourceState(*con.context);
+	auto local_source = exchange.GetLocalSourceState(context, *global_source);
+	InterruptState interrupt {weak_ptr<Task>()};
+	OperatorSinkInput sink_input {*global_sink, *local_sink, interrupt};
+	OperatorSourceInput source_input {*global_source, *local_source, interrupt};
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	auto first = MakeLazyExecutionBatch(backend);
+	REQUIRE(exchange.SinkBatch(context, first, sink_input) == SinkResultType::NEED_MORE_INPUT);
+	auto waiting = MakeLazyExecutionBatch(backend);
+	REQUIRE(exchange.SinkBatch(context, waiting, sink_input) == SinkResultType::BLOCKED);
+	REQUIRE(backend->materialize_calls == 2);
+	REQUIRE(waiting.kind == ExecutionBatchKind::MATERIALIZED_CHUNK);
+	auto payload = waiting.materialized.get();
+	REQUIRE(exchange.SinkBatch(context, waiting, sink_input) == SinkResultType::BLOCKED);
+	REQUIRE(backend->materialize_calls == 2);
+	RequireRetryablePayload(waiting, payload);
+	ExecutionBatch output;
+	REQUIRE(exchange.GetDataBatch(context, output, source_input) == SourceResultType::HAVE_MORE_OUTPUT);
+	REQUIRE(exchange.SinkBatch(context, waiting, sink_input) == SinkResultType::NEED_MORE_INPUT);
+	REQUIRE(backend->materialize_calls == 2);
+	REQUIRE(exchange.GetDataBatch(context, output, source_input) == SourceResultType::HAVE_MORE_OUTPUT);
+	REQUIRE(output.rows == 3);
+}
+
+namespace {
+
+unique_ptr<UDFExecutor> RejectHostUDFExecution(ClientContext &, const Value &, UDFConfig &, shared_ptr<void>) {
+	throw InvalidInputException("host UDF executor factory reached");
+}
+
+unique_ptr<VLLMExecutor> RejectHostInferenceExecution(ClientContext &, const string &, const Value &, VLLMConfig &) {
+	throw InvalidInputException("host inference executor factory reached");
+}
+
+unique_ptr<DataSourceStream> RejectHostSourceExecution(const char *, idx_t, ClientContext *) {
+	throw InvalidInputException("host datasource stream factory reached");
+}
+
+} // namespace
+
+TEST_CASE("Runtime registration is shared by connections and isolated between databases",
+          "[execution_batch][execution_runtime]") {
+	DuckDB first;
+	Connection con(first);
+	Connection sibling(first);
+	DuckDB second;
+	Connection other(second);
+	SetUDFExecutorFactory(*first.instance, RejectHostUDFExecution);
+	RegisterEngineExecutorFactory(*first.instance, "vllm", RejectHostInferenceExecution);
+	RegisterEngineExecutorFactory(*second.instance, "sglang", RejectHostInferenceExecution);
+	DataSourceCallbacks callbacks;
+	callbacks.produce_stream = RejectHostSourceExecution;
+	DataSourceScanFunction::SetCallbacks(*first.instance, callbacks);
+	for (auto context : {con.context, sibling.context}) {
+		REQUIRE(GetUDFExecutorFactory(*context) == RejectHostUDFExecution);
+		REQUIRE(GetEngineExecutorFactory(*context, "vllm") == RejectHostInferenceExecution);
+		REQUIRE(GetEngineExecutorFactory(*context, "sglang") == nullptr);
+		REQUIRE(DataSourceScanFunction::GetCallbacks(*context).produce_stream == RejectHostSourceExecution);
+	}
+	REQUIRE(GetUDFExecutorFactory(*other.context) == nullptr);
+	REQUIRE(GetEngineExecutorFactory(*other.context, "vllm") == nullptr);
+	REQUIRE(GetEngineExecutorFactory(*other.context, "sglang") == RejectHostInferenceExecution);
+	REQUIRE(DataSourceScanFunction::GetCallbacks(*other.context).produce_stream == nullptr);
+	SetUDFExecutorFactory(*first.instance, nullptr);
+	REQUIRE(GetUDFExecutorFactory(*sibling.context) == nullptr);
+}
+
+#ifdef VANE_BATCH_DEMO_PATH
+TEST_CASE("Private extension planners retain the host UDF executor", "[execution_batch][extension][udf]") {
+	DBConfig config;
+#ifndef VANE_BATCH_DEMO_SIGNED
+	config.options.allow_unsigned_extensions = true;
+#endif
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto loaded = con.Query(string("LOAD '") + VANE_BATCH_DEMO_PATH + "'");
+	INFO((loaded->HasError() ? loaded->GetError() : ""));
+	REQUIRE_FALSE(loaded->HasError());
+	REQUIRE_FALSE(con.Query("SET threads=1")->HasError());
+	SetUDFExecutorFactory(*db.instance, RejectHostUDFExecution);
+	const string input = R"(
+        SELECT udf(i, {'payload_version': 1, 'udf_name': 'private-copy', 'call_mode': 'map',
+                       'execution_backend': 'subprocess_task', 'method_return_type': 'BIGINT',
+                       'function_pickle': 'fixture'::BLOB, 'function_pickle_size_bytes': 7,
+                       'udf_task_input_max_bytes': 134217728,
+                       'udf_output_target_max_bytes': 134217728}) FROM range(4) t(i)
+    )";
+	SECTION("ordinary SQL still executes") {
+		auto result = con.Query("COPY (SELECT 42::BIGINT) TO 'unused' (FORMAT batch_demo_replan)");
+		INFO((result->HasError() ? result->GetError() : ""));
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(result->GetValue(0, 0) == Value::BIGINT(42));
+	}
+	SECTION("direct UDF reaches the host factory") {
+		auto result = con.Query(input);
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("UDF replanned inside the private extension reaches the same factory") {
+		auto result = con.Query("COPY (" + input + ") TO 'unused' (FORMAT batch_demo_replan)");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("a new connection inside the private extension reaches the same factory") {
+		auto result = con.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	SECTION("loading the same extension in another database does not inherit the host runtime") {
+		DBConfig other_config;
+#ifndef VANE_BATCH_DEMO_SIGNED
+		other_config.options.allow_unsigned_extensions = true;
+#endif
+		DuckDB other_db(nullptr, &other_config);
+		Connection other(other_db);
+		REQUIRE_FALSE(other.Query(string("LOAD '") + VANE_BATCH_DEMO_PATH + "'")->HasError());
+		auto result = other.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("UDF executor factory is not registered"));
+		result = con.Query("SELECT * FROM batch_demo_query(" + Value(input).ToSQLString() + ")");
+		REQUIRE(result->HasError());
+		REQUIRE_THAT(result->GetError(), Catch::Matchers::Contains("host UDF executor factory reached"));
+	}
+	REQUIRE_FALSE(con.Query("SELECT 1")->HasError());
+}
+
+TEST_CASE("Private dynamic adapters use the bound host reader", "[execution_batch][extension][external_block]") {
+	DBConfig config;
+#ifndef VANE_BATCH_DEMO_SIGNED
+	config.options.allow_unsigned_extensions = true;
+#endif
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto loaded = con.Query(string("LOAD '") + VANE_BATCH_DEMO_PATH + "'");
+	INFO((loaded->HasError() ? loaded->GetError() : ""));
+	REQUIRE_FALSE(loaded->HasError());
+	struct Library {
+		explicit Library(void *handle_p) : handle(handle_p) {
+		}
+		~Library() {
+			if (handle) {
+				dlclose(handle);
+			}
+		}
+		void *handle;
+	} library(dlopen(VANE_BATCH_DEMO_PATH, RTLD_NOW | RTLD_LOCAL));
+	REQUIRE(library.handle);
+	using HasReader = bool (*)();
+	using MakeOperator = PhysicalOperator *(*)(PhysicalPlan &, idx_t, vector<int64_t> &);
+	auto has_reader = reinterpret_cast<HasReader>(dlsym(library.handle, "batch_demo_has_private_reader"));
+	auto make_operator = reinterpret_cast<MakeOperator>(dlsym(library.handle, "batch_demo_make_operator"));
+	REQUIRE(has_reader);
+	REQUIRE(make_operator);
+	BatchBackendGuard guard;
+	auto backend = make_shared_ptr<CountingBatchBackend>();
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	REQUIRE_FALSE(has_reader());
+	ThreadContext thread(*con.context);
+	ExecutionContext context(*con.context, thread, nullptr);
+	PhysicalPlan plan(Allocator::DefaultAllocator());
+	idx_t object_releases = 0;
+	auto batch = MakeLazyExecutionBatch(backend);
+	vector<int64_t> values;
+	batch.lazy->blocks[0].object_ref = shared_ptr<void>(new int(1), [&object_releases](void *ptr) {
+		delete static_cast<int *>(ptr);
+		object_releases++;
+	});
+	idx_t kind = 0;
+	SECTION("ordinary sink blocks twice") {
+	}
+	SECTION("ordinary intermediate has multiple outputs") {
+		kind = 1;
+	}
+	SECTION("extension creates an internal COPY operator") {
+		kind = 2;
+	}
+	unique_ptr<PhysicalOperator> op(make_operator(plan, kind, values));
+	REQUIRE(op);
+	if (kind == 1) {
+		ExecutionBatch output;
+		GlobalOperatorState global_state;
+		OperatorState state;
+		for (idx_t call = 0; call < 3; call++) {
+			auto result = op->ExecuteBatch(context, batch, output, global_state, state);
+			REQUIRE(result == (call < 2 ? OperatorResultType::HAVE_MORE_OUTPUT : OperatorResultType::NEED_MORE_INPUT));
+			REQUIRE(backend->materialize_calls == 1);
+		}
+		REQUIRE(values == vector<int64_t> {11, 22, 33, 11, 22, 33, 11, 22, 33});
+	} else {
+		auto global_state = op->GetGlobalSinkState(*con.context);
+		auto local_state = op->GetLocalSinkState(context);
+		InterruptState interrupt;
+		OperatorSinkInput input {*global_state, *local_state, interrupt};
+		const DataChunk *payload = nullptr;
+		for (idx_t call = 0; call < (kind == 0 ? 3 : 1); call++) {
+			auto result = op->SinkBatch(context, batch, input);
+			REQUIRE(result == (kind == 0 && call < 2 ? SinkResultType::BLOCKED : SinkResultType::NEED_MORE_INPUT));
+			if (!payload) {
+				payload = batch.materialized.get();
+			}
+			RequireRetryablePayload(batch, payload);
+			REQUIRE(backend->materialize_calls == 1);
+		}
+		if (kind == 2) {
+			REQUIRE(op->type == PhysicalOperatorType::COPY_TO_FILE);
+			op->Cast<PhysicalCopyToFile>().FinalizeInternal(*con.context, *global_state);
+		}
+		REQUIRE(values == vector<int64_t> {11, 22, 33});
+	}
+	REQUIRE_FALSE(has_reader());
+	REQUIRE(object_releases == 1);
+}
+#endif
 
 TEST_CASE("Native streaming preserves rows through backpressure", "[execution_batch][streaming]") {
 	SECTION("single-threaded") {

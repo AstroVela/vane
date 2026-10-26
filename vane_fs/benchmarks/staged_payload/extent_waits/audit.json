@@ -1,0 +1,3208 @@
+{
+  "status": "PASS",
+  "published_epoch": 1792303464.06815,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/payload_file.hpp": "297d92e5612e7bdb400f328f53038d004f8f9d68ce59b8db9434f8c872741742",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/workspace.cpp": "0694dc91dd1b31ce7dc95679ed46e9f03b1356e3cb31847332d40025cea43b08",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrow-test-release": "b138d6b80c12cdad70e43dfa386961fff9449c4db17d85e1ada305b03677b543",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrow-test-asan": "df6bcd29318023fac631ee0c217dd5a4bcd793ac9b37e4c3dbeafb81ff57787a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/probe-borrowed": "c64219e2665e6c177cc380e2eb8c6a3efde5ca1f4b7a4f195e3e65d694646a14",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/probe-count-baseline": "59c43f5420cc357b1d031f697e8f0cd2b9d90d7aab58358f2f348fe17899761d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/probe-count-borrowed": "f5f13721d3fe7cac2d8d4587eb583a9c2e277037661f2b40582aab6c78aa5bad",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/build/python-release/libvane_fs.a": "1dd0f33e71a51c41bf955ec35834be4176bed057dbe712ae30fbcb429a6b85a7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/build/python-release/vane-fs-mount": "bb48e205d539601ec7f319806ce88fac7eb78126870195cc0fc499c032a0559a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/sanitize/libvane_fs.a": "37eead633b7b10bf3f87984de4eafaedfe9db85da4531305606b1bf7da998b41",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "39aa1aaa0b6e9a2e996fe4b9b4c1452efa82c5de39bfa5e7c32e282cfd57adf1",
+    "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "02ff3d6fd90c65062f6693311c7be3d88a385e46de956b86d53abd42632dad7e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/generate.py": "4f89ecaaf9dd00eabcfc91f0b3457f68ed79374f343c08dffb2b6b6eb033df65",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/extent_records.hpp": "c16fba2f7e98e2a4ac1fb3a9c08c12d3135ed7e38316d53280baad05380e20d6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/extent_data.hpp": "73f9d62f3fcfd00f28b58b99cdecc8e378f7d4d763427a15d75f2549b433c786",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/build.json": "6c0b0a36df358de757dbfb2e20e090256fab0d748324065194d4694f0b92c45b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrow-build.json": "2ab9d80aca36d717b5d6ea045c53ba4c5549e0e7713af02750c52545019f427a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/CMakeLists.txt": "ffd81e4260bf03649416c7d772d5c839d21ad75eefa19f5441e33196af3ffd44",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/staging.hpp": "9d8f4f647aeadb6301c67e23ca3921366dea2dbbda318af95329aa2c08d2b802",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/payload_file.hpp": "b542539e33c2c85b495a823f28d1996b725b40972d029d406115019d0cd42a69",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/extent_data.hpp": "73f9d62f3fcfd00f28b58b99cdecc8e378f7d4d763427a15d75f2549b433c786",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/workspace.cpp": "2fe8de2081f61d1d6db03524ef7fb38243d403ec3b3c133653981d505a5fab80",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/extent_records.hpp": "c16fba2f7e98e2a4ac1fb3a9c08c12d3135ed7e38316d53280baad05380e20d6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_core.cpp": "b71cf3587ffce390ce19f7c02fc0868c60ea3e452500d286de7c721217330471",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_external.py": "c95a45b8e6a72467371facca3de76a6c7c72ea875f1b20b0975992e6a6f549cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_checkpoint.cpp": "a66df1d0b2566c3d90abb147b5c5a4e296f9adc00b8e68b5afdac963f8e0d741",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_staging.py": "51893437716eaea0ed2526ebce1acdd1dd33566a0d60b1a505d91754f0757a31",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_workspace.py": "fb6c9716b81c4cbdadc002a999be0016b9516f94c6028407d740098bfadb3176",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_staging.cpp": "811f38a76528a485205c4284956edefb1251499a66b378c5e97d05ade4c652be",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_recovery.py": "9269ef3f9b1172ec38697cc32c08638ff40e861dcf6fff2ec7a4f9ece02f3794",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/test-extents-release": "8885075ef41a862d5061c2edf92228d7740df9ff454f9703d7a5c90236551e5b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/test-extents-asan": "b8a28b94d02db99a44d0dbf768ba97f676140df813ee48cef3d791e83f5d46c0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/build/python-release/libvane_fs.a": "6bf89e03216caefe6dc1f6a65393eedff1dad21cecef1349ed490ce139002990",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/build/python-release/vane-fs-mount": "196225d578dba5750590748dd4eeaff288ddd72de617e5d746c0d55590f25313",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/build/python-release/vane-fs": "c7d66a72de59c03261d67c5a0125931d02f051a79b17c220a8989d62e41a9922",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "4032e64b35ad231046b821ae241c00cd15bc980c6cf1e6b7b8e8e1bca656217d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/sanitize/libvane_fs.a": "616d7ffb6c1b88211ae9b24cae7887e59959f5289cef0a4820ae12c9bb86f3b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/test_extents.cpp": "0aa5af80330c1fddb5000afe92053ad6ad3256dff80b06e50beff09f4aae0904",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/build.py": "ce6779c60479b1f0ee985451be7a930c8fe43c3c37fca36818a631da3f9182a5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/build.json": "656d4bb2712ee128c48e906c1f9611121da2367a755e9c7233e966ba21e86b46",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/source.json": "572c12ade1d006f70234e8248594ec8ec69cd27d06f7403babecf7fc00d3c460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/fuse-screen/plan.json": "ca806d6187152f44950c5d0a11f5a1c71068dfdde6764b4ecfdab84e3d750ee1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/fuse-screen/run_fuse.py": "15df58c02e135d2a8072aebbd8e1a796c9aaad97a492dea2894b5d404f9df502",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/fuse-screen/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/extent_fuse/run.py": "e117e0d5dccc79ce8afc99560ecccdf2ddd672731c094d31ff925e9f6e9c0e74",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/extent_fuse/prepare.py": "2863c7d7208dc204b85d5e96e18eb68113ba82043a37122487122097add97a88",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/monitor.py": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_sync/analyze_writeback.py": "25f359a22d74f891a980ca1e48b3fc9a5f26c992b677dfdcfca84b0e21d37f25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/analyze.py": "97eff738b14acf891acdc47cd9841a190ef1bd2bf39ce76396614ab61f624985",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/build/python-release/vane-fs": "74f264b249059e9333d2db4b6dbdbefdd93265be826caea8f2370561ed0335f3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/full/run_fuse.py": "948f613eee90e1d08462efed77531df3d28afc25791ab76ffdf58061e5c09560",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/full/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/full/plan.json": "7e14d1d1793e6a9cf502e740f250b7c9a2434d00af4c35ce9e03abb4aa303680",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/full/build.json": "4eec1585685d55ea50953dba286583c2763f8b7f50f68933d134d41d2c847d08",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/full/tests.json": "bc0e2c028573b2268dbdedc4e32f66056e0fe21856d78bcc4e8380538995d918",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/sustained/run_fuse.py": "a9033033cc9ec3b2454ee84c4f35afffcee6c6ffe70bb7f1e1c0f3dbbf5b70dc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/sustained/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/sustained/plan.json": "64420adb8e52abc8a7bba6e120abb9133466105ff7c9ce3fe2a0e7a4c2d20636",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/sustained/build.json": "4eec1585685d55ea50953dba286583c2763f8b7f50f68933d134d41d2c847d08",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/sustained/tests.json": "bc0e2c028573b2268dbdedc4e32f66056e0fe21856d78bcc4e8380538995d918",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/workspace.cpp": "93dc4a6ead6ec3604cd459d450574618b8088e7fc780e37581920734902f08d1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/build/python-release/vane-fs-mount": "1441fa0b6db8b7aa72f866d335af7c046f6b4f6d3d802ec5508688410adea1db",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/build/python-release/libvane_fs.a": "110c831851b4d7c04ba18f64c4d4b684480ce9075784e9f3aaea038860f791f3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/fsync/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "5c1b975c307aabf74764433f6bde42a44d052245579abc799977093b41e1a0df",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/prepare.py": "f2e4d441cd2d28c7223e475a2165d21ce5c11245cbb7a05fb907bc433b41b19f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/wait_trace.hpp": "c037dcd3e2496592ee44047d3f903f6011e40aed2f867ba01d6f8b45af280e48",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/wait_trace.cpp": "ac377a052d91e0048dcc3f7b8825bddc2f048a723f16f2add416aa576a641145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/test_trace.cpp": "fec2bcbbb93ea222f4bac601232134c1a7d14cb92434deb43599631fd8c19c1d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/CMakeLists.txt": "736ab921bf7b0717d3499c9650892dfee1812f9279ff72abb2abb4baf65a84c9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/staging.hpp": "e6329d10fef5d70170b0022a3dc83c054cee08939e3dda84f4961d8193f6e604",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/wait_trace.cpp": "ac377a052d91e0048dcc3f7b8825bddc2f048a723f16f2add416aa576a641145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/wait_trace.hpp": "c037dcd3e2496592ee44047d3f903f6011e40aed2f867ba01d6f8b45af280e48",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/fuse.cpp": "af2bb08a5eff4f20501ba9050baa96eb53f0ead42f9f9e77889d453597250475",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/checkpoint.hpp": "f583f734657e06ad9f2b2a0af71e996cd6dae59ca146df5d02127f4fb5d6bddf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/workspace.cpp": "10ddc0ae28827445bc805095b0e25ce5f6e3969efc5e90b06e13b3413a10f052",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/CMakeLists.txt": "736ab921bf7b0717d3499c9650892dfee1812f9279ff72abb2abb4baf65a84c9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/staging.hpp": "e6329d10fef5d70170b0022a3dc83c054cee08939e3dda84f4961d8193f6e604",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/payload_file.hpp": "297d92e5612e7bdb400f328f53038d004f8f9d68ce59b8db9434f8c872741742",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/wait_trace.cpp": "ac377a052d91e0048dcc3f7b8825bddc2f048a723f16f2add416aa576a641145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/wait_trace.hpp": "c037dcd3e2496592ee44047d3f903f6011e40aed2f867ba01d6f8b45af280e48",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/fuse.cpp": "af2bb08a5eff4f20501ba9050baa96eb53f0ead42f9f9e77889d453597250475",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/checkpoint.hpp": "f583f734657e06ad9f2b2a0af71e996cd6dae59ca146df5d02127f4fb5d6bddf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/workspace.cpp": "488725020d17786e579e52046d87b5cba9dac863f137af0a40d6305c6ce47279",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/build/python-release/vane-fs-mount": "ecdba7de870db87250ca39cbb51f2bb43d79e4110e6df08759e6478e3e7a5705",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/build/python-release/libvane_fs.a": "dc98a12cbd6e2866ad62ae60e8d84ddffa151fac240b16a54197b52c5f19354f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/baseline/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "7b1c934f0b3686a1bdf9b1ab8ff226b93242a319a7164e7dc50d1170223e9c67",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/build/python-release/vane-fs-mount": "a37d42a0411294fd1b3b83335e9d03559555607788ab5e79af4bec6b66257e41",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/build/python-release/libvane_fs.a": "14f2bfb1d8455686e955c2a52404c67a087db19b555a2150254082a9de0349bd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/diagnostic/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "2ebd2198691980fff55378acf250545188aedee65a9c19ab3b427e5b4fdd89bd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/extent_waits/prepare.py": "eebe792c39f3bfea74476cba2f26b0e8614c63c983e3f36e156d52d04eb0520c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/extent_waits/run.py": "cf59d0cb53b0efb68ba4c5773b07e23a407d2eb86329d17753af3683f10b1d07",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-fuse-20261018/build.json": "04bd35500136cb2f493ee92bc2360debe0331c1cca66f7c7f580c9b4b380ec84",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fuse-waits-20261018/build.json": "4e2d357afac9ff61203c3bd635d44890ece6273d60e42c393ca25a2a7938d7dd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/CMakeLists.txt": "736ab921bf7b0717d3499c9650892dfee1812f9279ff72abb2abb4baf65a84c9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/staging.hpp": "e6329d10fef5d70170b0022a3dc83c054cee08939e3dda84f4961d8193f6e604",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/payload_file.hpp": "297d92e5612e7bdb400f328f53038d004f8f9d68ce59b8db9434f8c872741742",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/wait_trace.cpp": "ac377a052d91e0048dcc3f7b8825bddc2f048a723f16f2add416aa576a641145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/wait_trace.hpp": "c037dcd3e2496592ee44047d3f903f6011e40aed2f867ba01d6f8b45af280e48",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/fuse.cpp": "af2bb08a5eff4f20501ba9050baa96eb53f0ead42f9f9e77889d453597250475",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/checkpoint.hpp": "f583f734657e06ad9f2b2a0af71e996cd6dae59ca146df5d02127f4fb5d6bddf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/workspace.cpp": "488725020d17786e579e52046d87b5cba9dac863f137af0a40d6305c6ce47279",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/CMakeLists.txt": "736ab921bf7b0717d3499c9650892dfee1812f9279ff72abb2abb4baf65a84c9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/staging.hpp": "a55f56afc85c680f98ccf7aa200727063f52238a519a28f727998bbab78c4020",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/payload_file.hpp": "b542539e33c2c85b495a823f28d1996b725b40972d029d406115019d0cd42a69",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/wait_trace.cpp": "ac377a052d91e0048dcc3f7b8825bddc2f048a723f16f2add416aa576a641145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/wait_trace.hpp": "c037dcd3e2496592ee44047d3f903f6011e40aed2f867ba01d6f8b45af280e48",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/extent_data.hpp": "73f9d62f3fcfd00f28b58b99cdecc8e378f7d4d763427a15d75f2549b433c786",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/fuse.cpp": "af2bb08a5eff4f20501ba9050baa96eb53f0ead42f9f9e77889d453597250475",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/checkpoint.hpp": "f583f734657e06ad9f2b2a0af71e996cd6dae59ca146df5d02127f4fb5d6bddf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/workspace.cpp": "f3585daf4c65b3dfb764fa29076bb26946545647611dd98ee1a85b97962d7ae0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/extent_records.hpp": "c16fba2f7e98e2a4ac1fb3a9c08c12d3135ed7e38316d53280baad05380e20d6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_core.cpp": "b71cf3587ffce390ce19f7c02fc0868c60ea3e452500d286de7c721217330471",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_external.py": "c95a45b8e6a72467371facca3de76a6c7c72ea875f1b20b0975992e6a6f549cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_checkpoint.cpp": "a66df1d0b2566c3d90abb147b5c5a4e296f9adc00b8e68b5afdac963f8e0d741",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_staging.py": "51893437716eaea0ed2526ebce1acdd1dd33566a0d60b1a505d91754f0757a31",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_workspace.py": "fb6c9716b81c4cbdadc002a999be0016b9516f94c6028407d740098bfadb3176",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_staging.cpp": "811f38a76528a485205c4284956edefb1251499a66b378c5e97d05ade4c652be",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_recovery.py": "9269ef3f9b1172ec38697cc32c08638ff40e861dcf6fff2ec7a4f9ece02f3794",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/build/python-release/vane-fs": "d3476025a8a008aee45a4f0b774ca5234d533bd4eeda12fd23bad1dc5bf88cba",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/build/python-release/vane-fs-benchmark": "f79028906f39d2564eb6c803d624af57d2f519dcb4103dd457762f144a1b3b29",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/build/python-release/vane-fs-mount": "a37d42a0411294fd1b3b83335e9d03559555607788ab5e79af4bec6b66257e41",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/build/python-release/libvane_fs.a": "14f2bfb1d8455686e955c2a52404c67a087db19b555a2150254082a9de0349bd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/baseline/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "2ebd2198691980fff55378acf250545188aedee65a9c19ab3b427e5b4fdd89bd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/build/python-release/vane-fs": "77e9b98ac6cc59a1644e3ac1c99b7aad78840a22dccb37ca526a029f5dcda8c6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/build/python-release/vane-fs-benchmark": "71800374ec44532038b9976b3daba630cc8a7f14f55f36bafdd70418ac732c67",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/build/python-release/vane-fs-mount": "26afe4856b8c0be2ebeecba655f5e23a9f4aee5a4f331df20e6a6e75e45a32ea",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/build/python-release/libvane_fs.a": "6ba061309028bbd7399f841572771209198edea8581bf36b8936618d8ccc7d06",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/diagnostic/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "28ee4f9eb3a0a45dba0f7d41487527ce1cb5c4b23847d4652175b3e7e0b9f4d7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/trace-test-release": "7a2b0cb6edf5ba4ac0836b065718c34fdc65967838776eb769c4c16654b2a035",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/trace-test-asan": "bbe2ebe78ad1f1142e53bc4cbf35be834e10ae1e181054ca015f3918cb39eb16",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/request_costs/sample_cpu.py": "34a0df98daf2c4ae3a77212ffe67b0c67d6668b8cc8728b7f3831fdb785a0f7b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/build.json": "ec2f4beb72ce6c768b1d1a08503bc1b32cd3ea4de121249bda2494beddba8994",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/run_fuse.py": "8ca1aa7d2a1e57a600224beeaa1e4f61397b40a161793c298cec2c943ef808dd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/analyze.py": "02975ff94a67b857d9733494afea41e16cb047ee3af0867b25030d3aa1d5adee",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/request_costs/analyze_cpu.py": "28614d9a5ba92f836856f0c4a86b8148893f99c7984e7e1d46205f0ae55bc29f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/plan.json": "1bfc538f9ff0cfd3ae53c5999476321ac4dc15e5d1bf294cbed02701e287cbe9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/input-check.json": "0fa9344d99af5e76d8eb81f5232a2a95412c325162c5a60552602113ec29daeb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/results.json": "a4ca230c8fd4fcbbcc59feefad60856e5fd2c3c82d1e2e413d4aa8b6ea1812b1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/extent_waits/analyze.py": "08574c9ca794caa8440aa1d0dc23e0656673973ffeff15278f217f5a0c60eda3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/analysis.json": "866a17f96ced5978b6298378293d7c6e4bbf63ba825d92cd94e7a87717e0763d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/analysis-command.json": "ff16c1b709eba6a506fa8c2d5d860fa8e7342cec52e9b48ff8ba13608005fb3a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/wrapper-proof.json": "f1ae48da929a74929679247e0c427123c15d5a94560d94fd40a3b10643ed6817",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/run.py": "7020ea9c6456872684697c03bc8e0562f5986f887572144a7a166c56f345afa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-j62l1cyf-waits.json": "73b758455ffa20edc74415129dc1bfdd89d5a4767676d903aef5e3064aba9eea",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-qdy04yhf-waits.json": "f44c5eaa5bfc3f338a6485f811cd5bdc407cd015afa2d1fb10b4208428e89db1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-6p1ueoaa-waits.json": "98273176905810b7fc61c35e161d55f32e847a7efa302e9f253df525016becb0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-x1mmpnjo-waits.json": "f26b44f6a0f1165b9c45a0fc9b06c0beed7696180b4a4f8143e7d9de982cfedf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-eerjr70r-waits.json": "66e127d2198e0b4c80836200be6b1b04458e975e9b7101768560b9dbd7106f0a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-jddbb5in-waits.json": "db00538b32c1830363e75fda3218639c84167c6a6bae3137ea67329c39314e2a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-1j_vbzfa-waits.json": "3c8544fb8f688670d8b0e303069a099afcc2ddd2a4dfecf50763933c2d66bd25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-tp_vshw3-waits.json": "731b9120fd920520245ebd23718fc1929473c5044707683fbf4fa28578e2563c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-bx74uqke-waits.json": "a968707ea25639e7e8f5bafc2bb7a794f13ddf6522380d4a5c914023655a0b31",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vuh9smdr-waits.json": "cce5c70dd12091375fbc262ca511fb56a35ca299dfd63ef00b15dfd55a57fe04",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-72w56q66-waits.json": "daca7b75a55ae2d9fe6a57347820bda0d167b2e45c91ca2ac989546830c7ee5d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-x8bxk93k-waits.json": "dcb9e98479e117d998cca78ee9fb1cd26c5b3e7f266beade41720dbe35a95072",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-1un_qv1x-waits.json": "263be5fa689697019e499ae9d1be289f13cf9f44988ee2603403910cf0cdbc3f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-g_f0oy5l-waits.json": "9dc528a0d7d99bef1c63bb29e9f1e77b8a30de40e2ceb087de8915532edc7ec3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-35g5z_mw-waits.json": "96354658d427fae4457dc81917e8ca9049f6d3065b4f8e56adb5f4318079e677",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vhh5c9qd-waits.json": "4aafec0c411bafe63e94202454bbec09f9d891d74922b9efae4e7bc5733c42e5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/publish.py": "8d6d55727831319c56c51a6a32183f9bd46a015e5f4c92cc02266a39da60eafe"
+  },
+  "build_test_end": 1792302656.6088846,
+  "diagnostic_begin": 1792302734.0122645,
+  "diagnostic_end": 1792303037.4121034,
+  "analysis_begin": 1792303103.655379,
+  "owned_build_test_measurement_windows_do_not_overlap": true,
+  "source_and_runner_reverse_exact": true,
+  "mounts": 16,
+  "all_samples_retained": true,
+  "cleanup_directories": 18,
+  "all_owned_processes_stopped": true,
+  "original_plain_gate_failures_unchanged": true,
+  "original_files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-j62l1cyf-waits.json": {
+      "sha256": "73b758455ffa20edc74415129dc1bfdd89d5a4767676d903aef5e3064aba9eea",
+      "retained_as": "traces/fuse-baseline-0/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-j62l1cyf-cpu.jsonl": {
+      "sha256": "30dba83a87ea9ebb54bc3d6085599c7ef0fdf3dcea2a60a3777fb3e49972832e",
+      "retained_as": [
+        "cpu/fuse-baseline-0/000.json",
+        "cpu/fuse-baseline-0/001.json",
+        "cpu/fuse-baseline-0/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-qdy04yhf-waits.json": {
+      "sha256": "f44c5eaa5bfc3f338a6485f811cd5bdc407cd015afa2d1fb10b4208428e89db1",
+      "retained_as": "traces/fuse-updated-0/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-qdy04yhf-cpu.jsonl": {
+      "sha256": "7fe7d85661c0862553a3bbb3a433033dd5c4543ece9cf76311c23667226a5b2e",
+      "retained_as": [
+        "cpu/fuse-updated-0/000.json",
+        "cpu/fuse-updated-0/001.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-6p1ueoaa-waits.json": {
+      "sha256": "98273176905810b7fc61c35e161d55f32e847a7efa302e9f253df525016becb0",
+      "retained_as": "traces/fuse-updated-1/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-6p1ueoaa-cpu.jsonl": {
+      "sha256": "106204f2f75161a051c5da097f6ce87574d203905a706e54c4ed462d6eea2f7b",
+      "retained_as": [
+        "cpu/fuse-updated-1/000.json",
+        "cpu/fuse-updated-1/001.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-x1mmpnjo-waits.json": {
+      "sha256": "f26b44f6a0f1165b9c45a0fc9b06c0beed7696180b4a4f8143e7d9de982cfedf",
+      "retained_as": "traces/fuse-baseline-1/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-x1mmpnjo-cpu.jsonl": {
+      "sha256": "05345f53671030c179244a029b68ef205413919fba90f52f4211f53aaf890362",
+      "retained_as": [
+        "cpu/fuse-baseline-1/000.json",
+        "cpu/fuse-baseline-1/001.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-eerjr70r-waits.json": {
+      "sha256": "66e127d2198e0b4c80836200be6b1b04458e975e9b7101768560b9dbd7106f0a",
+      "retained_as": "traces/fuse-baseline-2/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-eerjr70r-cpu.jsonl": {
+      "sha256": "677e16ae1440e20e6d3c0de2cd758a183f81fefc05c53fd43067b95be425a84d",
+      "retained_as": [
+        "cpu/fuse-baseline-2/000.json",
+        "cpu/fuse-baseline-2/001.json",
+        "cpu/fuse-baseline-2/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-jddbb5in-waits.json": {
+      "sha256": "db00538b32c1830363e75fda3218639c84167c6a6bae3137ea67329c39314e2a",
+      "retained_as": "traces/fuse-updated-2/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-jddbb5in-cpu.jsonl": {
+      "sha256": "c2d663a8f0076849ae4b84e63198b67fa19ca66c8e7a09c9d6a7f9483ae6f7f1",
+      "retained_as": [
+        "cpu/fuse-updated-2/000.json",
+        "cpu/fuse-updated-2/001.json",
+        "cpu/fuse-updated-2/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-1j_vbzfa-waits.json": {
+      "sha256": "3c8544fb8f688670d8b0e303069a099afcc2ddd2a4dfecf50763933c2d66bd25",
+      "retained_as": "traces/fuse-updated-3/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-1j_vbzfa-cpu.jsonl": {
+      "sha256": "dc9fbc88b03d592ab74ccc850bb9442c193e8465a5c8527f9ea5a851c8d75a8a",
+      "retained_as": [
+        "cpu/fuse-updated-3/000.json",
+        "cpu/fuse-updated-3/001.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-tp_vshw3-waits.json": {
+      "sha256": "731b9120fd920520245ebd23718fc1929473c5044707683fbf4fa28578e2563c",
+      "retained_as": "traces/fuse-baseline-3/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-fuse-tp_vshw3-cpu.jsonl": {
+      "sha256": "6c84caf5ebe982d9b92f6044b7807212c47013ca79d986a0f536256864d89d2c",
+      "retained_as": [
+        "cpu/fuse-baseline-3/000.json",
+        "cpu/fuse-baseline-3/001.json",
+        "cpu/fuse-baseline-3/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-bx74uqke-waits.json": {
+      "sha256": "a968707ea25639e7e8f5bafc2bb7a794f13ddf6522380d4a5c914023655a0b31",
+      "retained_as": "traces/aged_fuse-baseline-0/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-bx74uqke-cpu.jsonl": {
+      "sha256": "5de8f1f357678b53a80edcae913d0df0d8202b6569c432d25fa1258710ed7fc5",
+      "retained_as": [
+        "cpu/aged_fuse-baseline-0/000.json",
+        "cpu/aged_fuse-baseline-0/001.json",
+        "cpu/aged_fuse-baseline-0/002.json",
+        "cpu/aged_fuse-baseline-0/003.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vuh9smdr-waits.json": {
+      "sha256": "cce5c70dd12091375fbc262ca511fb56a35ca299dfd63ef00b15dfd55a57fe04",
+      "retained_as": "traces/aged_fuse-updated-0/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vuh9smdr-cpu.jsonl": {
+      "sha256": "2a9125c2b9de77c9c3c769705ec1b1d53f48a4dc2b7d9b87d42bd5cc168a54d2",
+      "retained_as": [
+        "cpu/aged_fuse-updated-0/000.json",
+        "cpu/aged_fuse-updated-0/001.json",
+        "cpu/aged_fuse-updated-0/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-72w56q66-waits.json": {
+      "sha256": "daca7b75a55ae2d9fe6a57347820bda0d167b2e45c91ca2ac989546830c7ee5d",
+      "retained_as": "traces/aged_fuse-updated-1/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-72w56q66-cpu.jsonl": {
+      "sha256": "57f826cf41f3e7759a356866216c8287d85f349063fd5044ede09ee4e3148d27",
+      "retained_as": [
+        "cpu/aged_fuse-updated-1/000.json",
+        "cpu/aged_fuse-updated-1/001.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-x8bxk93k-waits.json": {
+      "sha256": "dcb9e98479e117d998cca78ee9fb1cd26c5b3e7f266beade41720dbe35a95072",
+      "retained_as": "traces/aged_fuse-baseline-1/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-x8bxk93k-cpu.jsonl": {
+      "sha256": "00c1abff60d0ac9ec73c3e6a0bec83871c4cf06bd358b07a82c6b446dc4c57d8",
+      "retained_as": [
+        "cpu/aged_fuse-baseline-1/000.json",
+        "cpu/aged_fuse-baseline-1/001.json",
+        "cpu/aged_fuse-baseline-1/002.json",
+        "cpu/aged_fuse-baseline-1/003.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-1un_qv1x-waits.json": {
+      "sha256": "263be5fa689697019e499ae9d1be289f13cf9f44988ee2603403910cf0cdbc3f",
+      "retained_as": "traces/aged_fuse-baseline-2/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-1un_qv1x-cpu.jsonl": {
+      "sha256": "0a505917af01507b53d58b7c53a95f405345a1d750dc1241289a1b3eb75b19e2",
+      "retained_as": [
+        "cpu/aged_fuse-baseline-2/000.json",
+        "cpu/aged_fuse-baseline-2/001.json",
+        "cpu/aged_fuse-baseline-2/002.json",
+        "cpu/aged_fuse-baseline-2/003.json",
+        "cpu/aged_fuse-baseline-2/004.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-g_f0oy5l-waits.json": {
+      "sha256": "9dc528a0d7d99bef1c63bb29e9f1e77b8a30de40e2ceb087de8915532edc7ec3",
+      "retained_as": "traces/aged_fuse-updated-2/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-g_f0oy5l-cpu.jsonl": {
+      "sha256": "d0ae5ea7b81535bdb371e339b0ebd093e21320a588da1551e3ff7e9bb0dbd2bf",
+      "retained_as": [
+        "cpu/aged_fuse-updated-2/000.json",
+        "cpu/aged_fuse-updated-2/001.json",
+        "cpu/aged_fuse-updated-2/002.json",
+        "cpu/aged_fuse-updated-2/003.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-35g5z_mw-waits.json": {
+      "sha256": "96354658d427fae4457dc81917e8ca9049f6d3065b4f8e56adb5f4318079e677",
+      "retained_as": "traces/aged_fuse-updated-3/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-35g5z_mw-cpu.jsonl": {
+      "sha256": "2d147c989471dbb982431094c30a8ea83ba394f75f0aded068117464a05f6fed",
+      "retained_as": [
+        "cpu/aged_fuse-updated-3/000.json",
+        "cpu/aged_fuse-updated-3/001.json",
+        "cpu/aged_fuse-updated-3/002.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vhh5c9qd-waits.json": {
+      "sha256": "4aafec0c411bafe63e94202454bbec09f9d891d74922b9efae4e7bc5733c42e5",
+      "retained_as": "traces/aged_fuse-baseline-3/index.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/ext4-diagnostic/vane-partial-owned-aged-vhh5c9qd-cpu.jsonl": {
+      "sha256": "106c6954ef33a7ff88fcd40b830e92a64e561171b049bb58c1bc084c26f6abfa",
+      "retained_as": [
+        "cpu/aged_fuse-baseline-3/000.json",
+        "cpu/aged_fuse-baseline-3/001.json",
+        "cpu/aged_fuse-baseline-3/002.json",
+        "cpu/aged_fuse-baseline-3/003.json",
+        "cpu/aged_fuse-baseline-3/004.json"
+      ],
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/build.json": {
+      "sha256": "ec2f4beb72ce6c768b1d1a08503bc1b32cd3ea4de121249bda2494beddba8994",
+      "retained_as": "validation/build.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/plan.json": {
+      "sha256": "1bfc538f9ff0cfd3ae53c5999476321ac4dc15e5d1bf294cbed02701e287cbe9",
+      "retained_as": "validation/plan.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/tests.json": {
+      "sha256": "1307e72ddd87f517ff68af6fbe40c674e340db2e2e3716d846759f37a3c2efe2",
+      "retained_as": "validation/tests.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/input-check.json": {
+      "sha256": "0fa9344d99af5e76d8eb81f5232a2a95412c325162c5a60552602113ec29daeb",
+      "retained_as": "validation/input-check.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/release-trace.json": {
+      "sha256": "4dd6b4bdb1e352764e29951676adc9889a67786df00e919b1055e83d5a851507",
+      "retained_as": "validation/release-trace.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/asan-trace.json": {
+      "sha256": "525ddb19397c6ea6afb86fab8f5d949c07e5885b4c78d722890feb697d259b72",
+      "retained_as": "validation/asan-trace.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/final-checks.json": {
+      "sha256": "480fca4ec687756140dd8b614d04a362cdaeeb3c2d72132f832419d7d18aefac",
+      "retained_as": "validation/final-checks.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/findings.json": {
+      "sha256": "cff64febde9522d253eb9ced46a1157074ef66cdcb49bc6626c33ae41ff043da",
+      "retained_as": "findings.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/wrapper-proof.json": {
+      "sha256": "f1ae48da929a74929679247e0c427123c15d5a94560d94fd40a3b10643ed6817",
+      "retained_as": "validation/wrapper-proof.json",
+      "values_unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/extent-waits-20261018/analysis-command.json": {
+      "sha256": "ff16c1b709eba6a506fa8c2d5d860fa8e7342cec52e9b48ff8ba13608005fb3a",
+      "retained_as": "validation/analysis-command.json",
+      "values_unchanged": true
+    }
+  },
+  "retained_files": {
+    "README.md": {
+      "bytes": 7664,
+      "sha256": "ebaafcfe1656b03309b0aad84464da0f985129e5baf30360feca9e9ca6aadd8b"
+    },
+    "analysis/aged_fuse-baseline-0/index.json": {
+      "bytes": 782,
+      "sha256": "7da4ad634a640473d0e9c6a3c9ec5ec13430958f477aeae97222d9c7e32506dd"
+    },
+    "analysis/aged_fuse-baseline-0/phases/000.json": {
+      "bytes": 66026,
+      "sha256": "823f0530bd11771015a1af841ae777fcc83b7c16e0e94595fd29dd54daeedbf5"
+    },
+    "analysis/aged_fuse-baseline-0/slow_roots/000.json": {
+      "bytes": 26763,
+      "sha256": "13828262f7b57df27cb0f43ebcf1f57d241967aed823200dea57dd2ee4a676b5"
+    },
+    "analysis/aged_fuse-baseline-0/slow_syscalls/000.json": {
+      "bytes": 979,
+      "sha256": "bc75a3c26277c85aef8869c2a17a021fdb2413c85830a8d223ae7cfa63d2345e"
+    },
+    "analysis/aged_fuse-baseline-1/index.json": {
+      "bytes": 782,
+      "sha256": "cea6cbc27d8fb2af9c9e2f7e783862af3bb69188881fbb60b47349f8682b45ed"
+    },
+    "analysis/aged_fuse-baseline-1/phases/000.json": {
+      "bytes": 65695,
+      "sha256": "6ede734ed9448bd8bc9b906b8dec2bf20a4516ff101d0b23693661d65494e89b"
+    },
+    "analysis/aged_fuse-baseline-1/slow_roots/000.json": {
+      "bytes": 30523,
+      "sha256": "2994ad8b5ab76009f9fa903a89d29a7fcf675e1f2312c0813bccaefac97ef5b7"
+    },
+    "analysis/aged_fuse-baseline-1/slow_syscalls/000.json": {
+      "bytes": 875,
+      "sha256": "bcdf98e05ac64eb20f576d63ef62f43b4233b3ca948b6bbddabbfb3a4a8cf046"
+    },
+    "analysis/aged_fuse-baseline-2/index.json": {
+      "bytes": 782,
+      "sha256": "ef34913610f3e6989e8615feba3cac6734036bc2924ac1dcf749f4117aa2f346"
+    },
+    "analysis/aged_fuse-baseline-2/phases/000.json": {
+      "bytes": 65580,
+      "sha256": "550867c9095869b5bd64ec1ff9589bae21656ccbdb7e478ae94edbd6b86bf009"
+    },
+    "analysis/aged_fuse-baseline-2/slow_roots/000.json": {
+      "bytes": 24878,
+      "sha256": "addc44bf6aa742ab44cd956350a1f23077fbb3cd0c7d0d948205e5be11421a25"
+    },
+    "analysis/aged_fuse-baseline-2/slow_syscalls/000.json": {
+      "bytes": 599,
+      "sha256": "67d2b602cd526e36d28219c078b11c1f4b5019c7304fddad48080702005067f5"
+    },
+    "analysis/aged_fuse-baseline-3/index.json": {
+      "bytes": 782,
+      "sha256": "f8154eea2ee5dbc21d13773b03ab6493a1286284185b652c0585c06bf4b7035b"
+    },
+    "analysis/aged_fuse-baseline-3/phases/000.json": {
+      "bytes": 66080,
+      "sha256": "3fb8017b31b02c1c19270e587f632df4bbbcb4f4c2b0bb7801aa2b35e3ff71c6"
+    },
+    "analysis/aged_fuse-baseline-3/slow_roots/000.json": {
+      "bytes": 88719,
+      "sha256": "8fafe080302d22957795bbe5af05816152e7a18439b7bc053663a45ad05f749b"
+    },
+    "analysis/aged_fuse-baseline-3/slow_syscalls/000.json": {
+      "bytes": 1433,
+      "sha256": "a6ace70bee6a44f961e83a9d627c46c392e316d531266c2c66ecfbcec6feb23f"
+    },
+    "analysis/aged_fuse-updated-0/index.json": {
+      "bytes": 778,
+      "sha256": "81d692c0c905d49f27aa872239397e561509a4ada70458c664bce845f6bb7a7c"
+    },
+    "analysis/aged_fuse-updated-0/phases/000.json": {
+      "bytes": 64027,
+      "sha256": "d5c77779e98ccb0b56032ba1db7513ded8362196101c80dbea64cab5f9644531"
+    },
+    "analysis/aged_fuse-updated-0/slow_roots/000.json": {
+      "bytes": 32615,
+      "sha256": "a2afd6a8405b2281d20c5705cf85d0036a59149491865afe4e0350ba5ee997c7"
+    },
+    "analysis/aged_fuse-updated-0/slow_syscalls/000.json": {
+      "bytes": 1045,
+      "sha256": "7f0fffa6848eebd821d3e57ff559476a2c23450e07d489b972fb47eabb3855dc"
+    },
+    "analysis/aged_fuse-updated-1/index.json": {
+      "bytes": 778,
+      "sha256": "b345f10081acbaf3d6f2ec8ca3dfea99025410652af6cae40388d15af8a81e39"
+    },
+    "analysis/aged_fuse-updated-1/phases/000.json": {
+      "bytes": 64087,
+      "sha256": "079102d4e483ec38110dcadfd9ea3e7faa9f5e7fe06a6f4ca35267a083cefe62"
+    },
+    "analysis/aged_fuse-updated-1/slow_roots/000.json": {
+      "bytes": 4487,
+      "sha256": "64ba9bb08477911152bb289e85e668c4eddab97635833d7345f91020b130d60f"
+    },
+    "analysis/aged_fuse-updated-1/slow_syscalls/000.json": {
+      "bytes": 305,
+      "sha256": "bb73301a1c3d0d6e67544ebf693cbd4bc5ae49e4d8eae7f230791ddd6942c292"
+    },
+    "analysis/aged_fuse-updated-2/index.json": {
+      "bytes": 778,
+      "sha256": "be6e159c4d694e746cbc98045c7cc1a06d3b92533812c6df87becc3ec83ebfbb"
+    },
+    "analysis/aged_fuse-updated-2/phases/000.json": {
+      "bytes": 64318,
+      "sha256": "d53909f082182ba80e04ebf085c2c622847c4d2602a65e6a6ee4fb8da0e6779c"
+    },
+    "analysis/aged_fuse-updated-2/slow_roots/000.json": {
+      "bytes": 7975,
+      "sha256": "d01a89acbdae86296f95d3127dbca44641f65e86fbc1b9679abee3ee4a770d6b"
+    },
+    "analysis/aged_fuse-updated-2/slow_syscalls/000.json": {
+      "bytes": 492,
+      "sha256": "517bfa5f13d8c4f03d8861d98d978a58cf646ba45bc40c3cea2ba3e44e9b95c5"
+    },
+    "analysis/aged_fuse-updated-3/index.json": {
+      "bytes": 778,
+      "sha256": "2a83d90952f00b711f042f1e04f14b504ba6aac871975ce3d40ff101fa31bb71"
+    },
+    "analysis/aged_fuse-updated-3/phases/000.json": {
+      "bytes": 64343,
+      "sha256": "30d399e84c7e87aa0cda7040a2e72b338da78c2f23cdb4b3ab063210ccb0b913"
+    },
+    "analysis/aged_fuse-updated-3/slow_roots/000.json": {
+      "bytes": 10288,
+      "sha256": "1a5fdcb20f5344616f4423a115e75aa8d6c72b4fa7d6ec591597bbb62cc295ce"
+    },
+    "analysis/aged_fuse-updated-3/slow_syscalls/000.json": {
+      "bytes": 672,
+      "sha256": "d47845d496ae312734d07314a12c3328a2866e15eb00c7a331e97223cd0ef643"
+    },
+    "analysis/fuse-baseline-0/index.json": {
+      "bytes": 761,
+      "sha256": "91e97afa8755bdf8031f6b42bea73ae8a4c4af99cc44fc4944a4fcb007b153ea"
+    },
+    "analysis/fuse-baseline-0/phases/000.json": {
+      "bytes": 66050,
+      "sha256": "e0e9028b1e761f1a72afe86f789f9daedf1a1bd7f2480876a0a8e7ae650f79ed"
+    },
+    "analysis/fuse-baseline-0/slow_roots/000.json": {
+      "bytes": 25722,
+      "sha256": "f4827c213a92127418b26095895638300c68e9e850e6abef77ae4bd2e7cc2896"
+    },
+    "analysis/fuse-baseline-0/slow_syscalls/000.json": {
+      "bytes": 876,
+      "sha256": "4b699588e41ca8533a1bb2686d18c1873e66314466af7dd157a17275bc39837c"
+    },
+    "analysis/fuse-baseline-1/index.json": {
+      "bytes": 761,
+      "sha256": "1d2ddac33b5900bb671f204da05838f854d54c6c5914750e2d2c6bab21aaea50"
+    },
+    "analysis/fuse-baseline-1/phases/000.json": {
+      "bytes": 65093,
+      "sha256": "9933cea8dc9a9bf7587433fe2dc9d7c89a7685561cf94fa791e33c8d434aba42"
+    },
+    "analysis/fuse-baseline-1/slow_roots/000.json": {
+      "bytes": 23636,
+      "sha256": "88c8043435838c437be3d418123204cbf9cefb88b76bdb007bd4100943f24cc6"
+    },
+    "analysis/fuse-baseline-1/slow_syscalls/000.json": {
+      "bytes": 502,
+      "sha256": "5681faf08837f5d39be07bb40b69b4bfac4a778c17ddbe70f80f39ed14d95da0"
+    },
+    "analysis/fuse-baseline-2/index.json": {
+      "bytes": 761,
+      "sha256": "73d12774028fc055d654f1a206580138918b2f3835527408f8a04958069ff15c"
+    },
+    "analysis/fuse-baseline-2/phases/000.json": {
+      "bytes": 65452,
+      "sha256": "1967fbf03bfe4d590a5fe06eb60a7c05a7a316239a52fe8af654cc9706ac7066"
+    },
+    "analysis/fuse-baseline-2/slow_roots/000.json": {
+      "bytes": 23622,
+      "sha256": "329c7cddfbdea85ecead4d694f5a819932a396b98cbb1b1becaba23ae5638828"
+    },
+    "analysis/fuse-baseline-2/slow_syscalls/000.json": {
+      "bytes": 502,
+      "sha256": "43313289beb9e035252c97900afc5f7ff67e925cfba472816da45e21c8fe2e25"
+    },
+    "analysis/fuse-baseline-3/index.json": {
+      "bytes": 761,
+      "sha256": "cbaf1be7bfd44989a997637904517c692f470163264aa7a8e157df5e828bf299"
+    },
+    "analysis/fuse-baseline-3/phases/000.json": {
+      "bytes": 66255,
+      "sha256": "13865ca88693f6cb2d0f2c3fa840033dda4971437f1b14f3f9c6c0150a4b0595"
+    },
+    "analysis/fuse-baseline-3/slow_roots/000.json": {
+      "bytes": 25092,
+      "sha256": "1468adf7ab9d4ed15fc18517f22bd5ff0f29b389b264045b85229029bf794ec1"
+    },
+    "analysis/fuse-baseline-3/slow_syscalls/000.json": {
+      "bytes": 779,
+      "sha256": "c41921e09e6ad4c03c2f7a7dc44dab85c7b2106842e39451eec69c6d554aaf03"
+    },
+    "analysis/fuse-updated-0/index.json": {
+      "bytes": 757,
+      "sha256": "e4f16aee72a2a9aa012294d8e95ab290100fc1e8e65b9469fe4651de8dc7c967"
+    },
+    "analysis/fuse-updated-0/phases/000.json": {
+      "bytes": 63928,
+      "sha256": "f972ef4aed7b9f0544c15a0936c4592f15380820b032939a67cadfa864602537"
+    },
+    "analysis/fuse-updated-0/slow_roots/000.json": {
+      "bytes": 4479,
+      "sha256": "8c0baf5c72819b327c924601173ab06e0706ef32a9c78658793c0fa205529294"
+    },
+    "analysis/fuse-updated-0/slow_syscalls/000.json": {
+      "bytes": 304,
+      "sha256": "19c1ead35d98267823cb5b874159d58e4b6262cee7134373396192605376f9e0"
+    },
+    "analysis/fuse-updated-1/index.json": {
+      "bytes": 757,
+      "sha256": "c95ecfea26cfcc1a4df097f8b56c2ee7ff0d7c1c337a0ea3aff3f3418b65e0d1"
+    },
+    "analysis/fuse-updated-1/phases/000.json": {
+      "bytes": 63800,
+      "sha256": "6da61c2c6a6af3aae48e1a5fe638dcb8bba8dd1c208d263a8412721031ca0719"
+    },
+    "analysis/fuse-updated-1/slow_roots/000.json": {
+      "bytes": 4618,
+      "sha256": "0508f659c56b7cb212f9b270de9a2c4aecab97a757dcc841adc2aa68939ca326"
+    },
+    "analysis/fuse-updated-1/slow_syscalls/000.json": {
+      "bytes": 304,
+      "sha256": "df3a5b39e4cda9c2d79f6f9d53713ccf6f270ff53a698e6661f693fd5d0c8e0d"
+    },
+    "analysis/fuse-updated-2/index.json": {
+      "bytes": 757,
+      "sha256": "b89fdf9899a9619b85e7476d4b4d3ad2be7439f3f137e8bd01d6dce1e076e988"
+    },
+    "analysis/fuse-updated-2/phases/000.json": {
+      "bytes": 63989,
+      "sha256": "ee2433695b379d69c9e061e07f7fe19a07937682db096c9c7337a187dbca2ffe"
+    },
+    "analysis/fuse-updated-2/slow_roots/000.json": {
+      "bytes": 6897,
+      "sha256": "72eff0273325f1e743dcfd177d85eec0aceff3bf897f0ee5386b17dedc641987"
+    },
+    "analysis/fuse-updated-2/slow_syscalls/000.json": {
+      "bytes": 304,
+      "sha256": "4ecd65fe2856eaafad4967d15e830c6c227593b5b11c8724fa59fa934201ccd8"
+    },
+    "analysis/fuse-updated-3/index.json": {
+      "bytes": 757,
+      "sha256": "8e125c6191577ef859a8024ffb55b0b56d15175329da0f029c08c5df71ed2d3c"
+    },
+    "analysis/fuse-updated-3/phases/000.json": {
+      "bytes": 63976,
+      "sha256": "4170c78910853d5e13bee6f91c4a9ecd495f5f8aacfa6c55fab30e17566b836b"
+    },
+    "analysis/fuse-updated-3/slow_roots/000.json": {
+      "bytes": 4580,
+      "sha256": "9f615310820a3806bc652979621b9751750b7a35db417c170a217668ab7a4203"
+    },
+    "analysis/fuse-updated-3/slow_syscalls/000.json": {
+      "bytes": 304,
+      "sha256": "6ea9ebe11e40854f5fbaf2dd072cfe910b40dae7bdf6a12612a86f962e30f7f8"
+    },
+    "analysis/index.json": {
+      "bytes": 2241,
+      "sha256": "26d1199d5232775ee9d8da86e93dc8aa9ab6f3ca797f293664f6f57ac7ba9c2c"
+    },
+    "analyze.py": {
+      "bytes": 11028,
+      "sha256": "08574c9ca794caa8440aa1d0dc23e0656673973ffeff15278f217f5a0c60eda3"
+    },
+    "cleanup/000.json": {
+      "bytes": 41110,
+      "sha256": "326e83f6e66f9ace26ce09020c28c9fac3df826eae4ecd9a1b2aa78f57ba8dea"
+    },
+    "cleanup.json": {
+      "bytes": 64,
+      "sha256": "50f60a6d2a0376e121be880c65937c0f7904bb97ef98681dabeb1386e5633347"
+    },
+    "cpu/aged_fuse-baseline-0/000.json": {
+      "bytes": 299858,
+      "sha256": "2fc49618a1ff19d24ef0be4a50f6f2df52b4495194aff55c95a968e70b440bee"
+    },
+    "cpu/aged_fuse-baseline-0/001.json": {
+      "bytes": 299950,
+      "sha256": "bd11a8bf973f0f78dbb2077c0a33aeb338c0f1101a22085179aae65a3dd912c0"
+    },
+    "cpu/aged_fuse-baseline-0/002.json": {
+      "bytes": 299934,
+      "sha256": "34e1b27257785373a1949e77c24fafd8a4038c8c152c0b34adf52a7d77c2dbec"
+    },
+    "cpu/aged_fuse-baseline-0/003.json": {
+      "bytes": 79070,
+      "sha256": "c0fb5e08d542c25026c0efa4c20afa17873ac50b1913c85d9e066477ba6cb6ec"
+    },
+    "cpu/aged_fuse-baseline-0/index.json": {
+      "bytes": 256,
+      "sha256": "f59f85a831c36cae8670ad9396e0ad0f2a56d62028feb872bb10f3abee168c8a"
+    },
+    "cpu/aged_fuse-baseline-1/000.json": {
+      "bytes": 299976,
+      "sha256": "e51ecf46a7c30d04880e1e5b61ca598e969baa0424e099ed32c81e8cb4f1231b"
+    },
+    "cpu/aged_fuse-baseline-1/001.json": {
+      "bytes": 299731,
+      "sha256": "afc7cf16049fd2563965060d5cdce0492865b1b002acf7c2531c45f00a99ddcc"
+    },
+    "cpu/aged_fuse-baseline-1/002.json": {
+      "bytes": 299861,
+      "sha256": "1a210d5fd5896769e2676d1dbe50eca8a6108d3c26a8e2ad3bafe2cbc2ee53a8"
+    },
+    "cpu/aged_fuse-baseline-1/003.json": {
+      "bytes": 295105,
+      "sha256": "6ffccfdc1387e23d1dd7a7e8156b9ced34e8540c64955338844a126a503c0093"
+    },
+    "cpu/aged_fuse-baseline-1/index.json": {
+      "bytes": 256,
+      "sha256": "5e23431bcc08fb5b750011f6cc5fdab83e0e9f1e808fb6bb8f0d07e4f9c13b1e"
+    },
+    "cpu/aged_fuse-baseline-2/000.json": {
+      "bytes": 299846,
+      "sha256": "3420a5893bca472533e4c116a1a630143d030b5055aec06568c9d22d9afdd55f"
+    },
+    "cpu/aged_fuse-baseline-2/001.json": {
+      "bytes": 299781,
+      "sha256": "e2c33ced0143a1b4f6f547c5d3e196502e6c4d90b6f7cb13b0a1a451cb33e924"
+    },
+    "cpu/aged_fuse-baseline-2/002.json": {
+      "bytes": 299967,
+      "sha256": "4438828edce719219d4138ee2773124c685f26d2c939756af75f010cc130d973"
+    },
+    "cpu/aged_fuse-baseline-2/003.json": {
+      "bytes": 299990,
+      "sha256": "fdd7d1f7a7c8c7ce387b9ed72b1810123c3fae4e12ce77b2d5a6775464bc3c3c"
+    },
+    "cpu/aged_fuse-baseline-2/004.json": {
+      "bytes": 77727,
+      "sha256": "75d879c4b2eb6a58d0439644599e250aa04c45d0e7d27cc45627386078fb78dd"
+    },
+    "cpu/aged_fuse-baseline-2/index.json": {
+      "bytes": 292,
+      "sha256": "bf8ae7227d537729a0d9f5c1dc98639adc531321178f1aa151b287eec9686f9b"
+    },
+    "cpu/aged_fuse-baseline-3/000.json": {
+      "bytes": 299756,
+      "sha256": "9bb4ad7e275ab099a279bd2e9532949ddd51ff1a60f8b55135f700613b9f31ab"
+    },
+    "cpu/aged_fuse-baseline-3/001.json": {
+      "bytes": 299932,
+      "sha256": "27d5f0f7737cc59ce40d7850c948a448d6048f8cbbc9440b4fb466019f82f960"
+    },
+    "cpu/aged_fuse-baseline-3/002.json": {
+      "bytes": 299883,
+      "sha256": "238cc6dde0d1a43cf1890c1c5c88f88b6a1711f8fde6692274d6e7e13909c753"
+    },
+    "cpu/aged_fuse-baseline-3/003.json": {
+      "bytes": 299769,
+      "sha256": "d6536e78d3c20212b630cb6ed54657679225022e1339cd5e2a5bfe3804c0e650"
+    },
+    "cpu/aged_fuse-baseline-3/004.json": {
+      "bytes": 28225,
+      "sha256": "9ea0cb8c2b79e4988bd5ac02b222894c718173f4f4aeb17bd1192cce08a9a7a4"
+    },
+    "cpu/aged_fuse-baseline-3/index.json": {
+      "bytes": 292,
+      "sha256": "1559f8017770b5483ee9f035ba6e9979f0ec6d7cae5d64c59ca4f5f82d85583e"
+    },
+    "cpu/aged_fuse-updated-0/000.json": {
+      "bytes": 299859,
+      "sha256": "ea71d7b5ccf5d91d585e24823b951f531782614c2228ff946eeb4fabacee3c43"
+    },
+    "cpu/aged_fuse-updated-0/001.json": {
+      "bytes": 299947,
+      "sha256": "a68d208d79e6711c09ed86310fb21b54b3528d83fe16f570f460da695f77f1d2"
+    },
+    "cpu/aged_fuse-updated-0/002.json": {
+      "bytes": 242042,
+      "sha256": "4a07c60fca1893da9303cdf6ebc0b9f5399cbe4558c97827aea422a90e1499b5"
+    },
+    "cpu/aged_fuse-updated-0/index.json": {
+      "bytes": 217,
+      "sha256": "f8fe73d55ae61a2d3938561f8071b9ad8fb8e03c2d16db99e8fb786402429dc9"
+    },
+    "cpu/aged_fuse-updated-1/000.json": {
+      "bytes": 299708,
+      "sha256": "57e8e3a54deb222c0fae68e306cd902bc0e7ccac2a2df501c6ee08300f8f20b2"
+    },
+    "cpu/aged_fuse-updated-1/001.json": {
+      "bytes": 278909,
+      "sha256": "cd76541a2a14d40e87ae381bd9ad8cb058c36c9795d203085441cead896098d1"
+    },
+    "cpu/aged_fuse-updated-1/index.json": {
+      "bytes": 182,
+      "sha256": "ef316ebc97eb31df6d5f3ffd291476c807a8762b965ac289c1ac63995b73aa1d"
+    },
+    "cpu/aged_fuse-updated-2/000.json": {
+      "bytes": 299821,
+      "sha256": "94cc6b6db384591dbb9d7a860d91909305af631c5ead5e19d0b368a74dffb370"
+    },
+    "cpu/aged_fuse-updated-2/001.json": {
+      "bytes": 299794,
+      "sha256": "02af179717e67136f3c8d53297e01c305b15c659d20bb38e75efe51051af3ca1"
+    },
+    "cpu/aged_fuse-updated-2/002.json": {
+      "bytes": 299794,
+      "sha256": "b57f7bdef14c3e17e6592bb009f719e017ae8814db3e4e8aec05b95aded50119"
+    },
+    "cpu/aged_fuse-updated-2/003.json": {
+      "bytes": 230244,
+      "sha256": "66aa62384e4e12f8f813fb25c9de1e075bde4cf11f74b6f44c2b2741da55f28f"
+    },
+    "cpu/aged_fuse-updated-2/index.json": {
+      "bytes": 252,
+      "sha256": "e774c94cdf35fbef0b85fb94cbf1a8a1ff81c8951639d8a403c4745f440c2457"
+    },
+    "cpu/aged_fuse-updated-3/000.json": {
+      "bytes": 299792,
+      "sha256": "6de99ee16081db4ca474b722177b2046014b5323c366d335d6a5cf72c968a865"
+    },
+    "cpu/aged_fuse-updated-3/001.json": {
+      "bytes": 299878,
+      "sha256": "fd7886d5c750a6b401320d0df13a0395ee0ab3475480c48fc0d585323061c4c9"
+    },
+    "cpu/aged_fuse-updated-3/002.json": {
+      "bytes": 271945,
+      "sha256": "c63b34efbb1d24c676f11f861fce399dbb64a3b6cd0aa9de1f2e2f34a8977d71"
+    },
+    "cpu/aged_fuse-updated-3/index.json": {
+      "bytes": 217,
+      "sha256": "df6358bb6c23e2cdf75cd7661232c4ad1c6c595a90934d39c791630f72c41f19"
+    },
+    "cpu/fuse-baseline-0/000.json": {
+      "bytes": 299877,
+      "sha256": "512f8ff031ebc939f220cc4cbc7071eca9e338033de58c9243c62aa94b8f51ed"
+    },
+    "cpu/fuse-baseline-0/001.json": {
+      "bytes": 299861,
+      "sha256": "d9c854ef00e3026a4b35e8af568422044b9c163cc392717d753150199a8fa7f7"
+    },
+    "cpu/fuse-baseline-0/002.json": {
+      "bytes": 271791,
+      "sha256": "9fd2c742952ca6cc97e96fc54b21e25eb44a5ededad277f667dc7a8882cdaf2f"
+    },
+    "cpu/fuse-baseline-0/index.json": {
+      "bytes": 205,
+      "sha256": "7ac6485798481f2f11b3974ee6f1f4c346ffcb1ae8e30b645c22a10258519adc"
+    },
+    "cpu/fuse-baseline-1/000.json": {
+      "bytes": 299751,
+      "sha256": "4fd8c17ff64ae0580f936498141e88b3d71409396a833791490cd8a5deebf650"
+    },
+    "cpu/fuse-baseline-1/001.json": {
+      "bytes": 255190,
+      "sha256": "93cc3fc3b8db5de0e5e80466b93add865fd1fe4f6f8a557af09c289c6e0bd90d"
+    },
+    "cpu/fuse-baseline-1/index.json": {
+      "bytes": 174,
+      "sha256": "624fbd180b4a5e339f3558f0702a15915e5cff5f29a88a92064503718d5b99bc"
+    },
+    "cpu/fuse-baseline-2/000.json": {
+      "bytes": 299777,
+      "sha256": "950ba1c6b32cc6864451b866fe166d869824842c7dd22d8b41abe915ec916364"
+    },
+    "cpu/fuse-baseline-2/001.json": {
+      "bytes": 299706,
+      "sha256": "691a2400d264b8bdd3ee1179068f7367f47815fe89f831885ab9739ed1e49c2c"
+    },
+    "cpu/fuse-baseline-2/002.json": {
+      "bytes": 286350,
+      "sha256": "420c17f85dd6387880c2e542f313c6d35bd59f06835a6946dfe81ceb510a7662"
+    },
+    "cpu/fuse-baseline-2/index.json": {
+      "bytes": 205,
+      "sha256": "4904d5f3730cab15ef42263e50ffd364eb01e815c8be25993c96fd57b2c501a5"
+    },
+    "cpu/fuse-baseline-3/000.json": {
+      "bytes": 299776,
+      "sha256": "2832dc26bfbf3597309f3ce745f2c4639797d50940fbdd32dc86564616109933"
+    },
+    "cpu/fuse-baseline-3/001.json": {
+      "bytes": 299961,
+      "sha256": "907030ebac36c872649fab33dd01f134a19f532527de95ecc580f8079381cd13"
+    },
+    "cpu/fuse-baseline-3/002.json": {
+      "bytes": 220532,
+      "sha256": "5c3ab7d258c9bb38223e5e658ebb0db69581d10b5c0bcd70841011f4f385c964"
+    },
+    "cpu/fuse-baseline-3/index.json": {
+      "bytes": 205,
+      "sha256": "96a635feddca583da7daaa4b192b346ea5ae9762b70fad803dac4cbbadf341c0"
+    },
+    "cpu/fuse-updated-0/000.json": {
+      "bytes": 299830,
+      "sha256": "ec23f4530c1900f8da1368d5940ef53d276e0e37a03a6083c560054996e903d7"
+    },
+    "cpu/fuse-updated-0/001.json": {
+      "bytes": 123665,
+      "sha256": "7b434dce40dc7a0566b35955b5be1d29e1a4e9c9029b93787cbb5a0ea7830e6e"
+    },
+    "cpu/fuse-updated-0/index.json": {
+      "bytes": 172,
+      "sha256": "c82deba5831cb76afe3e9c8b83d9bfd1de9ac1b5f9c10d61530f760373c6d8a2"
+    },
+    "cpu/fuse-updated-1/000.json": {
+      "bytes": 299957,
+      "sha256": "dd29108eb34d2e8c5a2b5d4214c23f41053fd9c9f16574d149c825d00a6ea924"
+    },
+    "cpu/fuse-updated-1/001.json": {
+      "bytes": 106563,
+      "sha256": "a833281b41a8e0526c5f3926fc57d867497e978e23186722d8483288e212815a"
+    },
+    "cpu/fuse-updated-1/index.json": {
+      "bytes": 172,
+      "sha256": "243705a7ebfc4d91393b3624086aafff32a2a1c39b2fbc1af66835e1ed2baa1a"
+    },
+    "cpu/fuse-updated-2/000.json": {
+      "bytes": 299945,
+      "sha256": "84ff99a91af701fa38cb5a6545a3808f5d0816738eee3da31a8d7714e5f6d5ec"
+    },
+    "cpu/fuse-updated-2/001.json": {
+      "bytes": 299872,
+      "sha256": "9d941e60f032f49e75998807cc41473cd61c9086c9faa1e9c8d692a5255ba6b2"
+    },
+    "cpu/fuse-updated-2/002.json": {
+      "bytes": 107344,
+      "sha256": "d31ca0406bb6b7cf96097ae70c0ce16629e5ffc1a0df97a83a6e8155f0bf08c9"
+    },
+    "cpu/fuse-updated-2/index.json": {
+      "bytes": 202,
+      "sha256": "9a44606579387b0de2e9442acd4556c48427ff2abd627864e474a61d6ddd53bb"
+    },
+    "cpu/fuse-updated-3/000.json": {
+      "bytes": 299806,
+      "sha256": "ac26cc615d7de866cbb01c9afb4ff1489e53e92d30d0ef6032acc1f7039f5e7d"
+    },
+    "cpu/fuse-updated-3/001.json": {
+      "bytes": 149213,
+      "sha256": "d06e4c1ef5a219af48f4a0f49e27008ed59888af0165687289e713282db8de6e"
+    },
+    "cpu/fuse-updated-3/index.json": {
+      "bytes": 172,
+      "sha256": "4a690670059a8f3f64c51a735ab5b7a6cd179b41f63a1ba7d5c418893ceaff3e"
+    },
+    "findings.json": {
+      "bytes": 87819,
+      "sha256": "020549145b54cced8a3ea749f51db961b9aa7e388fb05f091e3872b4a6dd14a5"
+    },
+    "host/000.json": {
+      "bytes": 281484,
+      "sha256": "602bde846b100a7a788066c8d9b69f6106d5d5e45f594089366dba905f2ded2a"
+    },
+    "host/index.json": {
+      "bytes": 113,
+      "sha256": "dca7b59a94f9c4e72f9d39e092fcfa36bafe180f28069b56c8dc7d80b2bd1148"
+    },
+    "prepare.py": {
+      "bytes": 10564,
+      "sha256": "eebe792c39f3bfea74476cba2f26b0e8614c63c983e3f36e156d52d04eb0520c"
+    },
+    "publish.py": {
+      "bytes": 1471,
+      "sha256": "6528cc2fefd1f21abe366f26785a8013bac2acfdcd913059181876f78107f97b"
+    },
+    "results.json": {
+      "bytes": 43192,
+      "sha256": "c58a044c0c7ebd80280a26477599e7a0c9fd65c9c36073f68677682de6ce8044"
+    },
+    "run.py": {
+      "bytes": 2236,
+      "sha256": "cf59d0cb53b0efb68ba4c5773b07e23a407d2eb86329d17753af3683f10b1d07"
+    },
+    "runs/aged_fuse-baseline-0.json": {
+      "bytes": 40311,
+      "sha256": "b432ec3b8d50c19730b59651ba0d5237c1b580fc982948c83ca0fb93e3907f7c"
+    },
+    "runs/aged_fuse-baseline-1.json": {
+      "bytes": 40297,
+      "sha256": "db46598a116c675eef9c72f9f29e343efe8900d5553f5415b38a17ec512efdc0"
+    },
+    "runs/aged_fuse-baseline-2.json": {
+      "bytes": 40408,
+      "sha256": "6033e60d80e681652fba54d72fbc7ffb05f23b0b34eb79d35651933d2113c089"
+    },
+    "runs/aged_fuse-baseline-3.json": {
+      "bytes": 40266,
+      "sha256": "255cd78a98f027731d4f9b27d137c9b4ab9890b48e948550d94e15bd7a609f08"
+    },
+    "runs/aged_fuse-updated-0.json": {
+      "bytes": 40194,
+      "sha256": "7870741cb8f7507baf9609c9e8bbc20a8cbdbe0c6cb90e698b5983642c934a2d"
+    },
+    "runs/aged_fuse-updated-1.json": {
+      "bytes": 40341,
+      "sha256": "367780944461d160c1eb89ce0ad63cb9af0f3f77f338c268bfe1cf7e9cfe29e5"
+    },
+    "runs/aged_fuse-updated-2.json": {
+      "bytes": 40296,
+      "sha256": "c336cca4b8ce2958d0d474bc49b2f529ee43b9a992bf3db0f9238469b1611b6c"
+    },
+    "runs/aged_fuse-updated-3.json": {
+      "bytes": 40303,
+      "sha256": "bcf368e3df5e8d63d4c6841184ee07e56ef2dbf772ccd27bb5da580d8d8a2f32"
+    },
+    "runs/fuse-baseline-0.json": {
+      "bytes": 40959,
+      "sha256": "788e3bbf7f4c60a09d39b3c40abc01c2ce4c3ca399c12c88cc1a4c6e1fa39c95"
+    },
+    "runs/fuse-baseline-1.json": {
+      "bytes": 40990,
+      "sha256": "10abf01a546bc0f0aa30b327f63fb73be73d116f98b872269a8f2dcea3ec34c9"
+    },
+    "runs/fuse-baseline-2.json": {
+      "bytes": 41017,
+      "sha256": "c2f8f9af0524ddf3efaa10679a3ee7e21cf0936fe170136278d7045e6358140e"
+    },
+    "runs/fuse-baseline-3.json": {
+      "bytes": 41021,
+      "sha256": "d8289d1919bb595f564d174eedca62b062ae23e79855ea821d73ddb6a502a709"
+    },
+    "runs/fuse-updated-0.json": {
+      "bytes": 40897,
+      "sha256": "33f70cbb3e9a9b3dccbd810d04ed89ad97aa4ec5853a6b683458cf0b67c42cd2"
+    },
+    "runs/fuse-updated-1.json": {
+      "bytes": 41057,
+      "sha256": "fe4f42ff7c4cdef508a8dac17fe80a42f7325e5df093ea592161ffaf351dbd2c"
+    },
+    "runs/fuse-updated-2.json": {
+      "bytes": 40925,
+      "sha256": "17527453645c4f090a136cc8d1ad79d2573cc6f0a043048c3e6568b7ee59503d"
+    },
+    "runs/fuse-updated-3.json": {
+      "bytes": 40935,
+      "sha256": "923464f45f3d67fcaaff8d49e3e8d970bb7320976456ecc31cdf1538559efa99"
+    },
+    "traces/aged_fuse-baseline-0/0/events/000.json": {
+      "bytes": 300000,
+      "sha256": "9924c2b5623e9ab41d9263f10d44ff42df8e8d3b69a8b8a3dc07db089e1c5731"
+    },
+    "traces/aged_fuse-baseline-0/0/events/001.json": {
+      "bytes": 299922,
+      "sha256": "561aa435134461136fa53360e31ca2dc2c7299b0d97df3a53f80340898dd3f17"
+    },
+    "traces/aged_fuse-baseline-0/0/events/002.json": {
+      "bytes": 21850,
+      "sha256": "4e49a4d944ec6bffb12f1912d74093f61807c863a16e23d8fc81faf36d587433"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/000.json": {
+      "bytes": 299959,
+      "sha256": "8d17b917d5f025190a7791516881463102743fa8e9fd4df714ee808b4eb12629"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/001.json": {
+      "bytes": 299486,
+      "sha256": "36b8aac3bb90a66affe206d5087a8c9356d390955abb4f45bb4e40296524320a"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/002.json": {
+      "bytes": 299461,
+      "sha256": "3fc851775821b9a04681094510cdc755edfc97e445f8c6441b06eef2a8d9242b"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/003.json": {
+      "bytes": 299728,
+      "sha256": "22fb61d2ad1a972e2eb5229363fa03eb61723cfd076498dcd7d47b55df96edf5"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/004.json": {
+      "bytes": 299633,
+      "sha256": "d00d26720088698bbddc2ff4afa6fc2c4dba3959a978f4a113b4b1eb4c1e428b"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/005.json": {
+      "bytes": 299923,
+      "sha256": "8f86dff28e8d4c87e97bc4ece7d729fd8e3fe163e921d51539fbedb7875d493c"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/006.json": {
+      "bytes": 299469,
+      "sha256": "9077ca005fa5527e7d7c6c85b5bda4ce166a630aa3ecacb51c8872c912d0aab9"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/007.json": {
+      "bytes": 299763,
+      "sha256": "cea4e55ace1bb493bb57dc147a86ff078fdd9d91f547089a03368d6ae3717cf6"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/008.json": {
+      "bytes": 299528,
+      "sha256": "c1dc73ef58efb528d0990e4bf11d54bed5a8572e01d0a8508db5e5fb82cea769"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/009.json": {
+      "bytes": 299666,
+      "sha256": "391a17e84d6ce894a617af807860e411cc46791f8c245958d13fe5da18e5f2bc"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/010.json": {
+      "bytes": 299779,
+      "sha256": "d1257c892290b2315f885725501bf131a97284094d5db143245b4aa38fd041c4"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/011.json": {
+      "bytes": 299711,
+      "sha256": "532732f80b481e45b4fa2bdff3194de6ceb0d96f7c3cbe0d732c6e3b5ccb89a8"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/012.json": {
+      "bytes": 299986,
+      "sha256": "99120dace30d7aba10c8bcb0550e30e2d439a9126b5851943c48d89470fd527f"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/013.json": {
+      "bytes": 299990,
+      "sha256": "19c70ed588b2b469ee6e34a499c39c4746df411d963f13cedbeb1f9c90d29350"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/014.json": {
+      "bytes": 299587,
+      "sha256": "a07938c1f98515887ebb708d6269d024762e25549400b11b88a50db35191d369"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/015.json": {
+      "bytes": 299552,
+      "sha256": "dc4e4f7e66d0c8cbcfa825c237a01fcdd3cadb746ce218c69da5df526a0561e5"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/016.json": {
+      "bytes": 299995,
+      "sha256": "91eb048fa7d3da86bb47009e907aca2225fa916c11a035764adf2f856334e13d"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/017.json": {
+      "bytes": 299956,
+      "sha256": "023c5cdf92191284964ca5255d9671c8e830c98ad1341505bb15f082bbcf1abe"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/018.json": {
+      "bytes": 299761,
+      "sha256": "a4d19a6768ef25d277bb0dd147cf1da90fd70c954075d5726db388d89cb0c911"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/019.json": {
+      "bytes": 299578,
+      "sha256": "efa47571da497dc681d4dccd8740d7506d6916afb353a8722e71bceb17814305"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/020.json": {
+      "bytes": 299998,
+      "sha256": "6d62c5d2b0a110a2ef0f631d82bcb5bdfdb576264fd83e117ef93c6b21358cb6"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/021.json": {
+      "bytes": 299797,
+      "sha256": "2292545d3cd77e28711d3257232ebd176542126d0400b5ae6307e7bd6c8948ac"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/022.json": {
+      "bytes": 299687,
+      "sha256": "2e4795d3f042f7eb97c5b508426521023db820b49a6c3b6a4e1a67d133b92e57"
+    },
+    "traces/aged_fuse-baseline-0/0/roots/023.json": {
+      "bytes": 243419,
+      "sha256": "6a0789e253ad04929aee10bcbc7c9715827059886cff4def02a45cd4a0580f61"
+    },
+    "traces/aged_fuse-baseline-0/1/events/000.json": {
+      "bytes": 299922,
+      "sha256": "fc42c1a8873925d10c16140a95f777d5a503708f8e67152cdeb81a17cd7a1338"
+    },
+    "traces/aged_fuse-baseline-0/1/events/001.json": {
+      "bytes": 59140,
+      "sha256": "b40142d4f36aed4b7f0be5bb3a48f49d22c14893121fd1989777f4c9b5c1c3ef"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/000.json": {
+      "bytes": 299555,
+      "sha256": "0de2ebcf404a549bfe57b6ab4c21b22e16a9dd26eecb80685276389282414145"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/001.json": {
+      "bytes": 299499,
+      "sha256": "8f6eae9f8d88b4e3f86ccd712cbaec2e6727076dbeb3311208d15f94cb4a7118"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/002.json": {
+      "bytes": 299657,
+      "sha256": "f8975f22a2fbb72862b6e5d5b20eedcd27b9a938a3eb75df0e6d72ec2774ae5e"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/003.json": {
+      "bytes": 299486,
+      "sha256": "47ede272b1a5c9e60acd0343b2fd058717c2702dce3730c916ffdbbfc517830c"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/004.json": {
+      "bytes": 299992,
+      "sha256": "9d6c3d3d84e34286d9dc015977ad40da54e5201d99df64ecde7ac5c11dcce333"
+    },
+    "traces/aged_fuse-baseline-0/1/roots/005.json": {
+      "bytes": 59508,
+      "sha256": "8a094a120bf0522adacf54986964bda5043df9a80a942868e9e2b949c63d2a6c"
+    },
+    "traces/aged_fuse-baseline-0/index.json": {
+      "bytes": 2424,
+      "sha256": "9cdc3434c04d67914087db4306e6e4818efa7a42bdaec3ff342aea2b1cc2f3b6"
+    },
+    "traces/aged_fuse-baseline-1/0/events/000.json": {
+      "bytes": 299947,
+      "sha256": "590923f169c50b03462bffa8316ebbb876419301417497162d4e67ac857d6fda"
+    },
+    "traces/aged_fuse-baseline-1/0/events/001.json": {
+      "bytes": 299930,
+      "sha256": "e2ebaadcd885ccb06236b9aa6b7d01cb863cbf260b6f93d3a32a5930095276c5"
+    },
+    "traces/aged_fuse-baseline-1/0/events/002.json": {
+      "bytes": 20662,
+      "sha256": "2165140cc8d6957ea32cb6edb76bb2fa25be9b7c2e86872b84019c867eb6ddea"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/000.json": {
+      "bytes": 299766,
+      "sha256": "ae95c1471928448095fff4ee7cd3106dfb7dc8788e552c387d6c97c113eaaec7"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/001.json": {
+      "bytes": 299509,
+      "sha256": "8a89cdd13b85eed7774ebbfcdee23217f77436fd2aa904c2ce7ec364e4113302"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/002.json": {
+      "bytes": 299572,
+      "sha256": "6ea45dfddf07af38c7a9706a87dda7ac63669203555200e07f7b54c59eac8a9a"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/003.json": {
+      "bytes": 299999,
+      "sha256": "21ab58d27cbaaf322147e77261d7573bd42b0fde991e400eadeae1f1a953b476"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/004.json": {
+      "bytes": 299856,
+      "sha256": "b8403a5abd0a04f962c5672362865c71ea42c383ff2239d2a4747be9815f925d"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/005.json": {
+      "bytes": 299536,
+      "sha256": "9bcdadc511414c35d678c8381b4175eda9bb0528f666e28c8bca1153eb7f873b"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/006.json": {
+      "bytes": 299562,
+      "sha256": "f50ef6d63284dd214c1e988da9dcd19c8b89a48bdf428d2820da1b237bd94872"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/007.json": {
+      "bytes": 299947,
+      "sha256": "0e7447b5374782b46612eb6a0b30fd674fe62d5621286d68e844b5d1774d296d"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/008.json": {
+      "bytes": 299569,
+      "sha256": "793ad352c8643ee24411822f1b10f7f814b3ab5aed16dad676a5c07a816ac45a"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/009.json": {
+      "bytes": 299937,
+      "sha256": "db7874add1fc3d48f24ae07e71ab302e62c0acccc6b2e8c9c7611ebda22244bc"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/010.json": {
+      "bytes": 299758,
+      "sha256": "b15646a7ba3b2abaaa3a5a8ebf5f266cc3a291cf0d0af3c730ebcf7e26a372a9"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/011.json": {
+      "bytes": 299759,
+      "sha256": "dc53f30e6e68571ec37678733cfd8acebf86de30f665c30bf28d19a6a66fb71c"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/012.json": {
+      "bytes": 299594,
+      "sha256": "91b3e10c35c64000cf0af56414be66a88dfd5de1301b39f111b5d42d54a065ca"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/013.json": {
+      "bytes": 299583,
+      "sha256": "4f7d8dec754363edad97a54e5c2a6ec558b7bb1d19012391af171f0195c4a3a5"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/014.json": {
+      "bytes": 299616,
+      "sha256": "b2aa8df8167e0a7be57e6d091f97cd5e0c8b18cb49c04e1fb64418b52f6e5b09"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/015.json": {
+      "bytes": 299558,
+      "sha256": "70de5a3ead3408961402911b6947faba5ce06058c4c74c574749867271882bbc"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/016.json": {
+      "bytes": 299673,
+      "sha256": "e7e0adce0164ce866ba7c977ac37ed8e95d65ff51557dce196942581abface2e"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/017.json": {
+      "bytes": 299635,
+      "sha256": "ce275f8f3cf66259e906f178c7adf588bb2efa897e3334262972021fccda0bbd"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/018.json": {
+      "bytes": 299937,
+      "sha256": "17625c5fb2e294a17a394aad495bfccab3340cf43b6e4b8d7f8fee23696ddcf2"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/019.json": {
+      "bytes": 299778,
+      "sha256": "a09e9cf6f3e9bd7240a2fbbe464cea0970d6703ff5ba9c5966e281297a537dc2"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/020.json": {
+      "bytes": 299915,
+      "sha256": "b88308f9a7af7e4cc247ac0ebfc68a0d4a6b337bb3c5408faee6c855f41ec695"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/021.json": {
+      "bytes": 299953,
+      "sha256": "1258941fbaf3401d21fa29c03d06b903d225db7d37caccf60eb98b6c1fc17298"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/022.json": {
+      "bytes": 299936,
+      "sha256": "d212343dca0f36deedfa370bcfbaae441bdf1d099dd3134a09c7c7954ea25ca4"
+    },
+    "traces/aged_fuse-baseline-1/0/roots/023.json": {
+      "bytes": 258949,
+      "sha256": "2ae9b06f1ebfb48e3d6cec8b1e09092d732810c019dee7a4d2c39aa45bd1ac7b"
+    },
+    "traces/aged_fuse-baseline-1/1/events/000.json": {
+      "bytes": 299963,
+      "sha256": "4255cc5e9878faa95b409004c577d83faa1a4a834fc63f6eaba2d6798037ed3f"
+    },
+    "traces/aged_fuse-baseline-1/1/events/001.json": {
+      "bytes": 14620,
+      "sha256": "999c6ffb314562bdc2616b1f4da55326b32d1c01e1900fe837dfd1ab4dd83d22"
+    },
+    "traces/aged_fuse-baseline-1/1/roots/000.json": {
+      "bytes": 299641,
+      "sha256": "7a24a2a7f9b2d58c17b62f9ae971c2d129040ca42a55615734643fedb80571a0"
+    },
+    "traces/aged_fuse-baseline-1/1/roots/001.json": {
+      "bytes": 299696,
+      "sha256": "ef9f0a0d4208c277cd04dcbd1f0b27edc6ce902c7abe609de9692be2799f271e"
+    },
+    "traces/aged_fuse-baseline-1/1/roots/002.json": {
+      "bytes": 299740,
+      "sha256": "2f580a142e1ea10ed638796f24c421b98fcefa2d1f057e98d134eecd5ab2484d"
+    },
+    "traces/aged_fuse-baseline-1/1/roots/003.json": {
+      "bytes": 299882,
+      "sha256": "e4319acaa9294eeea40483413191058903ef2500b66c26d737918e2b7b2e500d"
+    },
+    "traces/aged_fuse-baseline-1/1/roots/004.json": {
+      "bytes": 136757,
+      "sha256": "0728cbbed48363c70ad2ac3dd9a0538a3f77a6297e0554bfbb56c82800644081"
+    },
+    "traces/aged_fuse-baseline-1/index.json": {
+      "bytes": 2377,
+      "sha256": "acb7bf357a7866a2405c84326d6f8e111d49bea7326009de47da0139586257a8"
+    },
+    "traces/aged_fuse-baseline-2/0/events/000.json": {
+      "bytes": 299984,
+      "sha256": "207608497cd4810d29368d84ab67739f2cb9f554626dfce47a9a7f4e4be84fb9"
+    },
+    "traces/aged_fuse-baseline-2/0/events/001.json": {
+      "bytes": 299998,
+      "sha256": "e1d037322c1c8e3452523544cc82f8feb0a708c2fb35c8c9fefbe20cbbbab10d"
+    },
+    "traces/aged_fuse-baseline-2/0/events/002.json": {
+      "bytes": 21859,
+      "sha256": "dff44bb545a52733475856d935e5c762e1b9e30d5af9574e892ebb697f35399d"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/000.json": {
+      "bytes": 299612,
+      "sha256": "fe0381709b47c03ce87c0fcc72f8e2042e0cde89150acfbc95aabf647a26409c"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/001.json": {
+      "bytes": 299555,
+      "sha256": "1b57c78c7d2e8e7a2e5ad3d276c5b6ed452e10e7d4ba6a0f298a8fcbca96f9de"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/002.json": {
+      "bytes": 299784,
+      "sha256": "81023da7e36de8c364d86c9e4bce9dba54090fa5fa2214a3a9d501376cd7e7e8"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/003.json": {
+      "bytes": 299923,
+      "sha256": "27bce2839c257df27c981b36a06f1c7b9fbfc9fe8ade47b2a47d4df499cabd9b"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/004.json": {
+      "bytes": 299763,
+      "sha256": "92bd3d44c6f75d0397fc7375bbce6381126d0b64407780243d8067e016ce9b85"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/005.json": {
+      "bytes": 299824,
+      "sha256": "a611d90f3faaf2a0bf1ef00127aaab7154b1d0bff85b03253b21510e61e82ebf"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/006.json": {
+      "bytes": 299468,
+      "sha256": "dce65d8664d3ba8bd64ffa480fab354efaf0e93fc582c1c5c7a71de46da4f11c"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/007.json": {
+      "bytes": 299553,
+      "sha256": "125731a64c37a399e84f74cfc03d3b977574f3c8334bd4b96d9dfd9c76a51b4c"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/008.json": {
+      "bytes": 299655,
+      "sha256": "9bcf8954efcbad06ebe3ad260ba3fa04cb2015de5458a8419de4514b41a13029"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/009.json": {
+      "bytes": 299649,
+      "sha256": "266bb97d5d81e814a5ac348a9e47712f5f399064dc9c1b80c3da996126b40e0d"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/010.json": {
+      "bytes": 299799,
+      "sha256": "17066b395d741724a568bd4c64c9f5ba2f1c81e75cc3efc9b7553a3824381b38"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/011.json": {
+      "bytes": 299688,
+      "sha256": "936c92bcef493a220ce1fd68b0cb1646fa538141a829b8ee5bdc3e6f6dedafd8"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/012.json": {
+      "bytes": 299535,
+      "sha256": "c2248be5286247d90e541252d96c7c5064b8b0829d4ed2c8ad1a4b4fc42ee9bb"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/013.json": {
+      "bytes": 299988,
+      "sha256": "4fc80e56ba43cda577679992821d584caa3b81ac759edd53bcd51a8a6668920c"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/014.json": {
+      "bytes": 299579,
+      "sha256": "66a985e544d9637577a0e97c13d14202739b5738bed4e1c6c2bda9d0ab5c25d7"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/015.json": {
+      "bytes": 299986,
+      "sha256": "08999cdddffb1a85f2eb4220681ff4e1ed8f646c41cc5b30aaabddda5a9316d1"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/016.json": {
+      "bytes": 300000,
+      "sha256": "c29699aab56d07e724f1497dfe9516cb58607718fc1c43b819e9658db7952353"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/017.json": {
+      "bytes": 299947,
+      "sha256": "cf74e8956f3bd17cdb50580e0c640572df1e955dbb687e07bc1b279d39c13cb7"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/018.json": {
+      "bytes": 299771,
+      "sha256": "24bdee469f25df9eb046f2b79641ebd532410c4517d48ac5e7c4a89e650949d8"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/019.json": {
+      "bytes": 299998,
+      "sha256": "be2600bc01a4249c0a4a7f940fb3c61323850c97d627fe99c20d8363a61c68b2"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/020.json": {
+      "bytes": 299627,
+      "sha256": "eef2df8afcbaadccc715315409ecbff62eabf90a0eae794dbed33ec86d6269b3"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/021.json": {
+      "bytes": 299609,
+      "sha256": "5f35e9a20b779570a3025da9672c3460c6efc428b09f84b6fe796dd61ab5df48"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/022.json": {
+      "bytes": 299868,
+      "sha256": "d7e1a4dcaad24575de147b09b6a371230c59df754a4bcf03e8e91c047a577359"
+    },
+    "traces/aged_fuse-baseline-2/0/roots/023.json": {
+      "bytes": 239143,
+      "sha256": "65a24850822254ce79774f13d5ee383400aca14bfddac1c97e02c7ad7381e609"
+    },
+    "traces/aged_fuse-baseline-2/1/events/000.json": {
+      "bytes": 299935,
+      "sha256": "bd94f308f50b41f0fc54970c9a5369bcfb709ec8985bf3b9777c11213ef59618"
+    },
+    "traces/aged_fuse-baseline-2/1/events/001.json": {
+      "bytes": 51499,
+      "sha256": "6f177754d9d407e4370de1c98e3f452c1b358a30d678d98cf18263267041d581"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/000.json": {
+      "bytes": 299847,
+      "sha256": "176d1231c34509282a404f4b7e766bf3ed7ea13320f69c53658a84b96ae60b79"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/001.json": {
+      "bytes": 299571,
+      "sha256": "7db1868568c0183d09adb2d23f7ba43514a1550639f6898dcc45317f7021e38d"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/002.json": {
+      "bytes": 299760,
+      "sha256": "a71f459887557bd3a57fb17ba5f76d1ef148c24c64b5b0fde64ad8a052089de6"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/003.json": {
+      "bytes": 299619,
+      "sha256": "b78842859ee948cd193d30cab4c4da3776d09ad62733d0032085f80858aedc46"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/004.json": {
+      "bytes": 299865,
+      "sha256": "57128a1e1efb4d0e6684fa5d825728e0fbd3e68c0206491026259d6bf0d22ad4"
+    },
+    "traces/aged_fuse-baseline-2/1/roots/005.json": {
+      "bytes": 22659,
+      "sha256": "9157c88540c3bbca285faae814b3c0ec9b756e72cbe720151f8190d2ce967643"
+    },
+    "traces/aged_fuse-baseline-2/index.json": {
+      "bytes": 2424,
+      "sha256": "91510ee6fc3488a3832ec310283594d83173731f92ce111ef4ab54974ff98fd1"
+    },
+    "traces/aged_fuse-baseline-3/0/events/000.json": {
+      "bytes": 299998,
+      "sha256": "7ca8af7e33d72db87cf9256b57b4599fdfd21c7b197a4c4c99cb0af257277155"
+    },
+    "traces/aged_fuse-baseline-3/0/events/001.json": {
+      "bytes": 299977,
+      "sha256": "a89bd64e4296d0fe3de975ac46d1243f151fe6ba469af0dece094bfd2bfc6ba0"
+    },
+    "traces/aged_fuse-baseline-3/0/events/002.json": {
+      "bytes": 21675,
+      "sha256": "567f864d298e7be232586137a6fc42d3e1b8963be04d2cd22db4060ade11af46"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/000.json": {
+      "bytes": 299997,
+      "sha256": "06ebe035cb62ce93293bbfb44289fe4f7c2fe837857d85ee62fc5b39b010bde5"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/001.json": {
+      "bytes": 299869,
+      "sha256": "78eb8be131bec27bdd5b862e262a18c0185bb97443ccfdbe1146a1f8127412e7"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/002.json": {
+      "bytes": 299773,
+      "sha256": "8f08593eb211c589b0f5aff498fe3140c87dbac4524ecaf3ba5c8de03c14f141"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/003.json": {
+      "bytes": 299853,
+      "sha256": "ab643d63a88f356df886e423189bccc0746613b0d2af245e189714f237e4e4d3"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/004.json": {
+      "bytes": 299761,
+      "sha256": "e3d8324f109af2f6f71351acc7f96813e1e82a40310a1523f356c98d5facef47"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/005.json": {
+      "bytes": 299803,
+      "sha256": "92a95bf696af87080805297eaa976c825f905749ddd6d4d8d75308097fd9d3a7"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/006.json": {
+      "bytes": 299891,
+      "sha256": "8ed9ab5cf07371250a3f28912566a0a1ea2a04980d661c7fc5e1fe22a3ae9a9f"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/007.json": {
+      "bytes": 299992,
+      "sha256": "6a6c6d6d32da2ae6182d0b53881ad459bc6d96fe6e400efe1f70fdd3c90313f4"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/008.json": {
+      "bytes": 299627,
+      "sha256": "770dad42d8b546a7d81affab77ac8355a72ba289f42fadd7840b2d19bd007396"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/009.json": {
+      "bytes": 299598,
+      "sha256": "4c2008a6c41885b8361e2dd232029d1a23785e55096eab711901919ff48b209d"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/010.json": {
+      "bytes": 299895,
+      "sha256": "8be535f09a2ac33ff7b7cecc626e104b0e0f20358a16a731e56ff5e4786ca7ad"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/011.json": {
+      "bytes": 299843,
+      "sha256": "f1bb4585124fab6dd5a6516a764fa1be486c454c9cf0118f0d0f55683ad6409c"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/012.json": {
+      "bytes": 299761,
+      "sha256": "ecc2761958d27b0f341e622beb953823e690d023eee7ceac7af6ff7ea441eb6c"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/013.json": {
+      "bytes": 299586,
+      "sha256": "f69560268cd8feb3de8f2a8ddb21b47e921c750f8bd13218334f393853a4a292"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/014.json": {
+      "bytes": 299717,
+      "sha256": "5623efa622aa5261b83771135cf7e1488786737591a3cde52967db9757533ac8"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/015.json": {
+      "bytes": 299539,
+      "sha256": "758d8bb5e4d04a61f2efc133350c7beb199bf7f746303b81a9b390f185c5cb6b"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/016.json": {
+      "bytes": 299779,
+      "sha256": "31475b7a7da9b5c3262e05350decc844e279a8d62cffd5444da795032c976030"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/017.json": {
+      "bytes": 299824,
+      "sha256": "6a7b9f4c70392f1f41b6bf16fa0730af2e3a0ec5b9b98e88b1590f3ea9a386bb"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/018.json": {
+      "bytes": 299643,
+      "sha256": "8463e5a7b4b10fc3d16619e07ed1545081c895898c58365bd19c7f1bb8a123d4"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/019.json": {
+      "bytes": 299814,
+      "sha256": "c97a01b6012266abc1b0fdef7546629e0080434fd1c602664f69942a3ea6b7d0"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/020.json": {
+      "bytes": 299973,
+      "sha256": "aedda35b7f4953e8d53d47a7258d02b8e6c1912917f987cc234254f62fe08b42"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/021.json": {
+      "bytes": 299653,
+      "sha256": "47903991834c6b356309fc684339bc0f193cbbb8bd43e66d01a0959ca6897e34"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/022.json": {
+      "bytes": 299531,
+      "sha256": "5b4fb4f932800f52cebcaab53f2d301a375cd4fd1288d83941385c18b44a4df1"
+    },
+    "traces/aged_fuse-baseline-3/0/roots/023.json": {
+      "bytes": 232907,
+      "sha256": "42df7694c4513eff10c40271a35aeb45f0af188833b24b200a75bec3c11ed893"
+    },
+    "traces/aged_fuse-baseline-3/1/events/000.json": {
+      "bytes": 299935,
+      "sha256": "ab569b8703afa663592ee88154c8b2328b46c453b87b1d0c4c6f7c3afa9a1e92"
+    },
+    "traces/aged_fuse-baseline-3/1/events/001.json": {
+      "bytes": 34981,
+      "sha256": "deb1bc89453e16ed16e6d8d34176c456ba0bdc448dff8f23d9c93a362f614e92"
+    },
+    "traces/aged_fuse-baseline-3/1/roots/000.json": {
+      "bytes": 299552,
+      "sha256": "6b3af689e727c4855e99673f73af3aafab07607a7f540bdac61a65e4a92b1399"
+    },
+    "traces/aged_fuse-baseline-3/1/roots/001.json": {
+      "bytes": 299755,
+      "sha256": "9ad40f565ee1e39bd4cda4bbcf2dc5ff0006e7af91655188fd0850c3af22c1df"
+    },
+    "traces/aged_fuse-baseline-3/1/roots/002.json": {
+      "bytes": 299899,
+      "sha256": "7a00442c010b06ac2ee4838599cea19d602af67f4265735d6882c00e0d67f9d7"
+    },
+    "traces/aged_fuse-baseline-3/1/roots/003.json": {
+      "bytes": 299734,
+      "sha256": "1d8d0601d770292561fd22e8f95982f61d61c18d9c41f03162eba0dc23131446"
+    },
+    "traces/aged_fuse-baseline-3/1/roots/004.json": {
+      "bytes": 238296,
+      "sha256": "e44957e8a094a765018fb067ba7c041cc108de0d5cc08ccd8ed65311711535a1"
+    },
+    "traces/aged_fuse-baseline-3/index.json": {
+      "bytes": 2377,
+      "sha256": "afd11434a2b0be7c31e9288c7a7da7a4e14ede221799e7141ce51913f900dbe2"
+    },
+    "traces/aged_fuse-updated-0/0/events/000.json": {
+      "bytes": 299991,
+      "sha256": "385fece43ba4ab774910c3adb36aeb32ecbbfb64a6846841d703bafa1595739b"
+    },
+    "traces/aged_fuse-updated-0/0/events/001.json": {
+      "bytes": 299936,
+      "sha256": "b770f634135b40a4057be8d5cb00733d68513bf8e376ff522f01f8e9282578b5"
+    },
+    "traces/aged_fuse-updated-0/0/events/002.json": {
+      "bytes": 19190,
+      "sha256": "d44282b5b2f3e88293afff11d7fcf8c0e3e41e8b23eb4100645bd4c5c5fc34eb"
+    },
+    "traces/aged_fuse-updated-0/0/roots/000.json": {
+      "bytes": 299491,
+      "sha256": "7d31ff1e93e802f711812b00e3779b1c624310e10d1bfda420b5649be5076e8c"
+    },
+    "traces/aged_fuse-updated-0/0/roots/001.json": {
+      "bytes": 299854,
+      "sha256": "b819c9c6565f690e1ab4a7e6620389dc2fc0bab82cc0a37786f168791a75a610"
+    },
+    "traces/aged_fuse-updated-0/0/roots/002.json": {
+      "bytes": 299718,
+      "sha256": "987dda927bbde9a2695baf55ce8a71d06274728b09233f6dc0dcc86eb5e3a4ec"
+    },
+    "traces/aged_fuse-updated-0/0/roots/003.json": {
+      "bytes": 299819,
+      "sha256": "b0c2e11963e251aca99be15f49b5da3b2ec2fc629e3177d6ead0e24d1e74ab4a"
+    },
+    "traces/aged_fuse-updated-0/0/roots/004.json": {
+      "bytes": 299918,
+      "sha256": "71ed0910829ca87ac752ec5bd6cc81537031d3cf0bf3f742fc8bff72bbb95a75"
+    },
+    "traces/aged_fuse-updated-0/0/roots/005.json": {
+      "bytes": 299627,
+      "sha256": "70daaaf329cc8c2e0ee3c3e84350f1be4c64fc9be6af73b0794fda11e0d60e83"
+    },
+    "traces/aged_fuse-updated-0/0/roots/006.json": {
+      "bytes": 299705,
+      "sha256": "2ff93588586b6dfcc4ec5e639c1a00dafbf3dd8837e46790bf99cdc377b1fbe8"
+    },
+    "traces/aged_fuse-updated-0/0/roots/007.json": {
+      "bytes": 299586,
+      "sha256": "8bef192790119ada910bf83838f86c5319f58185f9e56564d6ca520b7fc392de"
+    },
+    "traces/aged_fuse-updated-0/0/roots/008.json": {
+      "bytes": 299929,
+      "sha256": "a2d15b6eaabacdce707b11c4597e500d974c4dfbdcddbf7c5f05ce64aaa8725a"
+    },
+    "traces/aged_fuse-updated-0/0/roots/009.json": {
+      "bytes": 299737,
+      "sha256": "1c19dfe182f293ebbcc81882a0ab3c86854f64d612d5ac8e34a8ae71a1d9bfb8"
+    },
+    "traces/aged_fuse-updated-0/0/roots/010.json": {
+      "bytes": 299762,
+      "sha256": "2afc0b1fa130326ece8908f9f9428bf7399cd62ee00cceb0b0b33501e5a70477"
+    },
+    "traces/aged_fuse-updated-0/0/roots/011.json": {
+      "bytes": 299721,
+      "sha256": "62894689fef6ca8fec4455a6dd59889d7f8c18069b054bc6e3d901fe3cdd5ab4"
+    },
+    "traces/aged_fuse-updated-0/0/roots/012.json": {
+      "bytes": 299719,
+      "sha256": "48729dcd9289242200e7de3789c3727630548060d03b3eeb4f5bc9034ff5e079"
+    },
+    "traces/aged_fuse-updated-0/0/roots/013.json": {
+      "bytes": 299721,
+      "sha256": "82ac8f726851bf598513c3d43419bc5c83027676866a371ca82a03fc3426749a"
+    },
+    "traces/aged_fuse-updated-0/0/roots/014.json": {
+      "bytes": 299679,
+      "sha256": "41bad92dd81d2c21fe256fee40a58ab5f91812c7311441a851f06035f9ebab04"
+    },
+    "traces/aged_fuse-updated-0/0/roots/015.json": {
+      "bytes": 299700,
+      "sha256": "80327efe957142766094d741143b3a8cb6abe9c5a42ed5a8e4a2a0854f15e165"
+    },
+    "traces/aged_fuse-updated-0/0/roots/016.json": {
+      "bytes": 299678,
+      "sha256": "6028c5cebcf39c9dd781f81ce99823a7328436cc12f6d99ea949c89c798606cc"
+    },
+    "traces/aged_fuse-updated-0/0/roots/017.json": {
+      "bytes": 299741,
+      "sha256": "16332c0bfe66becfe986473d26ad3e220d9c255530cacf7a74091b91bc1c8f47"
+    },
+    "traces/aged_fuse-updated-0/0/roots/018.json": {
+      "bytes": 299591,
+      "sha256": "52517b143f4c25fe7ca5f114dda7a6986fa003e6178d85e859038af808f84d97"
+    },
+    "traces/aged_fuse-updated-0/0/roots/019.json": {
+      "bytes": 299942,
+      "sha256": "9a5f5d814030e4a546f134d084bb1396143ef04a6e1d7d52de6e59129da566d9"
+    },
+    "traces/aged_fuse-updated-0/0/roots/020.json": {
+      "bytes": 299744,
+      "sha256": "2e143b271897bfc4058fa01509f61b3fb4d24bca63f4c26ae4db2519ebd11d1b"
+    },
+    "traces/aged_fuse-updated-0/0/roots/021.json": {
+      "bytes": 299760,
+      "sha256": "b175f5a72af81c4ca80c3d781a0bccb2c7aac7e185ea83ebcfb5044d4d5b370a"
+    },
+    "traces/aged_fuse-updated-0/0/roots/022.json": {
+      "bytes": 299861,
+      "sha256": "f003496cf4819178592c9d85081caa07f40be6bab262e90ad9333ccc2c9b104d"
+    },
+    "traces/aged_fuse-updated-0/0/roots/023.json": {
+      "bytes": 248476,
+      "sha256": "3fd446f017e02818eb75aeee312dd6d5a43c751edf467e0d0007882e23e7fb8d"
+    },
+    "traces/aged_fuse-updated-0/1/events/000.json": {
+      "bytes": 300000,
+      "sha256": "9eafe1f105a1b8cad04ba061f02126ff9fa095e8843ad27fc6786af7589d11b5"
+    },
+    "traces/aged_fuse-updated-0/1/events/001.json": {
+      "bytes": 27294,
+      "sha256": "02042417761b78fb356061cd9351bb8fa8c1df94c587fe70412c8866b05c24f5"
+    },
+    "traces/aged_fuse-updated-0/1/roots/000.json": {
+      "bytes": 299839,
+      "sha256": "eb02addda9d480660d67617ae4a68332bbd882a33860d5b7220daa40fb49a622"
+    },
+    "traces/aged_fuse-updated-0/1/roots/001.json": {
+      "bytes": 299620,
+      "sha256": "7fbba09a79690576df8def64f4572d1db8bebaf2a5d21e4b65ef493f005a3b91"
+    },
+    "traces/aged_fuse-updated-0/1/roots/002.json": {
+      "bytes": 299951,
+      "sha256": "ec7b9ab1d3e2559de0e89ca281365cfe1f4d9fcd5561b8ee16e753b08e2439a2"
+    },
+    "traces/aged_fuse-updated-0/1/roots/003.json": {
+      "bytes": 299947,
+      "sha256": "4001eb669a19890148bf6d3c9bbee44f94838e87a92089293381d30261bd1f02"
+    },
+    "traces/aged_fuse-updated-0/1/roots/004.json": {
+      "bytes": 183496,
+      "sha256": "912061247efec7caaf78a72a1716b76b3cd14a6ea5443cb16d0747f0d9c12637"
+    },
+    "traces/aged_fuse-updated-0/index.json": {
+      "bytes": 2343,
+      "sha256": "80c68a322c3f16cbdccf6aaf85ba3befdab422622b9943ec3380cb2b597e381e"
+    },
+    "traces/aged_fuse-updated-1/0/events/000.json": {
+      "bytes": 299962,
+      "sha256": "88935f1707e524416c1ac986a65d22a33fbc2bbc4b2cd9d7f1e60a48e208c02c"
+    },
+    "traces/aged_fuse-updated-1/0/events/001.json": {
+      "bytes": 300000,
+      "sha256": "db7160e810d25d43094971a498c4eba5ac0eb88723bc9d46351007c9d80ff7e3"
+    },
+    "traces/aged_fuse-updated-1/0/events/002.json": {
+      "bytes": 19749,
+      "sha256": "2b33796ffe1d6147dc5f01b268250f2dbdfa3c8f34c8864c35b8ec17d0b1afef"
+    },
+    "traces/aged_fuse-updated-1/0/roots/000.json": {
+      "bytes": 299473,
+      "sha256": "f9fe7f00e14fef9b4ca97c8a7a835bca68c20b0880988fa055d8fdc8ec474a8c"
+    },
+    "traces/aged_fuse-updated-1/0/roots/001.json": {
+      "bytes": 299668,
+      "sha256": "cdda88bb8e599c54299e796897e65099d221cfafd21dbcd73caa7e2ed2d111d6"
+    },
+    "traces/aged_fuse-updated-1/0/roots/002.json": {
+      "bytes": 299630,
+      "sha256": "e6799cce37cd634866eb9d0603b67df873ea2c997e261b17e80d9c85c03b1e08"
+    },
+    "traces/aged_fuse-updated-1/0/roots/003.json": {
+      "bytes": 299556,
+      "sha256": "8b655a7130887a6899c9fae9470e963ffef117dadf5fb9318e771f3e60072d5d"
+    },
+    "traces/aged_fuse-updated-1/0/roots/004.json": {
+      "bytes": 299668,
+      "sha256": "b44b76f979dcb5816972edda327140c0ccace7ab65f3a68a75af7611304f09d7"
+    },
+    "traces/aged_fuse-updated-1/0/roots/005.json": {
+      "bytes": 299889,
+      "sha256": "88c262c467544c2e840cd6e7adaca2132d63616856e48caa05660c8614af54f1"
+    },
+    "traces/aged_fuse-updated-1/0/roots/006.json": {
+      "bytes": 299740,
+      "sha256": "9e761d96c1345ad1f08b41837151dd1579440d68f72b8443a0eefa08aa0c815e"
+    },
+    "traces/aged_fuse-updated-1/0/roots/007.json": {
+      "bytes": 299579,
+      "sha256": "16e583711d0b99b05796c65e52badf9abcfe6cd92951d4ceafda9cdfb7b95362"
+    },
+    "traces/aged_fuse-updated-1/0/roots/008.json": {
+      "bytes": 299582,
+      "sha256": "2e3d44c3c0401f5662939bb3d9ddf712a0f402a16f54026ab5b965dc3116b3f2"
+    },
+    "traces/aged_fuse-updated-1/0/roots/009.json": {
+      "bytes": 299955,
+      "sha256": "19dbc093697ff1a1f0d572b229a9e921b8a85e469947d33d9021903593b5d3d2"
+    },
+    "traces/aged_fuse-updated-1/0/roots/010.json": {
+      "bytes": 299597,
+      "sha256": "9e28c5394b64e71d1966192a051d33ab4be2b0222a26002490c8ee61dc50a183"
+    },
+    "traces/aged_fuse-updated-1/0/roots/011.json": {
+      "bytes": 299541,
+      "sha256": "3526cadc5d0d9ba1f2cd10205287276e8a4b39e672a39695bf66bf23356f073e"
+    },
+    "traces/aged_fuse-updated-1/0/roots/012.json": {
+      "bytes": 299710,
+      "sha256": "a703e944f26a0aa3d679684fc89599341a9f82a53cfa8d7be04707347c3bc2c5"
+    },
+    "traces/aged_fuse-updated-1/0/roots/013.json": {
+      "bytes": 299738,
+      "sha256": "4e7a35acff2718c73fd0edbd37d1375736600a56b0477e454953e0f06160032a"
+    },
+    "traces/aged_fuse-updated-1/0/roots/014.json": {
+      "bytes": 299688,
+      "sha256": "86d1870bd9ffdc9367f8a9115780c2fcc0e1da26794b129e9cf6f2704e39b186"
+    },
+    "traces/aged_fuse-updated-1/0/roots/015.json": {
+      "bytes": 299678,
+      "sha256": "8ca931217a00f2a40aaac12fd94f81e658aade7cdc1307ea1bb2fc52f82cb177"
+    },
+    "traces/aged_fuse-updated-1/0/roots/016.json": {
+      "bytes": 299682,
+      "sha256": "37c73e2d46dc1ec789d4cc3ece92ba712c3189bb229b60f3715cf991f34d3823"
+    },
+    "traces/aged_fuse-updated-1/0/roots/017.json": {
+      "bytes": 299805,
+      "sha256": "481dbb635cd7f1dc09e5e3883ad2167e6085e04a71a26d871baff1c52cf768dc"
+    },
+    "traces/aged_fuse-updated-1/0/roots/018.json": {
+      "bytes": 299816,
+      "sha256": "18d39366fe63eda43ce1c9d43e018c9741ae06334855c4a77f58f6ae7896650a"
+    },
+    "traces/aged_fuse-updated-1/0/roots/019.json": {
+      "bytes": 299971,
+      "sha256": "99f9119982aa92445d52992ccc01a82be9f223dbe750fcb12769c712b0849616"
+    },
+    "traces/aged_fuse-updated-1/0/roots/020.json": {
+      "bytes": 299614,
+      "sha256": "1a488564e9887dd58cdc41ea85d00c6aeb5af6e07390b10e01bf357edd7a57c0"
+    },
+    "traces/aged_fuse-updated-1/0/roots/021.json": {
+      "bytes": 299697,
+      "sha256": "a0c28c4f1cc0241e8ac31025c4d1053104191c038d5d95bb6ae4c2a0bf80ec68"
+    },
+    "traces/aged_fuse-updated-1/0/roots/022.json": {
+      "bytes": 299886,
+      "sha256": "b25d0d4b01389030211ecaaa46bcf1a20c43af0d72e60c754d0a3d156dc94c59"
+    },
+    "traces/aged_fuse-updated-1/0/roots/023.json": {
+      "bytes": 248641,
+      "sha256": "f12876e441d4e5bff84af6884624a9de7e8ea363700e393837c34042682f0494"
+    },
+    "traces/aged_fuse-updated-1/1/events/000.json": {
+      "bytes": 299970,
+      "sha256": "87fac47cce1fb6fe5852f08b8da20103a316708959bb4a346e00d8981d4c5a9d"
+    },
+    "traces/aged_fuse-updated-1/1/events/001.json": {
+      "bytes": 63840,
+      "sha256": "0255f02e54c300aa5d3dc3d3b0ed9fff001c3dd4bf0ac4832621640684ac4904"
+    },
+    "traces/aged_fuse-updated-1/1/roots/000.json": {
+      "bytes": 299795,
+      "sha256": "4b55ca5bc6db4889340425bfb0be4c0e8a2ad8e2dfa76ddcecd61705797a4243"
+    },
+    "traces/aged_fuse-updated-1/1/roots/001.json": {
+      "bytes": 299817,
+      "sha256": "6695de656ede1c0d42cf60a1d1244ea468e409d34f574c3acc4ee11ef827440f"
+    },
+    "traces/aged_fuse-updated-1/1/roots/002.json": {
+      "bytes": 299965,
+      "sha256": "5be5098fcfc167b5ae37381fbe3d3212817698f458bbe5b61472bfbba6fe655b"
+    },
+    "traces/aged_fuse-updated-1/1/roots/003.json": {
+      "bytes": 299666,
+      "sha256": "016348630442386c40aae3965e288101b3eb2239fecf338ab98771bc9340db52"
+    },
+    "traces/aged_fuse-updated-1/1/roots/004.json": {
+      "bytes": 299796,
+      "sha256": "7c2ea2a0119dfde80d1edaa8e532f88049c967271e88ea6955991ee051721efc"
+    },
+    "traces/aged_fuse-updated-1/1/roots/005.json": {
+      "bytes": 69163,
+      "sha256": "98a4a601e3aba97a3f2fe300776e4dc35f751b9c97aa92041623b62c5ba8a8f4"
+    },
+    "traces/aged_fuse-updated-1/index.json": {
+      "bytes": 2389,
+      "sha256": "9eb32dea784e6b2fbcb2d2bd689d0dd9de2e84a50863b77eff24f0bc8e03f782"
+    },
+    "traces/aged_fuse-updated-2/0/events/000.json": {
+      "bytes": 299921,
+      "sha256": "2398d3553e03cdf1cb302c40560556e04bede0de4c08fd9791d15063025728b2"
+    },
+    "traces/aged_fuse-updated-2/0/events/001.json": {
+      "bytes": 299924,
+      "sha256": "9d14a2c4979010c6f88657254672428e7441c5c9d67cc17006b031f890e00c3c"
+    },
+    "traces/aged_fuse-updated-2/0/events/002.json": {
+      "bytes": 19917,
+      "sha256": "e8613f5d9d2596e102b8b91aecda448315d079214c7df2e3bbdda21ef504a959"
+    },
+    "traces/aged_fuse-updated-2/0/roots/000.json": {
+      "bytes": 299714,
+      "sha256": "a453834b441821ab9b003991341cc394b7a6014bbc2d1d9b17c79a935f9b68ee"
+    },
+    "traces/aged_fuse-updated-2/0/roots/001.json": {
+      "bytes": 299648,
+      "sha256": "c8df9a96df929d7638e4c8adf0467c10af0f773204a598c49130edc40fcab4ce"
+    },
+    "traces/aged_fuse-updated-2/0/roots/002.json": {
+      "bytes": 299755,
+      "sha256": "c34df9029984a1a47f13c41372343c97bd57e68f811ac72c2a0f5b0bb7e615f1"
+    },
+    "traces/aged_fuse-updated-2/0/roots/003.json": {
+      "bytes": 299894,
+      "sha256": "72621ed380887761c9e73148b170831b080b014ecd034f1a1c87d446349a5d00"
+    },
+    "traces/aged_fuse-updated-2/0/roots/004.json": {
+      "bytes": 299843,
+      "sha256": "e44df4df833b27da98547c42ed34ba83723a0fb12bbb5a90e403939140d10744"
+    },
+    "traces/aged_fuse-updated-2/0/roots/005.json": {
+      "bytes": 299657,
+      "sha256": "bfcc716ed4790e9bd9b0774f48c1d80000a4f76d30eb5639d5281574a6716c80"
+    },
+    "traces/aged_fuse-updated-2/0/roots/006.json": {
+      "bytes": 299755,
+      "sha256": "9c5d28aabe86b6efc481f0cd8c912b0dc7c8272440a4a5871a6aa318874bebbe"
+    },
+    "traces/aged_fuse-updated-2/0/roots/007.json": {
+      "bytes": 299753,
+      "sha256": "20c93e6ba33ae5b949d010b7e02aa3c5253290420c43e8d86f516471a0e02bd4"
+    },
+    "traces/aged_fuse-updated-2/0/roots/008.json": {
+      "bytes": 299693,
+      "sha256": "af6d3f89d9aca52002aced489e595c28f6a04093dcbaa3215630fe31f208e96f"
+    },
+    "traces/aged_fuse-updated-2/0/roots/009.json": {
+      "bytes": 299554,
+      "sha256": "0b4d8dfc5aa4c1a1508e36709e3be06bbddb355c2fd8f9f99587e3e61d709d72"
+    },
+    "traces/aged_fuse-updated-2/0/roots/010.json": {
+      "bytes": 299861,
+      "sha256": "2fa80808e0bd2e525b5d9babeea2b1eb7014dad094839615769ff36452e95be6"
+    },
+    "traces/aged_fuse-updated-2/0/roots/011.json": {
+      "bytes": 299797,
+      "sha256": "0a0a110cc104f5d5108a954721bb52fb444d9b580b5cf862d2977d73715c950f"
+    },
+    "traces/aged_fuse-updated-2/0/roots/012.json": {
+      "bytes": 299773,
+      "sha256": "e1876b68b4ac5f88a387bf5ce89d7f37ab99843d184e5f5ad01e623cf5cd18ad"
+    },
+    "traces/aged_fuse-updated-2/0/roots/013.json": {
+      "bytes": 299674,
+      "sha256": "9ea353c254724d9cda05fe90bd6e2de1ad666acebc3cb5518bbf3d3f36773e16"
+    },
+    "traces/aged_fuse-updated-2/0/roots/014.json": {
+      "bytes": 299682,
+      "sha256": "628a9a15e3dd84253c68948f61d6e90f803d6d76a41ab848f6f443a567d2631a"
+    },
+    "traces/aged_fuse-updated-2/0/roots/015.json": {
+      "bytes": 299652,
+      "sha256": "9060137995880d1d8de09268642740e799f259241dff011f12674eaa764e8ba6"
+    },
+    "traces/aged_fuse-updated-2/0/roots/016.json": {
+      "bytes": 299876,
+      "sha256": "c8b423a0fbbbbd09d5415f01c1ae34844ff9369c565d92d02714f67301d64a42"
+    },
+    "traces/aged_fuse-updated-2/0/roots/017.json": {
+      "bytes": 299536,
+      "sha256": "6b73d534582c97d3ad295eccb24ba4632c31de7185a35114449e659a717eb538"
+    },
+    "traces/aged_fuse-updated-2/0/roots/018.json": {
+      "bytes": 299646,
+      "sha256": "ed46fea6b6052c9a3087f553dfa5274d0ce602cbf40cc2d4fb5699f2130b13d8"
+    },
+    "traces/aged_fuse-updated-2/0/roots/019.json": {
+      "bytes": 299572,
+      "sha256": "3b886304a4d8e87e236935bcc7da4c56f71ad30327742a6e23346dc05e073b81"
+    },
+    "traces/aged_fuse-updated-2/0/roots/020.json": {
+      "bytes": 299602,
+      "sha256": "442e7750b4f2d69599ae543e4547f60ea85fb508cec0feb1ee78a907820417f8"
+    },
+    "traces/aged_fuse-updated-2/0/roots/021.json": {
+      "bytes": 299557,
+      "sha256": "7ebd091d73ac162d1cc9c960774f17fb033f1c44edc58cdc26613336e127db42"
+    },
+    "traces/aged_fuse-updated-2/0/roots/022.json": {
+      "bytes": 299988,
+      "sha256": "425cb55ed3cbf5d5d117da8e1fadd4925e9feeec4be6bb787b76594497a01ec3"
+    },
+    "traces/aged_fuse-updated-2/0/roots/023.json": {
+      "bytes": 246035,
+      "sha256": "12d890df5890201627bc355bea12f9c5eedcd1830ae1210ff312557c176c9e1a"
+    },
+    "traces/aged_fuse-updated-2/1/events/000.json": {
+      "bytes": 299924,
+      "sha256": "12ab65a7e071cd6d871d3dd46a25b9b0f86b62133e9c1e7e4fe288d94071d4b1"
+    },
+    "traces/aged_fuse-updated-2/1/events/001.json": {
+      "bytes": 72709,
+      "sha256": "c8bef7fce366c9057295279bf1c4937d1fee5ed35cd44ab626e1b1a51feabb72"
+    },
+    "traces/aged_fuse-updated-2/1/roots/000.json": {
+      "bytes": 299636,
+      "sha256": "798fcf0a6f701f202082aef5385fe4da1bb244f9804f3966e77a927a77f23fc6"
+    },
+    "traces/aged_fuse-updated-2/1/roots/001.json": {
+      "bytes": 299981,
+      "sha256": "eb4ebee1755263c506a2a3f487f2c1fe7546eda1b0fbc4a17071e52edf55d769"
+    },
+    "traces/aged_fuse-updated-2/1/roots/002.json": {
+      "bytes": 299563,
+      "sha256": "38919184483f5596d43f8b21bcbbd5e10ce8a2dbcaf6704662608b1cd459fb99"
+    },
+    "traces/aged_fuse-updated-2/1/roots/003.json": {
+      "bytes": 299596,
+      "sha256": "8760b102c2edcc1a05a37551d0406681cfd3558049fbb6d4712ebfc92e9e9f02"
+    },
+    "traces/aged_fuse-updated-2/1/roots/004.json": {
+      "bytes": 299663,
+      "sha256": "d6cfe9d2e732c8e4b1635eb09434af029ae470256f40223eb2b8f38739358f5f"
+    },
+    "traces/aged_fuse-updated-2/1/roots/005.json": {
+      "bytes": 97839,
+      "sha256": "e0d7c11f90653c0cf04764245fb3a0e5a23056e969afaf4c8b5357a330ce1ad3"
+    },
+    "traces/aged_fuse-updated-2/index.json": {
+      "bytes": 2389,
+      "sha256": "253ca432b7e08f2a287d968d114ab68e6b5d186bb9d84c947de3f60076aed2b8"
+    },
+    "traces/aged_fuse-updated-3/0/events/000.json": {
+      "bytes": 299916,
+      "sha256": "75246fd527de3624fd6a8fae3453fde8fc961764bedbd1a3d8955e5aab899e0c"
+    },
+    "traces/aged_fuse-updated-3/0/events/001.json": {
+      "bytes": 299936,
+      "sha256": "d027fdb490994d1efc2b19defed8e7520ca52234278726163caa020e0c46c8f4"
+    },
+    "traces/aged_fuse-updated-3/0/events/002.json": {
+      "bytes": 20156,
+      "sha256": "22935527ac6bff1cba53473d25e437fc146d985736c4871b506af5c506f0c7ad"
+    },
+    "traces/aged_fuse-updated-3/0/roots/000.json": {
+      "bytes": 299499,
+      "sha256": "ee2fd416ba74b82c2619c59c3852739c10658f24c7add019ac1327c880cebcf5"
+    },
+    "traces/aged_fuse-updated-3/0/roots/001.json": {
+      "bytes": 299547,
+      "sha256": "03bd4acfae2d7272f0e07c8db911bc53f852b4d1384c6f016d6d34934989dac8"
+    },
+    "traces/aged_fuse-updated-3/0/roots/002.json": {
+      "bytes": 299653,
+      "sha256": "3facd622532c618b1a9e1ce797a8e90a89ebecc65d64e7e24bbc188418da9be5"
+    },
+    "traces/aged_fuse-updated-3/0/roots/003.json": {
+      "bytes": 299565,
+      "sha256": "3c148d30a1c9bff45c6c5feb4f6f42677fa5de2161c913344de5f8bb4208dee1"
+    },
+    "traces/aged_fuse-updated-3/0/roots/004.json": {
+      "bytes": 299731,
+      "sha256": "011036ff219f50a83ceea8f9440f765ad5620720d14bd743b0223637ce506d69"
+    },
+    "traces/aged_fuse-updated-3/0/roots/005.json": {
+      "bytes": 299735,
+      "sha256": "bfd0a4dd93aad4330eddb5aa6af594b657d7355e1a35f62bbf61acb185769e6a"
+    },
+    "traces/aged_fuse-updated-3/0/roots/006.json": {
+      "bytes": 299925,
+      "sha256": "37c89a5e6bd177e6e0dc8d615f1147ed691273ead91cd714cb94d15c50e73395"
+    },
+    "traces/aged_fuse-updated-3/0/roots/007.json": {
+      "bytes": 299978,
+      "sha256": "77d883481b0303ccf291e5ebdd729f4df177306497e0a256592940ce227c788c"
+    },
+    "traces/aged_fuse-updated-3/0/roots/008.json": {
+      "bytes": 299544,
+      "sha256": "40b3aa1452b3d97a9059fbe38939c37739630826dbb577a50a9a8b0759d34db0"
+    },
+    "traces/aged_fuse-updated-3/0/roots/009.json": {
+      "bytes": 299486,
+      "sha256": "d253b84da6b7b2d21cd3408df6ac02c80be88245ee1db9549b6182681e3f8d71"
+    },
+    "traces/aged_fuse-updated-3/0/roots/010.json": {
+      "bytes": 299625,
+      "sha256": "10dc793ed9d712aa2f7d9a345f5dafcbcc4adbfd6c34311afd0d658819472b94"
+    },
+    "traces/aged_fuse-updated-3/0/roots/011.json": {
+      "bytes": 299828,
+      "sha256": "487a2fd7883611a00edf7bb8936bee292a0ff72eaba9a221356c1a40a0ed69cf"
+    },
+    "traces/aged_fuse-updated-3/0/roots/012.json": {
+      "bytes": 299866,
+      "sha256": "25b9893719b4342a057ebed222fcd0c844ed95040f5898bfbe4a0e3374de6b49"
+    },
+    "traces/aged_fuse-updated-3/0/roots/013.json": {
+      "bytes": 299719,
+      "sha256": "b6cc0747bea7bf3079d04a70c327962ea2ac76ee7958e1d5cf9574a39c37709a"
+    },
+    "traces/aged_fuse-updated-3/0/roots/014.json": {
+      "bytes": 299769,
+      "sha256": "28c2b3a094f29b477f4efb76db8614062c1695cb74219fcca74f16b02f61ba09"
+    },
+    "traces/aged_fuse-updated-3/0/roots/015.json": {
+      "bytes": 299659,
+      "sha256": "1e5b67002c8d404bf0fee92064575412a28677e2fd359f9a5c5285f63d0b9ebb"
+    },
+    "traces/aged_fuse-updated-3/0/roots/016.json": {
+      "bytes": 299735,
+      "sha256": "63e4360f00061675a49ad2a16a8a4add0b5e9d44d1677d6b281adf7ea1954e08"
+    },
+    "traces/aged_fuse-updated-3/0/roots/017.json": {
+      "bytes": 299929,
+      "sha256": "0ec2dbbe753c22629383cd16eb84dee43a0dce55aa3a0a5f60deb1eeb3f171ac"
+    },
+    "traces/aged_fuse-updated-3/0/roots/018.json": {
+      "bytes": 299706,
+      "sha256": "4475870c201bb4755847822b69119869d5b7b7e9ef4e223c21eefaea37410d9a"
+    },
+    "traces/aged_fuse-updated-3/0/roots/019.json": {
+      "bytes": 299500,
+      "sha256": "cdfba5dcdbe390ef6d7fdf59fb873c394bc284338dfbc49f885e83e00bde24bb"
+    },
+    "traces/aged_fuse-updated-3/0/roots/020.json": {
+      "bytes": 299962,
+      "sha256": "5aa63ee2913156070230585746e26fc5ba5425852f5cc74cffd88789c18b9882"
+    },
+    "traces/aged_fuse-updated-3/0/roots/021.json": {
+      "bytes": 299917,
+      "sha256": "4f5272bc4573bab2542be3fdaf574c4fb56f2c2e18175887b7d103a35edb12e0"
+    },
+    "traces/aged_fuse-updated-3/0/roots/022.json": {
+      "bytes": 299669,
+      "sha256": "6f554518f666b5e36e7580a473d65ab286b9509831df4a9fd3523e4e79c75f5e"
+    },
+    "traces/aged_fuse-updated-3/0/roots/023.json": {
+      "bytes": 254525,
+      "sha256": "e4d083494f9f6f08546b463bad390dec3ef70fb0b877ea74711e941eda4cf73b"
+    },
+    "traces/aged_fuse-updated-3/1/events/000.json": {
+      "bytes": 299949,
+      "sha256": "ca9b53bd9d9971960ee2a89dd47049af1f24dbfb723cede8c8ab92c9f6740d63"
+    },
+    "traces/aged_fuse-updated-3/1/events/001.json": {
+      "bytes": 74107,
+      "sha256": "a590e54bdd81783d735cf884713dc84aee9dfddae22cb4119ad3b534a3fba811"
+    },
+    "traces/aged_fuse-updated-3/1/roots/000.json": {
+      "bytes": 299669,
+      "sha256": "fefa56b32642ce97a83c9f55211f48b5a36236330c13c788c1309d3c8f85cc07"
+    },
+    "traces/aged_fuse-updated-3/1/roots/001.json": {
+      "bytes": 299698,
+      "sha256": "28488d3553dfddc8e2df21d4b0887929405e93b99b6c42243168ec65e0d57150"
+    },
+    "traces/aged_fuse-updated-3/1/roots/002.json": {
+      "bytes": 299576,
+      "sha256": "06e4b9d437352e33fd22536558e874308ca0b0a9d7c2865e703d697e6d5b8f50"
+    },
+    "traces/aged_fuse-updated-3/1/roots/003.json": {
+      "bytes": 299781,
+      "sha256": "53eab6b282f632359e51b4d2dea85a8c4f8f668c860d3c66b760e2d9b8457052"
+    },
+    "traces/aged_fuse-updated-3/1/roots/004.json": {
+      "bytes": 299703,
+      "sha256": "2de2eac5052154bbb481891fa02da8125b5ab2cb1bbb916ba8de39127108f33a"
+    },
+    "traces/aged_fuse-updated-3/1/roots/005.json": {
+      "bytes": 102530,
+      "sha256": "9544211aa0e47b8529a92985c06b6c99695f71f9dd8d150d31b7c93cb0470eb9"
+    },
+    "traces/aged_fuse-updated-3/index.json": {
+      "bytes": 2389,
+      "sha256": "74f2c8fdc5f6dabe83b0037ffed35a67d00aa20775b6fd277b0aa6b4b6809ac2"
+    },
+    "traces/fuse-baseline-0/0/events/000.json": {
+      "bytes": 243116,
+      "sha256": "32cf021886f0db3bfa10c08d979171ffd419a3ca146e6822221f85749a72adb3"
+    },
+    "traces/fuse-baseline-0/0/roots/000.json": {
+      "bytes": 299827,
+      "sha256": "4c53bceb8a8ff475ffb60c5beaea0d08e20bae816a2feae23f2d27f14bcd3897"
+    },
+    "traces/fuse-baseline-0/0/roots/001.json": {
+      "bytes": 299889,
+      "sha256": "5a204ab5343a77ce05b9225b9a87764dfa0aa6ef58c7b409c90b883a176ecac5"
+    },
+    "traces/fuse-baseline-0/0/roots/002.json": {
+      "bytes": 299769,
+      "sha256": "5c8f5b41ddc40e7fb151d9727afbd5d06fb0c0de4938344d027229523099f5f0"
+    },
+    "traces/fuse-baseline-0/0/roots/003.json": {
+      "bytes": 299919,
+      "sha256": "6421ee147a6b03545dc4bb1a12b0c7cb0d11a2abb6f68e3cb610467c54139db8"
+    },
+    "traces/fuse-baseline-0/0/roots/004.json": {
+      "bytes": 299597,
+      "sha256": "fe52e45680f443c6929851f1ddcf7f9c0806e054ed17ec7d36fcca8d46145ed7"
+    },
+    "traces/fuse-baseline-0/0/roots/005.json": {
+      "bytes": 299550,
+      "sha256": "591507570bd7bf7683dff59fac431fe47eaab59b170b44322e281785a6569774"
+    },
+    "traces/fuse-baseline-0/0/roots/006.json": {
+      "bytes": 299644,
+      "sha256": "5c68b8c4033065e9c1693a4a90b89dfc725aa986522769767fa0f17957ef3f3c"
+    },
+    "traces/fuse-baseline-0/0/roots/007.json": {
+      "bytes": 299597,
+      "sha256": "11c13af32219654b39a57ac91317d5da562be19a373c3d7319eb8b0b40f54396"
+    },
+    "traces/fuse-baseline-0/0/roots/008.json": {
+      "bytes": 299630,
+      "sha256": "851782909fcadc2cc44329e87f8b5f89da662647ba4315b654b4f443c56a32a2"
+    },
+    "traces/fuse-baseline-0/0/roots/009.json": {
+      "bytes": 299502,
+      "sha256": "a32733955b0d99d913b69dcd11e5757a66f2e14f7001b872da58c7a70e1339f4"
+    },
+    "traces/fuse-baseline-0/0/roots/010.json": {
+      "bytes": 299793,
+      "sha256": "3472c5b8844f08144c1a501f3feaff8069956f92b725b736ca4fbf01cdd98e19"
+    },
+    "traces/fuse-baseline-0/0/roots/011.json": {
+      "bytes": 299927,
+      "sha256": "a4483cc6f1baf8f44f365b4214cb757c3c4e04bdd03bd8b1e60c8a9c8eae0406"
+    },
+    "traces/fuse-baseline-0/0/roots/012.json": {
+      "bytes": 299661,
+      "sha256": "3741fde1c05b0fa03138537c05e598fbed7870e7705de8c536ced0b753083652"
+    },
+    "traces/fuse-baseline-0/0/roots/013.json": {
+      "bytes": 299560,
+      "sha256": "968f379e4c4f6072a060ff06aae23aac61e2cd3dc6f7c3ab29bb3fab71c56363"
+    },
+    "traces/fuse-baseline-0/0/roots/014.json": {
+      "bytes": 299805,
+      "sha256": "82d5de9ca1ee6cd5b6716fbd8dd960cafcc0a6606e592d8a91b0c35704bbe07c"
+    },
+    "traces/fuse-baseline-0/0/roots/015.json": {
+      "bytes": 288556,
+      "sha256": "46752b5dc3bbf1f492664de8621cbc4329cd3a7330d8bccedcad0da8c4fcc2b6"
+    },
+    "traces/fuse-baseline-0/1/events/000.json": {
+      "bytes": 179762,
+      "sha256": "1e4974041fb0d24081402261d26c8dd36b9e7d66541654e469b92808f238d329"
+    },
+    "traces/fuse-baseline-0/1/roots/000.json": {
+      "bytes": 299768,
+      "sha256": "d4fcf6cbd0f83f3abcf9a4273b526905278e3995fd8eeb6c4b144876afb942bc"
+    },
+    "traces/fuse-baseline-0/1/roots/001.json": {
+      "bytes": 299926,
+      "sha256": "79fd66c1fb11b15dc16d2d1f6cd7666cba55d3023f3471ea3038ec8acb03717c"
+    },
+    "traces/fuse-baseline-0/1/roots/002.json": {
+      "bytes": 138339,
+      "sha256": "ebd49825c5c113b7e3238488ed315aacba09a084f61f2b74fe6f5c81cc38777d"
+    },
+    "traces/fuse-baseline-0/index.json": {
+      "bytes": 1658,
+      "sha256": "1527ff3ebc294623e25f7aa5e45148729c57e7a76b5ae352cf43968d3bba76c5"
+    },
+    "traces/fuse-baseline-1/0/events/000.json": {
+      "bytes": 242978,
+      "sha256": "cf495a7f7cbf69d5c576ce70a85bb008a25afacaa16c42c8a216fad8d35e94e1"
+    },
+    "traces/fuse-baseline-1/0/roots/000.json": {
+      "bytes": 299745,
+      "sha256": "cb0c7c94f8b9323bd70a1f0b59ec42c84179baada485ec0ab7d1cad3f33bb960"
+    },
+    "traces/fuse-baseline-1/0/roots/001.json": {
+      "bytes": 299649,
+      "sha256": "dc42d9971570960f3443ef8170e8e3ade8fc32fd81bf271ea2bf0591c2c4b14c"
+    },
+    "traces/fuse-baseline-1/0/roots/002.json": {
+      "bytes": 299911,
+      "sha256": "d06b15b1821b2e9d8a0f3dc85810c6ad91cc3a8b941dccf525fe6f52a80710d9"
+    },
+    "traces/fuse-baseline-1/0/roots/003.json": {
+      "bytes": 299621,
+      "sha256": "9ce806990bde254d9d9227da94121b400abe5b6f28cb73e0b5ca8962b817bf42"
+    },
+    "traces/fuse-baseline-1/0/roots/004.json": {
+      "bytes": 299589,
+      "sha256": "596961073335f55f3647aa0016094d780f52702f7b4697c01fe9cd093deab602"
+    },
+    "traces/fuse-baseline-1/0/roots/005.json": {
+      "bytes": 299548,
+      "sha256": "aa021dea415e05358ee315767eb36634d069f5056e91db39c1c2f5da5d65d92f"
+    },
+    "traces/fuse-baseline-1/0/roots/006.json": {
+      "bytes": 299596,
+      "sha256": "525c58ae2ee691596de7208003991457d9973f4553f645657b4e898f13718a0a"
+    },
+    "traces/fuse-baseline-1/0/roots/007.json": {
+      "bytes": 299558,
+      "sha256": "65cc2fe4e309b63273338708b6359c418067744280e525140c0961f52d33b282"
+    },
+    "traces/fuse-baseline-1/0/roots/008.json": {
+      "bytes": 299974,
+      "sha256": "81766efaf8109d3fe6a88333fcb1af87d8168c89621636a63b30afa77675356d"
+    },
+    "traces/fuse-baseline-1/0/roots/009.json": {
+      "bytes": 299626,
+      "sha256": "bc3e9e4cbd6b92cbdbe4e3342429606fd68fbf99117458b333e41a8fe3d0b1f8"
+    },
+    "traces/fuse-baseline-1/0/roots/010.json": {
+      "bytes": 299935,
+      "sha256": "c5054855fed0662df0100220d523ce41e344b168b10d9bda10ef71f345ee8037"
+    },
+    "traces/fuse-baseline-1/0/roots/011.json": {
+      "bytes": 299701,
+      "sha256": "908fda571dd1b55c712f11d803b2e56ae101ce06cd232ec7895855a90e6b8d4c"
+    },
+    "traces/fuse-baseline-1/0/roots/012.json": {
+      "bytes": 299855,
+      "sha256": "72663c960b3a0cde4cc3fa18c32e4b80119d73dd188332fca1814a556f1109d5"
+    },
+    "traces/fuse-baseline-1/0/roots/013.json": {
+      "bytes": 299870,
+      "sha256": "a702181ad80d96fbbe00aa3434f24356dc61265e4928c9ed41cf2c3eee3f9287"
+    },
+    "traces/fuse-baseline-1/0/roots/014.json": {
+      "bytes": 299930,
+      "sha256": "a9ad6e4670b35e7d8c66d2f53d5af122aca1ac258144cf7bd6c6fd423d873dd0"
+    },
+    "traces/fuse-baseline-1/0/roots/015.json": {
+      "bytes": 282500,
+      "sha256": "d4409c6d1e41fbc86d9de4535690bcb632a267bdca6ff56001b76c5c74041a24"
+    },
+    "traces/fuse-baseline-1/1/events/000.json": {
+      "bytes": 176937,
+      "sha256": "aab87976a3e6a4c9e3414120c6e31d62bf1e137a59560d44665a31a4b3453cde"
+    },
+    "traces/fuse-baseline-1/1/roots/000.json": {
+      "bytes": 299848,
+      "sha256": "b02175b4fefac60f01304dfdfe070e39ad091e78c535475a17523cca1056ae34"
+    },
+    "traces/fuse-baseline-1/1/roots/001.json": {
+      "bytes": 299699,
+      "sha256": "6df80a28e2c6fd5a9136fcaa7a836b91d22eb8ba2eb74a743ae8d8ec7cbb1531"
+    },
+    "traces/fuse-baseline-1/1/roots/002.json": {
+      "bytes": 145633,
+      "sha256": "3920867531096857d8da73494ccd994c5e5c03f10cd360fc5fc7ce8c01e15df3"
+    },
+    "traces/fuse-baseline-1/index.json": {
+      "bytes": 1658,
+      "sha256": "68a227cc24a25e82906ac845e545ddf5f5429367b3208015a579fe3dd5093f66"
+    },
+    "traces/fuse-baseline-2/0/events/000.json": {
+      "bytes": 243114,
+      "sha256": "4a8c657021316e3bc2cc6e9da8ad34f79ae43cfd6010118293f00f9d3a2100c0"
+    },
+    "traces/fuse-baseline-2/0/roots/000.json": {
+      "bytes": 299737,
+      "sha256": "af7718b845b9064f1d439a75c5d642ef23828cbff9e6747731390c486ceeadac"
+    },
+    "traces/fuse-baseline-2/0/roots/001.json": {
+      "bytes": 299622,
+      "sha256": "14d00e1b03894a0d437d19c943f74becdc66822b883e4254efb3ec6361087ce1"
+    },
+    "traces/fuse-baseline-2/0/roots/002.json": {
+      "bytes": 299828,
+      "sha256": "2f14451d5a3dac338bc1b3262eb6c94999980d30ecea9676249fc80d9c81e254"
+    },
+    "traces/fuse-baseline-2/0/roots/003.json": {
+      "bytes": 299671,
+      "sha256": "67b19862e3f86486a5ed972ac4462c876d60f5dea7cdc983e46af745aa1dce33"
+    },
+    "traces/fuse-baseline-2/0/roots/004.json": {
+      "bytes": 299557,
+      "sha256": "a2f2b081c485e45d2f61bb8c8da7d7ed8429654afd12a3a4ddc5e14e7541d4bc"
+    },
+    "traces/fuse-baseline-2/0/roots/005.json": {
+      "bytes": 299564,
+      "sha256": "ccd0478e01c595df3b69f776c143f94bf717c5725a359af2e5593ff1d99fd7a9"
+    },
+    "traces/fuse-baseline-2/0/roots/006.json": {
+      "bytes": 299764,
+      "sha256": "adb093b54c7f0c0427f403019cbf9f2ce2d8006a70ebff077dae0c27c054fb14"
+    },
+    "traces/fuse-baseline-2/0/roots/007.json": {
+      "bytes": 299570,
+      "sha256": "644244e095e9252117a4fe6e5aea93ea7db92309c1ddd7dddf26e27c1af165ed"
+    },
+    "traces/fuse-baseline-2/0/roots/008.json": {
+      "bytes": 299605,
+      "sha256": "d97cd91d89600ac5b1b6f7890a72f843c8ba42bec35f35acc1086bfccd93bcf5"
+    },
+    "traces/fuse-baseline-2/0/roots/009.json": {
+      "bytes": 299689,
+      "sha256": "97bba5c7c8f3012e20970f4f1b25e95aec049a5362892a1862c231f04a6d747c"
+    },
+    "traces/fuse-baseline-2/0/roots/010.json": {
+      "bytes": 299996,
+      "sha256": "d53069e5a93e53d42d0cf9b35eafc3cba139a5a7001144ca81cd6f2333f3a6ec"
+    },
+    "traces/fuse-baseline-2/0/roots/011.json": {
+      "bytes": 299804,
+      "sha256": "60d658037f28de03452ec421f8a9606f5deff323cce6bde13d0a3923484bc84a"
+    },
+    "traces/fuse-baseline-2/0/roots/012.json": {
+      "bytes": 299746,
+      "sha256": "3000afcafe852cf5cd930a7219bc09c9c18a8ce4c428dc660d6453437b87a9bb"
+    },
+    "traces/fuse-baseline-2/0/roots/013.json": {
+      "bytes": 299670,
+      "sha256": "79efaa779e84c92164ffaa6146db2f46fd99399adc7d686a4e40337d200a3f79"
+    },
+    "traces/fuse-baseline-2/0/roots/014.json": {
+      "bytes": 299567,
+      "sha256": "0bac5ac34c867611165427bdab6d6d9151c00d40dd68e1f3de4aa0becd33896f"
+    },
+    "traces/fuse-baseline-2/0/roots/015.json": {
+      "bytes": 283009,
+      "sha256": "7517715d5226b51a848e7c999c58905f73531f513209cb1a690f52d23edcffde"
+    },
+    "traces/fuse-baseline-2/1/events/000.json": {
+      "bytes": 172224,
+      "sha256": "ef2d67d0ba68a79f96788921502f3ba6829e977a1332dafc51c9d9bb4e30351f"
+    },
+    "traces/fuse-baseline-2/1/roots/000.json": {
+      "bytes": 299708,
+      "sha256": "9df5bbe4126316e82889ccbac9c0d0872de9608fca82426a59f9eb7b4544c0ac"
+    },
+    "traces/fuse-baseline-2/1/roots/001.json": {
+      "bytes": 299626,
+      "sha256": "916f25a1d2c15f38830ebd09058a1811e1f97a9b4ea0cd1ced361994fb631af9"
+    },
+    "traces/fuse-baseline-2/1/roots/002.json": {
+      "bytes": 102113,
+      "sha256": "cca308a5e82498c2409f315f47b2bd5f962670f5ec06ccceac371045e65b94fd"
+    },
+    "traces/fuse-baseline-2/index.json": {
+      "bytes": 1658,
+      "sha256": "1d5ca4208330f8fb004738bbb084271a42071be27e0df2ac6fc6a117873690d5"
+    },
+    "traces/fuse-baseline-3/0/events/000.json": {
+      "bytes": 242947,
+      "sha256": "c70d87b132e2b2ecd030058b8ab554c9464690a2b6bb2f70f8993269d720ad4d"
+    },
+    "traces/fuse-baseline-3/0/roots/000.json": {
+      "bytes": 299925,
+      "sha256": "0f29b2d9907b4d8c264dc23185c24fb4a448a3fe87eec119bef86e285d786145"
+    },
+    "traces/fuse-baseline-3/0/roots/001.json": {
+      "bytes": 299782,
+      "sha256": "4e33c92f493459b768be72840942695c69aadd6ee008e8009f51d1d090cf2b59"
+    },
+    "traces/fuse-baseline-3/0/roots/002.json": {
+      "bytes": 299542,
+      "sha256": "8f95becff29d8580fab30e68529b0ab65dd80a24b08b6af6a8612d2aebc4a2bf"
+    },
+    "traces/fuse-baseline-3/0/roots/003.json": {
+      "bytes": 299748,
+      "sha256": "64fd59ba7f23c8342aeb606232476a14eb240769dead9a90821b5fb4bc9b51be"
+    },
+    "traces/fuse-baseline-3/0/roots/004.json": {
+      "bytes": 299995,
+      "sha256": "ae6a2fdb5cefa38318c964b5ff5db00c1d0fadfdf5ac85ff7008ea8a0b023265"
+    },
+    "traces/fuse-baseline-3/0/roots/005.json": {
+      "bytes": 299989,
+      "sha256": "9a1ef594c7ab9d4c3abf93501e4c26d929c18c3cd735fcc6d88cc8df535fbe4e"
+    },
+    "traces/fuse-baseline-3/0/roots/006.json": {
+      "bytes": 299616,
+      "sha256": "cd97d924eef2e8def4f2c9549a88f6355f5ff7091c2385ff176ae83d6508a3f0"
+    },
+    "traces/fuse-baseline-3/0/roots/007.json": {
+      "bytes": 299573,
+      "sha256": "92e5bb4f4bed711c63635e5a298636ef4b43fdf3a3d1792936a80563b38b4b14"
+    },
+    "traces/fuse-baseline-3/0/roots/008.json": {
+      "bytes": 299934,
+      "sha256": "73fc64190cb528b631ccc4c7969224bd5ddefbbf75ec7ec2cd8925fafcb1a550"
+    },
+    "traces/fuse-baseline-3/0/roots/009.json": {
+      "bytes": 299460,
+      "sha256": "9020e0b71d55bd892a4486528d7d6181a4970a3aa1a52f8ffd9dcd7cc976d4f7"
+    },
+    "traces/fuse-baseline-3/0/roots/010.json": {
+      "bytes": 299819,
+      "sha256": "4a947e9ffcfdcc755ee756a276e193c721a7403cd60c96d259882693fb1eb826"
+    },
+    "traces/fuse-baseline-3/0/roots/011.json": {
+      "bytes": 299452,
+      "sha256": "961c3b30b716a89327de5a4cc27f1ec6b080f1d9b0bc0e3c27e77940fd7e42b2"
+    },
+    "traces/fuse-baseline-3/0/roots/012.json": {
+      "bytes": 299859,
+      "sha256": "e5391b56ae96910d54ac133809e8e1da14be056a61485ac253752108c6641a6d"
+    },
+    "traces/fuse-baseline-3/0/roots/013.json": {
+      "bytes": 299805,
+      "sha256": "9a4e4dcfa69779975fc814b54a99a3b28720c1f7a9c2688e6bf3fd56275a54db"
+    },
+    "traces/fuse-baseline-3/0/roots/014.json": {
+      "bytes": 299708,
+      "sha256": "326f82cafcdb7d76819297a6dd0a8e89e5038520ce6c044edc6c0cea539fa11f"
+    },
+    "traces/fuse-baseline-3/0/roots/015.json": {
+      "bytes": 284267,
+      "sha256": "6f3ece3943dbae2d4d412efd74634fdc1a389b80c82f8ebf847c1a3b3b7b27e4"
+    },
+    "traces/fuse-baseline-3/1/events/000.json": {
+      "bytes": 170892,
+      "sha256": "b6406c4d5ece98d33e24a2a2a53ce57dd6371e74c7d1780588222da542029de5"
+    },
+    "traces/fuse-baseline-3/1/roots/000.json": {
+      "bytes": 299822,
+      "sha256": "b1801935998fbd280eb73b6464001463680fc6a6dfef235612f39a3716686d8d"
+    },
+    "traces/fuse-baseline-3/1/roots/001.json": {
+      "bytes": 299595,
+      "sha256": "56404487b7ffaaa3a9ed8fe1c2c505d97f7ebf49f0c0f77d3e5b9d0129b1a7b5"
+    },
+    "traces/fuse-baseline-3/1/roots/002.json": {
+      "bytes": 106860,
+      "sha256": "07b087ea58e5d948e3e9d3b359c6140f1eeb833ef5440759fe1dfbc380cec35c"
+    },
+    "traces/fuse-baseline-3/index.json": {
+      "bytes": 1658,
+      "sha256": "29a170b3e4483d65b40490d5628f722f26451e5ed3697159b7a1de00de7a6bdd"
+    },
+    "traces/fuse-updated-0/0/events/000.json": {
+      "bytes": 240922,
+      "sha256": "d4a328d82db5571bd15bbdc223491eb0fbb02637525cdfde765ca30f9cabce44"
+    },
+    "traces/fuse-updated-0/0/roots/000.json": {
+      "bytes": 299984,
+      "sha256": "4cb38a24f8af3e695cb0b15659bce46805875512e46d99dae891acfcc086ea4a"
+    },
+    "traces/fuse-updated-0/0/roots/001.json": {
+      "bytes": 299972,
+      "sha256": "3e226421d6456f8787a5b9b53bb5f8298c3ec7a6dcf1148745bce24a89894b93"
+    },
+    "traces/fuse-updated-0/0/roots/002.json": {
+      "bytes": 299834,
+      "sha256": "e316398784ee3d10a85d7599eca59e55d5800567578380a6ac199578ace31e9a"
+    },
+    "traces/fuse-updated-0/0/roots/003.json": {
+      "bytes": 299694,
+      "sha256": "7404cd009b0ee5183b5c4dd6c6e010be53682135daf4799586116f91d2778a99"
+    },
+    "traces/fuse-updated-0/0/roots/004.json": {
+      "bytes": 299615,
+      "sha256": "bce3652fd2ab95787335d1670b266e489190e5cc2cc320b5c929867642571cd1"
+    },
+    "traces/fuse-updated-0/0/roots/005.json": {
+      "bytes": 299709,
+      "sha256": "7858b8154c91dee70d34929d6e24a9c930f6a7d3f557d7dcbd2a92e24194ed56"
+    },
+    "traces/fuse-updated-0/0/roots/006.json": {
+      "bytes": 299758,
+      "sha256": "6ba0dfbe385cf0d93f1f47794cd909a78ae026535979374927e8233a91f9071c"
+    },
+    "traces/fuse-updated-0/0/roots/007.json": {
+      "bytes": 299677,
+      "sha256": "d702608d486b501d343ac8b31b0a24cb1f721d208afa7a8dd9bf5fb191724809"
+    },
+    "traces/fuse-updated-0/0/roots/008.json": {
+      "bytes": 299720,
+      "sha256": "7a37b4b43282682a1ce1b7d25c9852e181463c9b3c73f4008a077af3b815f884"
+    },
+    "traces/fuse-updated-0/0/roots/009.json": {
+      "bytes": 299852,
+      "sha256": "e86b0756e7586bcee0c74f7011a286a0506963a6395f273e253a0224cc2d7bd9"
+    },
+    "traces/fuse-updated-0/0/roots/010.json": {
+      "bytes": 299804,
+      "sha256": "2ef9c4e0a4ebb4fb7fdcda556a10156a182b101f941adfbcbb113cae8de3022d"
+    },
+    "traces/fuse-updated-0/0/roots/011.json": {
+      "bytes": 299551,
+      "sha256": "fc36ba335a3febbceaeb7bec5dc3a158a8815902046c379d25c04b97156db250"
+    },
+    "traces/fuse-updated-0/0/roots/012.json": {
+      "bytes": 299787,
+      "sha256": "d67f7a3b6a0e0e66469748b950a0054cd621ef3ee299c4aca93b1654e0ad11dc"
+    },
+    "traces/fuse-updated-0/0/roots/013.json": {
+      "bytes": 299915,
+      "sha256": "2e19200cd4c367bd2679fee7635b9791c7005be7e36708b852226e5ff890e4b9"
+    },
+    "traces/fuse-updated-0/0/roots/014.json": {
+      "bytes": 299673,
+      "sha256": "0cb3d4b5e6d90598fd07371a7fb19e94b5567e2ea0756a71cff79eaff8e20768"
+    },
+    "traces/fuse-updated-0/0/roots/015.json": {
+      "bytes": 273707,
+      "sha256": "7bf0a366269d50e743adf1267884d16ed9f9647404f96671674a50490a0407d2"
+    },
+    "traces/fuse-updated-0/1/events/000.json": {
+      "bytes": 117403,
+      "sha256": "f888c3ce3858acfd570df408df598f560a88ee812c4e3a779886c79cd5c9d6ab"
+    },
+    "traces/fuse-updated-0/1/roots/000.json": {
+      "bytes": 299902,
+      "sha256": "071a5cf4ebeacb8ca40d1cc3cdc69b0cb5724710ac371886a638cf06765dc1ba"
+    },
+    "traces/fuse-updated-0/1/roots/001.json": {
+      "bytes": 141616,
+      "sha256": "41e64c1ace327c2b320e8bb6945988c3c8750d33410d2cf474d722d5e79eb0bb"
+    },
+    "traces/fuse-updated-0/index.json": {
+      "bytes": 1596,
+      "sha256": "5ef72f6e21512fc18454b46bcae380cc34d52b8710d66257a80926634d22fcc7"
+    },
+    "traces/fuse-updated-1/0/events/000.json": {
+      "bytes": 240607,
+      "sha256": "d608767b03f18c1a11e852d65832a67f1d79489e0c0ace75d1e3be4cfbf445c0"
+    },
+    "traces/fuse-updated-1/0/roots/000.json": {
+      "bytes": 299706,
+      "sha256": "4108bf46f53f3bc771efedbc743a568ec9b043a1bbd43214ea38cfae1bc7928e"
+    },
+    "traces/fuse-updated-1/0/roots/001.json": {
+      "bytes": 299923,
+      "sha256": "ffc37bd87ad72236161843bff1590f216e465bc9143f45e681b4aa89b6cfe3b9"
+    },
+    "traces/fuse-updated-1/0/roots/002.json": {
+      "bytes": 299972,
+      "sha256": "dbb5462ece5c16c504536109a2ee56b7879323a370d01512b50ce6fb86f866b6"
+    },
+    "traces/fuse-updated-1/0/roots/003.json": {
+      "bytes": 299762,
+      "sha256": "894923bdd1947c594487fdd71560476b315df0f4a80651c7b52c144e19e459a0"
+    },
+    "traces/fuse-updated-1/0/roots/004.json": {
+      "bytes": 299619,
+      "sha256": "5b3f826491207d719c687fc486f6c025bf608a088f2caaf0d4f73bd6fcab3fba"
+    },
+    "traces/fuse-updated-1/0/roots/005.json": {
+      "bytes": 299643,
+      "sha256": "22f1441adc9029dba0086f2eee920dcc5b176d33368b19161a8bcfd2cb2270bf"
+    },
+    "traces/fuse-updated-1/0/roots/006.json": {
+      "bytes": 299717,
+      "sha256": "72483caa924fd22ceb71b677ead26e49ce26a3a0e7ee3f5a580e0c365b7fc7ed"
+    },
+    "traces/fuse-updated-1/0/roots/007.json": {
+      "bytes": 299664,
+      "sha256": "2961962b09ebc70f9f348502ffae7aaca85b6847accb0bd6c47c5a6d1a0d9045"
+    },
+    "traces/fuse-updated-1/0/roots/008.json": {
+      "bytes": 299678,
+      "sha256": "92b40e3c9eb2cc7f7c65a60a5bfde1d61f3d3775fa17263e4a4613c8d66f7c39"
+    },
+    "traces/fuse-updated-1/0/roots/009.json": {
+      "bytes": 299613,
+      "sha256": "a5b617266b547b43ac0251e143ec61bc20ed657874c37832a018455be9a95462"
+    },
+    "traces/fuse-updated-1/0/roots/010.json": {
+      "bytes": 299992,
+      "sha256": "fc62ea8872c06a75cf72048759e9c68a390b8565586b6e8e24434ef103806d85"
+    },
+    "traces/fuse-updated-1/0/roots/011.json": {
+      "bytes": 299708,
+      "sha256": "97f473a18970fad19388a59ab4bce153397d65a83204e606526fc41de6c1267a"
+    },
+    "traces/fuse-updated-1/0/roots/012.json": {
+      "bytes": 299720,
+      "sha256": "d02f7fd43bbfc1d0a4feada162a03662f09cad17705d2f330f06407ebd526cc9"
+    },
+    "traces/fuse-updated-1/0/roots/013.json": {
+      "bytes": 299772,
+      "sha256": "498b45d4bd4b6bfc62d0dd265fc4f6df2a131242b478d4c0e10a5275c96fa566"
+    },
+    "traces/fuse-updated-1/0/roots/014.json": {
+      "bytes": 299821,
+      "sha256": "4f87a0a2ec2d7c5a9a2f3f138f4b73adfc89363621a2f00bf3e8ae1a95995f10"
+    },
+    "traces/fuse-updated-1/0/roots/015.json": {
+      "bytes": 261598,
+      "sha256": "8abf40f657851f3a44b0c6e77ae3b0c72fb1dcde14a7688c614d4c921589f335"
+    },
+    "traces/fuse-updated-1/1/events/000.json": {
+      "bytes": 115491,
+      "sha256": "0064a0799ada560bfc87dcfaaf2f30d90aac366d5c4b8d5aca96db26988aca3f"
+    },
+    "traces/fuse-updated-1/1/roots/000.json": {
+      "bytes": 299823,
+      "sha256": "7c9a432986639368457facb6ffedadcd0af61045ef840728c12e6f2fc77666d9"
+    },
+    "traces/fuse-updated-1/1/roots/001.json": {
+      "bytes": 153299,
+      "sha256": "4eca54d8acbfc2e01879aab45764af90bfc8cc3029ec8868539d3382db7b6dee"
+    },
+    "traces/fuse-updated-1/index.json": {
+      "bytes": 1596,
+      "sha256": "69e8230753a305f5bb50070f0dd12a98cf52afd0013cd284b7e3fd1cbec9d199"
+    },
+    "traces/fuse-updated-2/0/events/000.json": {
+      "bytes": 240621,
+      "sha256": "ef0355c0f1248753e4dbc0fea10f0c5eb43f8a8a80b1c9089e07d77886b0337d"
+    },
+    "traces/fuse-updated-2/0/roots/000.json": {
+      "bytes": 299886,
+      "sha256": "4e48b58c54962ac518c6329f0a52fb8c186ba570affe8b2d0b1bb315fa5f84c5"
+    },
+    "traces/fuse-updated-2/0/roots/001.json": {
+      "bytes": 299609,
+      "sha256": "4cc2b5a30054bc6bc529a4dcbc3ace5684555fd2c22ef932dc8f7b55d700693e"
+    },
+    "traces/fuse-updated-2/0/roots/002.json": {
+      "bytes": 299908,
+      "sha256": "fd61616a788cbad74d121b38837583d943d2c5cd8e790d2b3ece70195b22e450"
+    },
+    "traces/fuse-updated-2/0/roots/003.json": {
+      "bytes": 299805,
+      "sha256": "a5c12cf1e6702599b7f803429d716fb9fbdfdfe2e7a70157d1ab1bc870dfd45d"
+    },
+    "traces/fuse-updated-2/0/roots/004.json": {
+      "bytes": 299665,
+      "sha256": "41f27f07775c998f9005085afdb8dbce19dea25b6e05bebf1e1f505e2cee073c"
+    },
+    "traces/fuse-updated-2/0/roots/005.json": {
+      "bytes": 299691,
+      "sha256": "655f0ff5c3f53b6e28788282563ee9eb50c03e771315f9af8faa2179fc2e047e"
+    },
+    "traces/fuse-updated-2/0/roots/006.json": {
+      "bytes": 299691,
+      "sha256": "3c13426879f9730f5b89dd683999b38a9c54d4bf0eaae21fb8a4da66519a9e93"
+    },
+    "traces/fuse-updated-2/0/roots/007.json": {
+      "bytes": 299656,
+      "sha256": "b65d28010c6b3d13db79d91af330fe648e169a34cf7e78438abee72316a41ebe"
+    },
+    "traces/fuse-updated-2/0/roots/008.json": {
+      "bytes": 299708,
+      "sha256": "6d133d6c702dc2ae0350c72c596e38e41a35ea62ec19eb5b31e5346f0d74cf21"
+    },
+    "traces/fuse-updated-2/0/roots/009.json": {
+      "bytes": 299935,
+      "sha256": "967b4e90f661f46542d97fed2e1f95294ed903b10a025fc4a2969d8ce59ccc0e"
+    },
+    "traces/fuse-updated-2/0/roots/010.json": {
+      "bytes": 299818,
+      "sha256": "6b512ef3ab43ee09fe1258e6a51f1aa8f87053574efa55c6b39d1b568e76cca4"
+    },
+    "traces/fuse-updated-2/0/roots/011.json": {
+      "bytes": 299447,
+      "sha256": "6c5b2eb13de47ffe5e5ba14d5e2305689fc55d19462449ad514241886df817b3"
+    },
+    "traces/fuse-updated-2/0/roots/012.json": {
+      "bytes": 299790,
+      "sha256": "3c1973b90a9be2e6b519c0dd4bee329de6d23aa2a2ea2b2987f302d969e6df80"
+    },
+    "traces/fuse-updated-2/0/roots/013.json": {
+      "bytes": 299655,
+      "sha256": "ff5f5ceac8f8b43e1266e3d097cdcfdd85e2ab9270ff756b3e03f93c66e1f629"
+    },
+    "traces/fuse-updated-2/0/roots/014.json": {
+      "bytes": 299661,
+      "sha256": "7ca17abeaf30ef8b2fc503c8aa236a96963790fd5e2850bea45c442f39b7d610"
+    },
+    "traces/fuse-updated-2/0/roots/015.json": {
+      "bytes": 275201,
+      "sha256": "be9f18849a83c1709fed30c897f4d7eef06cfbe0745a39fd9af96cadfe88d210"
+    },
+    "traces/fuse-updated-2/1/events/000.json": {
+      "bytes": 117242,
+      "sha256": "aa3941e59af4862a6c4ac170a1d6d47aaf0c9c9822154fd3efc49a017acef1ff"
+    },
+    "traces/fuse-updated-2/1/roots/000.json": {
+      "bytes": 299881,
+      "sha256": "cc2a40d8f5fd84b552334298a4f48eed1078126559b7e763933cc980b450c546"
+    },
+    "traces/fuse-updated-2/1/roots/001.json": {
+      "bytes": 161173,
+      "sha256": "cd230dd2d9d7a22e7d4ece09e9b151f03a52b210b73df99729c7b00d3c3d68d1"
+    },
+    "traces/fuse-updated-2/index.json": {
+      "bytes": 1596,
+      "sha256": "415e17a1fe5ba91c11cbcdcfd9eb443a4f55aca882f8117c13ee1ad5f38314a3"
+    },
+    "traces/fuse-updated-3/0/events/000.json": {
+      "bytes": 240582,
+      "sha256": "38de1042e07160b1b428103ccf7327705ddc56ad5889d5eb423c0c6bc0f7ee17"
+    },
+    "traces/fuse-updated-3/0/roots/000.json": {
+      "bytes": 299963,
+      "sha256": "02f72cd129c242f91c89e9bd677fd3aa95852ba2e4847d04f5e8e113faad6850"
+    },
+    "traces/fuse-updated-3/0/roots/001.json": {
+      "bytes": 299518,
+      "sha256": "a3af43851061f7356c74f8407e299985e2cc28b9e3ed2a5b5a37530ba617da7a"
+    },
+    "traces/fuse-updated-3/0/roots/002.json": {
+      "bytes": 299773,
+      "sha256": "57cb1875a23838261c775d8effaf2dc205251884c031b6f13aa6750ef6a8b9df"
+    },
+    "traces/fuse-updated-3/0/roots/003.json": {
+      "bytes": 299553,
+      "sha256": "f95404e510e1712d3223b6135b086ded1fa8cfe1d5d7ec42865c2239b8d0de66"
+    },
+    "traces/fuse-updated-3/0/roots/004.json": {
+      "bytes": 299709,
+      "sha256": "28c6078e260b31ce3bb60f069e502051a1d7228a68512858caa6902f73ebabd0"
+    },
+    "traces/fuse-updated-3/0/roots/005.json": {
+      "bytes": 299688,
+      "sha256": "a5e529bd30b80a8c07f055046b80a09f8d3bdc063eb5a4594f343d65e0d72dd6"
+    },
+    "traces/fuse-updated-3/0/roots/006.json": {
+      "bytes": 299701,
+      "sha256": "ea088752d7e3da54e47d730a1ba19eae5b8a2c51a302a68b5af00a4f3df1343d"
+    },
+    "traces/fuse-updated-3/0/roots/007.json": {
+      "bytes": 299663,
+      "sha256": "8ad164e3d720f00b4a681fe389f07dbd0b24f2e74fe05d9fbae8cff033dd01ad"
+    },
+    "traces/fuse-updated-3/0/roots/008.json": {
+      "bytes": 299660,
+      "sha256": "dbf8d7aca2ba0ed7ff2bbe7f85c8aada056b7162a24485061dbab0a0f19bd407"
+    },
+    "traces/fuse-updated-3/0/roots/009.json": {
+      "bytes": 299732,
+      "sha256": "afb7355feb89cabc7377e837ab7a9844d2d033e161d81638362a83828ac3a795"
+    },
+    "traces/fuse-updated-3/0/roots/010.json": {
+      "bytes": 299545,
+      "sha256": "311488e881d05898b11b8017082c673c9aba0416f30ab7aedcd2de2369e03230"
+    },
+    "traces/fuse-updated-3/0/roots/011.json": {
+      "bytes": 299608,
+      "sha256": "572e083d81bbde082539353befed534fd213354ce6724e324d7a75a85e0a8d0a"
+    },
+    "traces/fuse-updated-3/0/roots/012.json": {
+      "bytes": 299900,
+      "sha256": "3a8e03e55d9cf6fb8c9e3cbb0b0b1079d8614d4fa5341f10dc883a455b0d1f7b"
+    },
+    "traces/fuse-updated-3/0/roots/013.json": {
+      "bytes": 299860,
+      "sha256": "b8293bc4e816a20c05f7c5b69a986c0f288cbbeb7205b9eaeddb110172fce1af"
+    },
+    "traces/fuse-updated-3/0/roots/014.json": {
+      "bytes": 299672,
+      "sha256": "bfd673990231cceddffef6b3a80dc04cb9f9e5706f8f74d92bcafc9a695eb657"
+    },
+    "traces/fuse-updated-3/0/roots/015.json": {
+      "bytes": 265696,
+      "sha256": "9e2040257007c0990ffc81e7f205bb55db9b89b0bc3707c1a89fe05cd6ab686d"
+    },
+    "traces/fuse-updated-3/1/events/000.json": {
+      "bytes": 119424,
+      "sha256": "4d11a8b2ee561f3ab2d7cb62521d51bb1492c373725f0c0c75b3db858ae1b546"
+    },
+    "traces/fuse-updated-3/1/roots/000.json": {
+      "bytes": 299937,
+      "sha256": "0b9c08a3672a0ec90825cce8882e64499552e5f90639fbfad2de466b19478457"
+    },
+    "traces/fuse-updated-3/1/roots/001.json": {
+      "bytes": 169417,
+      "sha256": "37c70ce3f3193a1b277f3e0ae7e01579d06e95798dac7493aa9b5e6ff006f648"
+    },
+    "traces/fuse-updated-3/index.json": {
+      "bytes": 1596,
+      "sha256": "1646f98fd69ada73f9b1b311b0deba25aedfb7bb9dffdd9bb561d23bbef40253"
+    },
+    "validation/analysis-command.json": {
+      "bytes": 1284,
+      "sha256": "a27a7c0a3d90e251bb9066e0c8b708d837740577215c52b576df7f55beb8b9bb"
+    },
+    "validation/asan-trace.json": {
+      "bytes": 1862,
+      "sha256": "b750cd3f3bd1bb3d63dc680ba1a8a92a2c8f57ebefc1d4f46a7a1894e81c4d3d"
+    },
+    "validation/build.json": {
+      "bytes": 90481,
+      "sha256": "b4c2e613a2e21d9e68d1e40b8e1250d3d1883fe2660b50237f98a3d276e7976a"
+    },
+    "validation/final-checks.json": {
+      "bytes": 2236,
+      "sha256": "141cf3726bb8490870c28a903be3d828bd7b1ed69e8c2cca3c11bdb4094164bd"
+    },
+    "validation/input-check.json": {
+      "bytes": 1754,
+      "sha256": "b1174b2fd1e3d5a09bda65a915120dfb7a7b76252430dc14a24d2a0c17136871"
+    },
+    "validation/logs.json": {
+      "bytes": 7286,
+      "sha256": "f2ea01a65be504f13ab367d3a5fbceb79b3fcf2253118691e867edc711e0abb0"
+    },
+    "validation/plan.json": {
+      "bytes": 69739,
+      "sha256": "44d803c9644806be9ec17faea77a0d37258a2a299df8a7aa723a38802445cf6f"
+    },
+    "validation/release-trace.json": {
+      "bytes": 1857,
+      "sha256": "9fdf47c778e8c86f9fcf9907a116432ab76f7bdc06958a6553bb2ed318bf1bdf"
+    },
+    "validation/tests.json": {
+      "bytes": 206,
+      "sha256": "738f493a02861b52f2d157967c2857cbc5bf76e50ca26540f9566f3ce6a79269"
+    },
+    "validation/wrapper-proof.json": {
+      "bytes": 1220,
+      "sha256": "d5ea2700071a5733f55cedc6194d1ca82bbca99e542e44d289bbb367fc734570"
+    }
+  },
+  "format_versions": {
+    "baseline": 1004,
+    "updated": 1005
+  },
+  "original_plain_failed_checks": 14,
+  "baseline_diagnostic_reused_by_exact_source_identity": true
+}

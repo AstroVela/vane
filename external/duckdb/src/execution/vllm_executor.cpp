@@ -12,24 +12,22 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
-
-#include <mutex>
-#include <unordered_map>
+#include "duckdb/execution/execution_runtime.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
-static std::mutex vllm_executor_registry_lock;
-static std::unordered_map<string, vllm_executor_factory_t> vllm_executor_registry;
-
-void RegisterEngineExecutorFactory(const string &engine, vllm_executor_factory_t factory) {
-	std::lock_guard<std::mutex> lock(vllm_executor_registry_lock);
-	vllm_executor_registry[engine] = factory;
+void RegisterEngineExecutorFactory(DatabaseInstance &db, const string &engine, vllm_executor_factory_t factory) {
+	auto &runtime = db.GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	runtime.engine_executor_factories[engine] = factory;
 }
 
-vllm_executor_factory_t GetEngineExecutorFactory(const string &engine) {
-	std::lock_guard<std::mutex> lock(vllm_executor_registry_lock);
-	auto entry = vllm_executor_registry.find(engine);
-	if (entry == vllm_executor_registry.end()) {
+vllm_executor_factory_t GetEngineExecutorFactory(ClientContext &context, const string &engine) {
+	auto &runtime = DatabaseInstance::GetDatabase(context).GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	auto entry = runtime.engine_executor_factories.find(engine);
+	if (entry == runtime.engine_executor_factories.end()) {
 		return nullptr;
 	}
 	return entry->second;

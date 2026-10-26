@@ -1,0 +1,1 @@
+PASS stream passive=4 partial=1 hook_queries=0

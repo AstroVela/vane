@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Verify unchanged barriers and summarize checkpoint restart comparisons."""
+
+import argparse
+import hashlib
+import json
+import statistics
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    args = parser.parse_args()
+    out = args.artifacts.resolve()
+    build = json.loads((out / "build.json").read_text())
+    orphan = Path(build["orphan_parent"]) / "updated"
+    candidate = out / "updated"
+    before, after = build["source_inputs"]["orphan-control"], build["source_inputs"]["updated"]
+    assert {p for p, h in before.items() if h != after[p]} == {"src/checkpoint.hpp"}
+    result = dict(status="PASS", inputs={}, changed_files=["src/checkpoint.hpp"], groups=[])
+    result["inputs"][str(Path(__file__).resolve())] = digest(Path(__file__))
+    for relative in ("src/staging.hpp", "src/workspace.cpp", "src/payload_file.hpp"):
+        assert before[relative] == after[relative]
+        for root in (orphan, candidate):
+            assert digest(root / relative) == before[relative]
+            result["inputs"][str(root / relative)] = digest(root / relative)
+    result["publication_workspace_payload_files_byte_identical"] = True
+    for root, role, media in ((out, "adoption", ("tmpfs", "ext4")), (out / "causal", "causal", ("ext4",))):
+        path = root / "summary.json"
+        summary = json.loads(path.read_text())
+        result["inputs"][str(path)] = digest(path)
+        result[role] = dict(
+            pass_all=summary["pass_all"],
+            failed_checks=[c for c in summary["checks"] if not c["pass_gate"]],
+            large_writes=summary["large_writes"],
+        )
+        for medium in media:
+            path = root / (medium + "-plain/results.json")
+            raw = json.loads(path.read_text())
+            result["inputs"][str(path)] = digest(path)
+            for key, state in (("fuse", "fresh"), ("aged_fuse", "post_gc")):
+                for variant in ("baseline", "updated"):
+                    mounts = [m for m in raw[key] if m["variant"] == variant]
+                    result["groups"].append(
+                        dict(
+                            role=role,
+                            medium=medium,
+                            state=state,
+                            variant=variant,
+                            final_page_count=[m["inspection"]["page_count"] for m in mounts],
+                            median_final_page_count=statistics.median(m["inspection"]["page_count"] for m in mounts),
+                            final_used_pages=[
+                                m["inspection"]["page_count"] - m["inspection"]["freelist_count"] for m in mounts
+                            ],
+                            median_final_used_pages=statistics.median(
+                                m["inspection"]["page_count"] - m["inspection"]["freelist_count"] for m in mounts
+                            ),
+                            first_write_wal_file_bytes=[
+                                s["wal_bytes"][-1]
+                                for m in mounts
+                                for s in m["samples"]
+                                if s["workload"] == "stream_256"
+                            ],
+                            wal_file_length_is_not_uncopied_frames=True,
+                        )
+                    )
+    (out / "restart-analysis.json").write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    print("restart analysis PASS: publication, workspace and payload sources byte-identical")
+
+
+if __name__ == "__main__":
+    main()

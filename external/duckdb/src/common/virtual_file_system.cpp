@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/virtual_file_system.hpp"
 
 #include "duckdb/common/file_opener.hpp"
@@ -279,6 +285,11 @@ string VirtualFileSystem::CanonicalizePath(const string &path_p, optional_ptr<Fi
 	return FindFileSystem(path_p, opener).CanonicalizePath(path_p, opener);
 }
 
+FileWriteTarget VirtualFileSystem::ResolveWriteTarget(const string &path, const CopyInfo &info,
+                                                      optional_ptr<FileOpener> opener) {
+	return FindFileSystem(path, opener).ResolveWriteTarget(path, info, opener);
+}
+
 unique_ptr<MultiFileList> VirtualFileSystem::GlobFilesExtended(const string &path, const FileGlobInput &input,
                                                                optional_ptr<FileOpener> opener) {
 	return FindFileSystem(path, opener).Glob(path, input, opener);
@@ -326,6 +337,11 @@ vector<string> VirtualFileSystem::ListSubSystems() {
 		names.push_back(sub_system->file_system->GetName());
 	}
 	return names;
+}
+
+bool VirtualFileSystem::CanHandleFile(const string &path) {
+	auto registry = file_system_registry.atomic_load();
+	return FindFileSystemInternal(*registry, path) != nullptr;
 }
 
 std::string VirtualFileSystem::GetName() const {

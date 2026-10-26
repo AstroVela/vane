@@ -26,7 +26,6 @@ class RemoteUDFSubmitMixin:
         _payload: dict[str, Any]
         _pick_ready_actor_on_node: Callable[[str, int], tuple[int, Any]]
         _take_task_admission: Callable[[], Any]
-        _wait_for_ready_actor: Callable[[], None]
         actors: list[Any]
 
     def _rename_args(self, args: pa.Table) -> pa.Table:
@@ -75,7 +74,6 @@ class RemoteUDFSubmitMixin:
             raise RuntimeError("udf ray actor pool is empty")
 
         def _submit_after_lease(task_payload: dict[str, Any]) -> Any:
-            self._wait_for_ready_actor()
             actor_idx, actor = self._pick_ready_actor_on_node(
                 task_payload["node_id"],
                 task_payload["actor_index"],

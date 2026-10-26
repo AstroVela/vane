@@ -145,10 +145,18 @@ public:
 	virtual bool TrySubmitRefBundleWithRetainedBytes(LazyRefDataChunk &bundle, DataChunk &rows, ClientContext &context,
 	                                                 idx_t retained_input_bytes, idx_t &submit_id) = 0;
 	virtual void FinishedSubmitting(ClientContext &context) = 0;
+	// Retire admission and outstanding streams when no consumer needs more rows.
+	virtual void Cancel() = 0;
 	virtual bool AllTasksFinished(ClientContext &context) = 0;
 	virtual bool SupportsAsyncWakeup() = 0;
 	virtual UDFWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) = 0;
 	virtual void RegisterWakeupCallback(std::function<void()> callback) = 0;
+	// Observe admission pressure before a buffered input reaches its preferred
+	// batch size. Implementations notify the registered wakeup on new pressure.
+	// This does not acquire task capacity or authorize a byte-limit escape.
+	virtual bool ShouldFlushPartialInput(ClientContext &context) {
+		return false;
+	}
 	// Register exactly once, before the first submission.
 	virtual void RegisterOutputConsumer(UDFOutputConsumer consumer) = 0;
 	virtual void NotifyOutputConsumerSpaceAvailable() = 0;
@@ -159,7 +167,9 @@ public:
 using udf_executor_factory_t = unique_ptr<UDFExecutor> (*)(ClientContext &context, const Value &payload,
                                                            UDFConfig &config, shared_ptr<void> actor_handles);
 
-DUCKDB_API void SetUDFExecutorFactory(udf_executor_factory_t factory);
-DUCKDB_API udf_executor_factory_t GetUDFExecutorFactory();
+//! Registration is scoped to a database and shared by all of its connections,
+//! including connections constructed by a self-contained extension.
+DUCKDB_API void SetUDFExecutorFactory(DatabaseInstance &db, udf_executor_factory_t factory);
+DUCKDB_API udf_executor_factory_t GetUDFExecutorFactory(ClientContext &context);
 
 } // namespace duckdb

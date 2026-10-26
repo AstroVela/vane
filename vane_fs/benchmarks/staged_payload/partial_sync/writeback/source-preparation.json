@@ -1,0 +1,10 @@
+{
+  "parent": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z",
+  "baseline": "Previously measured partial-edge candidate; format 1004",
+  "modified_files": [
+    "src/staging.hpp",
+    "src/workspace.cpp"
+  ],
+  "policy": "Submit each contiguous 16 MiB payload span with WRITE only; preserve durable syscall ordering; unsupported hints fall back; I/O errors propagate",
+  "sqlite_prefix": "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release"
+}

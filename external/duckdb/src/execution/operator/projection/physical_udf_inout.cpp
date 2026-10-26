@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -342,24 +343,6 @@ idx_t SaturatingAdd(idx_t left, idx_t right) {
 	return left + right;
 }
 
-idx_t ResolveUDFRuntimeWorkerSlots(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "subprocess_task") {
-		return MaxValue<idx_t>(idx_t(1), task_operator_width);
-	}
-	if (backend.second == "subprocess_actor") {
-		auto actor_number = GetStructIntField(payload, "actor_number");
-		if (!actor_number.first || actor_number.second == 0) {
-			throw InvalidInputException("actor_number is required for execution_backend='%s'", backend.second);
-		}
-		return actor_number.second;
-	}
-	throw InvalidInputException("unsupported udf execution_backend '%s'", backend.second);
-}
-
 Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements) {
 	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
 		return payload;
@@ -385,20 +368,6 @@ Value ReplaceStructFields(const Value &payload, child_list_t<Value> replacements
 		children.emplace_back(replacement.first, std::move(replacement.second));
 	}
 	return Value::STRUCT(std::move(children));
-}
-
-Value ResolveUDFRuntimePayload(const Value &payload, idx_t task_operator_width) {
-	auto backend = GetStructStringField(payload, "execution_backend");
-	if (!backend.first || backend.second.empty()) {
-		throw InvalidInputException("udf payload is missing execution_backend");
-	}
-	if (backend.second == "ray_task" || backend.second == "ray_actor") {
-		return payload;
-	}
-	auto worker_slots = ResolveUDFRuntimeWorkerSlots(payload, task_operator_width);
-	child_list_t<Value> replacements;
-	replacements.emplace_back("udf_worker_slots", Value::BIGINT(static_cast<int64_t>(worker_slots)));
-	return ReplaceStructFields(payload, std::move(replacements));
 }
 
 string UDFDebugNameFromPayload(const Value &payload) {
@@ -638,7 +607,7 @@ static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state) {
 		return;
 	}
 
-	auto factory = GetUDFExecutorFactory();
+	auto factory = GetUDFExecutorFactory(context.client);
 	if (!factory) {
 		throw InvalidInputException("UDF executor factory is not registered");
 	}
@@ -756,7 +725,7 @@ private:
 		UDFWorkerSlotDebugLog(StringUtil::Format("resolve_runtime_commit udf_name=%s reason=%s width=%llu",
 		                                         DebugUDFName().c_str(), reason ? reason : "<missing>",
 		                                         static_cast<unsigned long long>(task_operator_width)));
-		resolved_payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		resolved_payload = original_payload;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 	}
@@ -826,10 +795,6 @@ static void AppendUDFExecutionConfigParams(InsertionOrderPreservingMap<string> &
 	auto ray_actor_thread_policy = GetStructStringField(payload, "ray_actor_thread_policy");
 	if (ray_actor_thread_policy.first && !ray_actor_thread_policy.second.empty()) {
 		result["ray_actor_thread_policy"] = ray_actor_thread_policy.second;
-	}
-	auto worker_slots = GetStructIntField(payload, "udf_worker_slots");
-	if (worker_slots.first && worker_slots.second > 0) {
-		result["udf_worker_slots"] = std::to_string(worker_slots.second);
 	}
 	auto min_task_batch_size = GetStructIntField(payload, "min_task_batch_size");
 	if (min_task_batch_size.first && min_task_batch_size.second > 0) {
@@ -936,6 +901,11 @@ struct StreamingUDFConfig {
 	// complete upstream blocks and coalesce only undersized blocks until this
 	// row count is reached. EOS and byte pressure may still submit a short tail.
 	idx_t min_task_batch_rows = 0;
+	// Transport size is independent of the user-visible compute batch. Only
+	// ordinary synchronous actor batches use the automatic byte target.
+	bool auto_task_batching = false;
+	idx_t transport_input_target_bytes = 0;
+	idx_t actor_pool_size = 1;
 	idx_t task_input_max_bytes = 0;
 	idx_t output_target_bytes = 0;
 };
@@ -1110,10 +1080,17 @@ struct StreamingHandoffCounters {
 static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t task_operator_width = 1);
 
 struct StreamingUDFState : public StateWithBlockableTasks {
-	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p)
-	    : original_payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
+	StreamingUDFState(Value payload_p, shared_ptr<void> actor_handles_p, idx_t transport_input_target_bytes_p)
+	    : original_payload(std::move(payload_p)), transport_input_target_bytes(transport_input_target_bytes_p),
+	      actor_handles(std::move(actor_handles_p)) {
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(original_payload);
+		config.transport_input_target_bytes = transport_input_target_bytes;
+		if (config.auto_task_batching &&
+		    GetStructStringField(payload, "execution_backend").second == "subprocess_actor" &&
+		    transport_input_target_bytes == 0) {
+			throw InvalidInputException("Local actor transport requires prepared arena capacity");
+		}
 		UDFWorkerSlotDebugLog(StringUtil::Format("streaming_ctor_unresolved udf_name=%s initial_config_width=1",
 		                                         UDFDebugNameFromPayload(original_payload).c_str()));
 	}
@@ -1169,8 +1146,9 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		    "streaming_resolve_commit udf_name=%s width=%llu operator_width_resolved=%s previous_width=%llu",
 		    UDFDebugNameFromPayload(original_payload).c_str(), static_cast<unsigned long long>(task_operator_width),
 		    operator_width_resolved ? "true" : "false", static_cast<unsigned long long>(resolved_task_operator_width)));
-		payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
+		payload = original_payload;
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
+		config.transport_input_target_bytes = transport_input_target_bytes;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 		runtime_operator_width_resolved = operator_width_resolved;
@@ -1178,6 +1156,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 
 	Value original_payload;
 	Value payload;
+	const idx_t transport_input_target_bytes;
 	shared_ptr<void> actor_handles;
 	StreamingUDFConfig config;
 	idx_t resolved_task_operator_width = 0;
@@ -1214,6 +1193,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	atomic<idx_t> output_capacity_bytes_snapshot {0};
 	atomic<idx_t> output_capacity_item_bytes_snapshot {0};
 	mutex output_event_lock;
+	bool output_events_closed = false; // Protected by output_event_lock.
 	std::deque<UDFOutputEvent> pending_output_events;
 	atomic<idx_t> sink_calls {0};
 	atomic<idx_t> source_calls {0};
@@ -1375,6 +1355,8 @@ struct StreamingUDFLocalSinkState : public LocalSinkState {
 	bool consumed_blocked_input = false;
 };
 
+static void StopStreamingConsumer(StreamingUDFState &state);
+
 struct StreamingUDFGlobalSourceState : public GlobalSourceState {
 	explicit StreamingUDFGlobalSourceState(std::shared_ptr<StreamingUDFState> state_p) : state(std::move(state_p)) {
 	}
@@ -1386,6 +1368,12 @@ struct StreamingUDFGlobalSourceState : public GlobalSourceState {
 		// one drain task; stage/slot parallelism remains independent.
 		state->resolved_source_threads.store(1, std::memory_order_relaxed);
 		return 1;
+	}
+
+	void OnConsumerFinished() override {
+		// This source has exactly one drain task, so no other consumer still
+		// needs rows when its downstream operator finishes early.
+		StopStreamingConsumer(*state);
 	}
 
 	std::shared_ptr<StreamingUDFState> state;
@@ -1437,6 +1425,18 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 		throw InvalidInputException("streaming UDF requires positive udf_task_input_max_bytes");
 	}
 	config.task_input_max_bytes = task_input_max_bytes.second;
+	auto call_mode = GetStructStringField(payload, "call_mode");
+	auto prebatched_input = GetStructBoolField(payload, "prebatched_input");
+	auto row_preserving = GetStructBoolField(payload, "row_preserving");
+	config.auto_task_batching =
+	    (execution_backend.second == "ray_actor" || execution_backend.second == "subprocess_actor") &&
+	    call_mode.first && call_mode.second == "map_batches" && config.compute_batch_rows > 0 &&
+	    config.min_task_batch_rows == 0 && !(prebatched_input.first && prebatched_input.second) &&
+	    !(row_preserving.first && row_preserving.second);
+	auto actor_number = GetStructIntField(payload, "actor_number");
+	if (actor_number.first && actor_number.second > 0) {
+		config.actor_pool_size = actor_number.second;
+	}
 	auto output_target_max_bytes = GetStructIntField(payload, "udf_output_target_max_bytes");
 	if (!output_target_max_bytes.first || output_target_max_bytes.second <= 0) {
 		throw InvalidInputException("streaming UDF requires positive udf_output_target_max_bytes");
@@ -1565,6 +1565,9 @@ static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &
 static void SetStreamingError(StreamingUDFState &state, const string &msg);
 static void NotifyStreamingDispatcherFinished(StreamingUDFState &state);
 
+// Scoped to the calling test thread; production dispatchers never install it.
+static thread_local std::function<void()> *streaming_after_event_publish_for_testing = nullptr;
+
 static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 	auto guard = state.Lock();
 	// Queue insertion is a real state transition for both sides. The source is
@@ -1580,13 +1583,25 @@ static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 
 static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &&event) {
 	{
-		lock_guard<mutex> event_guard(state.output_event_lock);
+		unique_lock<mutex> event_guard(state.output_event_lock);
+		if (state.output_events_closed) {
+			event_guard.unlock();
+			event.output_lease.Release();
+			return;
+		}
 		state.pending_output_events.push_back(std::move(event));
 		state.queued_output_events.fetch_add(1, std::memory_order_relaxed);
+		// A consumer can drain the event as soon as this lock is released.
+		// Clear capacity before publishing it so we cannot overwrite the
+		// capacity that the consumer restores after draining the queue.
+		state.output_capacity_rows_snapshot.store(0, std::memory_order_relaxed);
+		state.output_capacity_bytes_snapshot.store(0, std::memory_order_relaxed);
+		state.output_capacity_item_bytes_snapshot.store(0, std::memory_order_relaxed);
+		event_guard.unlock();
+		if (streaming_after_event_publish_for_testing) {
+			(*streaming_after_event_publish_for_testing)();
+		}
 	}
-	state.output_capacity_rows_snapshot.store(0, std::memory_order_relaxed);
-	state.output_capacity_bytes_snapshot.store(0, std::memory_order_relaxed);
-	state.output_capacity_item_bytes_snapshot.store(0, std::memory_order_relaxed);
 	TryWakeStreamingTasksForQueuedEvent(state);
 }
 
@@ -1869,6 +1884,7 @@ static void ReleaseQueuedStreamingEvents(StreamingUDFState &state) {
 	std::deque<UDFOutputEvent> events;
 	{
 		lock_guard<mutex> event_guard(state.output_event_lock);
+		state.output_events_closed = true;
 		events.swap(state.pending_output_events);
 		state.queued_output_events.store(0, std::memory_order_relaxed);
 	}
@@ -1889,6 +1905,9 @@ static void AbortStreamingInflightSubmitsLocked(StreamingUDFState &state, const 
 
 static void SetStreamingErrorLocked(StreamingUDFState &state, unique_lock<mutex> &guard, const string &msg) {
 	state.VerifyLock(guard);
+	if (state.source_finished) {
+		return;
+	}
 	if (!state.has_error) {
 		AbortStreamingInflightSubmitsLocked(state, guard);
 		ReleaseQueuedStreamingOutputsLocked(state, guard);
@@ -1905,6 +1924,33 @@ static void SetStreamingErrorLocked(StreamingUDFState &state, unique_lock<mutex>
 static void SetStreamingError(StreamingUDFState &state, const string &msg) {
 	auto guard = state.Lock();
 	SetStreamingErrorLocked(state, guard, msg);
+}
+
+static void StopStreamingConsumer(StreamingUDFState &state) {
+	auto guard = state.Lock();
+	if (state.source_finished) {
+		return;
+	}
+	state.source_finished = true;
+	AbortStreamingInflightSubmitsLocked(state, guard);
+	ReleaseQueuedStreamingOutputsLocked(state, guard);
+	ReleaseQueuedStreamingEvents(state);
+	state.pending_inputs.clear();
+	state.pending_lazy_inputs.clear();
+	state.planned_submit.Clear();
+	state.pending_rows = 0;
+	state.pending_bytes = 0;
+	RefreshStreamingOutputCapacitySnapshotLocked(state, guard);
+	PreventStreamingBlocking(state, guard);
+	WakeAllStreamingSources(state, guard);
+	WakeStreamingUDFTasks(state, guard);
+	auto executor = state.op ? state.op->executor.get() : nullptr;
+	guard.unlock();
+	// The dispatcher may be delivering a callback that needs the state lock.
+	// Retire it only after releasing that lock, without destroying its wrapper.
+	if (executor) {
+		executor->Cancel();
+	}
 }
 
 static void NotifyStreamingDispatcherFinished(StreamingUDFState &state) {
@@ -1999,6 +2045,43 @@ static StreamingSubmitPlan StreamingIncompleteSubmitPlan(const StreamingUDFState
 	return plan;
 }
 
+static StreamingSubmitPlan PlanStreamingAutoSubmit(const StreamingUDFState &state, bool flush_tail) {
+	StreamingSubmitPlan plan;
+	const auto compute_rows = state.config.compute_batch_rows;
+	// This estimates a target, not an admission limit. TakeStreaming* still
+	// applies the existing byte-bounded slicing and oversized-row rules.
+	const auto bytes_per_row = MaxValue<idx_t>(1, state.pending_bytes / state.pending_rows +
+	                                                  (state.pending_bytes % state.pending_rows != 0 ? 1 : 0));
+	const auto target_bytes =
+	    state.config.transport_input_target_bytes > 0
+	        ? MinValue(state.config.task_input_max_bytes, state.config.transport_input_target_bytes)
+	        : state.config.task_input_max_bytes;
+	const auto byte_rows = target_bytes / bytes_per_row;
+	const auto target_rows = MaxValue<idx_t>(compute_rows, byte_rows - byte_rows % compute_rows);
+	if (state.pending_rows >= target_rows) {
+		plan.target_rows = target_rows;
+		return plan;
+	}
+	if (flush_tail || state.pending_bytes >= state.config.task_input_max_bytes) {
+		// flush_tail also means "drain before accepting another input". Keep
+		// complete compute batches aligned under pressure; only the final
+		// sub-batch (or a byte-forced split in TakeStreaming*) may be short.
+		plan.target_rows = state.pending_rows - state.pending_rows % compute_rows;
+		if (plan.target_rows == 0) {
+			return StreamingIncompleteSubmitPlan(state, flush_tail);
+		}
+		return plan;
+	}
+	// Never wait for aggregation while an actor could start ready work. In
+	// particular, COMPLETE wakes the source to drain a short pending task if
+	// upstream is waiting for the output leases held by that input. No timer,
+	// extra prefetch queue or additional actor credit is needed.
+	if (state.inflight_batches.size() < state.config.actor_pool_size) {
+		plan.target_rows = state.pending_rows - state.pending_rows % compute_rows;
+	}
+	return plan;
+}
+
 // A deque entry is one upstream work unit. Preserve complete upstream blocks
 // while coalescing undersized blocks to the configured soft minimum; without
 // one, submit a compute-batch-aligned prefix.
@@ -2006,6 +2089,10 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 	StreamingSubmitPlan plan;
 	if (state.pending_rows == 0 || state.pending_lazy_inputs.empty()) {
 		return plan;
+	}
+	// Mixed channels retain the existing progress and head-of-line rules.
+	if (state.config.auto_task_batching && state.pending_inputs.empty()) {
+		return PlanStreamingAutoSubmit(state, flush_tail);
 	}
 	idx_t rows_through_boundary = 0;
 	for (const auto &entry : state.pending_lazy_inputs) {
@@ -2045,6 +2132,9 @@ static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFSta
 	StreamingSubmitPlan plan;
 	if (state.pending_rows == 0 || state.pending_inputs.empty()) {
 		return plan;
+	}
+	if (state.config.auto_task_batching && state.pending_lazy_inputs.empty()) {
+		return PlanStreamingAutoSubmit(state, flush_tail);
 	}
 	idx_t rows_through_boundary = 0;
 	for (const auto &entry : state.pending_inputs) {
@@ -2374,6 +2464,9 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 		pending = &state.planned_submit.Lazy();
 	} else {
 		auto plan = PlanStreamingLazySubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingLazySubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -2691,6 +2784,61 @@ static bool DrainStreamingOutputEventsLocked(StreamingUDFState &state, unique_lo
 	return did_work;
 }
 
+vector<idx_t> TestStreamingOutputCapacityPublication() {
+	if (!DebugEnvFlagEnabled("VANE_ENABLE_UDF_TEST_HOOKS")) {
+		throw InvalidInputException("streaming output capacity test requires VANE_ENABLE_UDF_TEST_HOOKS=1");
+	}
+	auto payload = Value::STRUCT({{"execution_backend", Value("ray_task")},
+	                              {"call_mode", Value("map")},
+	                              {"udf_task_input_max_bytes", Value::BIGINT(4096)},
+	                              {"udf_output_target_max_bytes", Value::BIGINT(4096)}});
+	auto state = std::make_shared<StreamingUDFState>(payload, nullptr, 0);
+	state->self = state;
+	state->op = make_uniq<UDFOperatorState>(payload);
+	// Model a submit whose DATA has already been consumed downstream.
+	StreamingInflightBatch inflight;
+	inflight.submit_id = 1;
+	inflight.total_rows = inflight.emitted_rows = 1;
+	inflight.bytes = 8;
+	state->inflight_batches.emplace(1, inflight);
+	state->inflight_rows = 1;
+	state->inflight_bytes = 8;
+
+	std::function<void()> consume_before_publisher_resumes = [&]() {
+		std::exception_ptr error;
+		std::thread consumer([&]() {
+			try {
+				auto guard = state->Lock();
+				if (!DrainStreamingOutputEventsLocked(*state, guard)) {
+					throw InternalException("capacity test did not consume the published event");
+				}
+				ThrowIfStreamingError(*state);
+			} catch (...) {
+				error = std::current_exception();
+			}
+		});
+		consumer.join();
+		if (error) {
+			std::rethrow_exception(error);
+		}
+	};
+	streaming_after_event_publish_for_testing = &consume_before_publisher_resumes;
+	try {
+		UDFOutputEvent event;
+		event.kind = UDFOutputEventKind::COMPLETE;
+		event.submit_id = 1;
+		event.submit_complete = true;
+		QueueStreamingOutputEvent(*state, std::move(event));
+	} catch (...) {
+		streaming_after_event_publish_for_testing = nullptr;
+		throw;
+	}
+	streaming_after_event_publish_for_testing = nullptr;
+	return {state->output_capacity_rows_snapshot.load(), state->output_capacity_bytes_snapshot.load(),
+	        state->output_capacity_item_bytes_snapshot.load(), state->queued_output_events.load(),
+	        state->completed_batches.load()};
+}
+
 static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, StreamingUDFState &state,
                                                 const unique_lock<mutex> &guard, bool flush_tail) {
 	state.VerifyLock(guard);
@@ -2708,6 +2856,9 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 		envelope = &state.planned_submit.Materialized();
 	} else {
 		auto plan = PlanStreamingMaterializedSubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingMaterializedSubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -2772,6 +2923,9 @@ static void DriveStreamingMaterializedSubmits(ExecutionContext &context, Streami
 static void DriveStreamingSubmits(ExecutionContext &context, StreamingUDFState &state, const unique_lock<mutex> &guard,
                                   bool flush_tail) {
 	state.VerifyLock(guard);
+	if (state.source_finished) {
+		return;
+	}
 	ThrowIfStreamingError(state);
 	if (state.planned_submit.HasValue()) {
 		const bool submitted = state.planned_submit.IsLazy()
@@ -2863,26 +3017,42 @@ std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(Clien
 	lock_guard<std::mutex> guard(streaming_state_lock);
 	if (!streaming_state) {
 		auto &udf_bind = bind_data->Cast<UDFFunctionData>();
-		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles);
+		streaming_state = std::make_shared<StreamingUDFState>(udf_bind.payload, udf_bind.actor_handles,
+		                                                      udf_bind.transport_input_target_bytes);
 		streaming_state->self = streaming_state;
 	}
 	return streaming_state;
 }
 
-void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+void PhysicalStreamingUDF::ResetStreamingState(bool preserve_statistics) {
+	InsertionOrderPreservingMap<string> final_stats;
+	if (preserve_statistics) {
+		// CancelTasks also runs on successful completion, before final task
+		// statistics are collected. Keep values, not the executor or its buffers.
+		for (auto &entry : ParamsToString()) {
+			if (StringUtil::StartsWith(entry.first, "udf_")) {
+				final_stats[entry.first] = entry.second;
+			}
+		}
+	}
 	sink_state.reset();
+	std::shared_ptr<StreamingUDFState> previous_streaming_state;
+	{
+		lock_guard<std::mutex> guard(streaming_state_lock);
+		final_streaming_stats = std::move(final_stats);
+		previous_streaming_state = std::move(streaming_state);
+	}
+	previous_streaming_state.reset();
+}
+
+void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
 	if (children.size() != 1) {
 		throw InternalException("PhysicalStreamingUDF requires exactly one child");
 	}
 
 	// Prepared statements reuse physical operators. Clear the source/sink
 	// rendezvous before either side initializes state for the next execution.
-	std::shared_ptr<StreamingUDFState> previous_streaming_state;
-	{
-		lock_guard<std::mutex> guard(streaming_state_lock);
-		previous_streaming_state = std::move(streaming_state);
-	}
-	previous_streaming_state.reset();
+	ResetStreamingState(false);
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, false);
@@ -2923,6 +3093,9 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	auto incoming_bytes = EstimateStreamingChunkBytes(chunk);
 
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		return SinkResultType::FINISHED;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, false);
@@ -2965,6 +3138,9 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	state.reserved_rows = state.reserved_rows >= incoming_rows ? state.reserved_rows - incoming_rows : 0;
 	state.reserved_bytes = state.reserved_bytes >= incoming_bytes ? state.reserved_bytes - incoming_bytes : 0;
 
+	if (state.source_finished) {
+		return SinkResultType::FINISHED;
+	}
 	StreamingPendingInputPiece piece;
 	piece.bytes = buffered_bytes;
 	piece.chunk = std::move(buffered);
@@ -3017,6 +3193,10 @@ SinkResultType PhysicalStreamingUDF::SinkBatch(ExecutionContext &context, Execut
 	auto incoming_bytes = batch.lazy->EstimatedBytes();
 
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		batch = ExecutionBatch();
+		return SinkResultType::FINISHED;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, false);
@@ -3067,6 +3247,10 @@ SinkFinalizeType PhysicalStreamingUDF::Finalize(Pipeline &pipeline, Event &, Cli
 	ThreadContext thread_context(context);
 	ExecutionContext execution_context(context, thread_context, &pipeline);
 	auto guard = state.Lock();
+	if (state.source_finished) {
+		state.sink_finished = true;
+		return SinkFinalizeType::READY;
+	}
 	DrainStreamingOutputEventsLocked(state, guard);
 	ThrowIfStreamingError(state);
 	state.sink_finished = true;
@@ -3167,6 +3351,9 @@ SourceResultType PhysicalStreamingUDF::GetDataBatch(ExecutionContext &context, E
 	state.source_calls.fetch_add(1);
 
 	auto drive_locked = [&](unique_lock<mutex> &guard) {
+		if (state.source_finished) {
+			return;
+		}
 		DrainStreamingOutputEventsLocked(state, guard);
 		DriveStreamingSubmits(context, state, guard, false);
 		ThrowIfStreamingError(state);
@@ -3325,6 +3512,11 @@ InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const
 	{
 		lock_guard<std::mutex> guard(streaming_state_lock);
 		state = streaming_state;
+		if (!state) {
+			for (auto &entry : final_streaming_stats) {
+				result[entry.first] = entry.second;
+			}
+		}
 	}
 	if (state) {
 		result["udf_resolved_source_threads"] =

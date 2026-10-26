@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed
+Prepared 1 package in 29.34s
+Installed 1 package in 1ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed)

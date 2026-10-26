@@ -11,10 +11,11 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.execution._common import ensure_table, estimate_table_bytes
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.udf_stream_backpressure import STREAM_BUFFER_BLOCKS
 
 RAY_UDF_STREAM_PROTOCOL_VERSION = 1
 RAY_UDF_STREAM_OBJECTS_PER_BLOCK = 2
-RAY_UDF_STREAM_BUFFER_BLOCKS = 2
+RAY_UDF_STREAM_BUFFER_BLOCKS = STREAM_BUFFER_BLOCKS
 RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS = RAY_UDF_STREAM_OBJECTS_PER_BLOCK * RAY_UDF_STREAM_BUFFER_BLOCKS
 
 
@@ -62,6 +63,7 @@ _PROVIDER_CAPABILITY_DETAIL_FIELDS = {
     "capability",
     "original_error_summary",
 }
+_DIAGNOSTIC_DETAIL_FIELDS = {"kind", "summary"}
 
 
 def _truncate_error_detail(value: str) -> str:
@@ -242,10 +244,13 @@ def make_stream_error_pair(
         exception_message = "<error message unavailable>"
     if len(exception_message) > _MAX_ERROR_TEXT_CHARS:
         exception_message = exception_message[:_MAX_ERROR_TEXT_CHARS] + _ERROR_TEXT_TRUNCATION_SUFFIX
-    exception_details = None
+    exception_details: dict[str, Any] | None = None
+    from vane.ai._errors import DiagnosticError
     from vane.ai.provider import ProviderCapabilityError
 
-    if isinstance(exc, ProviderCapabilityError):
+    if isinstance(exc, DiagnosticError):
+        exception_details = {"kind": "diagnostic", "summary": exc.summary}
+    elif isinstance(exc, ProviderCapabilityError):
         exception_details = {
             "kind": "provider_capability",
             "provider": _truncate_error_detail(exc.provider),
@@ -339,6 +344,14 @@ def validate_stream_error_metadata(metadata: Any) -> dict[str, Any]:
         raise ValueError("Ray UDF stream error metadata exception_message is too large")
     details = result["exception_details"]
     if details is not None:
+        if isinstance(details, dict) and details.get("kind") == "diagnostic":
+            if (
+                set(details) != _DIAGNOSTIC_DETAIL_FIELDS
+                or type(details["summary"]) is not str
+                or not 0 < len(details["summary"]) <= 512
+            ):
+                raise ValueError("Ray UDF stream diagnostic details are invalid")
+            return result
         if not isinstance(details, dict) or set(details) != _PROVIDER_CAPABILITY_DETAIL_FIELDS:
             raise ValueError("Ray UDF stream provider capability details have invalid fields")
         if details["kind"] != "provider_capability":

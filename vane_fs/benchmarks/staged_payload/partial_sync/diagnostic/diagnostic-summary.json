@@ -1,0 +1,5578 @@
+{
+  "status": "PASS",
+  "config": {
+    "orders": [
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ]
+    ],
+    "durability": "fsync",
+    "application_write_bytes": [
+      8388608,
+      1048576
+    ],
+    "read_fixture_application_write_bytes": 1048576,
+    "logical_block_bytes": 4096,
+    "page_bytes": 4096,
+    "cache_configuration": "production defaults",
+    "strict_wal_trigger_frames": 4096,
+    "external_threshold_bytes": 262144,
+    "wake_mib": 16,
+    "admission_mib": 64,
+    "retained_wal_mib": 16,
+    "global_drop_caches": false,
+    "owned_concurrent_tests_or_builds": false,
+    "fresh_fuse_rounds": 4,
+    "aged_fuse_rounds": 4,
+    "native_rounds": 0,
+    "aged_guard_bytes": 33554432,
+    "aged_guard_write_bytes": 1048576,
+    "aged_guard_zero_stride": 8192,
+    "aged_fuse_read_fixture_bytes": 67108864,
+    "aged_native_read_fixture_bytes": 16777216,
+    "medium": "ext4",
+    "instrumented": true,
+    "diagnostic_scope": "Publication and durable-syscall intervals; not plain throughput",
+    "format_version": 1004,
+    "sqlite_primitive": "original SDK fsync",
+    "buffer_page_offset": 48,
+    "sequence_mib_and_request_mib": [
+      [
+        256,
+        8
+      ],
+      [
+        64,
+        1
+      ]
+    ],
+    "first_workload": "256 MiB write into a fresh or independently aged workspace",
+    "interpretation": "tmpfs isolates software costs, not durable-storage throughput"
+  },
+  "samples": [
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "seconds": 4.22397044103127,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.123590794,
+        "fdatasync_fence": 0.061831743,
+        "fence_open": 0.041878406,
+        "begin_batch": 0.521208119,
+        "COMMIT": 0.711804203,
+        "publication_mutex_wait": 0.856907942,
+        "stage_checkpoint_mutex_wait": 0.333647721,
+        "fdatasync_payload": 0.127015946,
+        "payload_publication": 0.128762248,
+        "fsync_wal": 0.649421911,
+        "publish": 0.759024226,
+        "ftruncate64": 0.067930942,
+        "fsync_db": 0.590127789,
+        "checkpoint_2": 0.690213484,
+        "admission": 0.809163164,
+        "fence_clean": 0.005198094,
+        "pwrite64": 0.019649886,
+        "fsync_other": 2.622e-06,
+        "checkpoint_0": 0.558602617
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "write_64",
+      "seconds": 1.201521949027665,
+      "observed_union_seconds": {
+        "COMMIT": 0.032399283,
+        "stage_checkpoint_mutex_wait": 0.071409986,
+        "fdatasync_wal": 5.6979e-05,
+        "fdatasync_fence": 0.001752173,
+        "begin_batch": 0.072940006,
+        "fdatasync_payload": 0.145300708,
+        "payload_publication": 0.145386902,
+        "fsync_wal": 0.072491219,
+        "checkpoint_0": 0.072813326,
+        "publication_mutex_wait": 0.003846748
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "read_64",
+      "seconds": 0.07643442798871547,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "random_read_4k",
+      "seconds": 0.33644553599879146,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "seconds": 0.19953441701363772,
+      "observed_union_seconds": {
+        "fsync_wal": 0.055893275,
+        "ftruncate64": 0.000282373,
+        "COMMIT": 0.017232731,
+        "checkpoint_0": 0.048171816,
+        "publication_mutex_wait": 0.00909001
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "seconds": 0.52058232401032,
+      "observed_union_seconds": {
+        "fsync_wal": 0.313460047,
+        "COMMIT": 0.324983882,
+        "checkpoint_0": 0.038108008,
+        "publication_mutex_wait": 0.001797187,
+        "ftruncate64": 5.8434e-05,
+        "fsync_db": 0.020480266
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "mkdir",
+      "seconds": 0.08403535804245621,
+      "observed_union_seconds": {
+        "fsync_wal": 0.067123717,
+        "COMMIT": 0.002506506,
+        "checkpoint_0": 0.073293307,
+        "publication_mutex_wait": 0.0022761
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "rename",
+      "seconds": 0.07455030095297843,
+      "observed_union_seconds": {
+        "fsync_wal": 0.064298653,
+        "COMMIT": 0.003543249,
+        "ftruncate64": 2.5967e-05,
+        "fsync_db": 0.002766859,
+        "checkpoint_0": 0.071793342,
+        "publication_mutex_wait": 0.001640427
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "rmdir",
+      "seconds": 0.0614673919044435,
+      "observed_union_seconds": {
+        "fsync_wal": 0.037610081,
+        "COMMIT": 0.003125301,
+        "publication_mutex_wait": 1.0136e-05,
+        "checkpoint_0": 0.040944581
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "seconds": 1.6834271920379251,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.032047432,
+        "fdatasync_fence": 0.006446045,
+        "fence_open": 0.002067706,
+        "begin_batch": 0.117790676,
+        "publication_mutex_wait": 0.547535569,
+        "stage_checkpoint_mutex_wait": 0.079180566,
+        "fdatasync_payload": 0.596869026,
+        "payload_publication": 0.597175833,
+        "fsync_wal": 0.104576006,
+        "COMMIT": 0.024435923,
+        "fsync_other": 2.638e-06,
+        "publish": 0.546917752,
+        "ftruncate64": 6.8816e-05,
+        "fsync_db": 0.038831439,
+        "checkpoint_0": 0.084567849,
+        "fence_clean": 0.001028921
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "write_64",
+      "seconds": 1.2116853029001504,
+      "observed_union_seconds": {
+        "COMMIT": 0.031516502,
+        "stage_checkpoint_mutex_wait": 0.078231887,
+        "fdatasync_wal": 9.4693e-05,
+        "fdatasync_fence": 0.001698868,
+        "begin_batch": 0.079731822,
+        "fdatasync_payload": 0.144739973,
+        "payload_publication": 0.144828178,
+        "fsync_wal": 0.079353629,
+        "checkpoint_0": 0.080186268,
+        "publication_mutex_wait": 0.00477268
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "read_64",
+      "seconds": 0.08656629000324756,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_read_4k",
+      "seconds": 0.3236911330604926,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "seconds": 0.49746691796462983,
+      "observed_union_seconds": {
+        "fsync_wal": 0.339020665,
+        "ftruncate64": 0.000299947,
+        "COMMIT": 0.28791365,
+        "checkpoint_0": 0.337344474
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "seconds": 0.5569389410084113,
+      "observed_union_seconds": {
+        "fsync_wal": 0.317022387,
+        "COMMIT": 0.331864648,
+        "checkpoint_0": 0.033211152,
+        "publication_mutex_wait": 0.002274843,
+        "ftruncate64": 5.8035e-05,
+        "fsync_db": 0.018247088
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "mkdir",
+      "seconds": 0.08302803605329245,
+      "observed_union_seconds": {
+        "fsync_wal": 0.06979674,
+        "COMMIT": 0.004763078,
+        "ftruncate64": 6.1368e-05,
+        "fsync_db": 0.004657708,
+        "checkpoint_0": 0.081878775
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "rename",
+      "seconds": 0.07298739708494395,
+      "observed_union_seconds": {
+        "fsync_wal": 0.046454855,
+        "COMMIT": 0.003808612,
+        "fsync_db": 0.001534822,
+        "checkpoint_0": 0.048853694,
+        "publication_mutex_wait": 0.003272443
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "rmdir",
+      "seconds": 0.06230912101455033,
+      "observed_union_seconds": {
+        "fsync_wal": 0.036530407,
+        "COMMIT": 0.006680357,
+        "ftruncate64": 3.0305e-05,
+        "fsync_db": 0.002204993,
+        "checkpoint_0": 0.035480322,
+        "publication_mutex_wait": 0.00638571
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "seconds": 1.677826376981102,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.003200911,
+        "fdatasync_fence": 0.00646045,
+        "fence_open": 0.002066052,
+        "begin_batch": 0.087494745,
+        "publication_mutex_wait": 0.573189994,
+        "stage_checkpoint_mutex_wait": 0.077712696,
+        "fdatasync_payload": 0.596811918,
+        "payload_publication": 0.597174232,
+        "fsync_wal": 0.1345954,
+        "COMMIT": 0.025298442,
+        "fsync_other": 6.223e-06,
+        "fence_clean": 0.001061497,
+        "publish": 0.573633414,
+        "ftruncate64": 7.5109e-05,
+        "fsync_db": 0.038956706,
+        "checkpoint_0": 0.082868388
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "write_64",
+      "seconds": 1.2248038719408214,
+      "observed_union_seconds": {
+        "COMMIT": 0.035630934,
+        "stage_checkpoint_mutex_wait": 0.069238619,
+        "fdatasync_wal": 0.000120044,
+        "fdatasync_fence": 0.002461049,
+        "begin_batch": 0.07126337,
+        "fdatasync_payload": 0.145277592,
+        "payload_publication": 0.145396321,
+        "fsync_wal": 0.074260301,
+        "fence_clean": 0.001644178,
+        "checkpoint_0": 0.070549668,
+        "publication_mutex_wait": 0.006034628
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "read_64",
+      "seconds": 0.09179769398178905,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "random_read_4k",
+      "seconds": 0.31101425003726035,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "random_write_4k",
+      "seconds": 0.1995034390129149,
+      "observed_union_seconds": {
+        "fsync_wal": 0.054867062,
+        "ftruncate64": 0.000280613,
+        "COMMIT": 0.017521149,
+        "checkpoint_0": 0.048380628,
+        "publication_mutex_wait": 0.010061746
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "small_file_fsync",
+      "seconds": 0.5581133050145581,
+      "observed_union_seconds": {
+        "fsync_wal": 0.326066898,
+        "COMMIT": 0.339405895,
+        "checkpoint_0": 0.03755457,
+        "publication_mutex_wait": 0.003244327,
+        "ftruncate64": 7.0666e-05,
+        "fsync_db": 0.019695991
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "mkdir",
+      "seconds": 0.06986642198171467,
+      "observed_union_seconds": {
+        "fsync_wal": 0.061079776,
+        "COMMIT": 0.004213424,
+        "checkpoint_0": 0.067360934,
+        "publication_mutex_wait": 0.001567305
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "rename",
+      "seconds": 0.06771606404799968,
+      "observed_union_seconds": {
+        "fsync_wal": 0.059941991,
+        "COMMIT": 0.002657114,
+        "checkpoint_0": 0.06434878,
+        "publication_mutex_wait": 0.002073924
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "rmdir",
+      "seconds": 0.057553966995328665,
+      "observed_union_seconds": {
+        "fsync_wal": 0.050207289,
+        "COMMIT": 0.003658605,
+        "checkpoint_0": 0.054976234,
+        "publication_mutex_wait": 0.001533993
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "seconds": 10.584931437973864,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.575160481,
+        "fdatasync_fence": 0.906754185,
+        "fence_open": 0.007447862,
+        "begin_batch": 1.191569786,
+        "COMMIT": 0.692817929,
+        "publication_mutex_wait": 3.418268688,
+        "stage_checkpoint_mutex_wait": 0.581550877,
+        "fdatasync_payload": 0.631350343,
+        "payload_publication": 0.633121408,
+        "fsync_wal": 4.011471215,
+        "fence_clean": 0.882017955,
+        "publish": 4.920516517,
+        "pwrite64": 0.167616504,
+        "ftruncate64": 0.066775196,
+        "fsync_db": 1.446337825,
+        "checkpoint_2": 2.231634336,
+        "admission": 4.358730823,
+        "fsync_other": 2.911e-06,
+        "checkpoint_0": 0.805165945
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "write_64",
+      "seconds": 1.2162193979602307,
+      "observed_union_seconds": {
+        "COMMIT": 0.032958624,
+        "stage_checkpoint_mutex_wait": 0.069421308,
+        "fdatasync_wal": 0.002135594,
+        "fdatasync_fence": 0.001763558,
+        "begin_batch": 0.073020308,
+        "fdatasync_payload": 0.144732388,
+        "payload_publication": 0.144813046,
+        "fsync_wal": 0.071355135,
+        "fence_clean": 0.001004617,
+        "checkpoint_0": 0.071224041,
+        "publication_mutex_wait": 0.007030329
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "read_64",
+      "seconds": 0.09138984594028443,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "random_read_4k",
+      "seconds": 0.3424210569355637,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "random_write_4k",
+      "seconds": 0.23402096005156636,
+      "observed_union_seconds": {
+        "fsync_wal": 0.064116561,
+        "ftruncate64": 0.000277428,
+        "COMMIT": 0.020140208,
+        "checkpoint_0": 0.065906409
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "small_file_fsync",
+      "seconds": 0.5435338679235429,
+      "observed_union_seconds": {
+        "fsync_wal": 0.293611169,
+        "COMMIT": 0.309213873,
+        "checkpoint_0": 0.040870465,
+        "ftruncate64": 0.000107108,
+        "fsync_db": 0.021986248,
+        "publication_mutex_wait": 0.002699714
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "mkdir",
+      "seconds": 0.09290460601914674,
+      "observed_union_seconds": {
+        "fsync_wal": 0.076671005,
+        "COMMIT": 0.003731758,
+        "ftruncate64": 4.0377e-05,
+        "fsync_db": 0.002664097,
+        "checkpoint_0": 0.089674636,
+        "publication_mutex_wait": 0.00164946
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "rename",
+      "seconds": 0.07764036289881915,
+      "observed_union_seconds": {
+        "fsync_wal": 0.067782557,
+        "COMMIT": 0.002629474,
+        "checkpoint_0": 0.076143995
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "rmdir",
+      "seconds": 0.06351243203971535,
+      "observed_union_seconds": {
+        "fsync_wal": 0.056423137,
+        "COMMIT": 0.004779748,
+        "checkpoint_0": 0.061007567,
+        "publication_mutex_wait": 0.001611687
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "seconds": 4.171195390983485,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.125046789,
+        "fdatasync_fence": 0.03484742,
+        "fence_open": 0.010233943,
+        "begin_batch": 0.507399809,
+        "COMMIT": 0.694373872,
+        "publication_mutex_wait": 0.848804845,
+        "stage_checkpoint_mutex_wait": 0.348299185,
+        "fdatasync_payload": 0.137778696,
+        "payload_publication": 0.139458835,
+        "fsync_wal": 0.669303973,
+        "publish": 0.789217311,
+        "ftruncate64": 0.066568317,
+        "fsync_db": 0.579947656,
+        "checkpoint_2": 0.675880828,
+        "admission": 0.79597706,
+        "fence_clean": 0.012817394,
+        "fsync_other": 1.685e-06,
+        "checkpoint_0": 0.56672529
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "write_64",
+      "seconds": 1.2218755969079211,
+      "observed_union_seconds": {
+        "COMMIT": 0.032587875,
+        "stage_checkpoint_mutex_wait": 0.070773251,
+        "fdatasync_wal": 9.953e-05,
+        "fdatasync_fence": 0.00179832,
+        "begin_batch": 0.072275861,
+        "fdatasync_payload": 0.173764339,
+        "payload_publication": 0.173859738,
+        "fsync_wal": 0.072152497,
+        "fence_clean": 0.001065821,
+        "checkpoint_0": 0.072302203,
+        "publication_mutex_wait": 0.004767645
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "read_64",
+      "seconds": 0.10079453000798821,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_read_4k",
+      "seconds": 0.346864876919426,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "seconds": 0.22488511505071074,
+      "observed_union_seconds": {
+        "fsync_wal": 0.057145174,
+        "ftruncate64": 0.000304383,
+        "COMMIT": 0.01865133,
+        "checkpoint_0": 0.050082362,
+        "publication_mutex_wait": 0.014219157
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "seconds": 0.7624639350688085,
+      "observed_union_seconds": {
+        "fsync_wal": 0.567127255,
+        "COMMIT": 0.57757767,
+        "checkpoint_0": 0.03865571,
+        "publication_mutex_wait": 0.002008772,
+        "ftruncate64": 5.166e-05,
+        "fsync_db": 0.021445342
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "mkdir",
+      "seconds": 0.09198876493610442,
+      "observed_union_seconds": {
+        "fsync_wal": 0.065634283,
+        "COMMIT": 0.003717927,
+        "checkpoint_0": 0.0695989,
+        "publication_mutex_wait": 0.001561302
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "rename",
+      "seconds": 0.05702937894966453,
+      "observed_union_seconds": {
+        "fsync_wal": 0.051365138,
+        "COMMIT": 0.002891421,
+        "checkpoint_0": 0.054071053,
+        "publication_mutex_wait": 0.002045007
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "rmdir",
+      "seconds": 0.05863345297984779,
+      "observed_union_seconds": {
+        "fsync_wal": 0.033543601,
+        "COMMIT": 0.01506438,
+        "ftruncate64": 2.0869e-05,
+        "fsync_db": 0.002812733,
+        "checkpoint_0": 0.038359537
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "seconds": 1.6872944050701335,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.006064168,
+        "fdatasync_fence": 0.006813312,
+        "fence_open": 0.003372207,
+        "begin_batch": 0.094257745,
+        "publication_mutex_wait": 0.544873617,
+        "stage_checkpoint_mutex_wait": 0.081585733,
+        "fdatasync_payload": 0.597540094,
+        "payload_publication": 0.597891807,
+        "fsync_wal": 0.105331098,
+        "COMMIT": 0.024634086,
+        "fsync_other": 2.775e-06,
+        "fence_clean": 0.002115327,
+        "publish": 0.544267794,
+        "ftruncate64": 7.1568e-05,
+        "fsync_db": 0.038647603,
+        "checkpoint_0": 0.086228125
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "seconds": 6.3012023189803585,
+      "observed_union_seconds": {
+        "COMMIT": 0.693109917,
+        "stage_checkpoint_mutex_wait": 0.998135378,
+        "fdatasync_wal": 0.00085067,
+        "fdatasync_fence": 0.001838534,
+        "fence_open": 0.001049325,
+        "begin_batch": 1.000911131,
+        "fdatasync_payload": 3.622987883,
+        "payload_publication": 3.623099354,
+        "fsync_wal": 1.657774297,
+        "checkpoint_0": 0.999512432,
+        "publication_mutex_wait": 0.007252177
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "read_64",
+      "seconds": 0.08720653899945319,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "random_read_4k",
+      "seconds": 0.4257821789942682,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "seconds": 0.1827848789980635,
+      "observed_union_seconds": {
+        "fsync_wal": 0.05294684,
+        "ftruncate64": 0.000401464,
+        "COMMIT": 0.018563127,
+        "checkpoint_0": 0.051182241
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "seconds": 0.5417735090013593,
+      "observed_union_seconds": {
+        "fsync_wal": 0.31148233,
+        "COMMIT": 0.32412451,
+        "checkpoint_0": 0.033778214,
+        "publication_mutex_wait": 0.004493624,
+        "ftruncate64": 6.463e-05,
+        "fsync_db": 0.018009166
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "mkdir",
+      "seconds": 0.09025721601210535,
+      "observed_union_seconds": {
+        "fsync_wal": 0.074133464,
+        "COMMIT": 0.003145808,
+        "ftruncate64": 2.1217e-05,
+        "fsync_db": 0.002448096,
+        "checkpoint_0": 0.086371835,
+        "publication_mutex_wait": 0.002361083
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "rename",
+      "seconds": 0.10987602302338928,
+      "observed_union_seconds": {
+        "fsync_wal": 0.09762178,
+        "COMMIT": 0.029445652,
+        "ftruncate64": 3.0167e-05,
+        "fsync_db": 0.002597367,
+        "checkpoint_0": 0.105952514,
+        "publication_mutex_wait": 0.002429247
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "rmdir",
+      "seconds": 0.08581784402485937,
+      "observed_union_seconds": {
+        "fsync_wal": 0.071870367,
+        "COMMIT": 0.002840924,
+        "ftruncate64": 3.4096e-05,
+        "fsync_db": 0.002288595,
+        "checkpoint_0": 0.084386162
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "seconds": 1.6806217560078949,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.00316553,
+        "fdatasync_fence": 0.006433598,
+        "fence_open": 0.002150548,
+        "begin_batch": 0.089856612,
+        "publication_mutex_wait": 0.554784462,
+        "stage_checkpoint_mutex_wait": 0.079636891,
+        "fdatasync_payload": 0.609595964,
+        "payload_publication": 0.609930887,
+        "fsync_wal": 0.10667576,
+        "COMMIT": 0.024414864,
+        "fsync_other": 1.81e-06,
+        "publish": 0.554206488,
+        "ftruncate64": 6.8199e-05,
+        "fsync_db": 0.041377659,
+        "checkpoint_0": 0.083762921
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "write_64",
+      "seconds": 1.2164824560750276,
+      "observed_union_seconds": {
+        "COMMIT": 0.031890043,
+        "stage_checkpoint_mutex_wait": 0.062012528,
+        "fdatasync_wal": 0.000110134,
+        "fdatasync_fence": 0.001794959,
+        "begin_batch": 0.063626448,
+        "fdatasync_payload": 0.171186914,
+        "payload_publication": 0.171270919,
+        "fsync_wal": 0.061974854,
+        "fence_clean": 0.001013767,
+        "checkpoint_0": 0.063620989,
+        "publication_mutex_wait": 0.004882306
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "read_64",
+      "seconds": 0.060614946065470576,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "random_read_4k",
+      "seconds": 0.32720179890748113,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "random_write_4k",
+      "seconds": 0.1875366410240531,
+      "observed_union_seconds": {
+        "fsync_wal": 0.057750268,
+        "ftruncate64": 0.000296466,
+        "COMMIT": 0.021974249,
+        "checkpoint_0": 0.054722271
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "seconds": 6.729691612999886,
+      "observed_union_seconds": {
+        "fsync_wal": 6.499859164,
+        "COMMIT": 6.514469245,
+        "checkpoint_0": 0.034857817,
+        "ftruncate64": 6.8758e-05,
+        "fsync_db": 0.020482997,
+        "publication_mutex_wait": 0.002242119
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "mkdir",
+      "seconds": 0.07590152591001242,
+      "observed_union_seconds": {
+        "fsync_wal": 0.049235298,
+        "COMMIT": 0.003670048,
+        "checkpoint_0": 0.053511501,
+        "publication_mutex_wait": 0.001565514
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "rename",
+      "seconds": 0.06680731195956469,
+      "observed_union_seconds": {
+        "fsync_wal": 0.043147524,
+        "COMMIT": 0.002943088,
+        "checkpoint_0": 0.04409852,
+        "publication_mutex_wait": 0.002105298
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "rmdir",
+      "seconds": 0.05718632391653955,
+      "observed_union_seconds": {
+        "fsync_wal": 0.024579893,
+        "COMMIT": 0.006202787,
+        "ftruncate64": 2.8987e-05,
+        "fsync_db": 0.031392424,
+        "checkpoint_0": 0.057039998
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "seconds": 7.39345982298255,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.557522923,
+        "fdatasync_fence": 0.317148901,
+        "fence_open": 0.124806473,
+        "begin_batch": 1.271236735,
+        "COMMIT": 0.720633655,
+        "publication_mutex_wait": 3.741690512,
+        "stage_checkpoint_mutex_wait": 0.56712927,
+        "pwrite": 0.020281742,
+        "fdatasync_payload": 0.45131993,
+        "payload_publication": 0.453464715,
+        "fsync_wal": 2.660333598,
+        "publish": 3.207646031,
+        "ftruncate64": 0.070359226,
+        "fsync_db": 0.493890415,
+        "checkpoint_2": 0.598524435,
+        "admission": 0.719871048,
+        "fence_clean": 0.203692764,
+        "fsync_other": 0.080618613,
+        "checkpoint_0": 0.801407924
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "write_64",
+      "seconds": 1.165905423113145,
+      "observed_union_seconds": {
+        "COMMIT": 0.031737259,
+        "stage_checkpoint_mutex_wait": 0.069997429,
+        "fdatasync_wal": 9.5966e-05,
+        "fdatasync_fence": 0.001679768,
+        "begin_batch": 0.0714868,
+        "fdatasync_payload": 0.142111966,
+        "payload_publication": 0.142188592,
+        "fsync_wal": 0.072301656,
+        "checkpoint_0": 0.071363456,
+        "publication_mutex_wait": 0.003632496
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "read_64",
+      "seconds": 0.09002245997544378,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "random_read_4k",
+      "seconds": 0.34882395807653666,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "random_write_4k",
+      "seconds": 0.22378341504372656,
+      "observed_union_seconds": {
+        "fsync_wal": 0.059482402,
+        "ftruncate64": 0.000286424,
+        "COMMIT": 0.0206649,
+        "checkpoint_0": 0.063754667
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "seconds": 6.370595594984479,
+      "observed_union_seconds": {
+        "fsync_wal": 6.131288724,
+        "COMMIT": 6.146171813,
+        "checkpoint_0": 0.038529604,
+        "ftruncate64": 7.7324e-05,
+        "fsync_db": 0.021196012,
+        "publication_mutex_wait": 0.002568268
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "mkdir",
+      "seconds": 0.09767103206831962,
+      "observed_union_seconds": {
+        "fsync_wal": 0.082053307,
+        "COMMIT": 0.002641649,
+        "checkpoint_0": 0.093481683,
+        "publication_mutex_wait": 0.002285897
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "rename",
+      "seconds": 0.08289094909559935,
+      "observed_union_seconds": {
+        "fsync_wal": 0.052047305,
+        "COMMIT": 0.002568973,
+        "ftruncate64": 3.8342e-05,
+        "fsync_db": 0.002895352,
+        "checkpoint_0": 0.059160561,
+        "publication_mutex_wait": 0.002401096
+      }
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "rmdir",
+      "seconds": 0.06478932301979512,
+      "observed_union_seconds": {
+        "fsync_wal": 0.053766228,
+        "COMMIT": 0.003171301,
+        "ftruncate64": 3.5323e-05,
+        "fsync_db": 0.002384302,
+        "checkpoint_0": 0.063685951
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "seconds": 4.202298916061409,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.143084046,
+        "fdatasync_fence": 0.031948945,
+        "fence_open": 0.006117997,
+        "begin_batch": 0.509417088,
+        "COMMIT": 0.673093566,
+        "publication_mutex_wait": 0.907792062,
+        "stage_checkpoint_mutex_wait": 0.332625638,
+        "fdatasync_payload": 0.139267985,
+        "payload_publication": 0.141021705,
+        "fsync_wal": 0.704875575,
+        "publish": 0.819275176,
+        "ftruncate64": 0.071455403,
+        "fsync_db": 0.525367151,
+        "checkpoint_2": 0.628925939,
+        "admission": 0.750832167,
+        "fence_clean": 0.006312024,
+        "checkpoint_0": 0.554638639
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "write_64",
+      "seconds": 1.2214089520275593,
+      "observed_union_seconds": {
+        "COMMIT": 0.043380996,
+        "stage_checkpoint_mutex_wait": 0.068835631,
+        "fdatasync_wal": 0.000811523,
+        "fdatasync_fence": 0.00175651,
+        "begin_batch": 0.071311711,
+        "fdatasync_payload": 0.142669562,
+        "payload_publication": 0.142756281,
+        "fsync_wal": 0.069564357,
+        "fence_clean": 0.001044402,
+        "checkpoint_0": 0.070427488,
+        "publication_mutex_wait": 0.0059717
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "read_64",
+      "seconds": 0.08698042901232839,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "random_read_4k",
+      "seconds": 0.2948506319662556,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "seconds": 0.18573452497366816,
+      "observed_union_seconds": {
+        "fsync_wal": 0.060203617,
+        "ftruncate64": 0.000253319,
+        "COMMIT": 0.024167307,
+        "checkpoint_0": 0.052525335
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "seconds": 6.524631776963361,
+      "observed_union_seconds": {
+        "fsync_wal": 6.286053474,
+        "COMMIT": 6.300568804,
+        "checkpoint_0": 0.035407321,
+        "publication_mutex_wait": 0.005830631,
+        "ftruncate64": 7.2371e-05,
+        "fsync_db": 0.019666606
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "mkdir",
+      "seconds": 0.08407986501697451,
+      "observed_union_seconds": {
+        "fsync_wal": 0.072162939,
+        "COMMIT": 0.003173027,
+        "checkpoint_0": 0.08099958,
+        "publication_mutex_wait": 0.00159832
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "rename",
+      "seconds": 0.06609758804552257,
+      "observed_union_seconds": {
+        "fsync_wal": 0.057767025,
+        "COMMIT": 0.004176811,
+        "checkpoint_0": 0.062957874,
+        "publication_mutex_wait": 0.001573684
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "rmdir",
+      "seconds": 0.05896670592483133,
+      "observed_union_seconds": {
+        "fsync_wal": 0.052343128,
+        "COMMIT": 0.005029826,
+        "checkpoint_0": 0.056600656
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "seconds": 1.6966091869398952,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.001150113,
+        "fdatasync_fence": 0.005208258,
+        "begin_batch": 0.118256669,
+        "publication_mutex_wait": 0.519845559,
+        "stage_checkpoint_mutex_wait": 0.112111596,
+        "fdatasync_payload": 0.577317081,
+        "payload_publication": 0.577632947,
+        "fsync_wal": 0.163474091,
+        "COMMIT": 0.0536493,
+        "fence_clean": 0.002049623,
+        "publish": 0.519310522,
+        "ftruncate64": 8.5612e-05,
+        "fsync_db": 0.039680751,
+        "checkpoint_0": 0.116747242
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "write_64",
+      "seconds": 1.203257350018248,
+      "observed_union_seconds": {
+        "COMMIT": 0.043688942,
+        "stage_checkpoint_mutex_wait": 0.06880247,
+        "fdatasync_wal": 5.9464e-05,
+        "fdatasync_fence": 0.001725313,
+        "begin_batch": 0.070327621,
+        "fdatasync_payload": 0.146237343,
+        "payload_publication": 0.146311532,
+        "fsync_wal": 0.06986704,
+        "checkpoint_0": 0.0701681,
+        "publication_mutex_wait": 0.003903319
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "read_64",
+      "seconds": 0.09078301500994712,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_read_4k",
+      "seconds": 0.3800100330263376,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "seconds": 0.19980832107830793,
+      "observed_union_seconds": {
+        "fsync_wal": 0.059385256,
+        "ftruncate64": 0.000235759,
+        "COMMIT": 0.030109362,
+        "checkpoint_0": 0.052359391
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "seconds": 6.572678779019043,
+      "observed_union_seconds": {
+        "fsync_wal": 6.346391169,
+        "COMMIT": 6.361258144,
+        "checkpoint_0": 0.039290256,
+        "ftruncate64": 0.000123506,
+        "fsync_db": 0.022455115,
+        "publication_mutex_wait": 0.003605581
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "mkdir",
+      "seconds": 0.09110712201800197,
+      "observed_union_seconds": {
+        "fsync_wal": 0.0777238,
+        "COMMIT": 0.002497844,
+        "checkpoint_0": 0.087207137,
+        "publication_mutex_wait": 0.002274607
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "rename",
+      "seconds": 0.07612626301124692,
+      "observed_union_seconds": {
+        "fsync_wal": 0.029460329,
+        "COMMIT": 0.004385666,
+        "publication_mutex_wait": 2.6295e-05,
+        "ftruncate64": 5.3534e-05,
+        "fsync_db": 0.002891794,
+        "checkpoint_0": 0.03539385
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "rmdir",
+      "seconds": 0.06157980905845761,
+      "observed_union_seconds": {
+        "fsync_wal": 0.053850662,
+        "COMMIT": 0.003407201,
+        "checkpoint_0": 0.060653792
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "seconds": 1.7189608650514856,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.001910161,
+        "fdatasync_fence": 0.005450397,
+        "begin_batch": 0.086239238,
+        "publication_mutex_wait": 0.547878909,
+        "stage_checkpoint_mutex_wait": 0.079199656,
+        "fdatasync_payload": 0.638199828,
+        "payload_publication": 0.638537866,
+        "fsync_wal": 0.10602146,
+        "COMMIT": 0.024875585,
+        "fence_clean": 0.002138143,
+        "publish": 0.547267646,
+        "ftruncate64": 8.6888e-05,
+        "fsync_db": 0.038964981,
+        "checkpoint_0": 0.084221955
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "write_64",
+      "seconds": 1.2258695899508893,
+      "observed_union_seconds": {
+        "COMMIT": 0.044267599,
+        "stage_checkpoint_mutex_wait": 0.064019492,
+        "fdatasync_wal": 0.002100458,
+        "fdatasync_fence": 0.001681278,
+        "begin_batch": 0.067625483,
+        "fdatasync_payload": 0.145865666,
+        "payload_publication": 0.145955562,
+        "fsync_wal": 0.071858056,
+        "checkpoint_0": 0.06556789,
+        "publication_mutex_wait": 0.005897244
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "read_64",
+      "seconds": 0.08410039998125285,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "random_read_4k",
+      "seconds": 0.3608269529649988,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "random_write_4k",
+      "seconds": 0.2037386680021882,
+      "observed_union_seconds": {
+        "fsync_wal": 0.055060453,
+        "ftruncate64": 0.000242312,
+        "COMMIT": 0.017989801,
+        "checkpoint_0": 0.047163499,
+        "publication_mutex_wait": 0.011833292
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "small_file_fsync",
+      "seconds": 0.5348571389913559,
+      "observed_union_seconds": {
+        "fsync_wal": 0.286654985,
+        "COMMIT": 0.302592753,
+        "checkpoint_0": 0.038431311,
+        "ftruncate64": 0.000147061,
+        "fsync_db": 0.023203722,
+        "publication_mutex_wait": 0.005489729
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "mkdir",
+      "seconds": 0.0723109970567748,
+      "observed_union_seconds": {
+        "fsync_wal": 0.063173901,
+        "COMMIT": 0.003527948,
+        "checkpoint_0": 0.069762971,
+        "publication_mutex_wait": 0.001509088
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "rename",
+      "seconds": 0.06784436502493918,
+      "observed_union_seconds": {
+        "fsync_wal": 0.060088307,
+        "COMMIT": 0.0032699,
+        "checkpoint_0": 0.064943516,
+        "publication_mutex_wait": 0.001774494
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "rmdir",
+      "seconds": 0.05893318203743547,
+      "observed_union_seconds": {
+        "fsync_wal": 0.052397637,
+        "COMMIT": 0.002762122,
+        "checkpoint_0": 0.058229807
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "seconds": 15.187002597027458,
+      "observed_union_seconds": {
+        "fdatasync_wal": 1.059586012,
+        "fdatasync_fence": 0.9342855,
+        "begin_batch": 2.893922806,
+        "COMMIT": 0.92200142,
+        "publication_mutex_wait": 9.168375806,
+        "stage_checkpoint_mutex_wait": 1.645936934,
+        "fence_open": 0.159743551,
+        "pwrite64": 0.238425283,
+        "fdatasync_payload": 1.580456113,
+        "payload_publication": 1.582355204,
+        "fsync_wal": 8.282099645,
+        "publish": 9.025163676,
+        "ftruncate64": 0.067596284,
+        "fsync_db": 0.698838493,
+        "checkpoint_2": 0.799895011,
+        "admission": 1.927001477,
+        "fence_clean": 0.757051327,
+        "checkpoint_0": 2.120871725
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "write_64",
+      "seconds": 1.253612039028667,
+      "observed_union_seconds": {
+        "COMMIT": 0.043635188,
+        "stage_checkpoint_mutex_wait": 0.070777007,
+        "fdatasync_wal": 0.000100402,
+        "fdatasync_fence": 0.001686715,
+        "begin_batch": 0.072412805,
+        "fdatasync_payload": 0.172488048,
+        "payload_publication": 0.172557168,
+        "fsync_wal": 0.071540765,
+        "checkpoint_0": 0.072491009,
+        "publication_mutex_wait": 0.00649591
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "read_64",
+      "seconds": 0.08339215500745922,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "random_read_4k",
+      "seconds": 0.33216971799265593,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "random_write_4k",
+      "seconds": 0.19147031800821424,
+      "observed_union_seconds": {
+        "fsync_wal": 0.054857833,
+        "ftruncate64": 0.000172997,
+        "COMMIT": 0.017127834,
+        "checkpoint_0": 0.04867725,
+        "publication_mutex_wait": 0.011407678
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "small_file_fsync",
+      "seconds": 0.5651298430748284,
+      "observed_union_seconds": {
+        "fsync_wal": 0.32769387,
+        "COMMIT": 0.340979655,
+        "checkpoint_0": 0.040264303,
+        "publication_mutex_wait": 0.004292983,
+        "ftruncate64": 6.3065e-05,
+        "fsync_db": 0.019760414
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "mkdir",
+      "seconds": 0.10051905596628785,
+      "observed_union_seconds": {
+        "fsync_wal": 0.090018152,
+        "COMMIT": 0.005246928,
+        "checkpoint_0": 0.097624236,
+        "publication_mutex_wait": 0.001428671
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "rename",
+      "seconds": 0.08734738000202924,
+      "observed_union_seconds": {
+        "fsync_wal": 0.076247511,
+        "COMMIT": 0.003141301,
+        "checkpoint_0": 0.084062412,
+        "publication_mutex_wait": 0.001523829
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "rmdir",
+      "seconds": 0.06767265102826059,
+      "observed_union_seconds": {
+        "fsync_wal": 0.059363636,
+        "COMMIT": 0.003845415,
+        "publication_mutex_wait": 0.003278251,
+        "checkpoint_0": 0.063342495
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "seconds": 4.135985260014422,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.123785119,
+        "fdatasync_fence": 0.032297528,
+        "begin_batch": 0.465301954,
+        "COMMIT": 0.652516155,
+        "publication_mutex_wait": 0.881641501,
+        "stage_checkpoint_mutex_wait": 0.309062951,
+        "fdatasync_payload": 0.13764234,
+        "payload_publication": 0.139248992,
+        "fsync_wal": 0.695285869,
+        "publish": 0.81588743,
+        "ftruncate64": 0.065788276,
+        "fsync_db": 0.602476542,
+        "checkpoint_2": 0.700559366,
+        "admission": 0.819722336,
+        "fence_clean": 0.009887581,
+        "fence_open": 0.003047655,
+        "checkpoint_0": 0.5178958
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "write_64",
+      "seconds": 1.2218114800052717,
+      "observed_union_seconds": {
+        "COMMIT": 0.042749963,
+        "stage_checkpoint_mutex_wait": 0.069182061,
+        "fdatasync_wal": 9.9464e-05,
+        "fdatasync_fence": 0.001744586,
+        "begin_batch": 0.070917993,
+        "fdatasync_payload": 0.143508938,
+        "payload_publication": 0.143591434,
+        "fsync_wal": 0.069710484,
+        "checkpoint_0": 0.070587086,
+        "publication_mutex_wait": 0.004140204
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "read_64",
+      "seconds": 0.08833860803861171,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_read_4k",
+      "seconds": 0.3306247170548886,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "seconds": 1.2721081239869818,
+      "observed_union_seconds": {
+        "fsync_wal": 1.112126863,
+        "ftruncate64": 0.000245452,
+        "COMMIT": 1.062724716,
+        "checkpoint_0": 1.099534333
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "seconds": 4.607858335948549,
+      "observed_union_seconds": {
+        "fsync_wal": 4.370498865,
+        "COMMIT": 4.386241351,
+        "checkpoint_0": 0.012495356
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "mkdir",
+      "seconds": 0.07037386193405837,
+      "observed_union_seconds": {
+        "fsync_wal": 0.042174388,
+        "COMMIT": 0.005623511,
+        "ftruncate64": 3.0603e-05,
+        "fsync_db": 0.00244291,
+        "checkpoint_0": 0.049744026
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "rename",
+      "seconds": 0.07005666196346283,
+      "observed_union_seconds": {
+        "fsync_wal": 0.044174309,
+        "COMMIT": 0.004425877,
+        "checkpoint_0": 0.047478351,
+        "publication_mutex_wait": 0.001597686
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "rmdir",
+      "seconds": 0.05972612393088639,
+      "observed_union_seconds": {
+        "fsync_wal": 0.052431856,
+        "COMMIT": 0.00368023,
+        "checkpoint_0": 0.057223077,
+        "publication_mutex_wait": 0.001633723
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "seconds": 1.700071623083204,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.001910025,
+        "fdatasync_fence": 0.033875185,
+        "fence_open": 0.029567871,
+        "begin_batch": 0.118251089,
+        "publication_mutex_wait": 0.543381746,
+        "stage_checkpoint_mutex_wait": 0.082447909,
+        "fdatasync_payload": 0.601951392,
+        "payload_publication": 0.602305071,
+        "fsync_wal": 0.104366515,
+        "COMMIT": 0.024530299,
+        "fence_clean": 0.00205709,
+        "publish": 0.542847901,
+        "ftruncate64": 9.5714e-05,
+        "fsync_db": 0.039382132,
+        "checkpoint_0": 0.086642505
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "seconds": 1.2008388460380957,
+      "observed_union_seconds": {
+        "COMMIT": 0.043907294,
+        "stage_checkpoint_mutex_wait": 0.071803484,
+        "fdatasync_wal": 6.251e-05,
+        "fdatasync_fence": 0.001775387,
+        "begin_batch": 0.073427773,
+        "fdatasync_payload": 0.145909999,
+        "payload_publication": 0.145989265,
+        "fsync_wal": 0.07232296,
+        "fence_clean": 0.001020809,
+        "checkpoint_0": 0.073335994,
+        "publication_mutex_wait": 0.004842884
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "read_64",
+      "seconds": 0.0834308109479025,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "random_read_4k",
+      "seconds": 0.39550719992257655,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "seconds": 0.2187362959375605,
+      "observed_union_seconds": {
+        "fsync_wal": 0.058192905,
+        "ftruncate64": 0.000241276,
+        "COMMIT": 0.020724016,
+        "checkpoint_0": 0.048558991,
+        "publication_mutex_wait": 0.012321915
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "seconds": 0.5508332250174135,
+      "observed_union_seconds": {
+        "fsync_wal": 0.319570704,
+        "COMMIT": 0.33208263,
+        "checkpoint_0": 0.035907987,
+        "publication_mutex_wait": 0.005888748,
+        "ftruncate64": 4.3985e-05,
+        "fsync_db": 0.018278886
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "mkdir",
+      "seconds": 0.08881340699736029,
+      "observed_union_seconds": {
+        "fsync_wal": 0.076774467,
+        "COMMIT": 0.003241249,
+        "checkpoint_0": 0.085120641,
+        "publication_mutex_wait": 0.002251945
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "rename",
+      "seconds": 0.073290730942972,
+      "observed_union_seconds": {
+        "fsync_wal": 0.062343459,
+        "COMMIT": 0.003034868,
+        "publication_mutex_wait": 0.002167078,
+        "ftruncate64": 3.8932e-05,
+        "fsync_db": 0.003152993,
+        "checkpoint_0": 0.069906526
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "rmdir",
+      "seconds": 0.06202749197836965,
+      "observed_union_seconds": {
+        "fsync_wal": 0.044390131,
+        "COMMIT": 0.007305356,
+        "ftruncate64": 3.5396e-05,
+        "fsync_db": 0.002437638,
+        "checkpoint_0": 0.043538282
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "seconds": 1.6406446790788323,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.001809649,
+        "fdatasync_fence": 0.005319246,
+        "begin_batch": 0.085209109,
+        "publication_mutex_wait": 0.542338567,
+        "stage_checkpoint_mutex_wait": 0.078485773,
+        "fdatasync_payload": 0.59868594,
+        "payload_publication": 0.598971871,
+        "fsync_wal": 0.104647168,
+        "COMMIT": 0.024701235,
+        "fence_clean": 0.002010852,
+        "publish": 0.541812546,
+        "ftruncate64": 7.6893e-05,
+        "fsync_db": 0.039396342,
+        "checkpoint_0": 0.082796605
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "write_64",
+      "seconds": 1.3135660330299288,
+      "observed_union_seconds": {
+        "COMMIT": 0.073572731,
+        "stage_checkpoint_mutex_wait": 0.064165994,
+        "fdatasync_wal": 9.1707e-05,
+        "fdatasync_fence": 0.001813171,
+        "begin_batch": 0.065737496,
+        "fdatasync_payload": 0.14740338,
+        "payload_publication": 0.147488995,
+        "fsync_wal": 0.095411593,
+        "fence_clean": 0.00104016,
+        "checkpoint_0": 0.065733456,
+        "publication_mutex_wait": 0.004953998
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "read_64",
+      "seconds": 0.09082515898626298,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "random_read_4k",
+      "seconds": 0.35913531901314855,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "random_write_4k",
+      "seconds": 0.22594991698861122,
+      "observed_union_seconds": {
+        "fsync_wal": 0.056999688,
+        "ftruncate64": 0.000251706,
+        "COMMIT": 0.017622984,
+        "checkpoint_0": 0.050678264,
+        "publication_mutex_wait": 0.014330232
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "seconds": 0.5635180850513279,
+      "observed_union_seconds": {
+        "fsync_wal": 0.322762328,
+        "COMMIT": 0.337943325,
+        "checkpoint_0": 0.036706149,
+        "publication_mutex_wait": 0.005986133,
+        "ftruncate64": 8.0844e-05,
+        "fsync_db": 0.021669304
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "mkdir",
+      "seconds": 0.08579082204960287,
+      "observed_union_seconds": {
+        "fsync_wal": 0.074353067,
+        "COMMIT": 0.00362037,
+        "checkpoint_0": 0.081945121,
+        "publication_mutex_wait": 0.00248901
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "rename",
+      "seconds": 0.07675830100197345,
+      "observed_union_seconds": {
+        "fsync_wal": 0.064113909,
+        "COMMIT": 0.002900185,
+        "ftruncate64": 4.191e-05,
+        "fsync_db": 0.003057209,
+        "checkpoint_0": 0.073406863,
+        "publication_mutex_wait": 0.001870894
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "rmdir",
+      "seconds": 0.061473075998947024,
+      "observed_union_seconds": {
+        "fsync_wal": 0.037445708,
+        "COMMIT": 0.005134914,
+        "publication_mutex_wait": 2.1096e-05,
+        "checkpoint_0": 0.040828082
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "seconds": 10.038585884962231,
+      "observed_union_seconds": {
+        "fdatasync_wal": 0.551342125,
+        "fdatasync_fence": 0.297692783,
+        "begin_batch": 1.822427202,
+        "COMMIT": 0.780159813,
+        "publication_mutex_wait": 3.617062925,
+        "stage_checkpoint_mutex_wait": 1.119904865,
+        "fdatasync_payload": 0.753739656,
+        "payload_publication": 0.755813767,
+        "fsync_wal": 3.623913973,
+        "publish": 3.667452179,
+        "ftruncate64": 0.069560208,
+        "fsync_db": 2.097630483,
+        "checkpoint_2": 2.208808552,
+        "admission": 2.987089898,
+        "fence_open": 0.124884907,
+        "pwrite64": 0.071686725,
+        "fence_clean": 0.159193228,
+        "checkpoint_0": 1.424335956,
+        "pwrite": 0.002885511
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "write_64",
+      "seconds": 1.2831013889517635,
+      "observed_union_seconds": {
+        "COMMIT": 0.043997573,
+        "stage_checkpoint_mutex_wait": 0.071218008,
+        "fdatasync_wal": 0.000115999,
+        "fdatasync_fence": 0.001702422,
+        "begin_batch": 0.073232621,
+        "fdatasync_payload": 0.145950484,
+        "payload_publication": 0.146044164,
+        "fsync_wal": 0.071476934,
+        "checkpoint_0": 0.07265744,
+        "publication_mutex_wait": 0.004270068
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "read_64",
+      "seconds": 0.08815664297435433,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "random_read_4k",
+      "seconds": 0.3568148519843817,
+      "observed_union_seconds": {}
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "random_write_4k",
+      "seconds": 0.22383986704517156,
+      "observed_union_seconds": {
+        "fsync_wal": 0.06581335,
+        "ftruncate64": 0.000251955,
+        "COMMIT": 0.024816438,
+        "checkpoint_0": 0.052781218,
+        "publication_mutex_wait": 0.010487315
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "seconds": 0.524790478986688,
+      "observed_union_seconds": {
+        "fsync_wal": 0.295974333,
+        "COMMIT": 0.310317447,
+        "checkpoint_0": 0.04239016,
+        "publication_mutex_wait": 0.001977772,
+        "ftruncate64": 0.000121342,
+        "fsync_db": 0.023587682
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "mkdir",
+      "seconds": 0.08975559799000621,
+      "observed_union_seconds": {
+        "fsync_wal": 0.075245686,
+        "COMMIT": 0.00312484,
+        "checkpoint_0": 0.085894567,
+        "publication_mutex_wait": 0.002181447
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "rename",
+      "seconds": 0.07802173600066453,
+      "observed_union_seconds": {
+        "fsync_wal": 0.064961271,
+        "COMMIT": 0.002735513,
+        "ftruncate64": 3.4794e-05,
+        "fsync_db": 0.002939201,
+        "checkpoint_0": 0.074158095,
+        "publication_mutex_wait": 0.002270031
+      }
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "rmdir",
+      "seconds": 0.06452154496219009,
+      "observed_union_seconds": {
+        "fsync_wal": 0.044241206,
+        "COMMIT": 0.008214815,
+        "ftruncate64": 3.5213e-05,
+        "fsync_db": 0.002318707,
+        "checkpoint_0": 0.042893347
+      }
+    }
+  ],
+  "slow_syscalls": [
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200443,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.157242511,
+      "waits": {
+        "rq_qos_wait": 21,
+        "folio_wait_bit_common": 17,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 121256,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 18
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200443,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135996502,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121320,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200443,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135515842,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 121464,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200443,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.161372934,
+      "waits": {
+        "rq_qos_wait": 23,
+        "folio_wait_bit_common": 17,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 121512,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "write_64",
+      "tid": 3200443,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.145300708,
+      "waits": {
+        "rq_qos_wait": 25,
+        "folio_wait_bit_common": 14,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 131224,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200445,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.117988743,
+      "waits": {
+        "rq_qos_wait": 27,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 44384,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 9
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200445,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.139477256,
+      "waits": {
+        "rq_qos_wait": 28,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 125112,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200829,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.129378769,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 118896,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "write_64",
+      "tid": 3200829,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.144739973,
+      "waits": {
+        "rq_qos_wait": 40,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 131272,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200829,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.223560396,
+      "waits": {
+        "folio_wait_bit_common": 27,
+        "jbd2_log_wait_commit": 48
+      },
+      "completed_device_write_sectors": 6336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 76
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "tid": 3200829,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.284729738,
+      "waits": {
+        "rq_qos_wait": 79,
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 38608,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 18
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200831,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.224509986,
+      "waits": {
+        "rq_qos_wait": 57,
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 204984,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3200831,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.242980271,
+      "waits": {
+        "rq_qos_wait": 44,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 13
+      },
+      "completed_device_write_sectors": 200856,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 40
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200831,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 3.440458022,
+      "waits": {
+        "rq_qos_wait": 518,
+        "folio_wait_bit_common": 410,
+        "jbd2_log_wait_commit": 166
+      },
+      "completed_device_write_sectors": 125440,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 448
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200831,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.636332079,
+      "waits": {
+        "folio_wait_bit_common": 53,
+        "jbd2_log_wait_commit": 153
+      },
+      "completed_device_write_sectors": 24904,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 381
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3200831,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.531650941,
+      "waits": {
+        "rq_qos_wait": 75,
+        "folio_wait_bit_common": 26,
+        "jbd2_log_wait_commit": 70
+      },
+      "completed_device_write_sectors": 18408,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 148
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "tid": 3200831,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.336576204,
+      "waits": {
+        "folio_wait_bit_common": 93,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 43216,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 18
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201244,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.133717453,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 118856,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "write_64",
+      "tid": 3201244,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.145277592,
+      "waits": {
+        "rq_qos_wait": 25,
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 131120,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201246,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.245173192,
+      "waits": {
+        "rq_qos_wait": 57,
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 204880,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201246,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.217921273,
+      "waits": {
+        "rq_qos_wait": 40,
+        "folio_wait_bit_common": 13,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 201008,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "outside_workload_timers",
+      "tid": 3201246,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.135982551,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 125056,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 9
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.162544867,
+      "waits": {
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 50
+      },
+      "completed_device_write_sectors": 5384,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 79
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.301762086,
+      "waits": {
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 91
+      },
+      "completed_device_write_sectors": 8200,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 200
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.870917366,
+      "waits": {
+        "folio_wait_bit_common": 58,
+        "jbd2_log_wait_commit": 212
+      },
+      "completed_device_write_sectors": 29720,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 749
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fdatasync",
+      "file": "db.sqlite.stage-fence",
+      "seconds": 0.874614567,
+      "waits": {
+        "folio_wait_bit_common": 156,
+        "rq_qos_wait": 27,
+        "submit_bio_wait": 97
+      },
+      "completed_device_write_sectors": 14688,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 874
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.511274846,
+      "waits": {
+        "rq_qos_wait": 31,
+        "submit_bio_wait": 132
+      },
+      "completed_device_write_sectors": 19792,
+      "completed_device_flushes": 1,
+      "device_flush_milliseconds": 419
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 1.041977484,
+      "waits": {
+        "rq_qos_wait": 228,
+        "folio_wait_bit_common": 91,
+        "jbd2_log_wait_commit": 21
+      },
+      "completed_device_write_sectors": 40048,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 1065
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.131988498,
+      "waits": {
+        "rq_qos_wait": 28,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121256,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135541687,
+      "waits": {
+        "rq_qos_wait": 24,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121504,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201518,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.136830156,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 122112,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "write_64",
+      "tid": 3201518,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.144732388,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 131200,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.242807381,
+      "waits": {
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 75
+      },
+      "completed_device_write_sectors": 4208,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 87
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201520,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.917289602,
+      "waits": {
+        "rq_qos_wait": 112,
+        "folio_wait_bit_common": 25,
+        "jbd2_log_wait_commit": 147
+      },
+      "completed_device_write_sectors": 32528,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 473
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.169030314,
+      "waits": {
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 51
+      },
+      "completed_device_write_sectors": 4248,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 82
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201520,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.81395916,
+      "waits": {
+        "folio_wait_bit_common": 102,
+        "jbd2_log_wait_commit": 149
+      },
+      "completed_device_write_sectors": 29768,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 403
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3201520,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.167124829,
+      "waits": {
+        "jbd2_log_wait_commit": 52
+      },
+      "completed_device_write_sectors": 2968,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 165
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "outside_workload_timers",
+      "tid": 3201520,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.109057813,
+      "waits": {
+        "rq_qos_wait": 16,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 12
+      },
+      "completed_device_write_sectors": 69648,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 36
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "outside_workload_timers",
+      "tid": 3201520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.139426078,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 125496,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202119,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.152184766,
+      "waits": {
+        "rq_qos_wait": 26,
+        "folio_wait_bit_common": 11,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 121256,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 18
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202119,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135990739,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121288,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202119,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135631413,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121424,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202119,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.156140738,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 121560,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3202119,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.173764339,
+      "waits": {
+        "rq_qos_wait": 27,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 13
+      },
+      "completed_device_write_sectors": 131168,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 40
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "tid": 3202119,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.243258163,
+      "waits": {
+        "folio_wait_bit_common": 38,
+        "jbd2_log_wait_commit": 40
+      },
+      "completed_device_write_sectors": 208,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 1
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3202121,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.139374557,
+      "waits": {
+        "rq_qos_wait": 27,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 125080,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202518,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.133458279,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 2
+      },
+      "completed_device_write_sectors": 118856,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 9
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3202518,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 3.622987883,
+      "waits": {
+        "rq_qos_wait": 601,
+        "folio_wait_bit_common": 376,
+        "jbd2_log_wait_commit": 164
+      },
+      "completed_device_write_sectors": 131384,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 426
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3202518,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.690912331,
+      "waits": {
+        "folio_wait_bit_common": 74,
+        "jbd2_log_wait_commit": 151
+      },
+      "completed_device_write_sectors": 25504,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 385
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3202518,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.229946251,
+      "waits": {
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 71
+      },
+      "completed_device_write_sectors": 9024,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 152
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3202518,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.28824355,
+      "waits": {
+        "folio_wait_bit_common": 20,
+        "jbd2_log_wait_commit": 70
+      },
+      "completed_device_write_sectors": 6272,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 302
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.218383589,
+      "waits": {
+        "rq_qos_wait": 46,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 204936,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3202520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.245698226,
+      "waits": {
+        "rq_qos_wait": 44,
+        "folio_wait_bit_common": 18,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 201048,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 18
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3202520,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.966764165,
+      "waits": {
+        "folio_wait_bit_common": 155,
+        "jbd2_log_wait_commit": 148
+      },
+      "completed_device_write_sectors": 36000,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 473
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3202520,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 4.185793179,
+      "waits": {
+        "rq_qos_wait": 764,
+        "folio_wait_bit_common": 453,
+        "jbd2_log_wait_commit": 100
+      },
+      "completed_device_write_sectors": 150184,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 1906
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3202520,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.594804127,
+      "waits": {
+        "rq_qos_wait": 89,
+        "folio_wait_bit_common": 26,
+        "jbd2_log_wait_commit": 71
+      },
+      "completed_device_write_sectors": 18848,
+      "completed_device_flushes": 8,
+      "device_flush_milliseconds": 304
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3202986,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.137026206,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 118960,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 15
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "write_64",
+      "tid": 3202986,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.171186914,
+      "waits": {
+        "rq_qos_wait": 38,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 131232,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.26214418,
+      "waits": {
+        "folio_wait_bit_common": 31,
+        "jbd2_log_wait_commit": 51
+      },
+      "completed_device_write_sectors": 9080,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 80
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.108011473,
+      "waits": {
+        "jbd2_log_wait_commit": 34
+      },
+      "completed_device_write_sectors": 248,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 108
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.111200269,
+      "waits": {
+        "jbd2_log_wait_commit": 34
+      },
+      "completed_device_write_sectors": 592,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 110
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.111720771,
+      "waits": {
+        "jbd2_log_wait_commit": 35
+      },
+      "completed_device_write_sectors": 232,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 111
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.164497204,
+      "waits": {
+        "folio_wait_bit_common": 26,
+        "jbd2_log_wait_commit": 27
+      },
+      "completed_device_write_sectors": 296,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 165
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3202986,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.101981657,
+      "waits": {
+        "jbd2_log_wait_commit": 31
+      },
+      "completed_device_write_sectors": 232,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 101
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3202988,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.224106456,
+      "waits": {
+        "rq_qos_wait": 57,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 204936,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3202988,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.248463302,
+      "waits": {
+        "rq_qos_wait": 54,
+        "folio_wait_bit_common": 11,
+        "jbd2_log_wait_commit": 7
+      },
+      "completed_device_write_sectors": 200976,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3202988,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.13670771,
+      "waits": {
+        "rq_qos_wait": 27,
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 125032,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203515,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.10694741,
+      "waits": {
+        "folio_wait_bit_common": 9,
+        "jbd2_log_wait_commit": 22
+      },
+      "completed_device_write_sectors": 2824,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 149
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203515,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.339630614,
+      "waits": {
+        "folio_wait_bit_common": 13,
+        "jbd2_log_wait_commit": 90
+      },
+      "completed_device_write_sectors": 33488,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 258
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203515,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.134878825,
+      "waits": {
+        "rq_qos_wait": 27,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121328,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203515,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.158009087,
+      "waits": {
+        "rq_qos_wait": 34,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 7
+      },
+      "completed_device_write_sectors": 121456,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 21
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203515,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.13669232,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 121512,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "write_64",
+      "tid": 3203515,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.142111966,
+      "waits": {
+        "rq_qos_wait": 21,
+        "folio_wait_bit_common": 16,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 131336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3203515,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.235566793,
+      "waits": {
+        "folio_wait_bit_common": 27,
+        "jbd2_log_wait_commit": 48
+      },
+      "completed_device_write_sectors": 9112,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 78
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "tid": 3203515,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.105434929,
+      "waits": {
+        "jbd2_log_wait_commit": 32
+      },
+      "completed_device_write_sectors": 200,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 105
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203517,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.151635434,
+      "waits": {
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 44
+      },
+      "completed_device_write_sectors": 4168,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 74
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203517,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.8839634,
+      "waits": {
+        "rq_qos_wait": 72,
+        "folio_wait_bit_common": 49,
+        "jbd2_log_wait_commit": 148
+      },
+      "completed_device_write_sectors": 34904,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 404
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203517,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.172888749,
+      "waits": {
+        "folio_wait_bit_common": 30,
+        "jbd2_log_wait_commit": 23
+      },
+      "completed_device_write_sectors": 4240,
+      "completed_device_flushes": 5,
+      "device_flush_milliseconds": 145
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3203517,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.985148651,
+      "waits": {
+        "rq_qos_wait": 70,
+        "folio_wait_bit_common": 140,
+        "jbd2_log_wait_commit": 91
+      },
+      "completed_device_write_sectors": 36912,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 892
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3203517,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.160082874,
+      "waits": {
+        "rq_qos_wait": 34,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 7
+      },
+      "completed_device_write_sectors": 125552,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135289782,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 121544,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.154841755,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 7
+      },
+      "completed_device_write_sectors": 121368,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135960516,
+      "waits": {
+        "rq_qos_wait": 24,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121464,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "write_64",
+      "tid": 3204151,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.142669562,
+      "waits": {
+        "rq_qos_wait": 33,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 131296,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.247105364,
+      "waits": {
+        "folio_wait_bit_common": 29,
+        "jbd2_log_wait_commit": 52
+      },
+      "completed_device_write_sectors": 9040,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 159
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.102313016,
+      "waits": {
+        "jbd2_log_wait_commit": 32
+      },
+      "completed_device_write_sectors": 208,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 102
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.160404699,
+      "waits": {
+        "folio_wait_bit_common": 24,
+        "jbd2_log_wait_commit": 26
+      },
+      "completed_device_write_sectors": 312,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 162
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.105882315,
+      "waits": {
+        "jbd2_log_wait_commit": 33
+      },
+      "completed_device_write_sectors": 296,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 105
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.104097293,
+      "waits": {
+        "jbd2_log_wait_commit": 32
+      },
+      "completed_device_write_sectors": 248,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 103
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204151,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.190183695,
+      "waits": {
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 61
+      },
+      "completed_device_write_sectors": 4616,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 84
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204153,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.133671361,
+      "waits": {
+        "rq_qos_wait": 18,
+        "folio_wait_bit_common": 18,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 122600,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 8
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204645,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.151075067,
+      "waits": {
+        "folio_wait_bit_common": 25,
+        "jbd2_log_wait_commit": 28
+      },
+      "completed_device_write_sectors": 104,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 154
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204645,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 1.747098854,
+      "waits": {
+        "rq_qos_wait": 330,
+        "folio_wait_bit_common": 72,
+        "jbd2_log_wait_commit": 147
+      },
+      "completed_device_write_sectors": 66480,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 376
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.393918825,
+      "waits": {
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 128
+      },
+      "completed_device_write_sectors": 12368,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 392
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204645,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.137346348,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 123168,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "write_64",
+      "tid": 3204645,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.146237343,
+      "waits": {
+        "rq_qos_wait": 24,
+        "folio_wait_bit_common": 14,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 131200,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.2384356,
+      "waits": {
+        "folio_wait_bit_common": 25,
+        "jbd2_log_wait_commit": 50
+      },
+      "completed_device_write_sectors": 9072,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 84
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.170291573,
+      "waits": {
+        "folio_wait_bit_common": 28,
+        "jbd2_log_wait_commit": 25
+      },
+      "completed_device_write_sectors": 272,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 171
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.195768166,
+      "waits": {
+        "folio_wait_bit_common": 30,
+        "jbd2_log_wait_commit": 32
+      },
+      "completed_device_write_sectors": 264,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 196
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.121834846,
+      "waits": {
+        "jbd2_log_wait_commit": 38
+      },
+      "completed_device_write_sectors": 336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 121
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.100759637,
+      "waits": {
+        "folio_wait_bit_common": 31,
+        "jbd2_log_wait_commit": 1
+      },
+      "completed_device_write_sectors": 240,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 101
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.161083821,
+      "waits": {
+        "folio_wait_bit_common": 24,
+        "jbd2_log_wait_commit": 27
+      },
+      "completed_device_write_sectors": 280,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 162
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.150125023,
+      "waits": {
+        "folio_wait_bit_common": 25,
+        "submit_bio_wait": 24
+      },
+      "completed_device_write_sectors": 280,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 151
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "tid": 3204645,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.102493269,
+      "waits": {
+        "jbd2_log_wait_commit": 34
+      },
+      "completed_device_write_sectors": 216,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 102
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204651,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.670295965,
+      "waits": {
+        "folio_wait_bit_common": 28,
+        "jbd2_log_wait_commit": 189
+      },
+      "completed_device_write_sectors": 26344,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 510
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204651,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.107831126,
+      "waits": {
+        "rq_qos_wait": 21,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 98376,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 7
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204651,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.218269241,
+      "waits": {
+        "rq_qos_wait": 42,
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 201096,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "stream_256",
+      "tid": 3204651,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.221701492,
+      "waits": {
+        "rq_qos_wait": 43,
+        "do_get_write_access": 8,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 1
+      },
+      "completed_device_write_sectors": 201128,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 23
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "workload": "outside_workload_timers",
+      "tid": 3204651,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.144014772,
+      "waits": {
+        "rq_qos_wait": 26,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 127056,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205296,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.171326214,
+      "waits": {
+        "rq_qos_wait": 37,
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 13
+      },
+      "completed_device_write_sectors": 128808,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "write_64",
+      "tid": 3205296,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.145865666,
+      "waits": {
+        "rq_qos_wait": 33,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 131192,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205298,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.246189194,
+      "waits": {
+        "rq_qos_wait": 42,
+        "folio_wait_bit_common": 20,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 200984,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205298,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.22068442,
+      "waits": {
+        "rq_qos_wait": 45,
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 200808,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 14
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "workload": "outside_workload_timers",
+      "tid": 3205298,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.429876665,
+      "waits": {
+        "rq_qos_wait": 32,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 98
+      },
+      "completed_device_write_sectors": 127224,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 182
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.129291607,
+      "waits": {
+        "folio_wait_bit_common": 18,
+        "submit_bio_wait": 23
+      },
+      "completed_device_write_sectors": 1520,
+      "completed_device_flushes": 1,
+      "device_flush_milliseconds": 74
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.190047109,
+      "waits": {
+        "folio_wait_bit_common": 14,
+        "submit_bio_wait": 47
+      },
+      "completed_device_write_sectors": 8056,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 219
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.159533111,
+      "waits": {
+        "folio_wait_bit_common": 24,
+        "jbd2_log_wait_commit": 28
+      },
+      "completed_device_write_sectors": 2728,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 157
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.255759166,
+      "waits": {
+        "folio_wait_bit_common": 51,
+        "jbd2_log_wait_commit": 31
+      },
+      "completed_device_write_sectors": 19112,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 254
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.118289151,
+      "waits": {
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 25
+      },
+      "completed_device_write_sectors": 2848,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 152
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.193699023,
+      "waits": {
+        "folio_wait_bit_common": 13,
+        "jbd2_log_wait_commit": 48
+      },
+      "completed_device_write_sectors": 2600,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 76
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.278864326,
+      "waits": {
+        "folio_wait_bit_common": 37,
+        "jbd2_log_wait_commit": 49
+      },
+      "completed_device_write_sectors": 8256,
+      "completed_device_flushes": 5,
+      "device_flush_milliseconds": 234
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.562860305,
+      "waits": {
+        "folio_wait_bit_common": 26,
+        "jbd2_log_wait_commit": 149
+      },
+      "completed_device_write_sectors": 18800,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 400
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.333277444,
+      "waits": {
+        "rq_qos_wait": 74,
+        "folio_wait_bit_common": 20,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 89240,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.132932668,
+      "waits": {
+        "rq_qos_wait": 26,
+        "folio_wait_bit_common": 9,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 121536,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205600,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135074823,
+      "waits": {
+        "rq_qos_wait": 28,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121536,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "write_64",
+      "tid": 3205600,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.172488048,
+      "waits": {
+        "rq_qos_wait": 40,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 131232,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.148828963,
+      "waits": {
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 45
+      },
+      "completed_device_write_sectors": 4232,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 75
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.926395192,
+      "waits": {
+        "rq_qos_wait": 70,
+        "folio_wait_bit_common": 74,
+        "jbd2_log_wait_commit": 142
+      },
+      "completed_device_write_sectors": 35016,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 455
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.246923658,
+      "waits": {
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 76
+      },
+      "completed_device_write_sectors": 7296,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 166
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.896948669,
+      "waits": {
+        "rq_qos_wait": 78,
+        "folio_wait_bit_common": 49,
+        "jbd2_log_wait_commit": 152
+      },
+      "completed_device_write_sectors": 32488,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 81
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.stage-fence",
+      "seconds": 0.522450134,
+      "waits": {
+        "rq_qos_wait": 7,
+        "folio_wait_bit_common": 52,
+        "submit_bio_wait": 105
+      },
+      "completed_device_write_sectors": 16400,
+      "completed_device_flushes": 1,
+      "device_flush_milliseconds": 335
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.479526469,
+      "waits": {
+        "jbd2_log_wait_commit": 149
+      },
+      "completed_device_write_sectors": 16352,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 314
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.163928896,
+      "waits": {
+        "folio_wait_bit_common": 1,
+        "jbd2_log_wait_commit": 53
+      },
+      "completed_device_write_sectors": 4440,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 82
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.833930616,
+      "waits": {
+        "rq_qos_wait": 77,
+        "folio_wait_bit_common": 34,
+        "jbd2_log_wait_commit": 160
+      },
+      "completed_device_write_sectors": 29896,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 488
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.252694491,
+      "waits": {
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 80
+      },
+      "completed_device_write_sectors": 4440,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 87
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.980643763,
+      "waits": {
+        "rq_qos_wait": 78,
+        "folio_wait_bit_common": 79,
+        "jbd2_log_wait_commit": 157
+      },
+      "completed_device_write_sectors": 36008,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 484
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.174571049,
+      "waits": {
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 48
+      },
+      "completed_device_write_sectors": 4352,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 77
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.978613166,
+      "waits": {
+        "rq_qos_wait": 79,
+        "folio_wait_bit_common": 154,
+        "jbd2_log_wait_commit": 71
+      },
+      "completed_device_write_sectors": 32856,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 958
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.788205761,
+      "waits": {
+        "jbd2_log_wait_commit": 247
+      },
+      "completed_device_write_sectors": 32336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 705
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.247810033,
+      "waits": {
+        "folio_wait_bit_common": 16,
+        "jbd2_log_wait_commit": 62
+      },
+      "completed_device_write_sectors": 4160,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 285
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "stream_256",
+      "tid": 3205613,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.882755263,
+      "waits": {
+        "folio_wait_bit_common": 127,
+        "jbd2_log_wait_commit": 147
+      },
+      "completed_device_write_sectors": 30448,
+      "completed_device_flushes": 5,
+      "device_flush_milliseconds": 551
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "workload": "outside_workload_timers",
+      "tid": 3205613,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.139091817,
+      "waits": {
+        "rq_qos_wait": 28,
+        "folio_wait_bit_common": 6,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 127192,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-journal",
+      "seconds": 0.1051541,
+      "waits": {
+        "jbd2_log_wait_commit": 38
+      },
+      "completed_device_write_sectors": 616,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 100
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206310,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 1.722495093,
+      "waits": {
+        "rq_qos_wait": 329,
+        "do_get_write_access": 45,
+        "folio_wait_bit_common": 138,
+        "jbd2_log_wait_commit": 24
+      },
+      "completed_device_write_sectors": 66816,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 516
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.376489195,
+      "waits": {
+        "folio_wait_bit_common": 46,
+        "jbd2_log_wait_commit": 71
+      },
+      "completed_device_write_sectors": 12360,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 227
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.164695289,
+      "waits": {
+        "rq_qos_wait": 31,
+        "__submit_bio": 1,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 13
+      },
+      "completed_device_write_sectors": 121608,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 41
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.138152574,
+      "waits": {
+        "rq_qos_wait": 30,
+        "do_get_write_access": 5,
+        "folio_wait_bit_common": 5
+      },
+      "completed_device_write_sectors": 121656,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 16
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.135677592,
+      "waits": {
+        "rq_qos_wait": 19,
+        "folio_wait_bit_common": 14,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 121456,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.163951087,
+      "waits": {
+        "rq_qos_wait": 28,
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 121608,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 19
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3206310,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.143508938,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 131176,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 1.048818698,
+      "waits": {
+        "rq_qos_wait": 61,
+        "folio_wait_bit_common": 117,
+        "jbd2_log_wait_commit": 144
+      },
+      "completed_device_write_sectors": 39120,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 391
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.304447628,
+      "waits": {
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 97
+      },
+      "completed_device_write_sectors": 9400,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 149
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.161114513,
+      "waits": {
+        "folio_wait_bit_common": 27,
+        "jbd2_log_wait_commit": 25
+      },
+      "completed_device_write_sectors": 336,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 162
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "small_file_fsync",
+      "tid": 3206310,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.15055047,
+      "waits": {
+        "folio_wait_bit_common": 22,
+        "jbd2_log_wait_commit": 24
+      },
+      "completed_device_write_sectors": 264,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 152
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.557464706,
+      "waits": {
+        "folio_wait_bit_common": 32,
+        "jbd2_log_wait_commit": 144
+      },
+      "completed_device_write_sectors": 20688,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 588
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 1.300800617,
+      "waits": {
+        "rq_qos_wait": 324,
+        "do_get_write_access": 73,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 1
+      },
+      "completed_device_write_sectors": 105944,
+      "completed_device_flushes": 6,
+      "device_flush_milliseconds": 186
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.10050922,
+      "waits": {
+        "rq_qos_wait": 13,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 43816,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.140062266,
+      "waits": {
+        "rq_qos_wait": 18,
+        "folio_wait_bit_common": 17,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 127160,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "random_write_4k",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 1.098909574,
+      "waits": {
+        "rq_qos_wait": 75,
+        "folio_wait_bit_common": 117,
+        "jbd2_log_wait_commit": 144
+      },
+      "completed_device_write_sectors": 43728,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 391
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.156527776,
+      "waits": {
+        "jbd2_log_wait_commit": 49
+      },
+      "completed_device_write_sectors": 88,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 165
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206312,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.420785554,
+      "waits": {
+        "rq_qos_wait": 52,
+        "folio_wait_bit_common": 27,
+        "jbd2_log_wait_commit": 54
+      },
+      "completed_device_write_sectors": 11696,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 168
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206963,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.101157129,
+      "waits": {
+        "rq_qos_wait": 16,
+        "folio_wait_bit_common": 8,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 65664,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 17
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206963,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.138282022,
+      "waits": {
+        "rq_qos_wait": 35,
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 122984,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "write_64",
+      "tid": 3206963,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.145909999,
+      "waits": {
+        "rq_qos_wait": 35,
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 131328,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206965,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.218340181,
+      "waits": {
+        "rq_qos_wait": 46,
+        "folio_wait_bit_common": 8,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 200944,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "stream_256",
+      "tid": 3206965,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.245329189,
+      "waits": {
+        "rq_qos_wait": 46,
+        "folio_wait_bit_common": 8,
+        "jbd2_log_wait_commit": 13
+      },
+      "completed_device_write_sectors": 200888,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 42
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 2,
+      "workload": "outside_workload_timers",
+      "tid": 3206965,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.138752627,
+      "waits": {
+        "rq_qos_wait": 34,
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 127432,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 10
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207323,
+      "name": "fsync",
+      "file": "db.sqlite-journal",
+      "seconds": 0.110486467,
+      "waits": {
+        "jbd2_log_wait_commit": 39
+      },
+      "completed_device_write_sectors": 32,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 110
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207323,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.12109872,
+      "waits": {
+        "jbd2_log_wait_commit": 42
+      },
+      "completed_device_write_sectors": 96,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 120
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207323,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 1.874782811,
+      "waits": {
+        "rq_qos_wait": 284,
+        "folio_wait_bit_common": 142,
+        "jbd2_log_wait_commit": 154
+      },
+      "completed_device_write_sectors": 65976,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 496
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207323,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.365822972,
+      "waits": {
+        "folio_wait_bit_common": 47,
+        "jbd2_log_wait_commit": 66
+      },
+      "completed_device_write_sectors": 12256,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 365
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207323,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.136045456,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 5,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 123000,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 12
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "write_64",
+      "tid": 3207323,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.14740338,
+      "waits": {
+        "rq_qos_wait": 32,
+        "folio_wait_bit_common": 8,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 131224,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207325,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.582503325,
+      "waits": {
+        "folio_wait_bit_common": 34,
+        "jbd2_log_wait_commit": 140
+      },
+      "completed_device_write_sectors": 20624,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 468
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207325,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 2.504284645,
+      "waits": {
+        "rq_qos_wait": 424,
+        "do_get_write_access": 95,
+        "folio_wait_bit_common": 201,
+        "jbd2_log_wait_commit": 66
+      },
+      "completed_device_write_sectors": 104416,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 820
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207325,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.215774458,
+      "waits": {
+        "rq_qos_wait": 56,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 201608,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207325,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.246866026,
+      "waits": {
+        "rq_qos_wait": 45,
+        "folio_wait_bit_common": 16,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 200848,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207325,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.142353805,
+      "waits": {
+        "rq_qos_wait": 25,
+        "folio_wait_bit_common": 8,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 127080,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.138776698,
+      "waits": {
+        "rq_qos_wait": 31,
+        "folio_wait_bit_common": 3,
+        "jbd2_log_wait_commit": 2
+      },
+      "completed_device_write_sectors": 126336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 7
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.132025315,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 4,
+        "jbd2_log_wait_commit": 4
+      },
+      "completed_device_write_sectors": 121336,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.191846056,
+      "waits": {
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 47
+      },
+      "completed_device_write_sectors": 4160,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 232
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fdatasync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.260067927,
+      "waits": {
+        "folio_wait_bit_common": 12,
+        "jbd2_log_wait_commit": 68
+      },
+      "completed_device_write_sectors": 8112,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 300
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fdatasync",
+      "file": "db.sqlite.stage-fence",
+      "seconds": 0.117591089,
+      "waits": {
+        "submit_bio_wait": 36
+      },
+      "completed_device_write_sectors": 104,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 117
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.138984083,
+      "waits": {
+        "folio_wait_bit_common": 21,
+        "jbd2_log_wait_commit": 23
+      },
+      "completed_device_write_sectors": 2232,
+      "completed_device_flushes": 3,
+      "device_flush_milliseconds": 149
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.536749467,
+      "waits": {
+        "folio_wait_bit_common": 24,
+        "jbd2_log_wait_commit": 139
+      },
+      "completed_device_write_sectors": 18976,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 389
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 1.694055692,
+      "waits": {
+        "rq_qos_wait": 486,
+        "folio_wait_bit_common": 26,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 90048,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 20
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207898,
+      "name": "fsync",
+      "file": "db.sqlite",
+      "seconds": 0.132772778,
+      "waits": {
+        "rq_qos_wait": 30,
+        "folio_wait_bit_common": 2,
+        "jbd2_log_wait_commit": 3
+      },
+      "completed_device_write_sectors": 121888,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 11
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "write_64",
+      "tid": 3207898,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.145950484,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 10,
+        "jbd2_log_wait_commit": 5
+      },
+      "completed_device_write_sectors": 131200,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 13
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.220844412,
+      "waits": {
+        "folio_wait_bit_common": 7,
+        "jbd2_log_wait_commit": 63
+      },
+      "completed_device_write_sectors": 4168,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 81
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.824619054,
+      "waits": {
+        "rq_qos_wait": 95,
+        "folio_wait_bit_common": 23,
+        "jbd2_log_wait_commit": 140
+      },
+      "completed_device_write_sectors": 33504,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 372
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fdatasync",
+      "file": "db.sqlite.stage-fence",
+      "seconds": 0.149246877,
+      "waits": {
+        "rq_qos_wait": 23,
+        "submit_bio_wait": 24
+      },
+      "completed_device_write_sectors": 1504,
+      "completed_device_flushes": 1,
+      "device_flush_milliseconds": 76
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.676980246,
+      "waits": {
+        "jbd2_log_wait_commit": 211
+      },
+      "completed_device_write_sectors": 28016,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 598
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.199280689,
+      "waits": {
+        "folio_wait_bit_common": 27,
+        "jbd2_log_wait_commit": 34
+      },
+      "completed_device_write_sectors": 4248,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 110
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.825415217,
+      "waits": {
+        "rq_qos_wait": 70,
+        "folio_wait_bit_common": 46,
+        "jbd2_log_wait_commit": 139
+      },
+      "completed_device_write_sectors": 30056,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 445
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "stream_256",
+      "tid": 3207900,
+      "name": "fsync",
+      "file": "db.sqlite-wal",
+      "seconds": 0.145353401,
+      "waits": {
+        "jbd2_log_wait_commit": 45
+      },
+      "completed_device_write_sectors": 64,
+      "completed_device_flushes": 4,
+      "device_flush_milliseconds": 146
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "outside_workload_timers",
+      "tid": 3207900,
+      "name": "fdatasync",
+      "file": "db.sqlite.payload",
+      "seconds": 0.165883703,
+      "waits": {
+        "rq_qos_wait": 29,
+        "folio_wait_bit_common": 9,
+        "jbd2_log_wait_commit": 6
+      },
+      "completed_device_write_sectors": 127144,
+      "completed_device_flushes": 2,
+      "device_flush_milliseconds": 20
+    }
+  ],
+  "scope": "Instrumented diagnosis, not a performance adoption window; nested or cross-thread intervals must not be added; whole-device counters do not identify per-file physical writes"
+}

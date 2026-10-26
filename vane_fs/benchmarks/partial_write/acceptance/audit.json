@@ -1,0 +1,36 @@
+{
+  "status": "PASS",
+  "owned_correctness_tests_and_builds_outside_all_windows": true,
+  "benchmark_directories_removed": 128,
+  "production_identities": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": {
+      "sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+      "unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": {
+      "sha256": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+      "unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/fuse.cpp": {
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": {
+      "sha256": "6d02862badc3057451407c4e219bd11109e8e3933bb8924eef6ba55006a70479",
+      "unchanged": true
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": {
+      "sha256": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+      "unchanged": true
+    }
+  },
+  "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "kernel": "Linux 6.11.0-24-generic x86_64 GNU/Linux",
+  "pre_commit_passed": true,
+  "copyleft": {
+    "source_inventory": "passed",
+    "native_profile": "passed",
+    "installed_notices": []
+  },
+  "checked_epoch": 1791696021.0173485
+}

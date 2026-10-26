@@ -1,0 +1,26 @@
+[1/26] Building CXX object CMakeFiles/vane_fs_test.dir/tests/test_core.cpp.o
+[2/26] Building CXX object CMakeFiles/vane_fs_inode_refs_test.dir/tests/test_inode_refs.cpp.o
+[3/26] Building CXX object CMakeFiles/vane_fs_checkpoint_test.dir/tests/test_checkpoint.cpp.o
+[4/26] Building CXX object CMakeFiles/vane_fs_durability_test.dir/tests/test_durability.cpp.o
+[5/26] Building CXX object CMakeFiles/vane_fs_crash_test.dir/tests/test_crash.cpp.o
+[6/26] Building CXX object CMakeFiles/vane_fs_lookup_validation_test.dir/tests/test_lookup_validation.cpp.o
+[7/26] Building CXX object CMakeFiles/vane_fs_sync_syscalls_test.dir/tests/test_sync_syscalls.cpp.o
+[8/26] Building CXX object CMakeFiles/vane_fs_staging_test.dir/tests/test_staging.cpp.o
+[9/26] Building CXX object CMakeFiles/vane_fs_external_faults_test.dir/tests/test_external_faults.cpp.o
+[10/26] Building CXX object CMakeFiles/vane_fs.dir/src/workspace.cpp.o
+[11/26] Linking CXX static library libvane_fs.a
+[12/26] Linking CXX executable vane_fs_test
+[13/26] Linking CXX executable vane_fs_inode_refs_test
+[14/26] Building CXX object CMakeFiles/vane_fs_checkpoint_coalescing_test.dir/tests/test_checkpoint_coalescing.cpp.o
+[15/26] Linking CXX executable vane_fs_checkpoint_test
+[16/26] Linking CXX executable vane_fs_durability_test
+[17/26] Linking CXX executable vane_fs_crash_test
+[18/26] Linking CXX executable vane_fs_lookup_validation_test
+[19/26] Linking CXX executable vane_fs_sync_syscalls_test
+[20/26] Linking CXX executable vane_fs_staging_test
+[21/26] Linking CXX executable vane_fs_external_faults_test
+[22/26] Linking CXX executable vane_fs_checkpoint_coalescing_test
+[23/26] Building CXX object CMakeFiles/vane_fs_transaction_cache_test.dir/tests/test_transaction_cache.cpp.o
+[24/26] Linking CXX executable vane_fs_transaction_cache_test
+[25/26] Building CXX object CMakeFiles/vane_fs_inline_publication_test.dir/tests/test_inline_publication.cpp.o
+[26/26] Linking CXX executable vane_fs_inline_publication_test

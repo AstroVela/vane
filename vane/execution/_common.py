@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 
 _UDF_CALLABLE_CACHE_LOCK = threading.Lock()
 _UDF_CALLABLE_CACHE: OrderedDict[str, Any] = OrderedDict()
+# Failed executors own their callable and event loop independently of LRU
+# eviction. Reusing the key must first finish that cleanup on the old loop.
+_UDF_PENDING_CLEANUP: dict[str, list[Any]] = {}
+_UDF_CLEANUP_RETRYING: set[str] = set()
 _UDF_CALLABLE_STATS = {
     "python_udf_callable_cache_hit": 0,
     "python_udf_callable_cache_miss": 0,
@@ -143,8 +147,48 @@ def callable_cache_enabled(payload: dict[str, Any]) -> bool:
     return os.getenv("VANE_CPU_UDF_CALLABLE_CACHE", "").strip().lower() not in _TRUTHY_FALSE_VALUES
 
 
+def retain_udf_cleanup(payload: dict[str, Any], executor: Any) -> None:
+    key = udf_cache_key(payload)
+    with _UDF_CALLABLE_CACHE_LOCK:
+        pending = _UDF_PENDING_CLEANUP.setdefault(key, [])
+        if not any(owner is executor for owner in pending):
+            pending.append(executor)
+        # Failed live state must never be rebound by a cache hit. Keep the
+        # owner separately so clear/eviction cannot discard pending cleanup.
+        _UDF_CALLABLE_CACHE.pop(key, None)
+
+
+def release_udf_cleanup(payload: dict[str, Any], executor: Any) -> None:
+    key = udf_cache_key(payload)
+    with _UDF_CALLABLE_CACHE_LOCK:
+        pending = _UDF_PENDING_CLEANUP.get(key)
+        if pending is not None:
+            pending[:] = [owner for owner in pending if owner is not executor]
+            if not pending:
+                _UDF_PENDING_CLEANUP.pop(key)
+
+
+def _retry_udf_cleanup(key: str) -> None:
+    with _UDF_CALLABLE_CACHE_LOCK:
+        if key in _UDF_CLEANUP_RETRYING:
+            raise RuntimeError("cached UDF cleanup is already in progress")
+        pending = tuple(_UDF_PENDING_CLEANUP.get(key, ()))
+        if not pending:
+            return
+        _UDF_CLEANUP_RETRYING.add(key)
+    try:
+        # Provider code must not run while holding the process-wide cache lock.
+        for executor in pending:
+            executor.close()
+    finally:
+        with _UDF_CALLABLE_CACHE_LOCK:
+            _UDF_CLEANUP_RETRYING.remove(key)
+
+
 def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | None = None) -> Any:
-    """Deserialize a UDF callable with a process-local LRU cache."""
+    """Deserialize a UDF callable after completing any failed prior cleanup."""
+    key = udf_cache_key(payload)
+    _retry_udf_cleanup(key)
     if max_entries is None:
         max_entries = 64
     if max_entries <= 0:
@@ -152,7 +196,6 @@ def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | Non
             _UDF_CALLABLE_STATS["python_udf_callable_cache_bypass"] += 1
         return load_udf_from_payload(payload)
 
-    key = udf_cache_key(payload)
     with _UDF_CALLABLE_CACHE_LOCK:
         if key in _UDF_CALLABLE_CACHE:
             cached = _UDF_CALLABLE_CACHE[key]

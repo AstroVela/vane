@@ -37,6 +37,9 @@ public:
 	static void BuildJoinPipelines(Pipeline &current, MetaPipeline &meta_pipeline, PhysicalOperator &op,
 	                               bool build_rhs = true);
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+	vector<const_reference<PhysicalOperator>> GetMaterializedInputChildren(ClientContext &) const override {
+		return {children[1].get()};
+	}
 	vector<const_reference<PhysicalOperator>> GetSources() const override;
 
 	OrderPreservationType SourceOrder() const override {

@@ -1,0 +1,139 @@
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -8,11 +8,13 @@
+ // passed a data barrier; a CLEAN fence permits ordinary SQLite WAL recovery.
+ #include "payload_file.hpp"
+ #include <array>
++#include <atomic>
+ #include <mutex>
+ 
+ namespace vane_fs {
+ class Staging {
+ public:
++	static constexpr uint64_t PAYLOAD_BUDGET = 64 * 1024 * 1024;
+ 	static constexpr const char *CLIENT_DATA = "vane_fs.staged_payload_experiment";
+ 	static constexpr const char *PAYLOAD_MAGIC = "VANE-STAGED-1004:";
+ 	static void Check(int code) {
+@@ -120,6 +122,21 @@
+ 			value >>= 8;
+ 		}
+ 	}
++	static uint64_t Length(int fd) {
++		struct stat st {};
++		if (fstat(fd, &st))
++			IO("Inspecting publication payload");
++		return uint64_t(st.st_size);
++	}
++	uint64_t PendingPayloadBytes(uint64_t end) const {
++		if (!Pending())
++			return 0;
++		// Offset 80 was reserved and covered by the existing CRC. It is an
++		// advisory append origin, not part of WAL recovery or durability.
++		// Legacy zero origins and invalid/shrunken tails overestimate the cost.
++		auto begin = Decode(record.data() + 80);
++		return begin && begin <= end ? end - begin : end;
++	}
+ 	using Record = std::array<unsigned char, 4096>;
+ 	static constexpr const char *MAGIC = "VANE-STAGE-FENCE-1004";
+ 	static uint64_t Checksum(const Record &record) {
+@@ -166,6 +183,8 @@
+ 			synced_sequence = sequence;
+ 		}
+ 		record = newest;
++		if (!Pending())
++			payload_budget.store(false, std::memory_order_relaxed);
+ 	}
+ 	void Save(bool pending) {
+ 		auto sequence = Decode(record.data() + 32);
+@@ -190,6 +209,8 @@
+ 		Sync(fence.fd);
+ 		synced_sequence = sequence + 1;
+ 		record = next;
++		if (!pending)
++			payload_budget.store(false, std::memory_order_relaxed);
+ 	}
+ 	void Recover() {
+ 		if (!Pending())
+@@ -332,6 +353,21 @@
+ 	}
+ 	bool Pending() const {
+ 		return Decode(record.data() + 40) != 0;
++	}
++	uint64_t PendingPayloadBytes() {
++		if (!Pending())
++			return 0;
++		File data;
++		data.Open(path + ".payload", false);
++		return PendingPayloadBytes(Length(data.fd));
++	}
++	void RecordAppend(uint64_t end) {
++		// Called under the publication guard after a successful append. The WAL
++		// callback reads only this atomic hint; the worker rechecks shared state.
++		payload_budget.store(PendingPayloadBytes(end) >= PAYLOAD_BUDGET, std::memory_order_relaxed);
++	}
++	bool PayloadBudgetReached() const {
++		return payload_budget.load(std::memory_order_relaxed);
+ 	}
+ 	void BeginBatch(sqlite3 *writer) {
+ 		if (Pending())
+@@ -367,6 +403,9 @@
+ 			if (!Decode(record.data() + 132, 4) || std::memcmp(record.data() + 136, record.data() + 112, 8))
+ 				Fail("Not a committed WAL fence");
+ 		}
++		File data;
++		data.Open(path + ".payload", false);
++		Encode(record.data() + 80, Length(data.fd));
+ 		Sync(wal.fd);
+ 		Save(true);
+ 	}
+@@ -407,5 +446,6 @@
+ 	std::unique_ptr<Guard> startup;
+ 	Record record {};
+ 	uint64_t synced_sequence = 0;
++	std::atomic<bool> payload_budget {false};
+ };
+ } // namespace vane_fs
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -61,7 +61,7 @@
+ 	}
+ 	static int OnCommit(void *context, sqlite3 *, const char *, int frames) {
+ 		auto &self = *static_cast<Checkpointer *>(context);
+-		if (self.Bytes(frames) >= START_BYTES) {
++		if (self.Bytes(frames) >= START_BYTES || self.staging.PayloadBudgetReached()) {
+ 			{
+ 				std::lock_guard<std::mutex> lock(self.mutex);
+ 				self.requested = true;
+@@ -161,7 +161,7 @@
+ 						// Only unpublished external data needs coalesced publication.
+ 						// Once CLEAN, promptly backfill inline/namespace commits using
+ 						// the original wake policy, even below the uncopied-byte budget.
+-						if (!retry && staging.Pending()) {
++						if (!retry && staging.Pending() && staging.PendingPayloadBytes() < Staging::PAYLOAD_BUDGET) {
+ 							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+ 							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
+ 							           Bytes(frames - copied) < START_BYTES;
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -599,6 +599,7 @@
+ 			bytes += block.second;
+ 		Staging::Get(db).BeginBatch(db);
+ 		external = PayloadFile::Get(db).Append(bytes);
++		Staging::Get(db).RecordAppend(uint64_t(external) + bytes.size());
+ 	}
+ 	Statement payloads(db, payload_sql), versions(db, version_sql);
+ 	versions.Bind(1, inode);
+@@ -984,6 +985,13 @@
+ 		if (full || external_payload)
+ 			publication = std::make_unique<Staging::Guard>(*database.staging);
+ 		payload_guard = std::make_unique<PayloadFile::Guard>(*database.payload_file, exclusive_payload);
++		if (external_payload && database.checkpointer &&
++		    database.staging->PendingPayloadBytes() >= Staging::PAYLOAD_BUDGET) {
++			// Admission precedes BEGIN and sees all connections' append tails.
++			// One atomic write can exceed the budget; it is not a file quota.
++			Staging::CheckpointGuard checkpoint(*database.staging);
++			database.staging->Publish(database.db);
++		}
+ 		// SQLite requires changing synchronous outside a transaction. On failure
+ 		// leave FULL enabled until a subsequent successful synchronous commit.
+ 		if (restore_normal)

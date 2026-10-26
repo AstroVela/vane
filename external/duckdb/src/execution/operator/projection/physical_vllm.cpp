@@ -220,7 +220,7 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 			return;
 		}
 		auto engine = GetInferenceEngineName(options);
-		auto factory = GetEngineExecutorFactory(engine);
+		auto factory = GetEngineExecutorFactory(context.client, engine);
 		if (!factory) {
 			throw InvalidInputException("no executor factory registered for inference engine '" + engine + "'");
 		}

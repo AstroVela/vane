@@ -1152,12 +1152,17 @@ def _fte_partition_resource_key(query_id: str, fragment_id: str, partition_id: i
 def _fte_fragment_resource_identity(
     query_id: str,
     fragment_id: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     with _FTE_REGISTRY_LOCK:
         fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((str(query_id), str(fragment_id)))
     if fragment_execution is None:
         raise KeyError(f"FTE fragment execution {query_id}/{fragment_id} is not registered")
-    return resource_identity_from_context(fragment_execution.context)
+    context = fragment_execution.context
+    # CopySinkNode adds this field after appending the COPY operator to the
+    # physical fragment. The original resource unit alone cannot identify
+    # the output of a fused plan.
+    output_kind = "copy_metadata" if "copy_output_remote_base" in context else "data"
+    return (*resource_identity_from_context(context), output_kind)
 
 
 def _fte_partition_fragment_execution_id(query_id: str, fragment_id: str, partition_id: int) -> int:
@@ -1217,13 +1222,13 @@ def _acquire_fte_partition_task_lease(
     partition_id: int,
     node_id: str,
 ) -> Any:
-    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.execution.query_resource_policy import TaskRequest
     from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
     with _FTE_REGISTRY_LOCK:
         if str(query_id) in _FTE_CLOSING_QUERIES:
             raise RuntimeError(f"FTE query registry is closing: {query_id}")
-    resource_query_id, resource_unit_id = _fte_fragment_resource_identity(
+    resource_query_id, resource_unit_id, output_kind = _fte_fragment_resource_identity(
         query_id,
         fragment_id,
     )
@@ -1259,6 +1264,7 @@ def _acquire_fte_partition_task_lease(
         task_id=task_id,
         attempt_id=attempt_id,
         node_id=str(node_id),
+        output_kind=output_kind,
     )
     try:
         # This is a non-persistent descriptor probe.  QRM atomically arbitrates

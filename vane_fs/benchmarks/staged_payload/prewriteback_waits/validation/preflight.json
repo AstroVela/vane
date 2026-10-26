@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "started_epoch": 1792323640.8598819,
+  "ended_epoch": 1792323641.59207,
+  "measurement_started": false,
+  "generated_runner_and_workload_compile": true,
+  "read_workload_reverse_exact": true,
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/prewriteback-waits-20261018/run_fuse.py": "5ad2ab92494693ea68f66b7e973b1a0733855d5506b9325ef5ac1c7478a13bcc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/prewriteback-waits-20261018/workload.py": "e616ceb517ee3627ac3f7914ddbd05ed04376279c46f658b69bd585704bef3bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/prewriteback_waits/run.py": "e2370bbbcabd8f5d9946ef25a9d3776dc38b96cae47736aa19b90709158507e3"
+  }
+}
