@@ -4,6 +4,9 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 ## DuckDB 2.0 integration baseline
 
+The [DuckDB 2.0 integration design and roadmap](DUCKDB_2_MIGRATION_DESIGN.md)
+owns the migration stages, acceptance criteria, and completion record.
+
 The `integration/duckdb-2.0` branch starts with an unmodified official DuckDB
 v2.0.0 subtree. Its exact commit and source tree are recorded in
 [Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines).

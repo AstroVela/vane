@@ -32,7 +32,8 @@ including file modes and upstream license notices. No Vane engine changes are
 included in this initial snapshot. The preceding Vane implementation remains
 available at commit `95acdea830eb1fff407f0e09f4b97ee7b0a02e83`; its Python
 bindings and other root-level integration code have not yet been migrated.
-See [the integration stages](DEVELOPMENT.md#duckdb-20-integration-baseline).
+See [the migration roadmap](DUCKDB_2_MIGRATION_DESIGN.md#roadmap-and-acceptance-criteria)
+and [the current build status](DEVELOPMENT.md#duckdb-20-integration-baseline).
 
 The previous squashed subtree snapshot was imported from the official v1.5.0 tag at
 commit `3a3967aa8190d0a2d1931d4ca4f5d920760030b4`. The reviewed maintenance
