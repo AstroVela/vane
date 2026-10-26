@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -8713,6 +8714,69 @@ def test_local_ref_bundle_worker_payload_carries_input_lease_id():
     finally:
         for ref in refs:
             ref.release()
+
+
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_temporary_descriptor_survives_normalization_and_releases_after_adoption(monkeypatch, fail_open):
+    from vane.execution import ref_bundle
+
+    class OwningDescriptor(dict):
+        def __init__(self, publisher):
+            super().__init__(publisher)
+            self.publisher = publisher
+
+    publishers = []
+    finalized = []
+    names = []
+    opened = False
+    original_open = ref_bundle._open_existing_shm
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+
+    def temporary_descriptor():
+        publisher = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [1, 2, 3]}))
+        names.append(publisher["block_refs"][0]["shm_name"])
+        descriptor = OwningDescriptor(publisher)
+        publishers.append(weakref.ref(descriptor))
+        weakref.finalize(descriptor, finalized.append, "released")
+        return descriptor
+
+    def inspect_open(name, *, track):
+        nonlocal opened
+        if not opened:
+            opened = True
+            assert publishers[0]() is not None, "publisher finalized before mapping adoption"
+            if fail_open:
+                raise MemoryError("receiver mapping failed")
+        return original_open(name, track=track)
+
+    monkeypatch.setattr(ref_bundle, "_open_existing_shm", inspect_open)
+    result = None
+    try:
+        if fail_open:
+            # Keep the exception traceback alive: it must not retain a failed
+            # temporary publisher after adoption rollback finishes.
+            with pytest.raises(MemoryError, match="receiver mapping failed") as caught:
+                ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+                    temporary_descriptor(), block_on_budget=False
+                )
+            assert caught.value.__traceback__ is not None
+        else:
+            result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+                temporary_descriptor(), block_on_budget=False
+            )
+        gc.collect()
+        assert opened
+        assert publishers[0]() is None
+        assert finalized == ["released"]
+        if result is not None:
+            assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).to_pydict() == {"x": [1, 2, 3]}
+    finally:
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        for name in names:
+            ref_bundle._unlink_shared_memory_name(name)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
 
 
 def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_monkeypatch(monkeypatch):

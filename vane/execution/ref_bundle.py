@@ -2258,16 +2258,19 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     cancel_event: _CancellationFlag | None = None,
     on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
-    descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
-    local_descs = descriptor["block_refs"]
-    metadata_in = descriptor["metadata"]
-    grant_id = descriptor["grant_id"]
-    consuming_input = local_shm_budget_manager().output_grant_input(grant_id)
-    output_owner = local_shm_budget_manager().output_grant_owner(grant_id)
+    # Normalized wire fields do not retain the publisher's Windows handles.
+    # Keep the original descriptor alive until adoption or rollback finishes.
+    normalized_descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
     refs = []
     metadata = []
     grant_budget_remaining: int | None = None
+    output_owner: _OutputGrant | None = None
     try:
+        local_descs = normalized_descriptor["block_refs"]
+        metadata_in = normalized_descriptor["metadata"]
+        grant_id = normalized_descriptor["grant_id"]
+        consuming_input = local_shm_budget_manager().output_grant_input(grant_id)
+        output_owner = local_shm_budget_manager().output_grant_owner(grant_id)
         for local_desc, meta in zip(local_descs, metadata_in, strict=False):
             name = str(local_desc["shm_name"])
             size = int(local_desc["ipc_size_bytes"])
@@ -2392,6 +2395,10 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         except Exception as cleanup_error:
             raise adoption_error from cleanup_error
         raise
+    finally:
+        # A retained exception traceback must not keep the publisher alive
+        # after the receiver has adopted its handles or rolled back.
+        del descriptor
 
     if grant_budget_remaining is not None and grant_budget_remaining > 0:
         _release_local_shm_ref_budget(
@@ -2402,7 +2409,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         REF_BUNDLE_RESULT_MARKER,
         refs,
         metadata,
-        descriptor["names"],
+        normalized_descriptor["names"],
     )
 
 

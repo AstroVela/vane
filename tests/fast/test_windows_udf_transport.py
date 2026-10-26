@@ -72,6 +72,37 @@ def test_descriptor_retains_mapping_until_adoption_or_release(cleanup):
         ref_bundle._unlink_shared_memory_name(name)
 
 
+def test_temporary_descriptor_keeps_publisher_mapping_alive_until_receiver_opens(monkeypatch):
+    names = []
+    original_create = ref_bundle._create_shm
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+
+    def record_mapping(size, *, track):
+        shm = original_create(size, track=track)
+        names.append(shm.name)
+        return shm
+
+    monkeypatch.setattr(ref_bundle, "_create_shm", record_mapping)
+    result = None
+    try:
+        result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+            ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"value": [1, 2, 3]})),
+            block_on_budget=False,
+        )
+        assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).to_pydict() == {"value": [1, 2, 3]}
+        reopened = ref_bundle._open_existing_shm(names[0], track=False)
+        reopened.close()
+    finally:
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        for name in names:
+            ref_bundle._unlink_shared_memory_name(name)
+    with pytest.raises(FileNotFoundError):
+        ref_bundle._open_existing_shm(names[0], track=False)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
 def test_job_reaps_descendant_after_worker_has_exited():
     program = textwrap.dedent("""
         import subprocess
