@@ -1108,17 +1108,24 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         except Exception as exc:
             self._raise_result_decoding_error(exc, descriptor)
 
-    def _decode_ipc_result(self, result_size: int, *, shm_name: str | None = None) -> pa.Table:
+    def _adopt_ipc_result_mapping(self, shm_name: str) -> None:
         try:
             data_shm = self._require_data_shm()
-            if shm_name is not None and shm_name != data_shm.name:
-                replacement = _open_existing_shm(shm_name, track=False)
-                try:
-                    data_shm.close()
-                except BaseException:
-                    replacement.close()
-                    raise
-                self._data_shm = data_shm = replacement
+            if shm_name == data_shm.name:
+                return
+            replacement = _open_existing_shm(shm_name, track=False)
+            try:
+                data_shm.close()
+            except BaseException:
+                replacement.close()
+                raise
+            self._data_shm = replacement
+        except Exception as exc:
+            self._raise_result_decoding_error(exc)
+
+    def _decode_ipc_result(self, result_size: int) -> pa.Table:
+        try:
+            data_shm = self._require_data_shm()
             if result_size > len(cast(Any, data_shm.buf)):
                 name = data_shm.name
                 data_shm.close()
@@ -1453,6 +1460,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 raise RuntimeError(self._broken_error)
 
             result_size = struct.unpack("<Q", payload)[0]
+            if shm_name is not None:
+                # A terminal response leaves the worker reusable. Synchronize
+                # mapping ownership even when cancellation discards its data.
+                self._adopt_ipc_result_mapping(shm_name)
             scope = self._current_execution_scope()
             scope.raise_if_cancelled("UDF subprocess task")
             if result_size == 0:
@@ -1464,11 +1475,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     actor_lost=True,
                 )
                 raise RuntimeError(self._broken_error)
-            result = (
-                self._decode_ipc_result(result_size, shm_name=shm_name)
-                if shm_name is not None
-                else self._decode_ipc_result(result_size)
-            )
+            result = self._decode_ipc_result(result_size)
             return self._wrap_output(result)
         raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 

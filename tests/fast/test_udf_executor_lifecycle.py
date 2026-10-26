@@ -3582,6 +3582,72 @@ def test_subprocess_resizes_shared_memory_for_large_output(backend):
         executor.close()
 
 
+@pytest.mark.parametrize("mapping_failure", [None, "open", "close"])
+def test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker(monkeypatch, mapping_failure):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class Mapping:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def close(self):
+            if mapping_failure == "close" and self.name == "wnsm_original":
+                raise BufferError("original mapping is still exported")
+            self.closed = True
+
+    original = Mapping("wnsm_original")
+    replacement = Mapping("wnsm_replacement")
+    scope = subprocess_exec.ExecutionCancellationScope("cancelled-ipc", 1)
+    scope.cancel("result no longer needed")
+    worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._data_shm = original
+    worker._shm_peer = None
+    worker._broken_error = None
+    worker._current_execution_scope = lambda: scope
+    worker._recv_expected = lambda _expected: (
+        subprocess_exec._MSG_IPC_RESULT,
+        struct.pack("<Q", 128) + replacement.name.encode("ascii"),
+    )
+    protocol_errors = []
+    worker._record_worker_protocol_failure = protocol_errors.append
+
+    def mark_broken(error, **_kwargs):
+        worker._broken_error = error
+
+    def open_mapping(name, *, track):
+        assert name == replacement.name
+        assert track is False
+        if mapping_failure == "open":
+            raise FileNotFoundError("replacement mapping disappeared")
+        return replacement
+
+    def decode_result(*_args, **_kwargs):
+        pytest.fail("cancelled IPC results must not be decoded")
+
+    worker._mark_broken = mark_broken
+    worker._decode_ipc_result = decode_result
+    # Exercise Windows message handling on Linux/macOS CI without changing os globally.
+    monkeypatch.setattr(subprocess_exec, "os", types.SimpleNamespace(name="nt"))
+    monkeypatch.setattr(subprocess_exec, "_open_existing_shm", open_mapping)
+    if mapping_failure is None:
+        with pytest.raises(subprocess_exec.ExecutionCancelledError, match="result no longer needed"):
+            worker._recv_submit_result()
+        assert worker._data_shm is replacement
+        assert original.closed
+        assert not replacement.closed
+        assert worker._broken_error is None
+        assert protocol_errors == []
+    else:
+        with pytest.raises(RuntimeError, match="result decoding failed"):
+            worker._recv_submit_result()
+        assert worker._data_shm is original
+        assert worker._broken_error is not None
+        assert len(protocol_errors) == 1
+        assert replacement.closed is (mapping_failure == "close")
+    assert not worker._awaiting_submit_terminal
+
+
 def test_subprocess_map_batches_none_output_returns_empty_table():
     from vane.execution.udf_subprocess import UDFExecutor
 
