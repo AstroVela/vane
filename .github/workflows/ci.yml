@@ -376,6 +376,7 @@ jobs:
             tests/fast/test_native_runtime_integration.py \
             tests/fast/test_native_audio_parity.py \
             tests/fast/test_native_media_extensions.py \
+            tests/fast/test_native_media_admission.py \
             tests/fast/test_native_media_validation.py \
             tests/fast/test_read_video_frames.py \
             tests/fast/test_fixed_shape_image.py \
