@@ -56,6 +56,8 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
+Check [releases and support](RELEASE_SUPPORT.md) for version selection, published
+platforms, extension compatibility, maintenance status and upgrade boundaries.
 
 ### Quick Start
 

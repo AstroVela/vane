@@ -7,6 +7,7 @@ Vane is an alpha developer preview. It has not undergone a complete independent 
 | Version | Security fixes |
 | --- | --- |
 | Latest default branch | Yes |
+| `0.2.0` | No release-branch backport policy announced; see [releases and support](RELEASE_SUPPORT.md) |
 | Latest `0.1.x` prerelease | Best effort |
 | Older commits and prereleases | No |
 

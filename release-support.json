@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-10-26",
+  "latest_release": "0.2.0",
+  "recommended_release": "0.2.0",
+  "recommendation_scope": "evaluation",
+  "stable_release": null,
+  "development": {
+    "branch": "main",
+    "security_fixes": true
+  },
+  "releases": [
+    {
+      "version": "0.2.0",
+      "tag": "v0.2.0",
+      "source_commit": "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a",
+      "published_at": "2026-09-19T02:14:58Z",
+      "release_url": "https://github.com/AstroVela/vane/releases/tag/v0.2.0",
+      "pypi_url": "https://pypi.org/project/vane-ai/0.2.0/",
+      "maturity": "alpha",
+      "maintenance": "not_announced",
+      "maintenance_until": null,
+      "wheels": [
+        {
+          "filename": "vane_ai-0.2.0-cp310-cp310-manylinux_2_28_x86_64.whl",
+          "python": "3.10",
+          "platform": "manylinux_2_28_x86_64",
+          "sha256": "18642ccbea030bfe8af59d43ccb2b1b2a73db449ac0f9e2947ddb661d317289c"
+        },
+        {
+          "filename": "vane_ai-0.2.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+          "python": "3.11",
+          "platform": "manylinux_2_28_x86_64",
+          "sha256": "a9e43bbd06c2d18873a517b14ef767b0a9b41373d4dc35edc5c2a6187a983d90"
+        },
+        {
+          "filename": "vane_ai-0.2.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+          "python": "3.12",
+          "platform": "manylinux_2_28_x86_64",
+          "sha256": "f2c69437856e32de70c84263b343dd0245693f49f3628a3df4a332042f6fdfc8"
+        },
+        {
+          "filename": "vane_ai-0.2.0-cp313-cp313-manylinux_2_28_x86_64.whl",
+          "python": "3.13",
+          "platform": "manylinux_2_28_x86_64",
+          "sha256": "c6fdee98390db50f1ced81babbe9f18ef1588bfb50d62e94d913608483f3ab03"
+        },
+        {
+          "filename": "vane_ai-0.2.0-cp314-cp314-manylinux_2_28_x86_64.whl",
+          "python": "3.14",
+          "platform": "manylinux_2_28_x86_64",
+          "sha256": "9872c4bab776c201326bba1d23c685aa23e6db006c83de59dcd3ef448f140418"
+        }
+      ],
+      "extension_compatibility": {
+        "rule": "exact_runtime_and_descriptor",
+        "qualified_combinations": []
+      },
+      "upgrade_paths": [],
+      "limitations": [
+        {
+          "id": "trusted_cluster",
+          "source": "https://github.com/AstroVela/vane/blob/v0.2.0/SECURITY.md#trust-model"
+        },
+        {
+          "id": "same_version_workers",
+          "source": "https://github.com/AstroVela/vane/blob/v0.2.0/SECURITY.md#plaintext-flight-transport"
+        },
+        {
+          "id": "separate_extensions",
+          "source": "https://github.com/AstroVela/vane/releases/tag/v0.2.0"
+        }
+      ]
+    }
+  ]
+}

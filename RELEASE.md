@@ -5,6 +5,43 @@ reviewed commit on `main` or a `release/X.Y` maintenance branch. The GitHub
 Release body is the canonical public record of user-visible changes; the
 repository does not maintain a rolling changelog or a release-notes template.
 
+## Release support inventory
+
+[Releases and support](RELEASE_SUPPORT.md) is the user-facing version-selection
+guide. Its machine-readable inventory is [release-support.json](release-support.json).
+The inventory records published wheel identities, the evaluation recommendation,
+maintenance status, and qualified upgrade/extension combinations. An empty list
+means no qualification evidence is recorded here; it does not claim incompatibility.
+A final version number alone does not make an alpha release Stable.
+The inventory covers final and post releases. Prerelease and development
+candidates follow their existing publishing workflows and are not recorded here.
+
+After publishing a release, update the inventory from the actual GitHub Release
+assets and the release tag, and update the guide's dated summary. Do not infer
+published platforms from CI builds or describe development-branch APIs as released.
+Save the GitHub Releases API response for the published tag and validate it:
+
+```bash
+gh api repos/AstroVela/vane/releases/tags/v0.2.0 > /tmp/vane-release.json
+python -I scripts/check_release_support.py --github-release /tmp/vane-release.json
+python -I tests/fast/test_release_support.py
+git rev-parse 'v0.2.0^{commit}'
+```
+
+Replace the tag with the release being recorded. Compare the resolved tag commit
+with `source_commit`; the API's `target_commitish` may be a branch name and is not
+proof of that identity. The validator checks the complete wheel list, checksums,
+publication date and internal consistency. CI runs the offline checks and tests;
+it does not fetch release metadata or continuously certify external evidence.
+
+Stable designation requires explicit qualification evidence and a maintenance
+policy approved by maintainers. Record their URLs before selecting a production
+recommendation. Do not infer an LTS window or promise backports on maintainers'
+behalf. If a website vendors the inventory as `src/data/release-support.json`,
+`--website /path/to/website` also checks that its copy is identical.
+
+## Release workflow
+
 The separate native media distributions use the
 [native media publication workflow](NATIVE_MEDIA_RELEASE.md) after the matching
 base release is available. It requires public source-rebuild, library replacement
