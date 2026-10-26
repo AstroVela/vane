@@ -1,0 +1,61 @@
+# name: test/extension/load_extension.test
+# description: Try loading a shared object with an extension
+# group: [extension]
+
+require notmingw
+
+require skip_reload
+
+require allow_unsigned_extensions
+
+statement error
+LOAD 'asdf';
+----
+<REGEX>:IO Error: Extension.*not found.*
+
+statement error
+LOAD 'Makefile';
+----
+<REGEX>:IO Error: Extension.*not found.*
+
+statement error
+LOAD NULL;
+----
+<REGEX>:Parser Error: syntax error.*
+
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/loadable_extension_demo.duckdb_extension';
+
+query I
+SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'loadable_extension_demo';
+----
+default-version
+
+query I
+QUACK QUACK QUACK
+----
+QUACK
+QUACK
+QUACK
+
+query I
+quACk QUaCk QUACK
+----
+QUACK
+QUACK
+QUACK
+
+statement error
+QUAC
+----
+Parser Error: syntax error at or near "QUAC"
+
+statement error
+QUACK NOT QUACK
+----
+<REGEX>:Parser Error: syntax error at or near.*
+
+query I
+SELECT contains(loaded_extensions(), 'loadable_extension_demo')
+----
+true

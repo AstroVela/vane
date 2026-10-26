@@ -1,0 +1,6 @@
+# name: test/sql/export/empty_export.test
+# description: Export an empty database
+# group: [export]
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/empty_export' (FORMAT CSV)

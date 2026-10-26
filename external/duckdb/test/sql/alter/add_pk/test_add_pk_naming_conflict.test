@@ -1,0 +1,24 @@
+# name: test/sql/alter/add_pk/test_add_pk_naming_conflict.test
+# description: Constraint index names do not conflict with explicit index names.
+# group: [add_pk]
+
+load {TEST_DIR}/test_add_pk_naming_conflict.db
+
+statement ok
+CREATE TABLE test (i INTEGER)
+
+statement ok
+INSERT INTO test VALUES (1);
+
+statement ok
+ALTER TABLE test ADD PRIMARY KEY (i);
+
+statement ok
+CREATE INDEX PRIMARY_test_i ON test(i);
+
+restart
+
+statement error
+INSERT INTO test VALUES (1);
+----
+<REGEX>:Constraint Error.*violates primary key constraint.*

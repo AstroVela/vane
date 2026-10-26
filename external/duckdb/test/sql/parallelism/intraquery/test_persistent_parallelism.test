@@ -1,0 +1,74 @@
+# name: test/sql/parallelism/intraquery/test_persistent_parallelism.test
+# description: Test force parallelism on small-ish tables (few thousand rows)
+# group: [intraquery]
+
+load {TEST_DIR}/test_parallelism.db
+
+statement ok
+PRAGMA enable_profiling
+
+statement ok
+PRAGMA profiling_output='{TEST_DIR}/test.txt'
+
+statement ok
+PRAGMA profiling_mode = detailed
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+CREATE TABLE integers AS SELECT * FROM range(0, 5000) tbl(i)
+
+query II
+SELECT MIN(i), MAX(i) FROM integers
+----
+0	4999
+
+statement ok
+COMMIT
+
+query II
+SELECT MIN(i), MAX(i) FROM integers
+----
+0	4999
+
+restart
+
+statement ok
+PRAGMA threads=4
+
+statement ok
+PRAGMA verify_parallelism
+
+statement ok
+CREATE TABLE large_integers AS SELECT * FROM range(1000000) tbl(i)
+
+query III
+SELECT COUNT(*), MIN(i), MAX(i) FROM large_integers
+----
+1000000	0	999999
+
+query II
+SELECT MIN(i), MAX(i) FROM integers
+----
+0	4999
+
+# add some transient data
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO integers SELECT * FROM range(5000, 10000)
+
+query II
+SELECT MIN(i), MAX(i) FROM integers
+----
+0	9999
+
+statement ok
+COMMIT
+
+query II
+SELECT MIN(i), MAX(i) FROM integers
+----
+0	9999

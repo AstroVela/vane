@@ -1,0 +1,23 @@
+# name: test/sql/copy/csv/test_export_force_quotes.test
+# description: Test long value with escapes
+# group: [csv]
+
+statement ok
+create table integers(i int);
+
+statement ok
+insert into integers values (42);
+
+statement ok
+export database '{TEST_DIR}/test_export' (force_quote *);
+
+statement ok
+drop table integers;
+
+statement ok
+import database '{TEST_DIR}/test_export';
+
+query I
+select * from integers;
+----
+42

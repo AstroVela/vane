@@ -1,0 +1,66 @@
+# name: test/fuzzer/pedro/vacuum_table_with_generated_column.test
+# description: Test the ANALYZE statement with generated columns.
+# group: [pedro]
+
+# The distinct statistics sampling relies on the vector size.
+require vector_size 2048
+
+require skip_reload
+
+# distinct stats sampling is different for different vector sizes
+require no_vector_verification
+
+statement ok
+CREATE TABLE test (x INT, y AS (x + 100));
+
+statement error
+ANALYZE test(x, x);
+----
+<REGEX>:Binder Error.*cannot vacuum.*the same column twice.*
+
+statement error
+ANALYZE test(y);
+----
+cannot vacuum or analyze generated column "y"
+
+statement error
+ANALYZE test(y, x);
+----
+cannot vacuum or analyze generated column "y"
+
+statement ok
+INSERT INTO test SELECT range % 5000 FROM range(10000);
+
+# The approximate unique count is inaccurate due to sampling.
+query TTTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.approx_unique FROM (SELECT stats(x) s FROM test LIMIT 1);
+----
+0	4999	false	true	10000
+
+query TTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT stats(y) s FROM test LIMIT 1);
+----
+100	5099	false	true
+
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+ANALYZE test
+
+statement ok
+ANALYZE test(x);
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# The approximate unique count is more accurate now.
+query TTTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.approx_unique FROM (SELECT stats(x) s FROM test LIMIT 1);
+----
+0	4999	false	true	5661
+
+query TTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT stats(y) s FROM test LIMIT 1);
+----
+100	5099	false	true

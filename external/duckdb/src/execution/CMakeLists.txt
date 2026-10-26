@@ -1,0 +1,29 @@
+add_subdirectory(expression_executor)
+add_subdirectory(nested_loop_join)
+add_subdirectory(operator)
+add_subdirectory(physical_plan)
+add_subdirectory(index)
+add_subdirectory(sample)
+
+add_library_unity(
+  duckdb_execution
+  OBJECT
+  adaptive_filter.cpp
+  aggregate_hashtable.cpp
+  aggregate_state_spilling.cpp
+  base_aggregate_hashtable.cpp
+  column_binding_resolver.cpp
+  expression_executor.cpp
+  expression_executor_state.cpp
+  ie_join_union.cpp
+  join_hashtable.cpp
+  mark_join_row_comparison.cpp
+  perfect_aggregate_hashtable.cpp
+  physical_operator.cpp
+  physical_plan_generator.cpp
+  row_id_deduplicator.cpp
+  radix_ht_adaptivity.cpp
+  radix_partitioned_hashtable.cpp)
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_execution>
+    PARENT_SCOPE)

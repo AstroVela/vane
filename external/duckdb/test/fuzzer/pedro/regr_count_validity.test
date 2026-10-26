@@ -1,0 +1,9 @@
+# name: test/fuzzer/pedro/regr_count_validity.test
+# description: Recursive CTE error
+# group: [pedro]
+
+statement ok
+CREATE TABLE t0 (c0 INT);
+
+statement ok
+SELECT regr_count(1,1) FROM t0;

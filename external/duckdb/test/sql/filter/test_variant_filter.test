@@ -1,0 +1,96 @@
+# name: test/sql/filter/test_variant_filter.test
+# description: test comparison logic for VARIANT columns
+# group: [filter]
+
+# VARIANT comparison no longer throws on "incompatible" types - it uses a total, type-first order
+# (see variant_comparator). Values of different type ranks are simply not equal.
+
+# VARCHAR '12' and INTEGER 12 have different type ranks -> not equal
+query I
+WITH cte as (
+	select '12'::VARIANT a
+)
+select IF(a == 12, 1, 0) from cte
+----
+0
+
+query I
+WITH cte as (
+	select '12'::VARIANT a
+)
+select IF(a == [1,2,3], 1, 0) from cte
+----
+0
+
+# the VARCHAR '[1,2,3]' is not equal to the ARRAY [1,2,3] (different type ranks)
+query I
+WITH cte as (
+	select '[1,2,3]'::VARIANT a
+)
+select IF(a == [1,2,3], 1, 0) from cte
+----
+0
+
+# Different lists, not equal
+query I
+WITH cte as (
+	select [1,2,3]::VARIANT a
+)
+select IF(a == [3, 2, 1], 1, 0) from cte
+----
+0
+
+# Exact equality of list
+query I
+WITH cte as (
+	select [1,2,3]::VARIANT a
+)
+select IF(a == [1,2,3], 1, 0) from cte
+----
+1
+
+# the middle element is a VARCHAR '2', which has a different type rank than the INTEGER 2, so the
+# lists are not equal (type-first ordering)
+query I
+WITH cte as (
+	select [1::VARIANT,'2',3]::VARIANT a
+)
+select IF(a == [1,2,3], 1, 0) from cte
+----
+0
+
+# an OBJECT and an ARRAY have different type ranks -> not equal
+query I
+WITH cte as (
+	select {a: 21, b: [1,2,3]}::VARIANT a
+)
+select IF(a == [1,2,3], 1, 0) from cte
+----
+0
+
+# Compare equal because objects are compared by key, not position
+query I
+WITH cte as (
+	select {a: 21, b: [1,2,3]}::VARIANT a
+)
+select IF(a == {b: [1,2,3], a: 21}, 1, 0) from cte
+----
+1
+
+# GreaterThan / LessThan: OBJECT ranks above ARRAY, so an object is greater than any array
+
+query I
+WITH cte as (
+	select {a: 21, b: [1,2,3]}::VARIANT a
+)
+select IF(a < [1,2,3], 1, 0) from cte
+----
+0
+
+query I
+WITH cte as (
+	select {a: 21, b: [1,2,3]}::VARIANT a
+)
+select IF(a > [1,2,3], 1, 0) from cte
+----
+1

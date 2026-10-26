@@ -1,0 +1,40 @@
+# name: test/sql/outofcore/out_of_core_aggregation.test_slow
+# description: Test out of core aggregation
+# group: [outofcore]
+
+require tpch
+
+load {TEST_DIR}/out_of_core_aggregation.db
+
+statement ok
+CALL dbgen(sf=1);
+
+query I
+SELECT bit_xor(hash(*COLUMNS(*)))
+FROM lineitem;
+----
+340647416945014523
+
+foreach mem 300MiB 600MiB
+
+foreach threads 1 2 8
+
+statement ok
+SET memory_limit='{mem}';
+
+statement ok
+SET threads={threads};
+
+query I
+WITH cte AS (
+    FROM lineitem
+    GROUP BY ALL
+)
+SELECT bit_xor(hash(*COLUMNS(*)))
+FROM cte;
+----
+340647416945014523
+
+endloop
+
+endloop

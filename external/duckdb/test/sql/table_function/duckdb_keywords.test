@@ -1,0 +1,6 @@
+# name: test/sql/table_function/duckdb_keywords.test
+# description: Test duckdb_keywords function
+# group: [table_function]
+
+statement ok
+SELECT * FROM duckdb_keywords();

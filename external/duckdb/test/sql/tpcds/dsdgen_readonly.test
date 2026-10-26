@@ -1,0 +1,30 @@
+# name: test/sql/tpcds/dsdgen_readonly.test
+# description: Test that dsdgen respects read-only mode
+# group: [tpcds]
+
+require tpcds
+
+load {TEST_DIR}/test_dsdgen_ro.db
+
+statement ok
+CREATE TABLE tbl (i INTEGER);
+
+load {TEST_DIR}/test_dsdgen_ro.db readonly
+
+statement error
+CALL dsdgen(sf=0);
+----
+read-only
+
+load
+
+statement ok
+ATTACH '{TEST_DIR}/test_dsdgen_ro.db' AS dsdgentest (READ_ONLY)
+
+statement error
+CALL dsdgen(sf=0, catalog='dsdgentest');
+----
+read-only
+
+statement ok
+CALL dsdgen(sf=0);

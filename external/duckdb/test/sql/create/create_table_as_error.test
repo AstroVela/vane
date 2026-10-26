@@ -1,0 +1,8 @@
+# name: test/sql/create/create_table_as_error.test
+# description: Test incorrect usage of CREATE TABLE AS
+# group: [create]
+
+statement error
+CREATE TABLE tbl AS EXECUTE tbl;
+----
+<REGEX>:.*Parser Error.*requires a SELECT clause.*

@@ -1,0 +1,34 @@
+# name: test/sql/pragma/profiling/test_duckdb_profiling_settings_function.test
+# description: Test duckdb_profiling_settings function
+# group: [profiling]
+
+query I
+SELECT * EXCLUDE(value, description) FROM duckdb_profiling_settings();
+----
+enable_profiling
+profiling_coverage
+profiling_output
+tracked_metrics
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+PRAGMA profiling_output='{TEST_DIR}/test_profiling_output.json';
+
+statement ok
+PRAGMA profiling_coverage='ALL';
+
+statement ok
+PRAGMA profiling_mode='DETAILED';
+
+statement ok
+SET tracked_metrics = ['query.cpu_time'];
+
+query II
+SELECT * EXCLUDE(description) FROM duckdb_profiling_settings();
+----
+enable_profiling	json
+profiling_coverage	ALL
+profiling_output	{TEST_DIR}/test_profiling_output.json
+tracked_metrics	[query.cpu_time]

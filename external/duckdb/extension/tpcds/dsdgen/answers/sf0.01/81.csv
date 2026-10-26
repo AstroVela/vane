@@ -1,0 +1,10 @@
+c_customer_id|c_salutation|c_first_name|c_last_name|ca_street_number|ca_street_name|ca_street_type|ca_suite_number|ca_city|ca_county|ca_state|ca_zip|ca_country|ca_gmt_offset|ca_location_type|ctr_total_return
+AAAAAAAADEDAAAAA|Ms.|Annie|Burke|245|3rd |Ln|Suite 120|Franklin|Bulloch County|GA|39101|United States|-5.00|condo|2893.21
+AAAAAAAAILAAAAAA|Mr.|Clifford|Flynn|245|3rd |Ln|Suite 120|Franklin|Bulloch County|GA|39101|United States|-5.00|condo|2055.73
+AAAAAAAAJMAAAAAA|Dr.|James|Scott|562|5th Smith|Ct.|Suite G|Concord|Marion County|GA|34107|United States|-5.00|single family|1667.95
+AAAAAAAAJMAAAAAA|Dr.|James|Scott|562|5th Smith|Ct.|Suite G|Concord|Marion County|GA|34107|United States|-5.00|single family|5540.13
+AAAAAAAAKCDAAAAA|Dr.|Omar|Haggerty|245|3rd |Ln|Suite 120|Franklin|Bulloch County|GA|39101|United States|-5.00|condo|2781.79
+AAAAAAAALEAAAAAA|Dr.|Annie|Grant|313|2nd Eigth|Avenue|Suite 40|Marion|Glascock County|GA|30399|United States|-5.00|condo|4298.15
+AAAAAAAALNDAAAAA|Mr.|Todd|Norris|498|Lake |Way|Suite 490|Spring Valley|Habersham County|GA|36060|United States|-5.00|single family|3136.50
+AAAAAAAANACAAAAA|Miss|Judith|Winkler|52|6th Park|Drive|Suite E|Farmington|Johnson County|GA|39145|United States|-5.00|condo|395.36
+AAAAAAAAPBBAAAAA|Dr.|Carolyn|Wong|NULL|NULL|NULL|NULL|Lakeside|Washington County|GA|NULL|NULL|NULL|NULL|3209.38

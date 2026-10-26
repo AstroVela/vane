@@ -1,0 +1,48 @@
+# name: test/sql/window/test_rownumber_orderby.test
+# description: Test argument ordering for ROW_NUMBER and NTILE
+# group: [window]
+
+query IIII
+SELECT 
+	i,
+	(i * 29) % 11 AS outside,
+	row_number(ORDER BY (i // 2) DESC) OVER w,
+	ntile(4 ORDER BY (i // 2) DESC) OVER w,
+FROM range(10) tbl(i)
+WINDOW w AS (
+	ORDER BY (i * 29) % 11
+)
+ORDER BY 2
+----
+0	0	1	1
+8	1	1	1
+5	2	2	2
+2	3	3	3
+7	5	2	1
+4	6	4	2
+1	7	7	4
+9	8	2	1
+6	9	4	2
+3	10	8	3
+
+# Future-only and past-only frames with argument ordering for NTILE and ROW_NUMBER
+query IIII
+SELECT
+  id,
+  NTILE(2 ORDER BY y) OVER (
+    ORDER BY y
+    ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+  ) AS ntile_following,
+  NTILE(2 ORDER BY y) OVER (
+    ORDER BY y
+    ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+  ) AS ntile_preceding,
+  ROW_NUMBER(ORDER BY y) OVER (
+    ORDER BY y
+    ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+  ) AS row_following
+FROM (VALUES (1, 1), (2, 2)) AS t(id, y)
+ORDER BY id;
+----
+1	1	NULL	1
+2	NULL	1	1

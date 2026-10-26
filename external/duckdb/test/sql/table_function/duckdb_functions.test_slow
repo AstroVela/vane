@@ -1,0 +1,68 @@
+# name: test/sql/table_function/duckdb_functions.test_slow
+# description: Test duckdb_functions function
+# group: [table_function]
+
+statement ok
+SELECT * FROM duckdb_functions();
+
+query I
+select function_name from duckdb_functions() where not internal order by 1;
+----
+
+statement ok
+CREATE MACRO add_default1(a := 3, b := 5) AS a + b
+
+statement ok
+CREATE MACRO add_default2(a, b := 5) AS a + b
+
+statement ok
+SELECT * FROM duckdb_functions();
+
+statement ok
+SELECT * FROM duckdb_functions() WHERE function_type='table';
+
+statement ok
+SELECT sqrt(4)
+
+query I
+select distinct function_name from duckdb_functions() where function_name='sqrt';
+----
+sqrt
+
+query I
+select function_name from duckdb_functions() where not internal order by 1;
+----
+add_default1
+add_default2
+
+# table functions too
+statement ok
+create macro my_range(x) as table from range(x);
+
+query I
+select macro_definition from duckdb_functions() where function_name = 'my_range';
+----
+SELECT * FROM "range"(x)
+
+# without icu/json loaded, the autoloading placeholder overloads (e.g. the icu TIMESTAMPTZ
+# date part overloads) fall back to auto-generated parameter names like col0
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE (function_type == 'window' OR function_type == 'scalar' or function_type == 'aggregate')
+AND list_contains(parameters, 'col0')
+----
+55
+
+require json
+
+require icu
+
+# once the extensions are loaded, the real (named) function overloads replace the
+# auto-generated placeholders, so no scalar, window, or aggregate function should have
+# auto-generated param names anymore
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE (function_type == 'window' OR function_type == 'scalar' or function_type == 'aggregate')
+AND list_contains(parameters, 'col0')
+----
+0

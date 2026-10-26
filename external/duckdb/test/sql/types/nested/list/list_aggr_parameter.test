@@ -1,0 +1,47 @@
+# name: test/sql/types/nested/list/list_aggr_parameter.test
+# description: Test lists aggregations with extra parameters
+# group: [list]
+
+query I
+SELECT list_aggr(list(i), 'quantile', 0.5) FROM range(1, 11) tbl(i);
+----
+5
+
+query I
+SELECT list_aggr(list(i), 'quantile', [0.25, 0.5, 0.75]) FROM range(1, 11) tbl(i);
+----
+[3, 5, 8]
+
+query I
+SELECT list_aggr(list(i)::varchar[], 'string_agg', '|') FROM range(1, 4) tbl(i);
+----
+1|2|3
+
+# non-constant argument (not supported right now)
+statement error
+SELECT list_aggr([0, 1, 2, 3], 'arg_min', i) FROM range(1, 4) tbl(i);
+----
+<REGEX>:.*Invalid Input Error.*extra arguments must be constant.*
+
+# not enough arguments
+statement error
+SELECT list_aggr(list(i), 'quantile') FROM range(10) tbl(i);
+----
+<REGEX>:.*Binder Error.*requires a range argument.*
+
+# a constant extra argument the aggregate keeps is passed on to it - min(x, n) returns the n smallest values
+query I
+SELECT list_aggr(list(i), 'min', 1) FROM range(10) tbl(i);
+----
+[0]
+
+statement error
+SELECT list_aggr(list(i), 'quantile', 0.5, 0.3, 0.5) FROM range(10) tbl(i);
+----
+<REGEX>:.*Binder Error.*No matching aggregate function.*
+
+# non-constant argument
+statement error
+SELECT list_aggr(list(i), 'quantile', i) FROM range(10) tbl(i);
+----
+<REGEX>:.*Binder Error.*must be a constant expression.*

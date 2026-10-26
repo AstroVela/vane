@@ -1,0 +1,16 @@
+# name: test/sql/cte/cte_with_replacement_scan.test
+# description: Test CTE with same name as file
+# group: [cte]
+
+require parquet
+
+statement ok
+copy (select 42 as answer) to '{TEST_DIR}/df.parquet';
+
+query I
+WITH '{TEST_DIR}/df.parquet' AS (
+	SELECT answer FROM '{TEST_DIR}/df.parquet'
+)
+SELECT * FROM '{TEST_DIR}/df.parquet';
+----
+42

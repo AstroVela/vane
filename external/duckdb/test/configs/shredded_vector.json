@@ -1,0 +1,26 @@
+{
+	"description": "Run with verify-vector 'shredded_vector'.",
+	"on_init": "PRAGMA debug_verify_vector = 'shredded_vector';",
+	"skip_compiled": "true",
+	"skip_tests": [
+		{
+			"reason": "These tests need one shredded and one unshredded row group in the same table, which forcing every vector to be shredded takes away",
+			"paths": [
+				"test/sql/storage/types/variant/variant_object_key_order_shredded.test",
+				"test/sql/storage/types/variant/variant_object_key_order_shredded_json.test"
+			]
+		},
+		{
+			"reason": "Asserts that a non-shreddable VARIANT overlay is scanned as a FLAT_VECTOR; this config forces all vectors to be shredded",
+			"paths": [
+				"test/issues/general/test_24298.test"
+			]
+		},
+		{
+			"reason": "FIXME: merged DECIMAL statistics of forced shredded VARIANT vectors report the wrong scale",
+			"paths": [
+				"test/sql/types/variant/variant_stats_merge_decimal.test"
+			]
+		}
+	]
+}

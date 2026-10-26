@@ -1,0 +1,143 @@
+# name: test/sql/copy/parquet/parquet_schema_evolution.test
+# description: Test parquet schema evolution
+# group: [parquet]
+
+require parquet
+
+# we run this twice, once with multi threading and once without
+loop i 0 2
+
+# test column names in different orders
+statement ok
+COPY (SELECT 42::INT a, 43::INT c) TO '{TEST_DIR}/evolution_1.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT 88::INT b, 84::INT a) TO '{TEST_DIR}/evolution_2.parquet' (FORMAT PARQUET);
+
+query I
+SELECT a FROM '{TEST_DIR}/evolution_*.parquet' ORDER BY a
+----
+42
+84
+
+query I
+SELECT a FROM parquet_scan(['{TEST_DIR}/evolution_2.parquet', '{TEST_DIR}/evolution_1.parquet', '{TEST_DIR}/evolution_*.parquet']) ORDER BY a
+----
+42
+42
+84
+84
+
+# reading either b or c results in an error, since the name is not present in both files
+statement error
+SELECT b FROM '{TEST_DIR}/evolution_*.parquet' ORDER BY 1
+----
+
+statement error
+SELECT c FROM '{TEST_DIR}/evolution_*.parquet' ORDER BY 1
+----
+
+# we can also do this with COPY
+statement ok
+CREATE TABLE copy_test(a INT, b INT);
+
+# if we copy from both files, we run into a schema mismatch in the files themselves (name differences)
+statement error
+COPY copy_test FROM '{TEST_DIR}/evolution_*.parquet'
+----
+schema mismatch
+
+# copying from one file works, however
+statement ok
+COPY copy_test FROM '{TEST_DIR}/evolution_1.parquet'
+
+statement ok
+DROP TABLE copy_test
+
+# test type promotion
+statement ok
+COPY (SELECT 42::INT a, 43::INT b) TO '{TEST_DIR}/evolution_1.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT 'hello'::VARCHAR b, 84::TINYINT a) TO '{TEST_DIR}/evolution_2.parquet' (FORMAT PARQUET);
+
+query I
+SELECT a FROM '{TEST_DIR}/evolution_*.parquet' ORDER BY 1
+----
+42
+84
+
+# reading either b results in an error, however, since we can't cast from 'hello' to integer
+statement error
+SELECT b FROM parquet_scan(['{TEST_DIR}/evolution_1.parquet', '{TEST_DIR}/evolution_2.parquet']) ORDER BY 1
+----
+
+# if we flip the order of the reads we can read b
+query I
+SELECT b FROM parquet_scan(['{TEST_DIR}/evolution_2.parquet', '{TEST_DIR}/evolution_1.parquet']) ORDER BY 1
+----
+43
+hello
+
+# type promotion, but with lists
+statement ok
+COPY (SELECT [42::INT] a, [43::INT] b) TO '{TEST_DIR}/evolution_1.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT ['hello'::VARCHAR] b, [84::TINYINT] a) TO '{TEST_DIR}/evolution_2.parquet' (FORMAT PARQUET);
+
+query I
+SELECT a FROM '{TEST_DIR}/evolution_*.parquet' ORDER BY 1
+----
+[42]
+[84]
+
+# reading either b results in an error, however, since we can't cast from 'hello' to integer
+statement error
+SELECT b FROM parquet_scan(['{TEST_DIR}/evolution_1.parquet', '{TEST_DIR}/evolution_2.parquet']) ORDER BY 1
+----
+
+# if we flip the order of the reads we can read b
+query I
+SELECT b FROM parquet_scan(['{TEST_DIR}/evolution_2.parquet', '{TEST_DIR}/evolution_1.parquet']) ORDER BY 1
+----
+[43]
+[hello]
+
+# type promotion & skipping
+statement ok
+COPY (SELECT range id, 1::INT a FROM range(10000) UNION ALL SELECT 10000+range id, 2::INT FROM range(10000)) TO '{TEST_DIR}/evolution_1.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT (20000+range)::BIGINT id, 'hello'::VARCHAR b, 3::BIGINT a FROM range(10000) UNION ALL SELECT (30000+range)::BIGINT id, 'world'::VARCHAR, 4 FROM range(10000)) TO '{TEST_DIR}/evolution_2.parquet' (FORMAT PARQUET);
+
+query I
+SELECT COUNT(*) FROM '{TEST_DIR}/evolution_*.parquet' WHERE a=2
+----
+10000
+
+query I
+SELECT COUNT(*) FROM '{TEST_DIR}/evolution_*.parquet' WHERE a>=2
+----
+30000
+
+query II
+SELECT id, a FROM '{TEST_DIR}/evolution_*.parquet' WHERE id=2
+----
+2	1
+
+query II
+SELECT id, a FROM '{TEST_DIR}/evolution_*.parquet' WHERE id=27777
+----
+27777	3
+
+query II
+SELECT id, a FROM '{TEST_DIR}/evolution_*.parquet' WHERE id>=39998 ORDER BY id
+----
+39998	4
+39999	4
+
+statement ok
+PRAGMA threads=1
+
+endloop

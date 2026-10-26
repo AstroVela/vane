@@ -1,0 +1,52 @@
+#include "duckdb/execution/index/art/node256.hpp"
+
+#include "duckdb/execution/index/art/node48.hpp"
+
+namespace duckdb {
+
+void Node256::InsertChild(ART &art, NodePtr &node, const uint8_t byte, const NodePtr child) {
+	NodeHandle handle(art, node);
+	auto &n = handle.Get<Node256>();
+	n.count++;
+	n.children[byte] = child;
+}
+
+void Node256::DeleteChild(ART &art, NodePtr &node, const uint8_t byte) {
+	{
+		NodeHandle handle(art, node);
+		auto &n = handle.Get<Node256>();
+
+		// Free the child and decrease the count.
+		NodePtr::FreeTree(art, n.children[byte]);
+		n.count--;
+
+		if (n.count > SHRINK_THRESHOLD) {
+			return;
+		}
+	}
+
+	// Shrink to Node48.
+	auto node256 = node;
+	Node48::ShrinkNode256(art, node, node256);
+}
+
+void Node256::GrowNode48(ART &art, NodePtr &node256, NodePtr &node48) {
+	{
+		NodeHandle n48_handle(art, node48);
+		auto &n48 = n48_handle.Get<Node48>();
+
+		auto n256_handle = New(art, node256);
+		auto &n256 = n256_handle.Get<Node256>();
+		node256.SetGateStatus(node48.GetGateStatus());
+
+		n256.count = n48.count;
+		for (uint16_t i = 0; i < CAPACITY; i++) {
+			if (n48.child_index[i] != Node48::EMPTY_MARKER) {
+				n256.children[i] = n48.children[n48.child_index[i]];
+			}
+		}
+	}
+	NodePtr::FreeNode(art, node48);
+}
+
+} // namespace duckdb

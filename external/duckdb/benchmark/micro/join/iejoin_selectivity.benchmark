@@ -1,0 +1,32 @@
+# name: benchmark/micro/join/iejoin_selectivity.benchmark
+# description: IEJoin Selectivity Testing
+# group: [join]
+
+name IEJoinSelectivity
+group micro
+subgroup join
+
+argument n 10_000_000
+argument ksel 1000
+argument rsel 1
+argument iejoin True
+
+load
+create or replace table states as
+	select 
+		i // ${ksel} as k,
+		'2024-01-01'::TIMESTAMP + INTERVAL (i // ${rsel}) seconds as b,
+		b + INTERVAL ${rsel} second as e,
+	from range(${n}) as tbl(i);
+set prefer_range_joins=${iejoin};
+
+run
+with joined as (
+	select lhs.k l, rhs.k r
+	from states lhs 
+	inner join states rhs
+	   on lhs.b < rhs.e
+	  and rhs.b < lhs.e
+	  and lhs.k = rhs.k
+)
+select count(*) from joined;

@@ -1,0 +1,8 @@
+# name: test/sql/types/numeric/arithmetic_vector_types.test
+# description: Arithmetic on vector types
+# group: [numeric]
+
+statement error
+SELECT a + b FROM test_vector_types(NULL::INT, NULL::INT) t(a, b)
+----
+Overflow

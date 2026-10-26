@@ -1,0 +1,7 @@
+# name: test/fuzzer/pedro/lag_window_function.test
+# group: [pedro]
+
+query I
+SELECT lag(1) OVER (ORDER BY 0 RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING);
+----
+NULL

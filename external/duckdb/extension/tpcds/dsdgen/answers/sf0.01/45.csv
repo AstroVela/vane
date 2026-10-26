@@ -1,0 +1,18 @@
+ca_zip|ca_city|sum(ws_sales_price)
+25281|Bethel|50.54
+30059|Centerville|157.13
+33604|Pleasant Hill|37.23
+46614|Providence|176.52
+46867|Jamestown|49.92
+50162|Stringtown|59.17
+59303|Springfield|57.06
+59843|Oakland|84.30
+64489|Woodbury|0.00
+68482|NULL|14.85
+71904|Midway|80.11
+71952|Sunnyside|97.83
+83003|Hillcrest|27.93
+89101|Franklin|115.69
+89431|New Hope|179.38
+98014|Clifton|41.38
+NULL|NULL|36.25

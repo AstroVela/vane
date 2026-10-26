@@ -1,0 +1,36 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/planner/filter/constant_filter.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/enums/expression_type.hpp"
+
+namespace duckdb {
+
+//! DEPRECATED - only preserved for backwards-compatible deserialization and expression conversion
+class LegacyConstantFilter : public TableFilter {
+public:
+	static constexpr const TableFilterType TYPE = TableFilterType::LEGACY_CONSTANT_COMPARISON;
+
+public:
+	LegacyConstantFilter(ExpressionType comparison_type, Value constant);
+
+	//! The comparison type (e.g. COMPARE_EQUAL, COMPARE_GREATERTHAN, COMPARE_LESSTHAN, ...)
+	ExpressionType comparison_type;
+	//! The constant value to filter on
+	Value constant;
+
+public:
+	unique_ptr<Expression> ToExpression(const Expression &column) const override;
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<TableFilter> Deserialize(Deserializer &deserializer);
+};
+
+} // namespace duckdb

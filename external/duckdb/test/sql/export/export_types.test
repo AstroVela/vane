@@ -1,0 +1,109 @@
+# name: test/sql/export/export_types.test
+# description: Test export and import of type aliases and their data
+# group: [export]
+
+statement ok
+BEGIN TRANSACTION
+
+# Populate the database
+
+# Create a type alias
+statement ok
+CREATE TYPE mood AS ENUM ('happy', 'sad', 'curious');
+
+# Create an alias on 'mood', creating a dependency on 'mood'
+statement ok
+CREATE TYPE doom as mood;
+
+# Create tables that use mood and doom
+statement ok
+create table tbl1 (a mood, b doom);
+
+statement ok
+create table tbl2 (my_struct STRUCT(a mood, b doom));
+
+# Create an alias on STRUCT containing mood and doom
+statement ok
+CREATE TYPE doom_mood as STRUCT(a mood, b doom);
+
+# Create an alias on LIST of mood
+statement ok
+CREATE TYPE mood_list as mood[];
+
+# Create an alias on a UNION containing mood and doom
+statement ok
+CREATE TYPE my_union as UNION(a doom, b mood);
+
+# Create an alias on a MAP with mood as key and doom as value
+statement ok
+CREATE TYPE mood_map as MAP(doom, mood);
+
+# Create an alias on a regular type, VARCHAR in this case
+statement ok
+CREATE TYPE my_special_type as VARCHAR;
+
+# Create a table containing the doom_mood type
+statement ok
+CREATE TABLE tbl3 (my_struct doom_mood);
+
+statement ok
+CREATE TABLE tbl4 (a mood_list, b mood_map, d my_special_type);
+
+statement ok
+CREATE TABLE tbl5 (c my_union);
+
+statement ok
+INSERT INTO tbl1 VALUES ('happy', 'sad');
+
+statement ok
+INSERT INTO tbl2 VALUES ({'a': 'curious', 'b': 'happy'});
+
+statement ok
+INSERT INTO tbl3 VALUES ({'a': 'sad', 'b': 'curious'});
+
+statement ok
+INSERT INTO tbl4 VALUES (['happy', 'sad'], map(['curious'], ['happy']), 'type alias');
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/export_types' (FORMAT CSV);
+
+statement ok
+ROLLBACK
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/export_types'
+
+# Verify that the database was imported properly
+query I
+SELECT count(*) FROM tbl5
+----
+0
+
+# Verify that the imported UNION alias can store typed values.
+statement ok
+INSERT INTO tbl5 VALUES (union_value(b := 'sad'::mood))
+
+query TT
+SELECT a, b FROM tbl1
+----
+happy	sad
+
+query TT
+SELECT my_struct.a, my_struct.b FROM tbl2
+----
+curious	happy
+
+query TT
+SELECT my_struct.a, my_struct.b FROM tbl3
+----
+sad	curious
+
+query TTTTT
+SELECT a, b, union_tag(c), c.b, d FROM tbl4, tbl5
+----
+[happy, sad]	{curious=happy}	b	sad	type alias
+
+query TTTT
+SELECT enum_range(NULL::mood), enum_range(NULL::doom), enum_range(a[1]), enum_range(c.b) FROM tbl4, tbl5
+----
+[happy, sad, curious]	[happy, sad, curious]	[happy, sad, curious]	[happy, sad, curious]

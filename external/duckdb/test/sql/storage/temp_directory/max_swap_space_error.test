@@ -1,0 +1,129 @@
+# name: test/sql/storage/temp_directory/max_swap_space_error.test
+# description: Test the maximum swap space.
+# group: [temp_directory]
+
+require noforcestorage
+
+require skip_reload
+
+# This test performs comparisons against the DEFAULT_BLOCK_ALLOC_SIZE of 256KiB.
+require block_size 262144
+
+# The temporary directory usage changes with the vector size.
+require vector_size 2048
+
+# Set a temp_directory to offload data
+statement ok
+set temp_directory='{TEST_DIR}/max_swap_space_reached'
+
+# Use uncompressed, nonconstant data to make the spill budgets independent of encoding choices.
+statement ok
+SET force_compression='uncompressed';
+
+# Ensure the temp_directory is used
+statement ok
+PRAGMA memory_limit='4MB'
+
+# Zero blocks
+statement ok
+set max_temp_directory_size='0KiB'
+
+statement error
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(1000000);
+----
+failed to offload data block
+
+query I
+SELECT coalesce(sum("size"), 0) FROM duckdb_temporary_files();
+----
+0
+
+# Max. one block for the default block allocation size
+statement ok
+set max_temp_directory_size='256KiB'
+
+statement error
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(1000000);
+----
+failed to offload data block
+
+statement error
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(1000000);
+----
+failed to offload data block
+
+query I
+SELECT coalesce(sum("size"), 0) FROM duckdb_temporary_files();
+----
+0
+
+statement ok
+set max_temp_directory_size='4MB'
+
+statement ok
+pragma threads=2;
+
+statement ok
+set preserve_insertion_order=true;
+
+# These 200000 doubles fit within the memory budget.
+statement ok
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(200000);
+
+# One million uncompressed doubles exceed the combined memory and swap budgets.
+statement error
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(1000000);
+----
+failed to offload data block
+
+# The failed replacement must preserve the previous table.
+query I
+SELECT count(*) FROM t2;
+----
+200000
+
+# Keep a table larger than the memory budget alive so the lower-limit checks
+# exercise occupied swap space, independently of cleanup after the failed CREATE.
+statement ok
+SET max_temp_directory_size='16MiB';
+
+statement ok
+CREATE OR REPLACE TABLE t2 AS SELECT random() FROM range(1000000);
+
+query II
+SELECT sum("size") > 1048576, sum("size") <= 16777216 FROM duckdb_temporary_files();
+----
+true	true
+
+# Cannot lower the limit
+statement error
+set max_temp_directory_size='256KiB'
+----
+exceeds the new limit
+
+# Cannot lower the limit
+statement error
+set max_temp_directory_size='256KiB'
+----
+exceeds the new limit
+
+query I
+select current_setting('max_temp_directory_size')
+----
+16.0 MiB
+
+statement ok
+DROP TABLE t2;
+
+query I
+SELECT coalesce(sum("size"), 0) FROM duckdb_temporary_files();
+----
+0
+
+statement ok
+set max_temp_directory_size='2550KiB'
+
+query I
+select current_setting('max_temp_directory_size')
+----
+2.4 MiB

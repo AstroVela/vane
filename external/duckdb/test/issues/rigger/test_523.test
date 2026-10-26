@@ -1,0 +1,9 @@
+# name: test/issues/rigger/test_523.test
+# description: Issue 523
+# group: [rigger]
+
+# The trigonometric functions can result in -nan when IEEE floating point ops are enabled
+query I
+SELECT SIN(1e1000);
+----
+nan

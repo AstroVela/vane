@@ -1,0 +1,47 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// zstd_file_system.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include <stdint.h>
+#include <string>
+
+#include "duckdb.hpp"
+#include "duckdb/common/compressed_file_system.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+
+namespace duckdb {
+
+class ZStdFileSystem : public CompressedFileSystem {
+public:
+	unique_ptr<FileHandle> OpenCompressedFile(QueryContext context, unique_ptr<FileHandle> handle, bool write) override;
+
+	std::string GetName() const override {
+		return "ZStdFileSystem";
+	}
+
+	FileCompressionType GetCompressionType() override {
+		return FileCompressionType::ZSTD;
+	}
+
+	bool CanHandleFile(const string &fpath) override {
+		return IsFileCompressed(fpath, FileCompressionType::ZSTD);
+	}
+
+	unique_ptr<StreamWrapper> CreateStream() override;
+	idx_t InBufferSize() override;
+	idx_t OutBufferSize() override;
+
+	static int64_t DefaultCompressionLevel();
+	static int64_t MinimumCompressionLevel();
+	static int64_t MaximumCompressionLevel();
+};
+
+} // namespace duckdb

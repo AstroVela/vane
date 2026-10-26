@@ -1,0 +1,20 @@
+# name: test/sql/copy/csv/19411.test_slow
+# description: Test for issue #19411
+# group: [csv]
+
+statement ok
+COPY (
+  FROM range(8000)
+  SELECT
+    rpad('', CAST(range AS INTEGER), '0') as test_string,
+    chr(CAST(range AS INTEGER)) as test_unicode,
+) TO '{TEST_DIR}/fails.csv';
+
+
+query I nosort alltypes
+FROM read_csv('{TEST_DIR}/fails.csv');
+----
+
+query I nosort alltypes
+FROM read_csv('{TEST_DIR}/fails.csv', strict_mode = false);
+----

@@ -1,0 +1,78 @@
+# name: test/sql/index/art/issues/test_art_view_col_binding.test
+# description: Test Index Scan push down against views with reordered projections (issue #17290)
+# group: [issues]
+
+statement ok
+create or replace table test as (
+    select
+        cast(unnest(range(1000)) as varchar) as x,
+        cast(unnest(range(2000,3000)) as varchar) as y,
+        cast(unnest(range(3000,4000)) as varchar) as z
+);
+
+# test simple permutation of initial table projection
+statement ok
+create index test_x on test(x);
+
+statement ok
+create view test_view as (select z, y, x from test);
+
+query II
+explain analyze select * from test_view where x = '525';
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query III
+select z, y, x from test_view where x = '525';
+----
+3525	2525	525
+
+statement ok
+drop index test_x;
+
+# test columnref as a child of function
+statement ok
+create index test_upper_x on test(upper(x));
+
+query II
+explain analyze select * from test_view where upper(x) = '526';
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query III
+select z, y, x from test_view where upper(x) = '526';
+----
+3526	2526	526
+
+statement ok
+drop index test_upper_x;
+
+# Test an indexed column whose index-local ordinal and physical column ID differ
+statement ok
+CREATE TABLE t(a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y');
+
+statement ok
+CREATE VIEW v AS SELECT a, b FROM t;
+
+statement ok
+CREATE INDEX i ON t(b);
+
+query II
+EXPLAIN ANALYZE SELECT * FROM v WHERE b = 'x';
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+statement ok
+DROP INDEX i;
+
+# Test the same non-leading physical column inside an index expression
+statement ok
+CREATE INDEX i ON t(UPPER(b));
+
+query II
+EXPLAIN ANALYZE SELECT * FROM v WHERE UPPER(b) = 'X';
+----
+analyzed_plan	<REGEX>:.*Index Scan.*

@@ -1,0 +1,77 @@
+# name: test/sql/optimizer/test_rowid_pushdown.test
+# group: [optimizer]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE t1 AS SELECT i + 100 as x FROM range(250000) AS t(i);
+
+query I
+SELECT * FROM t1 where rowid = 6;
+----
+106
+
+query II
+EXPLAIN SELECT * FROM t1 where rowid = 6;
+----
+physical_plan	<REGEX>:.*Filters:.*rowid = 6.*
+
+query I
+SELECT * FROM t1 where rowid = 200000;
+----
+200100
+
+query II
+EXPLAIN SELECT * FROM t1 where rowid = 200000;
+----
+physical_plan	<REGEX>:.*Filters:.*rowid = 200000.*
+
+query I
+SELECT * FROM t1 where rowid IN (SELECT rowid FROM t1 ORDER BY rowid DESC LIMIT 10) ORDER BY rowid;
+----
+250090
+250091
+250092
+250093
+250094
+250095
+250096
+250097
+250098
+250099
+
+# IN filter
+query I
+SELECT * FROM t1 where rowid IN (6, 9) ORDER BY ALL;
+----
+106
+109
+
+query II
+EXPLAIN SELECT * FROM t1 where rowid IN (6, 9);
+----
+physical_plan	<REGEX>:.*Filters:.*rowid.*IN.*(6.*9).*
+
+# OR clause
+query I
+SELECT * FROM t1 where rowid = 6 OR rowid = 9 ORDER BY ALL;
+----
+106
+109
+
+query II
+EXPLAIN SELECT * FROM t1 where rowid = 6 OR rowid = 9 ORDER BY ALL;
+----
+physical_plan	<REGEX>:(?s).*Filters.*rowid.*6.*rowid.*9.*
+
+statement ok
+CREATE TABLE nested_columns(s STRUCT(a INTEGER, b INTEGER));
+
+statement ok
+INSERT INTO nested_columns VALUES ({'a': 1, 'b': 0}), ({'a': 3, 'b': 2});
+
+query II
+EXPLAIN SELECT s.a FROM nested_columns WHERE s.a = 3 AND s.b = 2 AND rowid >= 1;
+----
+physical_plan	<REGEX>:(?s).*Filters:.*s\.a = 3.*s\.b = 2.*rowid >= 1.*

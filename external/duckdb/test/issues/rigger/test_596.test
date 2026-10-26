@@ -1,0 +1,15 @@
+# name: test/issues/rigger/test_596.test
+# description: Issue 596
+# group: [rigger]
+
+# STDDEV_POP unexpectedly does not fetch any rows
+statement ok
+CREATE TABLE t0(c0 DOUBLE);
+
+statement ok
+INSERT INTO t0(c0) VALUES(1E200), (0);
+
+query R
+SELECT STDDEV_POP(c0) FROM t0;
+----
+inf

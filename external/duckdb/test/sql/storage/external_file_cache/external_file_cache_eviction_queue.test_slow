@@ -1,0 +1,37 @@
+# name: test/sql/storage/external_file_cache/external_file_cache_eviction_queue.test_slow
+# description: Test the external file cache eviction queue
+# group: [external_file_cache]
+
+require parquet
+
+# the cache skips local files unless forced, these tests exercise it with local files
+statement ok
+set cache_local_files=true;
+
+load {TEST_DIR}/external_file_cache_eviction_queue.db
+
+# create parquet file
+statement ok
+set threads=1
+
+statement ok
+set preserve_insertion_order=false
+
+statement ok
+copy (select hash(range) i from range(10_000_000)) to '{TEST_DIR}/efc_eviction_queue.parquet'
+
+statement ok
+set memory_limit='80mb'
+
+statement ok
+create table test as from '{TEST_DIR}/efc_eviction_queue.parquet'
+
+# query the base table, this should evict the file cache entries as they have a later timestamp
+statement ok
+from test
+
+# so this should be 0
+query I
+select memory_usage_bytes from duckdb_memory() where tag = 'EXTERNAL_FILE_CACHE'
+----
+0

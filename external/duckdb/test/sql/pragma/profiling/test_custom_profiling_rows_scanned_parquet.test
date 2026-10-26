@@ -1,0 +1,41 @@
+# name: test/sql/pragma/profiling/test_custom_profiling_rows_scanned_parquet.test
+# group: [profiling]
+
+require json
+
+require parquet
+
+statement ok
+COPY (SELECT * FROM range(0, 10) as r(i)) TO '{TEST_DIR}/range.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT * FROM range(0, 10) as r(i)) TO '{TEST_DIR}/range2.parquet' (FORMAT 'parquet');
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/profiling_output.json';
+
+statement ok
+SET tracked_metrics = ['operator.intermediate_rows', 'operator.rows_scanned', 'query.total_intermediate_rows', 'query.total_rows_scanned'];
+
+statement ok
+SELECT * FROM '{TEST_DIR}/range.parquet' order by all;
+
+statement ok
+pragma disable_profiling;
+
+statement ok
+CREATE OR REPLACE TABLE metrics_output AS SELECT * FROM '{TEST_DIR}/profiling_output.json';
+
+statement ok
+SELECT query.total_intermediate_rows, query.total_rows_scanned FROM metrics_output;
+
+query I
+SELECT
+	CASE WHEN query.total_rows_scanned = 10 THEN 'true'
+	ELSE 'false' END
+FROM metrics_output;
+----
+true

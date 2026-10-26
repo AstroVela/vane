@@ -1,0 +1,68 @@
+[
+    {
+        "name": "count_star",
+        "parameters": "",
+        "description": "",
+        "example": "",
+        "type": "aggregate_function"
+    },
+    {
+        "name": "count",
+        "parameters": "arg",
+        "description": "Returns the number of non-NULL values in arg.",
+        "example": "count(A)",
+        "type": "aggregate_function_set"
+    },
+    {
+        "name": "first",
+        "parameters": "arg",
+        "description": "Returns the first value (NULL or non-NULL) from arg. This function is affected by ordering.",
+        "example": "first(A)",
+        "type": "aggregate_function_set",
+        "aliases": ["arbitrary"]
+    },
+    {
+        "name": "last",
+        "parameters": "arg",
+        "description": "Returns the last value of a column. This function is affected by ordering.",
+        "example": "last(A)",
+        "type": "aggregate_function_set"
+    },
+    {
+        "name": "any_value",
+        "parameters": "arg",
+        "description": "Returns the first non-NULL value from arg. This function is affected by ordering.",
+        "example": "",
+        "type": "aggregate_function_set"
+    },
+    {
+        "name": "min",
+        "parameters": "arg,n",
+        "description": "Returns the minimum value present in arg.",
+        "example": "min(A)",
+        "type": "aggregate_function_set"
+    },
+    {
+        "name": "max",
+        "parameters": "arg,n",
+        "description": "Returns the maximum value present in arg.",
+        "example": "max(A)",
+        "type": "aggregate_function_set"
+    },
+    {
+        "name": "decimal_average",
+        "parameters": "arg",
+        "description": "Computes the average of a DECIMAL column using exact integer arithmetic with banker's rounding. Returns a DECIMAL with the same width and scale as the input.",
+        "example": "decimal_average(col::DECIMAL(18,2))",
+        "type": "aggregate_function_set",
+        "struct": "DecimalAverageFun"
+    },
+    {
+        "name": "combine_aggr",
+        "parameters": "arg,multiplicities",
+        "description": "Combines exported aggregate states",
+        "example": "combine_aggr(state_column)",
+        "type": "aggregate_function_set",
+        "extra_functions": ["static AggregateFunction GetFunction();"]
+    }
+]

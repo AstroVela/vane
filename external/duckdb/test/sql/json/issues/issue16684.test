@@ -1,0 +1,23 @@
+# name: test/sql/json/issues/issue16684.test
+# description: Test issue 16684 - When using read_json to read data, it always converts the md5 string to uuid format.
+# group: [issues]
+
+require json
+
+statement ok
+copy (select '00000000000000000000000000000000' md5) to '{TEST_DIR}/issue16684.json'
+
+# should be varchar, not uuid (no hyphens)
+query II
+select md5, typeof(md5) from '{TEST_DIR}/issue16684.json'
+----
+00000000000000000000000000000000	VARCHAR
+
+statement ok
+copy (select '00000000-0000-0000-0000-000000000000' id) to '{TEST_DIR}/issue16684.json'
+
+# if we add hyphens we get a uuid
+query II
+select id, typeof(id) from '{TEST_DIR}/issue16684.json'
+----
+00000000-0000-0000-0000-000000000000	UUID

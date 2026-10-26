@@ -1,0 +1,49 @@
+# name: test/sql/copy/csv/test_glob_reorder_lineitem.test
+# description: Test the generation of lineitem csv files in different orders
+# group: [csv]
+
+set variable sf 0.01
+
+include test/sql/tpch/tpch_setup.test_template
+
+statement ok
+copy (select l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_discount,l_tax,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_shipmode,l_comment from lineitem limit 10000 offset 0)
+  to '{TEST_DIR}/lineitem_part1.csv';
+
+statement ok
+copy (select l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_tax,l_discount,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_shipmode,l_comment from lineitem limit 10000 offset 10000)
+  to '{TEST_DIR}/lineitem_part2.csv';
+
+statement ok
+copy (select l_comment,l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_tax,l_discount,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_shipmode from lineitem limit 10000 offset 20000)
+  to '{TEST_DIR}/lineitem_part3.csv';
+
+statement ok
+copy (select l_comment,l_orderkey,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_tax,l_discount,l_shipmode from lineitem limit 10000 offset 30000)
+  to '{TEST_DIR}/lineitem_part4.csv';
+
+statement ok
+copy (select l_comment,l_orderkey,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,l_shipinstruct,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_tax,l_discount,l_shipmode,l_shipmode as shipmode2 from lineitem limit 10000 offset 40000)
+  to '{TEST_DIR}/lineitem_part5.csv';
+
+statement ok
+create table t as from read_csv(['{TEST_DIR}/lineitem_part1.csv', '{TEST_DIR}/lineitem_part3.csv']);
+
+query I
+select count(*) from t;
+----
+20000
+
+statement ok
+drop table t;
+
+statement ok
+create table t as from read_csv(['{TEST_DIR}/lineitem_part*.csv']);
+
+query I
+select count(*) from t;
+----
+50000
+
+statement ok
+drop table t;

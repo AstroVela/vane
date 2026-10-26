@@ -1,0 +1,10 @@
+# name: test/sql/copy/parquet/aws2.test
+# description: Read a file created by AWS (#3981)
+# group: [parquet]
+
+require parquet
+
+query I
+SELECT * FROM '{DATA_DIR}/parquet-testing/aws2.parquet'
+----
+READY

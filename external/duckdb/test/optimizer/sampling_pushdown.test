@@ -1,0 +1,103 @@
+# name: test/optimizer/sampling_pushdown.test
+# description: Test Sampling Pushdown optimization
+# group: [optimizer]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE integers1(i INTEGER, j INTEGER)
+
+statement ok
+CREATE TABLE integers2(i INTEGER, j INTEGER)
+
+statement ok
+INSERT INTO integers1 VALUES (1,1), (2,2), (3, 3), (4,4)
+
+statement ok
+INSERT INTO integers2 VALUES (1,1), (2,2), (3, 3), (4,4)
+
+
+# tablesample system + seq scan becomes sample scan
+query II
+EXPLAIN SELECT i FROM integers1 tablesample system(0.1%)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 0.1%.*
+
+# using sample system + seq scan becomes sample scan
+query II
+EXPLAIN SELECT i FROM integers1 using sample system(0.1%)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 0.1%.*
+
+# system sampling with pushed-down filters: no pushdown, sample remains after filtered scan
+query II
+EXPLAIN SELECT i FROM (SELECT i FROM integers1 WHERE i > 1) USING SAMPLE system(25%)
+----
+physical_plan	<REGEX>:.*STREAMING_SAMPLE.*System: 25.*%.*
+
+query II
+EXPLAIN SELECT i FROM (SELECT i FROM integers1 WHERE i > 1) USING SAMPLE system(25%)
+----
+physical_plan	<!REGEX>:.*SEQ_SCAN.*System: 25.*%.*
+
+# tablesample system + seq scan with join becomes sample scan with join
+query II
+EXPLAIN SELECT * FROM integers1 tablesample system(0.1%), integers2 tablesample system(0.1%)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 0.1%.*
+
+# tablesample bernoulli: no pushdown
+query II
+EXPLAIN SELECT i FROM integers1 tablesample bernoulli(0.1%)
+----
+physical_plan	<REGEX>:.*Bernoulli.*SEQ_SCAN.*
+
+# tablesample reservoir: no pushdown
+query II
+EXPLAIN SELECT i FROM integers1 tablesample reservoir(0.1%)
+----
+physical_plan	<REGEX>:.*RESERVOIR_SAMPLE.*SEQ_SCAN.*
+
+# tablesample system after a derived table: no pushdown
+query II
+EXPLAIN SELECT * FROM integers1, integers2 where integers1.i = integers2.i USING SAMPLE SYSTEM(25%)
+----
+physical_plan	<REGEX>:.*System.*SEQ_SCAN.*
+
+# system sampling with row count: pushdown is supported
+query II
+EXPLAIN SELECT i FROM integers1 USING SAMPLE 2 ROWS (system)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 2 rows.*
+
+# row-count system sampling with pushed-down filters: no pushdown, sample remains after filtered scan
+query II
+EXPLAIN SELECT i FROM (SELECT i FROM integers1 WHERE i > 1) USING SAMPLE 2 ROWS (system)
+----
+physical_plan	<REGEX>:.*STREAMING_SAMPLE.*System: 2 rows.*
+
+query II
+EXPLAIN SELECT i FROM (SELECT i FROM integers1 WHERE i > 1) USING SAMPLE 2 ROWS (system)
+----
+physical_plan	<!REGEX>:.*SEQ_SCAN.*System: 2 rows.*
+
+# Row-count system sampling: SamplingPushdown injects a LogicalLimit, but LogicalSample is
+# removed so plan_sample.cpp is not applied for that subtree. The physical plan must not
+# stack two LIMIT operators (would duplicate Limit: N in the rendered plan).
+query II
+EXPLAIN SELECT i FROM integers1 USING SAMPLE 2 ROWS (system)
+----
+physical_plan	<!REGEX>:.*Limit:.*Limit:.*
+
+# system sampling with row count using explicit method syntax: pushdown is supported
+query II
+EXPLAIN SELECT i FROM integers1 USING SAMPLE system(2 ROWS)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 2 rows.*
+
+# system sampling with row count and REPEATABLE: pushdown is supported
+query II
+EXPLAIN SELECT i FROM integers1 USING SAMPLE 2 ROWS (system, 42)
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*System: 2 rows.*

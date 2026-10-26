@@ -1,0 +1,15 @@
+# name: test/sql/json/test_json_bool.test
+# description: Test if Json can parse bool
+# group: [json]
+
+require json
+
+query I
+SELECT json_extract('{"key": true}', '$.key')::BOOLEAN
+----
+true
+
+query I
+SELECT json_extract('{"key": false}', '$.key')::BOOLEAN
+----
+false

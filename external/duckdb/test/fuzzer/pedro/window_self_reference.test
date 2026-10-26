@@ -1,0 +1,13 @@
+# name: test/fuzzer/pedro/window_self_reference.test
+# description: Window clause self-reference
+# group: [pedro]
+
+statement error
+SELECT count(*) OVER w1 WINDOW w1 AS (ORDER BY count(*) OVER w1);
+----
+window functions are not allowed in window definitions
+
+statement error
+SELECT count(*) OVER w1 WINDOW w1 AS (ORDER BY count(*) OVER w2), w2 AS (ORDER BY count(*) OVER w1);
+----
+window functions are not allowed in window definitions

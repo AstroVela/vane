@@ -1,0 +1,309 @@
+# name: test/sql/pragma/profiling/call_enable_profiling_function.test
+# description: Test enable_profiling() function.
+# group: [profiling]
+
+require json
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/test.txt'
+
+#########################################################################################################################
+#            disable_profiling()
+#########################################################################################################################
+
+statement ok
+CALL disable_profiling();
+
+query I
+SELECT CURRENT_SETTING('enable_profiling');
+----
+NULL
+
+#########################################################################################################################
+#            enable_profiling()	without args
+#########################################################################################################################
+
+statement ok
+CALL enable_profiling();
+
+query I
+SELECT CURRENT_SETTING('enable_profiling');
+----
+query_tree
+
+#########################################################################################################################
+#            test setting format
+#########################################################################################################################
+
+statement ok
+CALL enable_profiling(format='json')
+
+query I
+SELECT CURRENT_SETTING('enable_profiling');
+----
+json
+
+statement error
+CALL enable_profiling(format='i dont exist hehe')
+----
+Invalid Input Error: "i dont exist hehe" is not a valid FORMAT argument
+
+#########################################################################################################################
+#            test setting coverage
+#########################################################################################################################
+
+query I
+SELECT CURRENT_SETTING('profiling_coverage');
+----
+SELECT
+
+statement ok
+CALL enable_profiling(coverage='all')
+
+query I
+SELECT CURRENT_SETTING('profiling_coverage');
+----
+ALL
+
+statement error
+CALL enable_profiling(coverage='i dont exist hehe')
+----
+Not implemented Error
+
+#########################################################################################################################
+#            test setting save location
+#########################################################################################################################
+
+query I
+SELECT CURRENT_SETTING('profiling_output');
+----
+{TEST_DIR}/test.txt
+
+statement ok
+CALL enable_profiling(save_location='{TEST_DIR}/other_file.txt')
+
+query I
+SELECT CURRENT_SETTING('profiling_output');
+----
+{TEST_DIR}/other_file.txt
+
+# doesn't work on a wrong file type
+statement error
+CALL enable_profiling(save_location='{TEST_DIR}/other_file.db')
+----
+Parser Error: Invalid output file type: db
+
+#########################################################################################################################
+#            test setting mode
+#########################################################################################################################
+
+query I
+SELECT CURRENT_SETTING('profiling_mode');
+----
+standard
+
+statement ok
+CALL enable_profiling(mode='detailed')
+
+query I
+SELECT CURRENT_SETTING('profiling_mode');
+----
+standard
+
+statement error
+CALL enable_profiling(mode='i dont exist hehe')
+----
+Parser Error
+
+statement error
+CALL enable_profiling(mode='true')
+----
+Parser Error
+
+#########################################################################################################################
+#            test setting metrics
+#########################################################################################################################
+
+# Invalid type for metrics: neither overload takes it, and the candidate list says what they do take
+statement error
+CALL enable_profiling(metrics = 42);
+----
+<REGEX>:Binder Error:.*No function matches.*metrics VARCHAR.*
+
+# Set metrics from LIST
+statement ok
+CALL enable_profiling(metrics = ['operator.intermediate_rows', 'operator.rows_scanned', 'query.total_intermediate_rows', 'query.total_rows_scanned'])
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+operator.intermediate_rows
+operator.rows_scanned
+query.total_intermediate_rows
+query.total_rows_scanned
+
+# Set metrics from LIST (subset, some disabled)
+statement ok
+CALL enable_profiling(metrics = ['query.sql', 'operator.extra_info'])
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+operator.extra_info
+query.sql
+
+# Set metrics from LIST
+statement ok
+CALL enable_profiling(metrics = ['query.total_time', 'operator.intermediate_size_bytes']);
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+operator.intermediate_size_bytes
+query.total_time
+
+# Set metrics from glob pattern string
+statement ok
+CALL enable_profiling(metrics = 'query.*');
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+query.*
+
+# Set metrics from wildcard
+statement ok
+CALL enable_profiling(metrics = '*');
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+*
+
+# Can't mix types though - the list comes out BOOLEAN[], which neither overload accepts
+statement error
+CALL enable_profiling(metrics = ['LATENCY', 'RESULT_SET_SIZE' = true]);
+----
+<REGEX>:Binder Error:.*No function matches.*
+
+statement error
+CALL enable_profiling(metrics = 'QUERY_NAME': true, 'EXTRA_INFO': true, 'OPERATOR_ROWS_SCANNED': false, "CUMULATIVE_CARDINALITY": "true");
+----
+Parser Error:
+
+statement ok
+RESET tracked_metrics;
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+*
+
+# Set metrics straight into function
+statement ok
+CALL enable_profiling(['query.total_time', 'operator.intermediate_size_bytes']);
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+operator.intermediate_size_bytes
+query.total_time
+
+# Set metrics straight into function with other settings too
+statement ok
+CALL enable_profiling(['io.total_bytes_read', 'io.total_bytes_written'], mode = 'detailed');
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+io.total_bytes_read
+io.total_bytes_written
+
+query I
+SELECT CURRENT_SETTING('profiling_mode');
+----
+standard
+
+# Other way around doesn't work
+statement error
+CALL enable_profiling(mode = 'detailed', ['LATENCY', 'RESULT_SET_SIZE']);
+----
+Invalid Error: Unnamed parameters cannot come after named parameters
+
+#########################################################################################################################
+#            test setting format AND save location
+#########################################################################################################################
+
+# Set profiling format and save location to json file
+statement ok
+CALL enable_profiling(format='json', save_location='{TEST_DIR}/test.json')
+
+query I
+SELECT CURRENT_SETTING('enable_profiling');
+----
+json
+
+query I
+SELECT CURRENT_SETTING('profiling_output');
+----
+{TEST_DIR}/test.json
+
+# format and save location file type don't match
+statement error
+CALL enable_profiling(format='query_tree', save_location='{TEST_DIR}/test.json')
+----
+Invalid Input Error: EnableProfiling: the save_location must be a .txt file or match the specified format.
+
+#########################################################################################################################
+#            test all
+#########################################################################################################################
+
+statement ok
+CALL enable_profiling(format='query_tree', save_location='{TEST_DIR}/test.txt', coverage='select', mode='standard', metrics=['query.sql', 'query.total_time'])
+
+query I
+SELECT CURRENT_SETTING('enable_profiling');
+----
+query_tree
+
+query I
+SELECT CURRENT_SETTING('profiling_output');
+----
+{TEST_DIR}/test.txt
+
+query I
+SELECT CURRENT_SETTING('profiling_coverage');
+----
+SELECT
+
+query I
+SELECT CURRENT_SETTING('profiling_mode');
+----
+standard
+
+query I
+SELECT UNNEST(CURRENT_SETTING('tracked_metrics')) ORDER BY ALL;
+----
+query.sql
+query.total_time
+
+#########################################################################################################################
+#            Invalid input
+#########################################################################################################################
+
+# Invalid parameter
+statement error
+CALL enable_profiling(this_does_not_exist = 'hello');
+----
+Invalid named parameter "this_does_not_exist" for function enable_profiling
+
+# a bare identifier is converted to the string 'format' and accepted as a metric name,
+# the same as any other unvalidated metric name
+statement ok
+CALL enable_profiling(format);
+
+# there is one metrics parameter, so a second positional argument matches no overload
+statement error
+CALL enable_profiling('hello', 'goodbye');
+----
+<REGEX>:Binder Error:.*No function matches.*

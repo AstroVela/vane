@@ -1,0 +1,33 @@
+channel|id|sales|returns_|profit
+NULL|NULL|222763.41|9525.05|-60865.95
+catalog channel|NULL|76810.48|8996.48|-14163.16
+catalog channel|catalog_pageAAAAAAAAAHABAAAA|11046.64|8912.63|-525.75
+catalog channel|catalog_pageAAAAAAAAAOPAAAAA|1712.69|0.00|-112.66
+catalog channel|catalog_pageAAAAAAAABLPAAAAA|673.38|0.00|-2046.89
+catalog channel|catalog_pageAAAAAAAABNPAAAAA|3737.36|0.00|897.16
+catalog channel|catalog_pageAAAAAAAACDCBAAAA|6874.20|0.00|1439.25
+catalog channel|catalog_pageAAAAAAAACKCBAAAA|226.07|0.00|-2837.90
+catalog channel|catalog_pageAAAAAAAACLPAAAAA|1092.50|0.00|470.50
+catalog channel|catalog_pageAAAAAAAADCABAAAA|7617.06|0.00|1453.36
+catalog channel|catalog_pageAAAAAAAADNPAAAAA|840.56|0.00|-174.61
+catalog channel|catalog_pageAAAAAAAAEAABAAAA|2280.30|0.00|228.60
+catalog channel|catalog_pageAAAAAAAAGAABAAAA|2304.44|83.85|-380.71
+catalog channel|catalog_pageAAAAAAAAGDCBAAAA|3387.90|0.00|-1665.66
+catalog channel|catalog_pageAAAAAAAAHLPAAAAA|1227.31|0.00|394.27
+catalog channel|catalog_pageAAAAAAAAHNPAAAAA|363.69|0.00|-574.98
+catalog channel|catalog_pageAAAAAAAAHOPAAAAA|2765.33|0.00|-1299.03
+catalog channel|catalog_pageAAAAAAAAIKPAAAAA|3008.60|0.00|-679.00
+catalog channel|catalog_pageAAAAAAAAJKCBAAAA|6678.96|0.00|-1426.05
+catalog channel|catalog_pageAAAAAAAAKCABAAAA|2561.76|0.00|1303.02
+catalog channel|catalog_pageAAAAAAAALOPAAAAA|244.16|0.00|21.56
+catalog channel|catalog_pageAAAAAAAANBABAAAA|2642.64|0.00|-663.35
+catalog channel|catalog_pageAAAAAAAANECBAAAA|6279.46|0.00|122.64
+catalog channel|catalog_pageAAAAAAAANFCBAAAA|4968.96|0.00|-3658.56
+catalog channel|catalog_pageAAAAAAAANLPAAAAA|502.08|0.00|-4037.14
+catalog channel|catalog_pageAAAAAAAAONPAAAAA|588.00|0.00|49.56
+catalog channel|catalog_pageAAAAAAAAPBABAAAA|2160.65|0.00|-618.57
+catalog channel|catalog_pageAAAAAAAAPEABAAAA|1025.78|0.00|157.78
+store channel|NULL|89524.13|525.09|-48132.94
+store channel|storeAAAAAAAABAAAAAAA|89524.13|525.09|-48132.94
+web channel|NULL|56428.80|3.48|1430.15
+web channel|web_siteAAAAAAAABAAAAAAA|56428.80|3.48|1430.15
