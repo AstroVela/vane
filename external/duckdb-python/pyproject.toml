@@ -1,0 +1,563 @@
+# pyproject.toml: contains most project, build, linting, formatting and ci configuration
+
+######################################################################################################
+# PROJECT CONFIG
+######################################################################################################
+
+[project]
+name = "duckdb"
+dynamic = ["version"]
+description = "DuckDB in-process database"
+readme = "README.md"
+keywords = ["DuckDB", "Database", "SQL", "OLAP"]
+requires-python = ">=3.11.0"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: C++",
+]
+authors = [{name = "DuckDB Foundation"}]
+maintainers = [{name = "DuckDB Foundation"}]
+
+[project.urls]
+Documentation = "https://duckdb.org/docs/stable/clients/python/overview"
+Source = "https://github.com/duckdb/duckdb-python"
+Issues = "https://github.com/duckdb/duckdb-python/issues"
+Changelog = "https://github.com/duckdb/duckdb-python/releases"
+
+[project.optional-dependencies]
+all = [ # users can install duckdb with 'duckdb[all]', which will install this list
+    "ipython", # used in duckdb.query_graph
+    "fsspec",  # used in duckdb.filesystem
+    "numpy",   # used in duckdb.fetchnumpy()
+    "pandas",  # used for pandas dataframes all over the place
+    "pyarrow", # used for pyarrow support
+    "adbc-driver-manager", # for the adbc driver
+]
+
+######################################################################################################
+# BUILD CONFIG
+#
+# Includes config used for building wheels, sdists and for installing
+# Tools: scikit-build-core and cmake
+######################################################################################################
+
+[build-system]
+build-backend = "duckdb_packaging.build_backend"
+backend-path = ["./"]
+requires = [
+    "scikit-build-core>=0.11.4",
+	"nanobind>=3.0",
+    # numpy C API headers (PyArray_Empty in the result path). Building against numpy 2.x yields a
+    # binary compatible with numpy >=1.19 AND 2.x at runtime (numpy 2.0 backward-compat), so the
+    # unpinned runtime numpy range is preserved. Build-time only; the runtime numpy dep is unchanged.
+    "numpy>=2.0",
+]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.29.0"
+ninja.version = ">=1.10"
+ninja.make-fallback = false
+metadata.version.provider = "duckdb_packaging.build_info"
+# Required for a metadata provider that is not shipped by scikit-build-core itself.
+# It is project wide: it also unlocks PEP 817 variant settings and absolute wheel
+# destinations, neither of which is used or meant to be.
+experimental = true
+# Stable build dir instead of the default randomized temp dir. A randomized dir
+# changes every include path and the compile cwd on every run, which makes
+# ccache direct mode miss 100% of the time in CI (only the slower preprocessed
+# mode hits). The editable and coverage overrides below set their own build-dir
+# and are unaffected. {cache_tag} is e.g. cpython-314.
+build-dir = "build/{cache_tag}"
+
+[tool.scikit-build.wheel]
+cmake = true
+# One stable ABI wheel for CPython 3.12 and up, where nanobind can link the stable ABI; an older interpreter gets
+# a wheel of its own from the same setting.
+py-api = "cp312"
+packages.duckdb = "duckdb"
+packages.adbc_driver_duckdb = "adbc_driver_duckdb"
+packages._duckdb-stubs = "_duckdb-stubs"
+
+[tool.scikit-build.cmake.define]
+BUILD_EXTENSIONS = "core_functions;json;parquet;icu"
+# Extensions to statically link into the module, picked from BUILD_EXTENSIONS.
+# Empty means all of BUILD_EXTENSIONS. Always passed so a stale CMake cache
+# value never survives an override being dropped.
+LINK_EXTENSIONS = ""
+# Link time optimization mode for the engine, the bindings and the module link:
+# thin, full, or empty for none. Always passed for the same reason.
+DUCKDB_PY_LTO = ""
+
+[tool.duckdb_packaging]
+# The version this branch releases next. A release forces exactly this version, a
+# dev build appends .dev<yymmddhhmm> of the latest commit across this repository
+# and the DuckDB submodule. Bump it right after every release from this branch.
+release_version = "2.0.0"
+
+[[tool.scikit-build.overrides]]
+if.env.CIBUILDWHEEL_BUILD_IDENTIFIER = true
+build-dir = "build/shared"
+build.tool-args = ["-v"]
+
+# Override: the Linux wheels link with ThinLTO, the platforms DuckDB's own release does it for. clang and lld come
+# from the before-build step and CC/CXX from the environment table under [tool.cibuildwheel.linux]. macOS and
+# Windows get no define and stay native, like DuckDB's release.
+[[tool.scikit-build.overrides]]
+if.env.CIBUILDWHEEL_BUILD_IDENTIFIER = true
+if.platform-system = "^linux$"
+inherit.cmake.define = "append"
+cmake.define.DUCKDB_PY_LTO = "thin"
+
+# Override: if COVERAGE is set then:
+# - we create a RelWithDebInfo build
+# - we make sure we use a persistent build dir so we get access to the .gcda files
+# - we build the extension with --coverage
+# note: unity builds should be enabled to speeds things up (and use significantly less space)
+[[tool.scikit-build.overrides]]
+if.env.COVERAGE = true
+cmake.build-type = "RelWithDebInfo"
+build-dir  = "build/coverage/"
+
+# Separate override because we have to append to cmake.define with `inherit` in order not to overwrite other defines.
+#   see https://scikit-build-core.readthedocs.io/en/latest/configuration/overrides.html#inheriting-for-tables-and-arrays
+[[tool.scikit-build.overrides]]
+if.env.COVERAGE = true
+inherit.cmake.define = "append"
+cmake.define.CMAKE_CXX_FLAGS = "--coverage -O0"
+cmake.define.CMAKE_C_FLAGS = "--coverage -O0"
+cmake.define.CMAKE_SHARED_LINKER_FLAGS = "--coverage"
+
+# Override: an editable build keeps the full API, for the debug asserts on the GIL that the stable ABI cannot express.
+[[tool.scikit-build.overrides]]
+if.state = "editable"
+wheel.py-api = ""
+
+# Override: if we're in editable mode then make sure a build dir is set. Note that COVERAGE runs have their own
+#   build-dir, and we don't want to interfere with that. We're also disabling unity builds to help with debugging.
+[[tool.scikit-build.overrides]]
+if.state = "editable"
+if.env.COVERAGE = false
+build-dir = "build/debug/"
+editable.rebuild = true
+editable.mode = "redirect"
+cmake.build-type = "Debug"
+
+# Separate override because we have to append to cmake.define with `inherit` in order not to overwrite other defines.
+#   see https://scikit-build-core.readthedocs.io/en/latest/configuration/overrides.html#inheriting-for-tables-and-arrays
+[[tool.scikit-build.overrides]]
+if.state = "editable"
+if.env.COVERAGE = false
+if.platform-system = "(?i)darwin"
+inherit.cmake.define = "append"
+cmake.define.DISABLE_UNITY = "1"
+
+[tool.scikit-build.sdist]
+include = [
+    "README.md",
+    "LICENSE",
+
+    # Build configuration
+    "pyproject.toml",
+    "CMakeLists.txt",
+    "cmake/**",
+
+    # Source code and stubs
+    "src/**",
+    "duckdb/**",
+    "duckdb_packaging/**",
+    "adbc_driver_duckdb/**",
+    "_duckdb-stubs/*.pyi",
+
+    # Generated during the sdist build, the identity the wheel build inherits
+    "duckdb_packaging/build_info.json",
+
+    # -------------- DuckDB submodule includes
+    # Core DuckDB source and build system
+    "external/duckdb/LICENSE",
+    "external/duckdb/src/**",
+    "external/duckdb/CMakeLists.txt",
+    "external/duckdb/DuckDBConfig.cmake.in",
+    "external/duckdb/DuckDBConfigVersion.cmake.in",
+    "external/duckdb/scripts/*.cmake",
+    "external/duckdb/scripts/null.txt",
+    "external/duckdb/scripts/ci/release_version.txt",
+
+    # Third-party libraries and extensions
+    "external/duckdb/third_party/**",
+    "external/duckdb/extension/**",
+
+    # Can't avoid including a small subset of ./tools and ./.github
+    "external/duckdb/tools/CMakeLists.txt",
+    "external/duckdb/tools/utils/**",
+    "external/duckdb/tools/cpp/**",
+    "external/duckdb/.github/config/out_of_tree_extensions.cmake",
+    "external/duckdb/.github/config/in_tree_extensions.cmake",
+    "external/duckdb/.github/config/extensions/**",
+]
+exclude = [
+    "/*",
+    "/.*",
+]
+
+######################################################################################################
+# TEST AND DEV DEPENDENCY CONFIG
+#
+# !!! HERE BE (CI) DRAGONS !!!
+#
+# This section has dependency groups for testing and development. Tread carefully, the current setup makes sure that
+# test dependencies can be installed on as many platforms we build wheel for. Especially picky are:
+# - tensorflow: we can only run tests on cp311, for osx there is no tensorflow-cpu, for windows we need
+#          tensorflow-cpu-aws and there is no distribution availalbe for Linux aarch64.
+# - torch: since we can't use gpu acceleration, we need to rely on torch-cpu, which isn't available on pypi. We use
+#          `tool.uv.index` and `tool.uv.sources` to make sure the official pytorch index is used. Even there, we don't
+#          have a wheel available for x86_64 OSX + cp313 and later.
+# - adbc-driver-manager: no cp315 wheels yet (1.12.0 stops at cp314); the adbc tests importorskip it on 3.15.
+# - numpy: tensorflow doesn't play nice with numpy>2 so for every platform that can run tensorflow (cp311) we use
+#          numpy<2. numpy<2 has no wheels for cp31[2|3], meaning an sdist will be used. However, on Windows amd64 +
+#          cp313 this results in a segfault / access violation. To get around this, we install numpy>=2 on all >=cp312
+#          platforms. Then for windows arm64, for which there is no tensorflow, we only allow numpy>=2.3 because that
+#          ships arm64 win32 wheels.
+# - pyarrow: pyarrow>=26 refuses to import with numpy<2, so wherever numpy<2 is installed pyarrow stays below 26.
+######################################################################################################
+
+[tool.uv]
+default-groups = ["dev"]
+# `tool.uv.environments` and `tool.uv.required-environments` are used for dependency resolving. These settings should
+# make sure that all test and dev dependencies can be resolved on these platforms, which are all platforms we currently
+# build wheels for.
+# See https://docs.astral.sh/uv/concepts/resolution/#universal-resolution
+environments = [ # no need to resolve packages beyond these platforms with uv...
+    "python_version >= '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "python_version >= '3.11' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "python_version >= '3.11' and sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "python_version >= '3.11' and sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+required-environments = [ # ... but do always resolve for all of them
+    "python_version >= '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "python_version >= '3.11' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "python_version >= '3.11' and sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "python_version >= '3.11' and sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# We just need pytorch for tests, wihtout GPU acceleration. PyPI doesn't host a cpu-only version for Linux, so we have
+# to configure the index url for cpu-only pytorch manually
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [ { index = "pytorch-cpu" } ]
+torchvision = [ { index = "pytorch-cpu" } ]
+
+# todo: adjust for windows arm64 while test dependencies become available
+[dependency-groups] # used for development only, requires pip >=25.1.0
+test = [ # dependencies used for running tests
+    "adbc-driver-manager>=1.10.0; python_version < '3.15' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "pytest",
+    "pytest-reraise",
+    "pytest-timeout",
+    "pytest-timestamper",
+    "pytest-xdist", # parallel test execution (-n auto); without this `uv sync --reinstall` prunes a manual install
+    "pytest_codspeed",
+    "coverage",
+    "gcovr; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "packaging",
+    "polars>=1.33.0",
+    "psutil",
+    "py4j",
+    "pyotp",
+    "pyspark",
+    "pytz",
+    "requests",
+    "urllib3",
+    "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "pandas>=3.0.0",
+    "pyarrow>=23.0.0,<26; python_version < '3.12' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "pyarrow>=23.0.0; python_version >= '3.12' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "torch>=2.2.2; python_version < '3.13' and ( sys_platform != 'win32' or platform_machine != 'ARM64' )",
+    "torch>=2.2.2,<2.12.1; python_version > '3.11' and python_version < '3.13' and sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "torch>=2.2.2,<2.11.0; python_version >= '3.13' and python_version < '3.14' and ( sys_platform != 'darwin' or platform_machine != 'x86_64' ) and ( sys_platform != 'win32' or platform_machine != 'ARM64' )",
+    "torch>=2.10.0; python_version >= '3.14' and ( sys_platform != 'darwin' or platform_machine != 'x86_64' ) and ( sys_platform != 'win32' or platform_machine != 'ARM64' )",
+    "tensorflow==2.14.0; sys_platform == 'darwin' and python_version < '3.12'",
+    "tensorflow-cpu>=2.14.0; sys_platform == 'linux' and platform_machine != 'aarch64' and python_version < '3.12'",
+    "tensorflow-cpu>=2.14.0; sys_platform == 'win32' and platform_machine != 'ARM64' and python_version < '3.12'",
+    "tensorflow-cpu-aws==2.15.1; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "typing-extensions",
+    "numpy<2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version < '3.12'",
+    "numpy>=2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version >= '3.12'",
+    "numpy>=2.3; sys_platform == 'win32' and platform_machine == 'ARM64'",
+]
+bench = [ # Pinned deps for the benchmark suite (see benchmarks/README.md). Minimal, not the heavy `test` group.
+          # Constraints mirror `test` so the lockfile resolves identically; torch/tf are local-only (importorskip).
+    "pytest",
+    "pytest_codspeed",
+    "polars>=1.33.0",
+    "pytz",
+    "numpy<2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version < '3.12'",
+    "numpy>=2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version >= '3.12'",
+    "numpy>=2.3; sys_platform == 'win32' and platform_machine == 'ARM64'",
+    "pandas>=3.0.0",
+    "pyarrow>=23.0.0,<26; python_version < '3.12' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "pyarrow>=23.0.0; python_version >= '3.12' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+]
+scripts = [ # dependencies used for running scripts
+    "ipython",
+    "ipywidgets",
+    "numpy",
+    "pandas",
+    "polars>=1.33.0",
+    "pyarrow; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    "pytz"
+]
+pypi = [ # dependencies used by the pypi cleanup script
+    "pyotp>=2.9.0",
+    "requests>=2.32.4",
+]
+build = [
+    "cmake>=3.29.0",
+    "ninja>=1.10",
+    "nanobind>=3.0",
+    # C API headers for the editable build. Unpinned because the test group forces numpy<2 on
+    # Python 3.11 for tensorflow, and one universal resolution must satisfy both. Release wheels
+    # build isolated against the numpy>=2.0 in [build-system].
+    "numpy",
+    "scikit_build_core>=0.11.4",
+]
+dev = [ # tooling like uv will install this automatically when syncing the environment
+    "pre-commit",
+    "mypy",
+    "ruff>=0.13.0",
+    {include-group = "build"},
+    {include-group = "test"},
+    {include-group = "scripts"},
+]
+
+######################################################################################################
+# DEV CONFIG
+#
+# Config for testig, coverage, linting and formatting
+#
+# Tools:
+# - mypy: Static type checking for Python
+# - ruff: Python linter and code formatter
+# - coverage.py: Code coverage (Python and C++)
+# - pytest
+######################################################################################################
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra --verbose"
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    # Jupyter is throwing DeprecationWarnings
+    "ignore:function ham() is deprecated:DeprecationWarning",
+    # Pyspark is throwing these warnings
+    "ignore:distutils Version classes are deprecated:DeprecationWarning:pyspark",
+    "ignore:is_datetime64tz_dtype is deprecated:DeprecationWarning:pyspark",
+    "ignore:The distutils package is deprecated:DeprecationWarning:pyspark",
+    "ignore:The copy keyword is deprecated:DeprecationWarning:pyspark",
+]
+
+[tool.mypy]
+packages = ["duckdb", "_duckdb"]
+strict = true
+warn_unreachable = true
+pretty = true
+python_version = "3.12"
+exclude = [
+    "duckdb/experimental/", # not checking the pyspark API
+    "duckdb/query_graph/",  # old and unmaintained (should probably remove)
+    "tests", "scripts",
+]
+
+[[tool.mypy.overrides]]
+module = "duckdb.experimental.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "fsspec.*",
+    "pandas",
+    "polars",
+    "pyarrow.*",
+    "torch",
+    "tensorflow",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "duckdb.filesystem"
+disallow_subclassing_any = false
+
+[tool.coverage.run]
+branch = true
+source = ["duckdb"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py310"
+fix = true
+exclude = ['external/duckdb', 'sqllogic']
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+exclude = ['*.pyi']
+select = [
+    "ANN", # flake8-annotations
+    "B", # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "D", # flake8-docstrings
+    "E", # pycodestyle
+    "EM", # flake8-errmsg
+    "F", # pyflakes
+    "FBT001", # flake8-boolean-trap
+    "I", # isort
+    #"ICN", # flake8-import-conventions
+    "INT", # flake8-gettext
+    "PERF", # perflint
+    "PIE", # flake8-pie
+    "PT", # flake8-pytest-style
+    "PTH", # flake8-use-pathlib
+    "PYI", # flake8-pyi
+    "RUF", # ruff-specific rules
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "TD", # flake8-todos
+    #"TID", # flake8-tidy-imports
+    "TRY", # tryceratops
+    "UP", # pyupgrade
+    "W", # pycodestyle
+]
+ignore = [
+    "C901", # ignore function complexity
+    "ANN002", "ANN003", # don't require type annotations for *args and **kwargs
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+[tool.ruff.lint.per-file-ignores]
+"duckdb/experimental/spark/**.py" = [
+    # No need for moduledocstrings for spark
+    'D100',
+    # Ignore boolean positional args in the Spark API
+    'FBT001'
+]
+"duckdb_packaging/**.py" = [
+    # ignore all performance-related rules for duckdb_packaging
+    'PERF'
+]
+"tests/**.py" = [
+    # No need for package, module, class, function, init etc docstrings in tests
+    'D100', 'D101', 'D102', 'D103', 'D104', 'D105', 'D107',
+    # No need for type hinting in tests
+    'ANN001', 'ANN201', 'ANN202'
+]
+"benchmarks/**.py" = [
+    # benchmarks are test-like: docstrings optional (shared context lives in benchmarks/README.md)
+    'D100', 'D101', 'D102', 'D103', 'D104', 'D105', 'D107',
+]
+"tests/fast/spark/**.py" = [
+    "E402"
+]
+"tests/spark_namespace/**.py" = [
+    # we need * imports for Spark
+    'F403'
+]
+"scripts/**.py" = [
+    # No need for package, module, class, function, init etc docstrings in scripts
+    'D100', 'D101', 'D102', 'D103', 'D104', 'D105', 'D107', 'D205',
+    # No need for type hinting in scripts
+    'ANN001', 'ANN201'
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 88
+quote-style = "double"
+indent-style = "space"
+
+######################################################################################################
+# CI CONFIG
+#
+# Configuration for CI Workflows. Specified here instead of in the workflow yamls so you can use `cibuildwheel` locally
+# (to some extent).
+######################################################################################################
+[tool.cibuildwheel]
+# --env-dir needs build>=1.6.0; cibuildwheel pins build==1.5.0
+dependency-versions = "latest"
+build-frontend = "build[uv]"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-pypy_x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+manylinux-pypy_aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.linux]
+build-frontend = { name = "build[uv]", args = ["--env-dir", "/tmp/duckdb-build-env"] }
+before-build = [
+  'pip install -U "build>=1.6.0"',
+  'rm -rf /tmp/duckdb-build-env',
+  'yum install -y ccache clang lld',
+]
+# The wheels build with clang, like the engine's own Linux release. In CI the build-wheel action's CIBW_ENVIRONMENT
+# replaces this table and carries the same two variables; this copy serves a local cibuildwheel run.
+environment = { CC = "clang", CXX = "clang++" }
+# The build runs in a container that keeps its files, so the compile database is checked there, in front of the
+# default repair command.
+repair-wheel-command = [
+  'python {project}/scripts/check_compile_commands.py {project}/build/shared/compile_commands.json --lto thin --compiler clang',
+  'auditwheel repair -w {dest_dir} {wheel}',
+]
+
+[tool.cibuildwheel.macos]
+build-frontend = { name = "build[uv]", args = ["--env-dir", "/tmp/duckdb-build-env"] }
+before-build = [
+  'rm -rf /tmp/duckdb-build-env',
+  'brew install ccache',
+]
+# nanobind uses C++17 aligned new/delete (std::align_val_t), which the runtime only provides on macOS 10.13+.
+# cp311's framework defaults to a 10.9 deployment target (used for the x86_64 slice of x86_64/universal2
+# wheels), so nanobind fails to compile there; cp312+ frameworks already target 10.13+. 
+# cibuildwheel bumps automatically to the minimum per target, so use a minimum that'll work on all python versions
+# otherwise caching is defeated
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.15" }
+
+[tool.cibuildwheel.windows]
+build-frontend = { name = "build", args = ["--env-dir", "C:/duckdb-build-env"] }
+before-build = [
+  'if exist C:\duckdb-build-env (rmdir /s /q C:\duckdb-build-env)',
+  'choco install ccache -y',
+]

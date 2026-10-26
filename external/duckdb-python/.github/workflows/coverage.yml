@@ -1,0 +1,160 @@
+name: Test coverage
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        type: string
+        description: Git ref of the DuckDB python package
+        required: false
+      duckdb_git_ref:
+        type: string
+        description: Git ref of DuckDB
+        required: false
+      testsuite:
+        type: choice
+        description: Testsuite to run ('all' or 'fast')
+        default: all
+        required: true
+        options:
+          - all
+          - fast
+  workflow_call:
+    inputs:
+      git_ref:
+        type: string
+        description: Git ref of the DuckDB python package
+        required: false
+      duckdb_git_ref:
+        type: string
+        required: false
+      testsuite:
+        type: string
+        description: Testsuite to run ('all' or 'fast')
+        required: true
+        default: all
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate_coverage_reports:
+    name: Generate code coverage reports for both Python and C++ code
+    runs-on: ubuntu-24.04
+    env: { COVERAGE: 1 }
+    outputs:
+      summary_py: ${{ steps.py_coverage.outputs.summary }}
+      summary_cpp: ${{ steps.cpp_coverage.outputs.summary }}
+    steps:
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Checkout DuckDB to provided ref
+        if: ${{ inputs.duckdb_git_ref != '' }}
+        shell: bash
+        run: |
+          cd external/duckdb
+          git fetch origin
+          git checkout ${{ inputs.duckdb_git_ref }}
+
+      # Its own key: RelWithDebInfo objects with coverage flags share nothing with the other builds. A dispatch
+      # that builds another ref or engine commit must not write the branch's cache.
+      - name: Setup Ccache
+        uses: ./.github/actions/ccache-action
+        with:
+          key: ubuntu-coverage
+          save: ${{ inputs.git_ref == '' && inputs.duckdb_git_ref == '' && 'true' || 'false' }}
+
+      # No setup-uv cache: its entries ran to 900 MB per ref and crowded the ccaches out of the repository's budget.
+      - name: Install Astral UV
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.23"
+          python-version: 3.12
+          enable-cache: false
+
+      - name: Run tests with coverage
+        shell: bash
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          if [[ "${{ inputs.testsuite }}" == "all" ]]; then
+            uv run coverage run -m pytest ./tests
+          elif [[ "${{ inputs.testsuite }}" == "fast" ]]; then
+            uv run coverage run -m pytest ./tests/fast
+          else
+            echo "Invalid testsuite!"
+            exit 1
+          fi
+
+      - name: Get Python coverage data
+        id: py_coverage
+        shell: bash
+        run: |
+          # save HTML report in coverage-python
+          uv run coverage html -d coverage-python
+          # save markdown summary in step output
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          uv run coverage report --format=markdown >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload Python coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-python
+          path: coverage-python
+
+      - name: Get C++ coverage data
+        id: cpp_coverage
+        shell: bash
+        run: |
+          mkdir coverage-cpp
+          uv run gcovr \
+            --gcov-ignore-errors all \
+            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+            --root "$PWD" \
+            --filter "${PWD}/src" \
+            --exclude '.*/\.cache/.*' \
+            --gcov-exclude '.*/\.cache/.*' \
+            --gcov-exclude '.*/external/.*' \
+            --gcov-exclude '.*/site-packages/.*' \
+            --exclude-unreachable-branches \
+            --exclude-throw-branches \
+            --html --html-details -o coverage-cpp/index.html \
+            build/coverage/src \
+            --print-summary > cpp_summary.txt
+          # save the summary in the output
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          cat cpp_summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload C++ coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-cpp
+          path: coverage-cpp
+
+  summary:
+    name: Coverage Summary
+    runs-on: ubuntu-24.04
+    needs: [generate_coverage_reports]
+    env:
+      SUMMARY_PY: ${{ needs.generate_coverage_reports.outputs.summary_py }}
+      SUMMARY_CPP: ${{ needs.generate_coverage_reports.outputs.summary_cpp }}
+    if: always()
+    steps:
+      - name: Summarize
+        shell: bash
+        run: |
+          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### Python Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "$SUMMARY_PY" >> $GITHUB_STEP_SUMMARY
+          echo "### C++ Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "$SUMMARY_CPP" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

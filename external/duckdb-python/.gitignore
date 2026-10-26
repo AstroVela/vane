@@ -1,0 +1,65 @@
+#==============================================================================#
+# This file specifies intentionally untracked files that git should ignore.
+#==============================================================================#
+
+#==============================================================================#
+# General
+#==============================================================================#
+# Temp files created by most text editors.
+*~
+# Merge files created by git.
+*.orig
+# vim swap files
+.*.sw?
+.sw?
+#OS X specific files.
+.DS_store
+#VSCode specifics
+.vscode/
+
+#==============================================================================#
+# Build artifacts
+#==============================================================================#
+*.o
+*.lo
+*.la
+*.lai
+*.lib
+*.slo
+*.cuo
+*.pdf
+*.swp
+a.out
+*.so
+*.dylib
+*.dll
+
+build
+.build_debug/*
+.build_release/*
+distribute/*
+*.testbin
+*.bin
+cmake_build
+.cmake_build
+cmake-build-debug
+cmake-build-release
+cmake-build-relwithdebinfo
+duckdb_packaging/build_info.json
+duckdb/_build_info.py
+test.db
+tmp/
+
+#==============================================================================#
+# Python
+#==============================================================================#
+
+*.pyc
+.venv
+uv.lock
+dist
+duckdb.egg-info
+.eggs
+.pytest_cache
+.coverage
+duckdb_build

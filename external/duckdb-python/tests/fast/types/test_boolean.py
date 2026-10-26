@@ -1,0 +1,5 @@
+class TestBoolean:
+    def test_bool(self, duckdb_cursor):
+        duckdb_cursor.execute("SELECT TRUE")
+        results = duckdb_cursor.fetchall()
+        assert results[0][0]
