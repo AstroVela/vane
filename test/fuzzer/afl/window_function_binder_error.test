@@ -1,0 +1,13 @@
+# name: test/fuzzer/afl/window_function_binder_error.test
+# description: Invalid window function call
+# group: [afl]
+
+query I
+SELECT count(x) OVER () FROM (SELECT 1) x(x);
+----
+1
+
+statement error
+SELECT count(x) OVER () FROM (SELECT 1) x(x) GROUP BY ALL;
+----
+Binder Error: Cannot group on a window clause

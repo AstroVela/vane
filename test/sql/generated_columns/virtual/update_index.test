@@ -1,0 +1,50 @@
+# name: test/sql/generated_columns/virtual/update_index.test
+# description: Tests updates on a table with virtual columns and indexes
+# group: [virtual]
+
+statement ok
+CREATE TABLE tbl_comp (
+	a INT,
+	gen AS (2 * a),
+	b INT,
+	c VARCHAR,
+	PRIMARY KEY(c));
+
+statement ok
+INSERT INTO tbl_comp VALUES (1, 1, 'hello');
+
+statement ok
+UPDATE tbl_comp SET c='world'
+
+query IIII
+FROM tbl_comp
+----
+1	2	1	world
+
+statement ok
+CREATE TABLE tbl_only_indexed (
+	gen AS (y + 1),
+	y INT UNIQUE
+);
+
+statement ok
+INSERT INTO tbl_only_indexed (y) VALUES (10), (20);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tbl_only_indexed SET y = 30 WHERE y = 10;
+
+statement ok
+INSERT INTO tbl_only_indexed (y) VALUES (10);
+
+statement ok
+COMMIT;
+
+query II
+SELECT * FROM tbl_only_indexed ORDER BY y;
+----
+11	10
+21	20
+31	30

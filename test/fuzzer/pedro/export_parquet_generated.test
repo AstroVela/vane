@@ -1,0 +1,40 @@
+# name: test/fuzzer/pedro/export_parquet_generated.test
+# description: Generated columns and Parquet export
+# group: [pedro]
+
+require parquet
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE t0 (c0 INT AS (1), c1 INT);
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/parquet_generated_dump' (FORMAT PARQUET);
+
+statement ok
+ROLLBACK;
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/parquet_generated_dump';
+
+statement ok
+COPY (SELECT 42) TO '{TEST_DIR}/parquet_single.parquet'
+
+statement ok
+COPY t0 FROM '{TEST_DIR}/parquet_single.parquet'
+
+query II
+FROM t0
+----
+1	42
+
+statement ok
+COPY t0 (c1) FROM '{TEST_DIR}/parquet_single.parquet'
+
+query II
+FROM t0
+----
+1	42
+1	42

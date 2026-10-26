@@ -1,0 +1,18 @@
+# name: test/sql/copy/parquet/replacement_scan_custom_extension.test
+# description: Test unknown extensions in replacement scans
+# group: [parquet]
+
+require parquet
+
+statement ok
+COPY (SELECT 42 a) to '{TEST_DIR}/lists.my_file_extension' (FORMAT PARQUET);
+
+statement error
+FROM '{TEST_DIR}/lists.my_file_extension';
+----
+No extension found that is capable of reading the file
+
+query I
+FROM read_parquet('{TEST_DIR}/lists.my_file_extension')
+----
+42

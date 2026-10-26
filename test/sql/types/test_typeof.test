@@ -1,0 +1,7 @@
+# name: test/sql/types/test_typeof.test
+# group: [types]
+
+query I
+SELECT typeof(1)
+----
+INTEGER

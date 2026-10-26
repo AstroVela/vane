@@ -1,0 +1,11 @@
+# name: test/sql/storage/test_empty_shutdown.test
+# description: Test restart of empty database
+# group: [storage]
+
+# load the DB from disk
+load {TEST_DIR}/test_empty_shutdown.db
+
+# restart some times
+restart
+
+restart

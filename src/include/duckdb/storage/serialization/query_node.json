@@ -1,0 +1,434 @@
+[
+  {
+    "class": "QueryNode",
+    "class_type": "type",
+    "includes": [
+      "duckdb/parser/query_node/list.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "type",
+        "type": "QueryNodeType"
+      },
+      {
+        "id": 101,
+        "name": "modifiers",
+        "type": "vector<ResultModifier*>"
+      },
+      {
+        "id": 102,
+        "name": "cte_map",
+        "type": "CommonTableExpressionMap"
+      }
+    ],
+    "finalize_deserialization": [
+      "if (type == QueryNodeType::CTE_NODE) {",
+      "\tresult = std::move(result->Cast<CTENode>().child);",
+      "}",
+      "QueryNode::VerifyDeserialized(result);"
+    ]
+  },
+  {
+    "class": "SelectNode",
+    "base": "QueryNode",
+    "enum": "SELECT_NODE",
+    "includes": [
+      "duckdb/parser/tableref/emptytableref.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "select_list",
+        "type": "vector<ParsedExpression*>"
+      },
+      {
+        "id": 201,
+        "name": "from_table",
+        "type": "TableRef*"
+      },
+      {
+        "id": 202,
+        "name": "where_clause",
+        "type": "ParsedExpression*"
+      },
+      {
+        "id": 203,
+        "name": "group_expressions",
+        "type": "vector<ParsedExpression*>",
+        "property": "groups.group_expressions"
+      },
+      {
+        "id": 204,
+        "name": "group_sets",
+        "type": "vector<GroupingSet>",
+        "property": "groups.grouping_sets"
+      },
+      {
+        "id": 205,
+        "name": "aggregate_handling",
+        "type": "AggregateHandling"
+      },
+      {
+        "id": 206,
+        "name": "having",
+        "type": "ParsedExpression*"
+      },
+      {
+        "id": 207,
+        "name": "sample",
+        "type": "SampleOptions*"
+      },
+      {
+        "id": 208,
+        "name": "qualify",
+        "type": "ParsedExpression*"
+      }
+    ],
+    "finalize_deserialization": [
+      "if (!result->from_table) {",
+      "\tresult->from_table = make_uniq<EmptyTableRef>();",
+      "}",
+      "for (auto &grouping_set : result->groups.grouping_sets) {",
+      "\tfor (auto &group_index : grouping_set) {",
+      "\t\tif (!group_index.IsValid() || group_index.GetIndex() >= result->groups.group_expressions.size()) {",
+      "\t\t\tthrow SerializationException(\"Grouping set refers to a group that does not exist\");",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+  {
+    "class": "SetOperationNode",
+    "base": "QueryNode",
+    "enum": "SET_OPERATION_NODE",
+    "members": [
+      {
+        "id": 200,
+        "name": "setop_type",
+        "type": "SetOperationType"
+      },
+      {
+        "id": 201,
+        "name": "left",
+        "type": "QueryNode*",
+        "serialize_property": "SerializeChildNode(serializer, 0)"
+      },
+      {
+        "id": 202,
+        "name": "right",
+        "type": "QueryNode*",
+        "serialize_property": "SerializeChildNode(serializer, 1)"
+      },
+      {
+        "id": 203,
+        "name": "setop_all",
+        "type": "bool",
+        "default": "true"
+      },
+      {
+        "id": 204,
+        "name": "children",
+        "type": "vector<QueryNode*>",
+        "version": "v1.5.0"
+      }
+    ],
+    "constructor": [
+      "setop_type",
+      "left",
+      "right",
+      "children",
+      "setop_all"
+    ]
+  },
+  {
+    "class": "RecursiveCTENode",
+    "base": "QueryNode",
+    "enum": "RECURSIVE_CTE_NODE",
+    "members": [
+      {
+        "id": 200,
+        "name": "cte_name",
+        "type": "Identifier",
+        "property": "ctename"
+      },
+      {
+        "id": 201,
+        "name": "union_all",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 202,
+        "name": "left",
+        "type": "QueryNode*"
+      },
+      {
+        "id": 203,
+        "name": "right",
+        "type": "QueryNode*"
+      },
+      {
+        "id": 204,
+        "name": "aliases",
+        "type": "vector<Identifier>"
+      },
+      {
+        "id": 205,
+        "name": "key_targets",
+        "type": "vector<ParsedExpression*>"
+      }
+    ]
+  },
+  {
+    "class": "CTENode",
+    "base": "QueryNode",
+    "enum": "CTE_NODE",
+    "members": [
+      {
+        "id": 200,
+        "name": "cte_name",
+        "type": "Identifier",
+        "property": "ctename"
+      },
+      {
+        "id": 201,
+        "name": "query",
+        "type": "QueryNode*"
+      },
+      {
+        "id": 202,
+        "name": "child",
+        "type": "QueryNode*"
+      },
+      {
+        "id": 203,
+        "name": "aliases",
+        "type": "vector<Identifier>"
+      },
+      {
+        "id": 204,
+        "name": "materialized",
+        "type": "CTEMaterialize",
+        "default": "CTEMaterialize::CTE_MATERIALIZE_DEFAULT"
+      }
+    ]
+  },
+  {
+    "class": "UpdateQueryNode",
+    "base": "QueryNode",
+    "enum": "UPDATE_QUERY_NODE",
+    "includes": [
+      "duckdb/parser/query_node/update_query_node.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "table",
+        "type": "TableRef*"
+      },
+      {
+        "id": 201,
+        "name": "from_table",
+        "type": "TableRef*"
+      },
+      {
+        "id": 202,
+        "name": "returning_list",
+        "type": "vector<ParsedExpression*>"
+      },
+      {
+        "id": 203,
+        "name": "set_info",
+        "type": "UpdateSetInfo*"
+      },
+      {
+        "id": 204,
+        "name": "prioritize_table_when_binding",
+        "type": "bool",
+        "default": "false"
+      }
+    ]
+  },
+  {
+    "class": "DeleteQueryNode",
+    "base": "QueryNode",
+    "enum": "DELETE_QUERY_NODE",
+    "includes": [
+      "duckdb/parser/query_node/delete_query_node.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "condition",
+        "type": "ParsedExpression*"
+      },
+      {
+        "id": 201,
+        "name": "table",
+        "type": "TableRef*"
+      },
+      {
+        "id": 202,
+        "name": "using_clauses",
+        "type": "vector<TableRef*>"
+      },
+      {
+        "id": 203,
+        "name": "returning_list",
+        "type": "vector<ParsedExpression*>"
+      }
+    ]
+  },
+  {
+    "class": "InsertQueryNode",
+    "base": "QueryNode",
+    "enum": "INSERT_QUERY_NODE",
+    "includes": [
+      "duckdb/parser/query_node/insert_query_node.hpp",
+      "duckdb/parser/statement/insert_statement.hpp",
+      "duckdb/parser/statement/select_statement.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "select_statement",
+        "type": "SelectStatement*"
+      },
+      {
+        "id": 201,
+        "name": "columns",
+        "type": "vector<Identifier>"
+      },
+      {
+        "id": 202,
+        "name": "table",
+        "type": "Identifier",
+        "serialize_property": "qualified_name.Name()"
+      },
+      {
+        "id": 203,
+        "name": "schema",
+        "type": "Identifier",
+        "serialize_property": "qualified_name.Schema()"
+      },
+      {
+        "id": 204,
+        "name": "catalog",
+        "type": "Identifier",
+        "serialize_property": "qualified_name.Catalog()"
+      },
+      {
+        "id": 205,
+        "name": "returning_list",
+        "type": "vector<ParsedExpression*>"
+      },
+      {
+        "id": 206,
+        "name": "on_conflict_info",
+        "type": "OnConflictInfo*"
+      },
+      {
+        "id": 207,
+        "name": "table_ref",
+        "type": "TableRef*"
+      },
+      {
+        "id": 208,
+        "name": "default_values",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 209,
+        "name": "column_order",
+        "type": "InsertColumnOrder",
+        "default": "InsertColumnOrder::INSERT_BY_POSITION"
+      },
+      {
+        "id": 210,
+        "name": "qualified_name",
+        "serialize_property": "qualified_name",
+        "deserialize_property": "qualified_name",
+        "type": "QualifiedName",
+        "version": "v2.0.0",
+        "serialize_condition": "qualified_name.Path().size() > 3",
+        "deserialize_default": "QualifiedName()",
+        "deserialize_skip_assign": true
+      }
+    ],
+    "finalize_deserialization": [
+      "if (!qualified_name.Path().empty()) {",
+      "\tresult->qualified_name = std::move(qualified_name);",
+      "}"
+    ],
+    "methods": {
+      "SetQualifiedName": [
+        "catalog",
+        "schema",
+        "table"
+      ]
+    }
+  },
+  {
+    "class": "MergeQueryNode",
+    "base": "QueryNode",
+    "enum": "MERGE_QUERY_NODE",
+    "includes": [
+      "duckdb/parser/query_node/merge_query_node.hpp",
+      "duckdb/parser/statement/merge_into_statement.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "target",
+        "type": "TableRef*"
+      },
+      {
+        "id": 201,
+        "name": "source",
+        "type": "TableRef*"
+      },
+      {
+        "id": 202,
+        "name": "join_condition",
+        "type": "ParsedExpression*"
+      },
+      {
+        "id": 203,
+        "name": "using_columns",
+        "type": "vector<Identifier>"
+      },
+      {
+        "id": 204,
+        "name": "actions",
+        "type": "map<MergeActionCondition, vector<unique_ptr<MergeIntoAction>>>"
+      },
+      {
+        "id": 205,
+        "name": "returning_list",
+        "type": "vector<ParsedExpression*>"
+      }
+    ]
+  },
+  {
+    "class": "CopyQueryNode",
+    "base": "QueryNode",
+    "enum": "COPY_QUERY_NODE",
+    "includes": [
+      "duckdb/parser/query_node/copy_query_node.hpp",
+      "duckdb/parser/parsed_data/copy_info.hpp"
+    ],
+    "members": [
+      {
+        "id": 200,
+        "name": "info",
+        "type": "CopyInfo*",
+        "base": "ParseInfo"
+      }
+    ],
+    "constructor": [
+      "info"
+    ]
+  }
+]

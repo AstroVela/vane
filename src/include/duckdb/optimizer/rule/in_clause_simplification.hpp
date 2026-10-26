@@ -1,0 +1,42 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/optimizer/rule/in_clause_simplification.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/optimizer/rule.hpp"
+
+namespace duckdb {
+
+// The in clause simplification rule rewrites cases where left is a column ref with a cast and right are constant values
+class InClauseSimplificationRule : public Rule {
+public:
+	explicit InClauseSimplificationRule(ExpressionRewriter &rewriter);
+
+	unique_ptr<Expression> Apply(LogicalOperator &op, vector<reference<Expression>> &bindings, bool &changes_made,
+	                             bool is_root) override;
+};
+
+// The in enum simplification rule rewrites cases where a left enum::VARCHAR is compared with right string literals
+class InEnumSimplificationRule : public Rule {
+public:
+	explicit InEnumSimplificationRule(ExpressionRewriter &rewriter);
+
+	unique_ptr<Expression> Apply(LogicalOperator &op, vector<reference<Expression>> &bindings, bool &changes_made,
+	                             bool is_root) override;
+};
+
+// The enum equals simplification rule rewrites cases where a left enum::VARCHAR is compared a right string literal
+class EnumCompareSimplificationRule : public Rule {
+public:
+	explicit EnumCompareSimplificationRule(ExpressionRewriter &rewriter);
+
+	unique_ptr<Expression> Apply(LogicalOperator &op, vector<reference<Expression>> &bindings, bool &changes_made,
+	                             bool is_root) override;
+};
+
+} // namespace duckdb

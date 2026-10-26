@@ -1,0 +1,54 @@
+# name: test/sql/types/map/map_cast.test
+# description: Test map cast
+# group: [map]
+
+query I
+SELECT MAP(['a', 'b', 'c'], [1, 2, NULL])::MAP(VARCHAR, VARCHAR)
+----
+{a=1, b=2, c=NULL}
+
+query I
+SELECT MAP(['a', 'b', 'c'], [1, 2, NULL])::MAP(VARCHAR, BIGINT)
+----
+{a=1, b=2, c=NULL}
+
+
+query I
+SELECT MAP([1, 2, 3], [1, 2, NULL])::MAP(VARCHAR, BIGINT)
+----
+{1=1, 2=2, 3=NULL}
+
+query I
+SELECT MAP([[1, 2, 3], [0], [123]], [1.0, 2.1, 4.9])::MAP(VARCHAR[], TINYINT)
+----
+{[1, 2, 3]=1, [0]=2, [123]=5}
+
+statement error
+SELECT MAP([1, 2, 'hi'::VARCHAR], [1.0, 2.1, 4.9])::MAP(VARCHAR, TINYINT)
+----
+Binder Error: Cannot deduce template type
+
+query I
+SELECT MAP([1, 2, 3], ['A', 'B', 'C'])::MAP(TINYINT, VARCHAR)
+----
+{1=A, 2=B, 3=C}
+
+statement error
+SELECT MAP(['1', '01'], [10, 20])::MAP(INTEGER, INTEGER)
+----
+Invalid Input Error: Map keys must be unique.
+
+query I
+SELECT TRY_CAST(MAP(['1', '01'], [10, 20]) AS MAP(INTEGER, INTEGER))
+----
+NULL
+
+query I
+SELECT TRY_CAST(MAP(['a'], ['x']) AS MAP(VARCHAR, INTEGER))
+----
+{a=NULL}
+
+query I
+SELECT TRY_CAST([MAP{'a':1}, MAP{'3':3}, MAP{'b':2}] AS MAP(INT,INT)[])
+----
+[NULL, {3=3}, NULL]

@@ -1,0 +1,47 @@
+# name: test/sql/json/test_json_export.test
+# description: Test Json Export
+# group: [json]
+
+require json
+
+statement ok
+create table text(i varchar);
+
+statement ok
+insert into text values ('bla');
+
+statement ok
+export database '{TEST_DIR}/test_export' (FORMAT JSON);
+
+statement ok
+drop table text;
+
+statement ok
+import database '{TEST_DIR}/test_export';
+
+query I
+select * from text;
+----
+bla
+
+statement ok
+COPY text TO '{TEST_DIR}/text.json' (ARRAY)
+
+statement ok
+drop table text;
+
+statement ok
+create table text(i varchar);
+
+statement ok
+COPY text from '{TEST_DIR}/text.json' (ARRAY)
+
+query I
+select * from text;
+----
+bla
+
+query I
+select * from '{TEST_DIR}/text.json';
+----
+bla

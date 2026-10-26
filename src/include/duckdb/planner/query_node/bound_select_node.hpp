@@ -1,0 +1,116 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/planner/query_node/bound_select_node.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/planner/bound_query_node.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/parser/expression_map.hpp"
+#include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/parser/group_by_node.hpp"
+#include "duckdb/planner/expression_binder/select_bind_state.hpp"
+#include "duckdb/common/index_vector.hpp"
+
+namespace duckdb {
+
+class BoundGroupByNode {
+public:
+	//! The total set of all group expressions
+	vector<unique_ptr<Expression>> group_expressions;
+	//! The different grouping sets as they map to the group expressions
+	vector<GroupingSet> grouping_sets;
+};
+
+struct BoundUnnestNode {
+	//! The index of the UNNEST node
+	TableIndex index;
+	//! The set of expressions
+	vector<unique_ptr<Expression>> expressions;
+};
+
+using BoundUnnestMap = unordered_map<idx_t, BoundUnnestNode>;
+
+class BoundUnnestCollection {
+public:
+	BoundUnnestMap &SelectList() {
+		return select_list;
+	}
+	const BoundUnnestMap &SelectList() const {
+		return select_list;
+	}
+	BoundUnnestMap &GroupBy() {
+		return group_by;
+	}
+	const BoundUnnestMap &GroupBy() const {
+		return group_by;
+	}
+
+private:
+	BoundUnnestMap select_list;
+	BoundUnnestMap group_by;
+};
+
+//! Bound equivalent of SelectNode
+class BoundSelectNode : public BoundQueryNode {
+public:
+	//! Bind information
+	SelectBindState bind_state;
+	//! The projection list
+	vector<unique_ptr<Expression>> select_list;
+	//! The FROM clause
+	BoundStatement from_table;
+	//! list of groups
+	BoundGroupByNode groups;
+	//! HAVING clause
+	unique_ptr<Expression> having;
+	//! QUALIFY clause
+	unique_ptr<Expression> qualify;
+
+	//! The amount of columns in the final result
+	idx_t column_count;
+	//! The amount of bound columns in the select list
+	idx_t bound_column_count = 0;
+
+	//! Index used by the LogicalProjection
+	TableIndex projection_index;
+
+	//! Group index used by the LogicalAggregate (only used if HasAggregation is true)
+	TableIndex group_index;
+	//! Table index for the projection child of the group op
+	TableIndex group_projection_index;
+	//! Aggregate index used by the LogicalAggregate (only used if HasAggregation is true)
+	TableIndex aggregate_index;
+	//! Index used for GROUPINGS column references
+	TableIndex groupings_index;
+	//! Aggregate functions to compute (only used if HasAggregation is true)
+	vector<unique_ptr<Expression>> aggregates;
+
+	//! GROUPING function calls
+	vector<unsafe_vector<ProjectionIndex>> grouping_functions;
+
+	//! Map from aggregate function to aggregate index (used to eliminate duplicate aggregates)
+	expression_map_t<ProjectionIndex> aggregate_map;
+
+	//! Window index used by the LogicalWindow (only used if HasWindow is true)
+	TableIndex window_index;
+	//! Window functions to compute (only used if HasWindow is true)
+	vector<unique_ptr<Expression>> windows;
+
+	//! UNNEST expressions, split by SELECT-list and GROUP BY binding context
+	BoundUnnestCollection unnests;
+
+	//! Index of pruned node
+	TableIndex prune_index;
+	bool need_prune = false;
+
+public:
+	TableIndex GetRootIndex() override {
+		return need_prune ? prune_index : projection_index;
+	}
+};
+} // namespace duckdb

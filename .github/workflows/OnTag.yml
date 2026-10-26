@@ -1,0 +1,17 @@
+name: On Tag
+on:
+  workflow_dispatch:
+    inputs:
+      duckdb_version:
+        type: string
+  push:
+    tags:        
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  staged_upload:
+    uses: ./.github/workflows/StagedUpload.yml
+    secrets: inherit
+    with:
+      duckdb_commit: ${{ github.sha }}
+      duckdb_version: ${{ inputs.duckdb_version || github.ref_name }}

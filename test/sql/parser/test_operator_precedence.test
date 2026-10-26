@@ -1,0 +1,122 @@
+# name: test/sql/parser/test_operator_precedence.test
+# description: Test operator precedence
+# group: [parser]
+
+# basic arithmetic precedence
+query I
+SELECT 2*3+1
+----
+7
+
+query I
+SELECT 1+2*3
+----
+7
+
+# ** precedence (issue 3561)
+query I
+SELECT 2^2 + 1;
+----
+5
+
+query I
+SELECT 2**2 + 1;
+----
+5
+
+query I
+SELECT 1+2**2;
+----
+5
+
+query I
+SELECT 1+2^2;
+----
+5
+
+query I
+SELECT 2**4 / 2;
+----
+8
+
+query I
+SELECT 2**(4 / 2);
+----
+4
+
+query I
+SELECT 16/2**4;
+----
+1
+
+query I
+SELECT (16/2)**4;
+----
+4096
+
+query I
+SELECT 2**3**2;
+----
+64
+
+query I
+SELECT 2^3**2;
+----
+64
+
+query I
+SELECT 2**3^2;
+----
+64
+
+# prefix bitwise NOT binds below arithmetic and above bitwise operators
+query I
+SELECT ~1 + 2;
+----
+-4
+
+query I
+SELECT ~1 * 2;
+----
+-3
+
+query I
+SELECT ~(1 + 2);
+----
+-4
+
+query I
+SELECT (~1) + 2;
+----
+0
+
+query I
+SELECT ~1 & 3;
+----
+2
+
+query I
+SELECT ~1 | 3;
+----
+-1
+
+query I
+SELECT 5 & ~1 + 2;
+----
+4
+
+query I
+SELECT ~ ~1 + 2;
+----
+3
+
+# exponentiation produces DOUBLE, which bitwise NOT cannot accept
+statement error
+SELECT ~2 ^ 2;
+----
+Binder Error: No function matches the given name and argument types '~(DOUBLE)'. You might need to add explicit type casts.
+
+query I
+SELECT (~2) ^ 2;
+----
+9

@@ -1,0 +1,38 @@
+# name: test/sql/copy/csv/csv_memory_management.test_slow
+# description: Test the CSV Buffer Manager under strict memory limit conditions
+# group: [csv]
+
+statement ok
+SET memory_limit='512MB';
+
+statement ok
+SET threads=16;
+
+#100KK rows, 2 BIGINT columns = 1.6GB uncompressed
+statement ok
+COPY (SELECT i, i // 5 AS j FROM range(100000000) t(i)) TO '{TEST_DIR}/integers.csv'
+
+statement ok
+CALL enable_logging('FileSystem')
+
+query I
+select count(*) from '{TEST_DIR}/integers.csv'
+----
+100000000
+
+statement ok
+COPY (SELECT i, i // 5 AS j FROM range(100000000) t(i)) TO '{TEST_DIR}/integers.csv.gz'
+
+statement ok
+SET temp_directory='';
+
+statement ok
+SET memory_limit='80MB';
+
+statement ok
+SET threads=1;
+
+query I
+select count(*) from '{TEST_DIR}/integers.csv.gz'
+----
+100000000

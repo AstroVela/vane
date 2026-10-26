@@ -1,0 +1,198 @@
+# name: test/sql/constraints/foreignkey/test_fk_transaction.test
+# description: Test foreign key in same transaction
+# group: [foreignkey]
+
+# Insert a tuple in the main table and the referencing table.
+
+statement ok
+CREATE TABLE pkt(i INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE fkt(j INTEGER, FOREIGN KEY (j) REFERENCES pkt(i))
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO pkt VALUES (1)
+
+statement ok
+INSERT INTO fkt VALUES (1)
+
+statement ok
+ROLLBACK
+
+statement ok
+INSERT INTO pkt VALUES (1)
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO pkt VALUES (2)
+
+statement error
+INSERT INTO fkt VALUES (3)
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO fkt VALUES (1)
+
+statement error
+DELETE FROM pkt WHERE i = 1
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+ROLLBACK
+
+# Delete a tuple in the referencing table and then delete that tuple in the main table.
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+DELETE FROM pkt WHERE i = 1
+
+statement error
+INSERT INTO fkt VALUES (1)
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO pkt VALUES (2)
+
+statement ok
+INSERT INTO fkt VALUES (1), (2)
+
+statement ok
+DELETE FROM fkt WHERE j = 1
+
+statement ok
+DELETE FROM pkt WHERE i = 1
+
+statement ok
+COMMIT
+
+statement error
+DELETE FROM pkt WHERE i = 2
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+DELETE FROM fkt WHERE j = 2
+
+statement ok
+DELETE FROM pkt WHERE i = 2
+
+# Insert a tuple in the primary key table, delete it,
+# and in the same transaction try to insert that tuple in the foreign key table.
+
+statement ok
+INSERT INTO pkt VALUES (3)
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+DELETE FROM pkt WHERE i = 3
+
+statement error
+INSERT INTO fkt VALUES (3)
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+ROLLBACK
+
+statement error
+DROP TABLE pkt;
+----
+<REGEX>:Catalog Error.*table is main key table of the table.*
+
+statement ok
+DROP TABLE fkt;
+
+statement ok
+DROP TABLE pkt;
+
+# Test with MAX_ROW_ID when deleting a tuple.
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+CREATE TABLE a(i INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE b(j INTEGER, FOREIGN KEY (j) REFERENCES a(i))
+
+statement ok
+INSERT INTO a VALUES (1), (2)
+
+statement ok
+INSERT INTO b VALUES (1), (2)
+
+statement ok
+DELETE FROM b
+
+statement ok
+DELETE FROM a
+
+statement ok
+COMMIT
+
+# Cross-table check: a parent DELETE followed by a child INSERT in the same
+# transaction must not commit a dangling foreign key reference.
+
+statement ok
+CREATE TABLE cross_fk_parent(id INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE cross_fk_child(pid INTEGER, FOREIGN KEY (pid) REFERENCES cross_fk_parent(id))
+
+statement ok
+INSERT INTO cross_fk_parent VALUES (1)
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+DELETE FROM cross_fk_parent WHERE id = 1
+
+statement error
+INSERT INTO cross_fk_child VALUES (1)
+----
+<REGEX>:Constraint Error.*Violates foreign key constraint.*
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM cross_fk_parent
+----
+1
+
+query I
+SELECT count(*) FROM cross_fk_child
+----
+0
+
+statement ok
+DROP TABLE cross_fk_child
+
+statement ok
+DROP TABLE cross_fk_parent

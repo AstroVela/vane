@@ -1,0 +1,31 @@
+add_library_unity(
+  duckdb_operator_helper
+  OBJECT
+  physical_connect.cpp
+  physical_external_resource.cpp
+  physical_create_secret.cpp
+  physical_disconnect.cpp
+  physical_execute.cpp
+  physical_explain_analyze.cpp
+  launch_external_resource.cpp
+  physical_limit.cpp
+  physical_limit_percent.cpp
+  physical_load.cpp
+  physical_pragma.cpp
+  physical_prepare.cpp
+  physical_reservoir_sample.cpp
+  physical_result_collector.cpp
+  physical_result_sink.cpp
+  physical_set.cpp
+  physical_set_variable.cpp
+  physical_reset.cpp
+  physical_secure_view.cpp
+  physical_streaming_limit.cpp
+  physical_streaming_sample.cpp
+  physical_transaction.cpp
+  physical_update_extensions.cpp
+  physical_vacuum.cpp
+  physical_verify_vector.cpp)
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_operator_helper>
+    PARENT_SCOPE)

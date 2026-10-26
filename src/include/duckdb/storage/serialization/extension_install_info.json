@@ -1,0 +1,51 @@
+[
+  {
+    "class": "ExtensionInstallInfo",
+    "includes": [
+      "duckdb/main/extension_install_info.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "mode",
+        "type": "ExtensionInstallMode"
+      },
+      {
+        "id": 101,
+        "name": "full_path",
+        "type": "string"
+      },
+      {
+        "id": 102,
+        "name": "repository_url",
+        "type": "string"
+      },
+      {
+        "id": 103,
+        "name": "version",
+        "type": "string"
+      },
+      {
+        "id": 104,
+        "name": "etag",
+        "type": "string"
+      },
+      {
+        "id": 105,
+        "name": "repository_type",
+        "type": "ExtensionRepositoryType",
+        "default": "ExtensionRepositoryType::CORE"
+      },
+      {
+        "id": 106,
+        "name": "repository_name",
+        "type": "string"
+      },
+      {
+        "id": 107,
+        "name": "signature_key_fingerprint",
+        "type": "string"
+      }
+    ]
+  }
+]

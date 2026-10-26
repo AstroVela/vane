@@ -1,0 +1,8 @@
+# name: test/sql/types/nested/map/map_from_entries/empty.test
+# description: Show expected behavior with an empty arguments list
+# group: [map_from_entries]
+
+statement error
+SELECT map_from_entries();
+----
+<REGEX>:.*Binder Error.*No function matches the given name and argument types.*

@@ -1,0 +1,98 @@
+# name: test/sql/function/string/test_complex_unicode.test
+# description: Test correct behavior of various string functions under complex unicode characters
+# group: [string]
+
+# length_grapheme returns the number of grapheme clusters
+query I
+SELECT length_grapheme('S̈a')
+----
+2
+
+query I
+SELECT length_grapheme('🤦🏼‍♂️')
+----
+1
+
+query I
+SELECT length_grapheme('🤦🏼‍♂️ L🤦🏼‍♂️R 🤦🏼‍♂️')
+----
+7
+
+# length returns the number of unicode codepoints
+query I
+SELECT length('S̈a')
+----
+3
+
+query I
+SELECT length('🤦🏼‍♂️')
+----
+5
+
+query I
+SELECT length('🤦🏼‍♂️ L🤦🏼‍♂️R 🤦🏼‍♂️')
+----
+19
+
+# strlen returns size in bytes
+query I
+SELECT strlen('🤦🏼‍♂️')
+----
+17
+
+query I
+SELECT strlen('S̈a')
+----
+4
+
+# reverse with grapheme clusters
+query T
+SELECT REVERSE('S̈a︍')
+----
+a︍S̈
+
+query T
+SELECT REVERSE('Z͑ͫ̓ͪ̂ͫ̽͏̴̙̤̞͉͚̯̞̠͍A̴̵̜̰͔ͫ͗͢')
+----
+A̴̵̜̰͔ͫ͗͢Z͑ͫ̓ͪ̂ͫ̽͏̴̙̤̞͉͚̯̞̠͍
+
+query T
+SELECT REVERSE('🤦🏼‍♂️')
+----
+🤦🏼‍♂️
+
+query T
+SELECT REVERSE('🤦🏼‍♂️ L🤦🏼‍♂️R 🤦🏼‍♂️')
+----
+🤦🏼‍♂️ R🤦🏼‍♂️L 🤦🏼‍♂️
+
+query T
+SELECT REVERSE('MotörHead')
+----
+daeHrötoM
+
+# substring with grapheme clusters
+query T
+SELECT substring_grapheme('🤦🏼‍♂️🤦🏼‍♂️🤦🏼‍♂️', 1, 1)
+----
+🤦🏼‍♂️
+
+query T
+SELECT substring_grapheme('S̈a︍', 2, 1)
+----
+a︍
+
+query T
+SELECT substring_grapheme('test: 🤦🏼‍♂️hello🤦🏼‍♂️ world', 7, 7)
+----
+🤦🏼‍♂️hello🤦🏼‍♂️
+
+query T
+SELECT substring_grapheme('S̈a', 1, 1)
+----
+S̈
+
+query T
+SELECT substring_grapheme('S̈a︍', -1, 1)
+----
+a︍

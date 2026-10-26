@@ -1,0 +1,136 @@
+#include "duckdb/optimizer/expression_rewriter.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/function/builtin_function_lookup.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/function/scalar/generic_functions.hpp"
+#include "duckdb/function/scalar/generic_common.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+
+namespace duckdb {
+
+struct RewriteFrame {
+	reference<unique_ptr<Expression>> expr;
+	bool is_root;
+	bool children_visited;
+};
+
+static unique_ptr<Expression> ApplyRule(LogicalOperator &op, const vector<reference<Rule>> &rules,
+                                        unique_ptr<Expression> expr, bool &changes_made, bool is_root) {
+	for (auto &rule : rules) {
+		vector<reference<Expression>> bindings;
+		if (rule.get().root->Match(*expr, bindings)) {
+			// the rule matches! try to apply it
+			bool rule_made_change = false;
+			auto alias = expr->GetAlias();
+#ifdef D_ASSERT_IS_ENABLED
+			auto return_type = expr->GetReturnType();
+#endif
+			auto result = rule.get().Apply(op, bindings, rule_made_change, is_root);
+			if (result) {
+				D_ASSERT(result->GetReturnType() != return_type ||
+				         result->GetReturnType().EqualsIncludingCollation(return_type));
+				changes_made = true;
+				// the base node changed: the rule applied changes
+				if (!alias.empty()) {
+					result->SetAlias(std::move(alias));
+				}
+				return result;
+			} else if (rule_made_change) {
+				changes_made = true;
+				return expr;
+			}
+			// else nothing changed, continue to the next rule
+			continue;
+		}
+	}
+	return expr;
+}
+
+static void CollectChildren(Expression &expr, vector<reference<unique_ptr<Expression>>> &children) {
+	children.clear();
+	ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) { children.push_back(child); });
+}
+
+unique_ptr<Expression> ExpressionRewriter::ApplyRules(LogicalOperator &op, const vector<reference<Rule>> &rules,
+                                                      unique_ptr<Expression> expr, bool &changes_made, bool is_root) {
+	vector<RewriteFrame> stack;
+	vector<reference<unique_ptr<Expression>>> children;
+	stack.push_back({expr, is_root, false});
+
+	while (!stack.empty()) {
+		auto &frame = stack.back();
+		auto &current_expr = frame.expr.get();
+		D_ASSERT(current_expr);
+		if (!frame.children_visited) {
+			frame.children_visited = true;
+			// Rewrite the subtree bottom-up so parent rules see already-simplified children.
+			CollectChildren(*current_expr, children);
+			for (idx_t i = children.size(); i > 0; i--) {
+				stack.push_back({children[i - 1], false, false});
+			}
+			continue;
+		}
+		bool node_made_change = false;
+		current_expr = ApplyRule(op, rules, std::move(current_expr), node_made_change, frame.is_root);
+		if (node_made_change) {
+			changes_made = true;
+			frame.children_visited = false;
+			continue;
+		}
+		stack.pop_back();
+	}
+	return expr;
+}
+
+unique_ptr<Expression> ExpressionRewriter::ConstantOrNull(ClientContext &context, unique_ptr<Expression> child,
+                                                          Value value) {
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(child));
+	return ConstantOrNull(context, std::move(children), std::move(value));
+}
+
+unique_ptr<Expression> ExpressionRewriter::ConstantOrNull(ClientContext &context,
+                                                          vector<unique_ptr<Expression>> children, Value value) {
+	children.insert(children.begin(), make_uniq<BoundConstantExpression>(std::move(value)));
+	// the bind of constant_or_null derives the return type and the bind data from the leading constant
+	return BindBuiltinScalarFunction(context, ConstantOrNullFun::Name, std::move(children));
+}
+
+void ExpressionRewriter::VisitOperator(LogicalOperator &op) {
+	VisitOperatorChildren(op);
+	this->op = &op;
+
+	to_apply_rules.clear();
+	for (auto &rule : rules) {
+		to_apply_rules.push_back(*rule);
+	}
+
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		// For FILTER we want to ensure we always visit the split predicates
+		// Rewrites can add more predicates, so we need to loop
+		auto &filter = op.Cast<LogicalFilter>();
+		idx_t visited_until = 0;
+		do {
+			for (idx_t i = visited_until; i < filter.expressions.size(); i++) {
+				VisitExpression(&filter.expressions[i]);
+			}
+			visited_until = filter.expressions.size();
+		} while (LogicalFilter::SplitPredicates(filter.expressions));
+	} else {
+		VisitOperatorExpressions(op);
+	}
+}
+
+void ExpressionRewriter::VisitExpression(unique_ptr<Expression> *expression) {
+	bool changes_made = false;
+	*expression = ExpressionRewriter::ApplyRules(*op, to_apply_rules, std::move(*expression), changes_made, true);
+}
+
+ClientContext &Rule::GetContext() const {
+	return rewriter.context;
+}
+
+} // namespace duckdb

@@ -1,0 +1,108 @@
+# name: test/sql/vacuum/test_analyze.test
+# description: Test the ANALYZE statement.
+# group: [vacuum]
+
+# The distinct statistics sampling relies on the vector size.
+require vector_size 1024
+
+require skip_reload
+
+# Distinct statistics sampling is different for different vector sizes.
+require no_vector_verification
+
+statement ok
+ANALYZE;
+
+statement ok
+ANALYSE;
+
+statement ok
+VACUUM;
+
+statement ok
+VACUUM ANALYSE;
+
+statement error
+VACUUM test;
+----
+Table with name test does not exist
+
+statement error
+ANALYZE test;
+----
+Table with name test does not exist
+
+statement ok
+CREATE TABLE test (i INT, j INT);
+
+statement ok
+ANALYZE test;
+
+statement ok
+ANALYSE test;
+
+statement ok
+CREATE VIEW testview AS SELECT * FROM test;
+
+statement error
+ANALYZE testview;
+----
+Can only vacuum or analyze base tables
+
+statement ok
+INSERT INTO test SELECT range % 5000, range % 5000 FROM range(10000);
+
+# The approximate unique count is inaccurate due to sampling.
+query TTTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.approx_unique FROM (SELECT stats(i) s FROM test LIMIT 1);
+----
+0	4999	false	true	10000
+
+query TTTTT
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.approx_unique FROM (SELECT stats(j) s FROM test LIMIT 1);
+----
+0	4999	false	true	10000
+
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+ANALYZE test(i);
+
+statement ok
+VACUUM test(i);
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# The approximate unique count for i is more accurate now.
+query T
+SELECT s.approx_unique FROM (SELECT stats(i) s FROM test LIMIT 1);
+----
+5661
+
+query T
+SELECT s.approx_unique FROM (SELECT stats(j) s FROM test LIMIT 1);
+----
+10000
+
+# Now we analyze the entire table.
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+ANALYZE test;
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# The approximate unique count for i and j is more accurate now.
+query T
+SELECT s.approx_unique FROM (SELECT stats(i) s FROM test LIMIT 1);
+----
+5661
+
+query T
+SELECT s.approx_unique FROM (SELECT stats(j) s FROM test LIMIT 1);
+----
+5661

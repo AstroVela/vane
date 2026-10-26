@@ -1,0 +1,102 @@
+[
+	{
+		"class": "DependencyDependentFlags",
+		"includes": [
+			"duckdb/catalog/dependency.hpp"
+		],
+		"members": [
+			{
+				"id": 100,
+				"name": "value",
+				"type": "uint8_t",
+				"serialize_property": "RawValue()"
+			}
+		],
+		"pointer_type": "none",
+		"constructor": ["value"]
+	},
+	{
+		"class": "CatalogEntryInfo",
+		"includes": [
+			"duckdb/catalog/dependency.hpp"
+		],
+		"finalize_deserialization": [
+			"if (result.schema_path.empty() && result.type != CatalogType::SCHEMA_ENTRY && !schema.empty()) {",
+			"\tresult.schema_path.push_back(std::move(schema));",
+			"}"
+		],
+		"members": [
+			{
+				"id": 100,
+				"name": "type",
+				"type": "CatalogType"
+			},
+			{
+				"id": 101,
+				"name": "schema",
+				"type": "Identifier",
+				"serialize_property": "LegacySchema()",
+				"serialize_until": "v2.0.0",
+				"deserialize_skip_assign": true
+			},
+			{
+				"id": 102,
+				"name": "name",
+				"type": "Identifier"
+			},
+			{
+				"id": 103,
+				"name": "schema_path",
+				"type": "vector<Identifier>",
+				"version": "v2.0.0",
+				"default": "vector<Identifier>()"
+			},
+			{
+				"id": 104,
+				"name": "table",
+				"type": "Identifier",
+				"default": "Identifier()",
+				"version": "v2.0.0"
+			}
+		],
+		"pointer_type": "none"
+	},
+	{
+		"class": "LogicalDependency",
+		"includes": [
+			"duckdb/catalog/dependency_list.hpp"
+		],
+		"members": [
+			{
+				"id": 100,
+				"name": "entry",
+				"type": "CatalogEntryInfo"
+			},
+			{
+				"id": 101,
+				"name": "catalog",
+				"type": "Identifier"
+			},
+			{
+				"id": 102,
+				"name": "flags",
+				"type": "DependencyDependentFlags",
+				"default": "DependencyDependentFlags().SetBlocking()",
+				"version": "v2.0.0"
+			}
+		],
+		"pointer_type": "none",
+		"constructor": ["?Catalog", "entry", "catalog"]
+	},
+	{
+		"class": "LogicalDependencyList",
+		"members": [
+			{
+				"id": 100,
+				"name": "set",
+				"type": "create_info_set_t"
+			}
+		],
+		"pointer_type": "none"
+	}
+]

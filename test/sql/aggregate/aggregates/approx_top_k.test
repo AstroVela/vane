@@ -1,0 +1,106 @@
+# name: test/sql/aggregate/aggregates/approx_top_k.test
+# description: Test approx top K operator
+# group: [aggregates]
+
+statement ok
+CREATE TABLE integers AS SELECT i%5 as even_groups, log(1 + i*i)::int as skewed_groups  FROM range(10000) t(i);
+
+# select all groups
+query I
+SELECT list_sort(approx_top_k(even_groups, 10)) FROM integers
+----
+[0, 1, 2, 3, 4]
+
+# select a subset of the groups
+# they should be ordered from most frequent to least frequent
+query I
+SELECT approx_top_k(skewed_groups, 5) FROM integers
+----
+[8, 7, 6, 5, 4]
+
+# varchars
+query I
+SELECT approx_top_k(concat('this is a long prefix', skewed_groups::VARCHAR), 5) FROM integers
+----
+[this is a long prefix8, this is a long prefix7, this is a long prefix6, this is a long prefix5, this is a long prefix4]
+
+# lists
+query I
+SELECT approx_top_k([skewed_groups], 5) FROM integers
+----
+[[8], [7], [6], [5], [4]]
+
+# structs
+query I
+SELECT approx_top_k({'i': skewed_groups}, 5) FROM integers
+----
+[{'i': 8}, {'i': 7}, {'i': 6}, {'i': 5}, {'i': 4}]
+
+statement error
+select approx_top_k(i, 0) from range(5) t(i)
+----
+k value must be > 0
+
+statement error
+select approx_top_k(i, -1) from range(5) t(i)
+----
+k value must be > 0
+
+statement error
+select approx_top_k(i, 999999999999999) from range(5) t(i)
+----
+k value must be < 1000000
+
+statement error
+select approx_top_k(i, NULL) from range(5) t(i)
+----
+NULL
+
+# ordered approx_top_k with grouping - the sorted aggregate wrapper finalizes one group at a time at increasing
+# offsets, so ApproxTopKFinalize must honor a non-zero offset (regression: it used to crash on the second group)
+statement ok
+CREATE TABLE ordered_groups AS SELECT (i % 8)::TINYINT AS g, i AS v FROM range(4000) t(i);
+
+query I
+SELECT count(*) FROM (
+    SELECT g, list_sort(approx_top_k(v, 5 ORDER BY v)) AS ordered,
+              list_sort(approx_top_k(v, 5)) AS unordered
+    FROM ordered_groups GROUP BY g
+) WHERE ordered IS DISTINCT FROM unordered;
+----
+0
+
+query I
+SELECT g FROM (SELECT g, approx_top_k(v, 3 ORDER BY v DESC) k FROM ordered_groups GROUP BY g)
+WHERE len(k) <> 3;
+----
+
+statement error
+SELECT approx_top_k(x, k) actual
+FROM (VALUES
+  (1, 100, 1),
+  (2,   1, 2),
+  (3,  50, 3),
+  (4,   2, 1),
+  (5,  49, 2)
+) AS t(id, x, k)
+----
+Binder Error: The "k" argument in function "approx_top_k" must be a constant expression
+
+statement error
+SELECT id,
+       approx_top_k(x, k) OVER (
+         ORDER BY id
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+         EXCLUDE CURRENT ROW
+       ) AS actual
+FROM (VALUES
+  (1, 100, 1),
+  (2,   1, 2),
+  (3,  50, 3),
+  (4,   2, 1),
+  (5,  49, 2)
+) AS t(id, x, k)
+ORDER BY id;
+----
+Binder Error: The "k" argument in function "approx_top_k" must be a constant expression

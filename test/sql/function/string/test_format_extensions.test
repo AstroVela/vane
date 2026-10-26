@@ -1,0 +1,166 @@
+# name: test/sql/function/string/test_format_extensions.test
+# description: Test format extensions
+# group: [string]
+
+# thousands separator
+query I
+select printf('%,d', 123456789)
+----
+123,456,789
+
+query I
+select format('{:d}', 123456789)
+----
+123456789
+
+query I
+select printf('%,d', 123456789123456789123456789::HUGEINT)
+----
+123,456,789,123,456,789,123,456,789
+
+# other supported thousand separators
+query I
+select printf('%.d', 123456789)
+----
+123.456.789
+
+query I
+select printf('%.d', -123456789123456789123456789::HUGEINT)
+----
+-123.456.789.123.456.789.123.456.789
+
+query I
+select printf('%_d', 123456789)
+----
+123_456_789
+
+query I
+select printf('%''d', 123456789)
+----
+123'456'789
+
+query I
+select printf('%.0d', 123456789)
+----
+123456789
+
+# prints a thousands separator as well
+query I
+select format('{:,}', 123456789)
+----
+123,456,789
+
+query I
+select format('{:_}', 123456789)
+----
+123_456_789
+
+query I
+select format('{:''}', 123456789)
+----
+123'456'789
+
+query I
+select format('{:,}', 123456789123456789123456789::UHUGEINT)
+----
+123,456,789,123,456,789,123,456,789
+
+# custom thousand separator
+query I
+select format('{:t }', 123456789)
+----
+123 456 789
+
+query I
+select format('{:t|}', 123456789)
+----
+123|456|789
+
+query I
+select format('{:tss}', 123456789)
+----
+123s456s789
+
+# thousands separator for floats
+query I
+select format('{:,}', 123456789.123)
+----
+123,456,789.123
+
+query I
+select format('{:_}', 123456789.123)
+----
+123_456_789.123
+
+query I
+select printf('%,.3f', 123456.789::DOUBLE)
+----
+123,456.789
+
+# preserve the sign when grouped float-family formats receive signed integers
+query IIIII
+select printf('%+,.0f', -5::TINYINT), printf('%+,.0f', -5::SMALLINT), printf('%+,.0f', -5::INTEGER), printf('%+,.0f', -5::BIGINT), printf('%+,.0f', -5::HUGEINT)
+----
+-5	-5	-5	-5	-5
+
+# grouped integer formatting remains exact above the double precision limit
+query II
+select printf('%,.0f', 9007199254740993::BIGINT), printf('%,.0f', 18446744073709551615::UBIGINT)
+----
+9,007,199,254,740,993	18,446,744,073,709,551,615
+
+# all grouped float-family specifiers preserve signed integer arguments
+query IIII
+select printf('%,.0e', -5::BIGINT), printf('%,.0f', -5::BIGINT), printf('%,.3g', -5::BIGINT), printf('%,.0a', -5::BIGINT)
+----
+-5	-5	-005	-5
+
+# conversions are applied independently in multi-argument calls
+query I
+select printf('%+,.0f / %,.0f / %,.0f', -5::BIGINT, 9007199254740993::BIGINT, 5::UBIGINT)
+----
+-5 / 9,007,199,254,740,993 / 5
+
+foreach val 1.724e12 1.7e12 1.72456e12 1.723456e11 1.724567e12 1.234e4
+
+query I
+select printf('%,.f', {val}::double) = printf('%,d', {val}::bigint);
+----
+true
+
+endloop
+
+statement error
+select format('{:t}', 123456789)
+----
+
+query I
+select format('{0:d} {0:L}', 123456789)
+----
+123456789 123456789
+
+statement error
+select format('{1}', 123456789)
+----
+Argument index "1" out of range
+
+statement error
+select format('{L}', 123456789)
+----
+Argument with name
+
+# better error messages
+statement error
+select printf('%:', 123456789)
+----
+Invalid type specifier ":"
+
+statement error
+select printf('%:', 123456789.123)
+----
+Invalid type specifier ":"
+
+statement error
+select printf('%:', 'str')
+----
+Invalid type specifier ":"

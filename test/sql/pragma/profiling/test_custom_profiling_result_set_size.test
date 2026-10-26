@@ -1,0 +1,33 @@
+# name: test/sql/pragma/profiling/test_custom_profiling_result_set_size.test
+# description: Test RESULT_SET_SIZE metric.
+# group: [profiling]
+
+require json
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/profiling_output.json';
+
+statement ok
+SET tracked_metrics = ['operator.intermediate_size_bytes', 'operator.intermediate_rows'];
+
+statement ok
+SELECT unnest(['Maia', 'Thijs', 'Mark', 'Hannes', 'Tom', 'Max', 'Carlo', 'Sam', 'Tania']) AS names ORDER BY random();
+
+statement ok
+PRAGMA disable_profiling;
+
+statement ok
+CREATE OR REPLACE TABLE metrics_output AS SELECT * FROM '{TEST_DIR}/profiling_output.json';
+
+query I
+SELECT
+    CASE
+        WHEN operator[1].intermediate_size_bytes < 10_000 THEN NULL
+        ELSE operator[1].intermediate_size_bytes
+    END AS result
+FROM metrics_output;
+----
+NULL

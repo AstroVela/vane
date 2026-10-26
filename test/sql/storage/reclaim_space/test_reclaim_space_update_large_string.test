@@ -1,0 +1,74 @@
+# name: test/sql/storage/reclaim_space/test_reclaim_space_update_large_string.test
+# description: Test that we reclaim space when updating a large string
+# group: [reclaim_space]
+
+load {TEST_DIR}/test_reclaim_space.db
+
+statement ok
+PRAGMA force_checkpoint;
+
+# Force overflow blocks instead of compressing the repeated string into a single segment.
+statement ok
+SET force_compression = 'uncompressed';
+
+# create a big string
+statement ok
+CREATE TABLE test (a VARCHAR);
+
+# length 1000000
+statement ok
+INSERT INTO test VALUES (repeat('a', 1000000));
+
+# checkpoint the string
+statement ok
+CHECKPOINT
+
+query I
+SELECT a = repeat('a', 1000000) FROM test
+----
+true
+
+query I
+SELECT bool_and(compression = 'Uncompressed' AND len(additional_block_ids) > 0)
+FROM pragma_storage_info('test') WHERE segment_type = 'VARCHAR';
+----
+true
+
+# Allocated blocks can alternate as checkpoint generations reuse free space.
+# The number of live blocks must remain constant, including the overflow blocks.
+query I nosort expected_blocks
+SELECT used_blocks FROM pragma_database_size() WHERE database_name = current_database();
+
+# now update by adding one character to the string on every iteration
+loop i 0 10
+
+statement ok
+UPDATE test SET a=concat(a, 'a')
+
+query I
+SELECT a = repeat('a', 1000001 + ${i}) FROM test
+----
+true
+
+statement ok
+CHECKPOINT
+
+query I nosort expected_blocks
+SELECT used_blocks FROM pragma_database_size() WHERE database_name = current_database();
+
+query I
+SELECT a = repeat('a', 1000001 + ${i}) FROM test
+----
+true
+
+endloop
+
+restart
+
+query I
+SELECT a = repeat('a', 1000010) FROM test
+----
+true
+
+query I nosort expected_blocks
+SELECT used_blocks FROM pragma_database_size() WHERE database_name = current_database();

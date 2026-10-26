@@ -1,0 +1,177 @@
+# name: test/sql/window/test_leadlag_orderby.test
+# description: Test secondary ordering of LEAD/LAG
+# group: [window]
+
+query IIIII
+SELECT 
+	i,
+	(i * 29) % 11 AS outside,
+	i // 2 AS inside,
+	lead(i, 1, NULL ORDER BY inside DESC, i) OVER w,
+	lag(i, 1, NULL ORDER BY inside DESC, i) OVER w,
+FROM range(10) tbl(i)
+WINDOW w AS (
+	ORDER BY outside
+)
+ORDER BY inside DESC, i
+----
+8	1	4	0	NULL
+9	8	4	7	8
+6	9	3	7	9
+7	5	3	5	8
+4	6	2	5	7
+5	2	2	0	8
+2	3	1	0	5
+3	10	1	0	2
+0	0	0	NULL	NULL
+1	7	0	NULL	0
+
+query IIII
+SELECT 
+	i,
+	i // 2 AS inside,
+	lead(i, 1, NULL ORDER BY i // 2, i) OVER w AS next,
+	lag(i, 1, NULL ORDER BY i // 2, i) OVER w AS prev,
+FROM range(10) tbl(i)
+WINDOW w AS (
+	ORDER BY i // 2
+	ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING
+)
+ORDER BY i
+----
+0	0	1	NULL
+1	0	2	0
+2	1	3	1
+3	1	4	2
+4	2	5	3
+5	2	6	4
+6	3	7	5
+7	3	8	6
+8	4	9	7
+9	4	NULL	8
+
+# test lag and lead when offset is null
+statement ok
+CREATE TABLE issue17266(c1 INT, c2 SMALLINT, c3 BITSTRING);
+
+statement ok
+INSERT INTO issue17266 VALUES
+(0, null, null),
+(1, 32767, '101'),
+(2, -32767, '101'),
+(3, 0, '000'),
+(4, 1, '010'),
+(5, 0, '110'),
+(6, null, null);
+
+query IIII
+SELECT
+	c1,
+        c3,
+        c2,
+        LAG(c3, c2 ORDER BY c1, BITSTRING'010101010') OVER (PARTITION BY c1 ORDER BY c3)
+FROM issue17266
+ORDER BY c1;
+----
+0	NULL	NULL	NULL
+1	101	32767	NULL
+2	101	-32767	NULL
+3	000	0	000
+4	010	1	NULL
+5	110	0	110
+6	NULL	NULL	NULL
+
+query IIII
+SELECT
+	c1,
+        c3,
+        c2,
+        LEAD(c3, c2 ORDER BY c1, BITSTRING'010101010') OVER (PARTITION BY c1 ORDER BY c3)
+FROM issue17266
+ORDER BY c1;
+----
+0	NULL	NULL	NULL
+1	101	32767	NULL
+2	101	-32767	NULL
+3	000	0	000
+4	010	1	NULL
+5	110	0	110
+6	NULL	NULL	NULL
+
+# The argument ordering must not change the result when it agrees with the window ordering
+# on the data, even when it is not a syntactic prefix of it.
+
+statement ok
+CREATE TABLE issue25699(id INTEGER, x VARCHAR);
+
+statement ok
+INSERT INTO issue25699 VALUES (1, 'b'), (2, 'a');
+
+query IIII
+SELECT
+	id,
+	x,
+	LEAD(x ORDER BY x DESC, id DESC) OVER w,
+	LEAD(x ORDER BY x DESC, id ASC) OVER w
+FROM issue25699
+WINDOW w AS (ORDER BY x DESC, id ASC ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING)
+ORDER BY id;
+----
+1	b	a	a
+2	a	NULL	NULL
+
+# Frames that do not contain the own row: the offset is counted from the frame edge.
+
+statement ok
+CREATE TABLE leadlag_frames(id INTEGER, x VARCHAR);
+
+statement ok
+INSERT INTO leadlag_frames VALUES (1, 'e'), (2, 'd'), (3, 'c'), (4, 'b'), (5, 'a');
+
+query IIIIIIIII
+SELECT
+	id,
+	LEAD(x ORDER BY x DESC, id ASC, id ASC) OVER w1,
+	LEAD(x, 2 ORDER BY x DESC, id ASC, id ASC) OVER w1,
+	LEAD(x, 0 ORDER BY x DESC, id ASC, id ASC) OVER w1,
+	LAG(x ORDER BY x DESC, id ASC, id ASC) OVER w1,
+	LEAD(x ORDER BY x DESC, id ASC, id ASC) OVER w2,
+	LAG(x ORDER BY x DESC, id ASC, id ASC) OVER w2,
+	LEAD(x ORDER BY x DESC, id ASC, id ASC) OVER w3,
+	LAG(x, 2 ORDER BY x DESC, id ASC, id ASC) OVER w3
+FROM leadlag_frames
+WINDOW w1 AS (ORDER BY x DESC, id ASC ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+       w2 AS (ORDER BY x DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+       w3 AS (ORDER BY x DESC, id ASC ROWS BETWEEN 2 FOLLOWING AND 4 FOLLOWING)
+ORDER BY id;
+----
+1	d	c	e	NULL	NULL	NULL	c	NULL
+2	c	b	d	NULL	NULL	e	b	NULL
+3	b	a	c	NULL	NULL	d	a	NULL
+4	a	NULL	b	NULL	NULL	c	NULL	NULL
+5	NULL	NULL	a	NULL	NULL	b	NULL	NULL
+
+# The same results must come out of the shared-ordering fast path.
+
+query IIIIIIIII
+SELECT
+	id,
+	LEAD(x ORDER BY x DESC, id ASC) OVER w1,
+	LEAD(x, 2 ORDER BY x DESC, id ASC) OVER w1,
+	LEAD(x, 0 ORDER BY x DESC, id ASC) OVER w1,
+	LAG(x ORDER BY x DESC, id ASC) OVER w1,
+	LEAD(x ORDER BY x DESC, id ASC) OVER w2,
+	LAG(x ORDER BY x DESC, id ASC) OVER w2,
+	LEAD(x ORDER BY x DESC, id ASC) OVER w3,
+	LAG(x, 2 ORDER BY x DESC, id ASC) OVER w3
+FROM leadlag_frames
+WINDOW w1 AS (ORDER BY x DESC, id ASC ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+       w2 AS (ORDER BY x DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+       w3 AS (ORDER BY x DESC, id ASC ROWS BETWEEN 2 FOLLOWING AND 4 FOLLOWING)
+ORDER BY id;
+----
+1	d	c	e	NULL	NULL	NULL	c	NULL
+2	c	b	d	NULL	NULL	e	b	NULL
+3	b	a	c	NULL	NULL	d	a	NULL
+4	a	NULL	b	NULL	NULL	c	NULL	NULL
+5	NULL	NULL	a	NULL	NULL	b	NULL	NULL

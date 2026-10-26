@@ -1,0 +1,48 @@
+# name: test/sql/types/bignum/test_bignum_sum.test_slow
+# description: Test TPC-H Bignum Sum
+# group: [bignum]
+
+require parquet
+
+statement ok
+CREATE TABLE hits AS
+SELECT CASE WHEN i % 97 = 0 THEN NULL
+            ELSE 1000000000000000000::BIGINT * (1 + i % 2) + i END AS UserId
+FROM range(300000) t(i);
+
+statement ok
+COPY hits TO '{TEST_DIR}/hits.parquet' (ROW_GROUP_SIZE 8192);
+
+foreach threads 1 4
+
+statement ok
+SET threads={threads};
+
+query I
+select sum((case when hits.UserId%2=0 then -hits.UserId else hits.UserId end)::BIGNUM) AS res from read_parquet('{TEST_DIR}/hits.parquet') hits;
+----
+148455000000000000299962
+
+query I
+select sum(res + res2 + res2 + res2) from (
+  select sum((case when hits.UserId%7=0 then -hits.UserId else hits.UserId end)::BIGNUM) AS res, sum((case when hits.UserId%7=0 then hits.UserId else -hits.UserId end)::BIGNUM) AS res2 from read_parquet('{TEST_DIR}/hits.parquet') hits
+  ), range(10000);
+----
+-6362260000000636225394760000
+
+endloop
+
+require tpch
+
+statement ok
+CALL dbgen(sf=1)
+
+query I
+select sum(l_orderkey::bignum) as l_orderkey from lineitem
+----
+18005322964949
+
+query I
+select sum((select sum(l_orderkey::bignum) from lineitem)) from lineitem;
+----
+108053814257096413035

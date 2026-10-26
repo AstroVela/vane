@@ -1,0 +1,47 @@
+# name: test/parquet/encrypted_parquet.test
+# description: Validate unsupported Parquet encryption and read unencrypted columns
+# group: [parquet]
+
+require parquet
+
+# Encrypted footers require an explicit key.
+statement error
+SELECT * FROM parquet_scan('{DATA_DIR}/parquet-testing/encryption/encrypted_footer.parquet') limit 50;
+----
+is encrypted, but 'encryption_config' was not set
+
+# A plaintext footer can describe encrypted columns. Reject those columns
+# before interpreting encrypted page headers as unencrypted Thrift data.
+foreach cache false true
+
+statement ok
+SET parquet_metadata_cache={cache}
+
+statement error
+SELECT * FROM parquet_scan('{DATA_DIR}/parquet-testing/encryption/encrypted_column.parquet') limit 50;
+----
+File is encrypted but no file crypto metadata is set
+
+statement error
+SELECT a FROM parquet_scan('{DATA_DIR}/parquet-testing/encryption/encrypted_column.parquet');
+----
+File is encrypted but no file crypto metadata is set
+
+statement error
+SELECT b FROM parquet_scan('{DATA_DIR}/parquet-testing/encryption/encrypted_column.parquet');
+----
+File is encrypted but no file crypto metadata is set
+
+# Unencrypted columns in the same file remain readable, including cache hits.
+loop iteration 0 2
+
+query T rowsort
+SELECT c FROM parquet_scan('{DATA_DIR}/parquet-testing/encryption/encrypted_column.parquet');
+----
+x
+y
+z
+
+endloop
+
+endloop

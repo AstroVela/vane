@@ -1,0 +1,22 @@
+# name: test/sql/table_function/duckdb_functions_window.test
+# group: [table_function]
+
+query IIII
+select function_name, parameters, parameter_types, function_type 
+from duckdb_functions() 
+where function_type = 'window' 
+order by all;
+----
+cume_dist	[]	[]	window
+dense_rank	[]	[]	window
+fill	[expr]	[ANY]	window
+first_value	[expr]	[ANY]	window
+lag	[col, offset, default]	[T, BIGINT, ANY]	window
+last_value	[expr]	[ANY]	window
+lead	[col, offset, default]	[T, BIGINT, ANY]	window
+nth_value	[expr, n]	[ANY, BIGINT]	window
+ntile	[num_buckets]	[BIGINT]	window
+percent_rank	[]	[]	window
+rank	[]	[]	window
+rank_dense	[]	[]	window
+row_number	[]	[]	window

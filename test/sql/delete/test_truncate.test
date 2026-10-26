@@ -1,0 +1,125 @@
+# name: test/sql/delete/test_truncate.test
+# description: Test truncate
+# group: [delete]
+
+statement ok
+CREATE TABLE a(i INTEGER);
+
+statement ok
+INSERT INTO a VALUES (42);
+
+query I
+TRUNCATE TABLE a
+----
+1
+
+# delete everything
+statement ok
+TRUNCATE a
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+INSERT INTO a VALUES (42);
+
+query I
+SELECT COUNT(*) FROM a;
+----
+1
+
+# now test rollback of deletion
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+TRUNCATE a
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+ROLLBACK
+
+query I
+SELECT COUNT(*) FROM a;
+----
+1
+
+statement ok
+INSERT INTO a VALUES (42);
+
+# the alias is accepted and ignored
+statement ok
+TRUNCATE a AS ignored_alias
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+INSERT INTO a VALUES (42);
+
+# RESTRICT is the default behavior
+statement ok
+TRUNCATE TABLE a RESTRICT
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+INSERT INTO a VALUES (42);
+
+statement ok
+TRUNCATE a AS ignored_alias RESTRICT
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+INSERT INTO a VALUES (42);
+
+# CASCADE is not supported
+statement error
+TRUNCATE a CASCADE
+----
+Not implemented Error: TRUNCATE ... CASCADE is not implemented
+
+statement error
+TRUNCATE TABLE a ignored_alias CASCADE
+----
+Not implemented Error: TRUNCATE ... CASCADE is not implemented
+
+query I
+SELECT COUNT(*) FROM a;
+----
+1
+
+# a quoted alias is not a drop behavior
+statement ok
+TRUNCATE a "cascade"
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0
+
+statement ok
+INSERT INTO a VALUES (42);
+
+statement ok
+TRUNCATE a AS restrict
+
+query I
+SELECT COUNT(*) FROM a;
+----
+0

@@ -1,0 +1,81 @@
+# name: test/sql/function/generic/test_stats.test
+# description: Test stats function
+# group: [generic]
+
+statement ok
+select 1=1
+
+# scalar stats
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(5) s);
+----
+5	5	false	true
+
+query IIIIII
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.has_unicode, s.max_string_length FROM (SELECT STATS('hello') s);
+----
+hello	hello	false	true	false	5
+
+
+query IIIIII
+SELECT s.min, s.max, s.has_null, s.has_no_null, s.has_unicode, s.max_string_length FROM (SELECT STATS('1234567ü') s);
+----
+1234567\xC3\xBC	1234567\xC3\xBC	false	true	true	9
+
+# arithmetic
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(5 + 2) s);
+----
+7	7	false	true
+
+# non-scalar stats
+statement ok
+CREATE TABLE integers(i INTEGER);
+
+statement ok
+INSERT INTO integers VALUES (1), (2), (3);
+
+# read stats
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i) s FROM integers LIMIT 1);
+----
+1	3	false	true
+
+# arithmetic
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i + 2) s FROM integers LIMIT 1);
+----
+3	5	false	true
+
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i - 5) s FROM integers LIMIT 1);
+----
+-4	-2	false	true
+
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i * 2) s FROM integers LIMIT 1);
+----
+2	6	false	true
+
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i * -1) s FROM integers LIMIT 1);
+----
+-3	-1	false	true
+
+# disabling statistics propagation means there will be no stats
+statement ok
+PRAGMA disable_optimizer
+
+query I
+SELECT STATS(i+1) FROM integers LIMIT 1;
+----
+NULL
+
+# we can enable the optimizer again
+statement ok
+PRAGMA enable_optimizer
+
+query IIII
+SELECT s.min, s.max, s.has_null, s.has_no_null FROM (SELECT STATS(i * -1) s FROM integers LIMIT 1);
+----
+-3	-1	false	true

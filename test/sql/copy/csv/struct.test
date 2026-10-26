@@ -1,0 +1,8 @@
+# name: test/sql/copy/csv/struct.test
+# description: Verify that we can sniff a struct string properly
+# group: [csv]
+
+query I
+FROM '{DATA_DIR}/csv/struct.csv'
+----
+{'a': 1, 'b': 2}

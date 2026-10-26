@@ -1,0 +1,15 @@
+# name: test/issues/rigger/test_586.test
+# description: Issue 586
+# group: [rigger]
+
+# NOACCENT.NOCASE comparison with a special character results in a segmentation fault
+query T
+SELECT ''='Ʇ';
+----
+0
+
+query T
+SELECT '' COLLATE NOACCENT.NOCASE='Ʇ';
+----
+0
+

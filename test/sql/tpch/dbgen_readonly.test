@@ -1,0 +1,32 @@
+# name: test/sql/tpch/dbgen_readonly.test
+# description: Test that dbgen respects read-only mode
+# group: [tpch]
+
+require tpch
+
+require skip_reload
+
+load {TEST_DIR}/test_dbgen_ro.db
+
+statement ok
+CREATE TABLE tbl (i INTEGER);
+
+load {TEST_DIR}/test_dbgen_ro.db readonly
+
+statement error
+CALL dbgen(sf=0);
+----
+read-only
+
+load
+
+statement ok
+ATTACH '{TEST_DIR}/test_dbgen_ro.db' AS dbgentest (READ_ONLY)
+
+statement error
+CALL dbgen(sf=0, catalog='dbgentest');
+----
+read-only
+
+statement ok
+CALL dbgen(sf=0);

@@ -1,0 +1,119 @@
+# name: test/sql/function/string/test_ilike_escape.test
+# description: Test ILIKE statement with ESCAPE
+# group: [string]
+
+# scalar ilike
+query T
+select 'a%c' ilike 'a$%C' escape '$';
+----
+true
+
+query T
+select 'A%C' ilike 'a$%c' escape '$';
+----
+true
+
+query T
+select 'a%c' ilike 'a$%C' escape '/';
+----
+false
+
+# nulls as parameter
+query T
+select NULL ilike 'a$%C' escape '/';
+----
+NULL
+
+query T
+select 'a%c' ilike NULL escape '$';
+----
+NULL
+
+query T
+select 'a%c' ilike 'a$%C' escape NULL;
+----
+NULL
+
+# non-scalar ilike
+statement ok
+CREATE TABLE tbl(str VARCHAR, pat VARCHAR);
+
+statement ok
+INSERT INTO tbl VALUES ('a%c', 'a$%C');
+
+query T
+SELECT str ILIKE pat ESCAPE '$' FROM tbl
+----
+true
+
+query T
+SELECT str NOT ILIKE pat ESCAPE '$' FROM tbl
+----
+false
+
+query T
+SELECT NULL ILIKE pat ESCAPE '$' FROM tbl
+----
+NULL
+
+query T
+SELECT str ILIKE NULL ESCAPE '$' FROM tbl
+----
+NULL
+
+query T
+SELECT str ILIKE pat ESCAPE NULL FROM tbl
+----
+NULL
+
+# multi-byte escape not supported
+statement error
+select 'a%c' ilike 'a$%C' escape '///';
+----
+<REGEX>:.*Syntax Error: Invalid escape string.*
+
+# escape must be a constant
+statement error
+SELECT str ILIKE pat ESCAPE str FROM tbl
+----
+<REGEX>:.*Syntax Error: Invalid escape string.*
+
+# An embedded NUL is a valid escape character and must not be confused with
+# the empty escape string, which disables escaping.
+query IIII
+SELECT '%' ILIKE (chr(0) || '%') ESCAPE chr(0),
+       '%' NOT ILIKE (chr(0) || '%') ESCAPE chr(0),
+       '%' ILIKE (chr(0) || '%') ESCAPE '',
+       (chr(0) || '%') ILIKE (chr(0) || '%') ESCAPE ''
+----
+true	false	false	true
+
+# Exercise the non-constant ternary path as well as case folding around a NUL escape.
+statement ok
+CREATE TABLE nul_escapes(str VARCHAR, pat VARCHAR, esc VARCHAR);
+
+statement ok
+INSERT INTO nul_escapes VALUES
+	('A%', 'a' || chr(0) || '%', chr(0)),
+	('A%', 'a' || chr(0) || '%', '');
+
+query I
+SELECT str ILIKE pat ESCAPE esc FROM nul_escapes ORDER BY esc
+----
+false
+true
+
+# Constant pattern/escape over a vector takes the specialised fast path.
+query II
+SELECT str ILIKE ('a' || chr(0) || '%') ESCAPE chr(0),
+       str ILIKE ('a' || chr(0) || '%') ESCAPE ''
+FROM (VALUES ('A%'), ('🦆')) t(str)
+ORDER BY str
+----
+true	false
+false	false
+
+statement error
+SELECT 'ab' ILIKE ('a' || chr(0)) ESCAPE chr(0)
+----
+<REGEX>:.*Syntax Error: Like pattern must not end with escape character.*

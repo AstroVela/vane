@@ -1,0 +1,12 @@
+# name: test/sql/types/nested/array/array_statistics.test
+# group: [array]
+
+query IIII
+SELECT s.child_stats.min, s.child_stats.max, s.has_no_null, s.has_null FROM (SELECT STATS(array_value(1,2)) s)
+----
+1	2	true	false
+
+
+# Trigger unknown statistics propagation
+statement ok
+PREPARE v1 AS SELECT array_cross_product($1::float[3], $2::float[3])

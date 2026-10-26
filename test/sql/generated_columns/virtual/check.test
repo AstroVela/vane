@@ -1,0 +1,66 @@
+# name: test/sql/generated_columns/virtual/check.test
+# description: Test generated columns with the CHECK constraint
+# group: [virtual]
+
+#Check constraint involving a generated column is not supported
+
+# Using a CHECK constraint that doesnt involve the generated column itself is fine
+statement ok
+CREATE TABLE unit (
+	price INTEGER,
+	amount_sold AS (price) CHECK (price > 5),
+);
+
+# When it references a generated column, it fails
+statement error
+CREATE TABLE tbl (
+	price INTEGER,
+	amount_sold AS (price) CHECK (amount_sold > 5)
+);
+----
+<REGEX>:.*Binder Error.*Constraints on generated columns.*
+
+# Also when used in this way
+statement error
+CREATE TABLE tbl (
+	price INTEGER,
+	amount_sold AS (price),
+	CHECK (amount_sold > price)
+);
+----
+<REGEX>:.*Binder Error.*Constraints on generated columns.*
+
+statement ok
+CREATE TABLE chk (
+	g1 AS (x),
+	g2 AS (x),
+	x INTEGER,
+	CHECK (x > 5)
+);
+
+statement ok
+INSERT INTO chk VALUES (6);
+
+statement error
+INSERT INTO chk VALUES (3);
+----
+<REGEX>:.*Constraint Error.*constraint failed.*
+
+# Issue #24378: DROP COLUMN CASCADE with generated column and CHECK constraint
+statement ok
+CREATE TABLE test_24378 (
+	i INTEGER,
+	j INTEGER CHECK (j > 0),
+	k INTEGER GENERATED ALWAYS AS (j + 1)
+);
+
+statement ok
+ALTER TABLE test_24378 DROP COLUMN j CASCADE;
+
+statement ok
+INSERT INTO test_24378 VALUES (1);
+
+query I
+SELECT * FROM test_24378;
+----
+1

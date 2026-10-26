@@ -1,0 +1,35 @@
+add_library_unity(
+  duckdb_optimizer_rules
+  OBJECT
+  arithmetic_simplification.cpp
+  case_simplification.cpp
+  comparison_simplification.cpp
+  conjunction_simplification.cpp
+  constant_folding.cpp
+  date_part_simplification.cpp
+  date_trunc_simplification.cpp
+  distinct_aggregate_optimizer.cpp
+  distributivity.cpp
+  empty_needle_removal.cpp
+  enum_comparison.cpp
+  equal_or_null_simplification.cpp
+  in_clause_simplification_rule.cpp
+  join_dependent_filter.cpp
+  least_greatest_simplification.cpp
+  string_prefix.cpp
+  like_optimizations.cpp
+  list_comprehension_rewrite.cpp
+  monotone_preimage.cpp
+  move_constants.cpp
+  not_comparison_simplification.cpp
+  not_conjunction_simplification.cpp
+  ordered_aggregate_optimizer.cpp
+  predicate_factoring.cpp
+  regex_optimizations.cpp
+  struct_extract_struct_pack_folding.cpp
+  timestamp_comparison.cpp
+  constant_order_normalization.cpp
+  contains_to_in_clause.cpp)
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_optimizer_rules>
+    PARENT_SCOPE)

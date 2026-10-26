@@ -1,0 +1,34 @@
+# name: test/sql/pragma/test_metadata_info.test
+# description: Test metadata info
+# group: [pragma]
+
+load {TEST_DIR}/test_metadata_info.db
+
+statement ok
+CREATE TABLE integers(i INTEGER, j INTEGER)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA metadata_info;
+
+statement ok
+FROM pragma_metadata_info();
+
+statement ok
+ATTACH '{TEST_DIR}/test_metadata_info_attach.db' AS db1
+
+statement ok
+CREATE TABLE db1.integers(i INTEGER, j INTEGER)
+
+statement ok
+CHECKPOINT db1
+
+statement ok
+FROM pragma_metadata_info('db1');
+
+statement error
+FROM pragma_metadata_info(NULL)
+----
+cannot be NULL

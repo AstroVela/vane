@@ -1,0 +1,32 @@
+# name: test/sql/pragma/profiling/test_custom_profiling_errors.test
+# description: Test that custom_profiling_settings and its aliases have been removed in favor of tracked_metrics.
+# group: [profiling]
+
+require json
+
+statement error
+PRAGMA custom_profiling_settings='}}}}}}';
+----
+<REGEX>:Catalog Error:.*custom_profiling_settings.*
+
+statement error
+PRAGMA configure_profiling='{"INVALID_SETTING": "true"}';
+----
+<REGEX>:Catalog Error:.*configure_profiling.*
+
+statement error
+SET configure_metrics = 'hello';
+----
+<REGEX>:Catalog Error:.*configure_metrics.*
+
+# tracked_metrics is the replacement
+statement ok
+SET tracked_metrics = ['*'];
+
+query I
+SELECT unnest(current_setting('tracked_metrics'));
+----
+*
+
+statement ok
+RESET tracked_metrics;

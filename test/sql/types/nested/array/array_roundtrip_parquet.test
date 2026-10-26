@@ -1,0 +1,23 @@
+# name: test/sql/types/nested/array/array_roundtrip_parquet.test
+# group: [array]
+
+require parquet
+
+statement ok
+SET debug_force_external=true;
+
+statement ok
+CREATE OR REPLACE TABLE arrays2 (a INTEGER[3])
+
+statement ok
+COPY (SELECT [range, range + 1, range + 2] a FROM range(3)) TO '{TEST_DIR}/arrays_parquet_test.parquet'
+
+statement ok
+COPY arrays2 FROM '{TEST_DIR}/arrays_parquet_test.parquet'
+
+query I
+SELECT * FROM arrays2
+----
+[0, 1, 2]
+[1, 2, 3]
+[2, 3, 4]

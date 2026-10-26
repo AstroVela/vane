@@ -1,0 +1,15 @@
+# name: test/sql/pragma/profiling/test_no_reset_setting.test
+# description: Test that the profiling settings are not reset after setting profiling output.
+# group: [profiling]
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/profile_file.json';
+
+statement ok
+SET tracked_metrics = ['io.total_bytes_read', 'io.total_bytes_written'];
+
+statement ok
+SET profiling_coverage='ALL';

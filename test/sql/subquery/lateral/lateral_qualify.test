@@ -1,0 +1,12 @@
+# name: test/sql/subquery/lateral/lateral_qualify.test
+# description: Test LATERAL joins and QUALIFY clause interaction
+# group: [lateral]
+
+query III
+FROM (SELECT 42) t(x), (SELECT x, row_number() OVER () QUALIFY NULL);
+----
+
+query II
+FROM (SELECT 42) t(x), (SELECT x * 2 QUALIFY row_number() OVER () < 10);
+----
+42	84

@@ -1,0 +1,52 @@
+# This is a reusable workflow to be used by extensions based on the extension template
+
+name: Client Tests
+on:
+  workflow_call:
+    inputs:
+      duckdb_commit:
+        required: true
+        type: string
+      duckdb_version:
+        required: true
+        type: string
+
+env:
+  DUCKDB_COMMIT: ${{ inputs.duckdb_commit }}
+  DUCKDB_VERSION: ${{ inputs.duckdb_version }}
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+
+    steps:
+      - name: Install Ninja
+        run: |
+          python3 scripts/ci/retry.py -- make toolsci
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Checkout DuckDB to version
+        run: |
+          cd duckdb
+          git checkout "${DUCKDB_COMMIT}"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build DuckDB Python client
+        run: make debug_python
+
+      - name: Install Python test dependencies
+        run: python scripts/ci/retry.py -- python -m pip install --upgrade pytest
+
+      - name: Run Python client tests
+        run: |
+          make test_debug_python

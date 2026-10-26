@@ -1,0 +1,42 @@
+{
+  "description": "Run without the LocalFileSystem enabled.",
+  "on_init": "SET disabled_filesystems = 'LocalFileSystem';",
+  "skip_compiled": "true",
+  "skip_error_messages": [
+    "LocalFileSystem"
+  ],
+  "skip_tests": [
+    {
+      "reason": "Cannot install extensions without a local filesystem",
+      "paths": [
+        "test/extension/install_extension_httpfs.test",
+        "test/sql/logging/http_response_log_redaction.test",
+        "test/sql/logging/http_url_log_redaction.test"
+      ]
+    },
+    {
+      "reason": "TODO",
+      "paths": [
+        "test/sql/attach/attach_filepath_roundtrip.test"
+      ]
+    },
+    {
+      "reason": "Autoloading means errors will differ",
+      "paths": [
+        "test/sql/secrets/secret_autoloading_errors.test"
+      ]
+    },
+    {
+      "reason": "COPY TO local paths requires LocalFileSystem during binding/planning",
+      "paths": [
+        "test/sql/json/test_json_copy_serialize_plan.test"
+      ]
+    },
+    {
+      "reason": "Writes and reads a local profiling JSON file.",
+      "paths": [
+        "test/sql/optimizer/nested_null_segment_pruning.test"
+      ]
+    }
+  ]
+}

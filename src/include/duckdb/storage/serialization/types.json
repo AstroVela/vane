@@ -1,0 +1,250 @@
+[
+  {
+    "class": "LogicalTypeModifier",
+    "includes": [
+      "duckdb/common/extension_type_info.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "value",
+        "type": "Value"
+      },
+      {
+        "id": 101,
+        "name": "label",
+        "type": "string"
+      }
+    ],
+    "pointer_type": "none",
+    "constructor": [
+      "value"
+    ]
+  },
+  {
+    "class": "ExtensionTypeInfo",
+    "includes": [
+      "duckdb/common/extension_type_info.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "modifiers",
+        "type": "vector<LogicalTypeModifier>"
+      },
+      {
+        "id": 101,
+        "name": "properties",
+        "type": "unordered_map<string, Value>",
+        "default": "unordered_map<string, Value>()"
+      }
+    ]
+  },
+  {
+    "class": "LogicalTypeInfo",
+    "class_type": "type",
+    "includes": [
+      "duckdb/common/logical_type_info.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "type",
+        "type": "LogicalTypeInfoType"
+      },
+      {
+        "id": 101,
+        "name": "alias",
+        "type": "string"
+      },
+      {
+        "id": 102,
+        "name": "modifiers",
+        "type": "vector<Value>",
+        "status": "deleted"
+      },
+      {
+        "id": 103,
+        "name": "extension_info",
+        "type": "unique_ptr<ExtensionTypeInfo>"
+      }
+    ]
+  },
+  {
+    "class": "DecimalTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "DECIMAL_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "width",
+        "type": "uint8_t"
+      },
+      {
+        "id": 201,
+        "name": "scale",
+        "type": "uint8_t"
+      }
+    ]
+  },
+  {
+    "class": "StringTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "STRING_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "collation",
+        "type": "string"
+      }
+    ]
+  },
+  {
+    "class": "ListTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "LIST_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "child_type",
+        "type": "LogicalType"
+      }
+    ]
+  },
+  {
+    "class": "StructTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "STRUCT_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "child_types",
+        "type": "child_list_t<LogicalType>"
+      }
+    ]
+  },
+  {
+    "class": "LegacyAggregateStateTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "LEGACY_AGGREGATE_STATE_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "function_name",
+        "type": "string",
+        "status": "deleted"
+      },
+      {
+        "id": 201,
+        "name": "return_type",
+        "type": "LogicalType",
+        "status": "deleted"
+      },
+      {
+        "id": 202,
+        "name": "bound_argument_types",
+        "type": "vector<LogicalType>",
+        "status": "deleted"
+      }
+    ],
+    "constructor_method": "LegacyAggregateStateTypeInfo::LegacyDeserialize"
+  },
+  {
+    "class": "ArrayTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "ARRAY_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "child_type",
+        "type": "LogicalType"
+      },
+      {
+        "id": 201,
+        "name": "size",
+        "type": "uint32_t"
+      }
+    ],
+    "constructor": [
+      "child_type",
+      "size"
+    ]
+  },
+  {
+    "class": "EnumTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "ENUM_TYPE_INFO",
+    "custom_implementation": true
+  },
+  {
+    "class": "InvalidTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "INVALID_TYPE_INFO",
+    "custom_switch_code": "return nullptr;"
+  },
+  {
+    "class": "GenericTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "GENERIC_TYPE_INFO",
+    "custom_switch_code": "result = make_uniq<LogicalTypeInfo>(type);\nbreak;"
+  },
+  {
+    "class": "AnyTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "ANY_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "target_type",
+        "type": "LogicalType"
+      },
+      {
+        "id": 201,
+        "name": "cast_score",
+        "type": "idx_t"
+      }
+    ]
+  },
+  {
+    "class": "IntegerLiteralTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "INTEGER_LITERAL_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "constant_value",
+        "type": "Value"
+      }
+    ]
+  },
+  {
+    "class": "TemplateTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "TEMPLATE_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "name",
+        "type": "string"
+      }
+    ]
+  },
+  {
+    "class": "GeoTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "GEO_TYPE_INFO",
+    "members": [
+      {
+        "id": 200,
+        "name": "crs",
+        "type": "CoordinateReferenceSystem"
+      }
+    ]
+  },
+  {
+    "class": "UnboundTypeInfo",
+    "base": "LogicalTypeInfo",
+    "enum": "UNBOUND_TYPE_INFO",
+    "custom_implementation": true
+  }
+]

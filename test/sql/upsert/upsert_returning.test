@@ -1,0 +1,114 @@
+# name: test/sql/upsert/upsert_returning.test
+# group: [upsert]
+
+statement ok
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY,
+    username TEXT UNIQUE,
+    email TEXT
+);
+
+query ITT
+INSERT INTO users (id, username, email) VALUES
+	(1, 'john_doe', 'john@example.com')
+ON CONFLICT (username) DO NOTHING
+RETURNING *;
+----
+1	john_doe	john@example.com
+
+query ITT
+INSERT INTO users (id, username, email) VALUES
+	(1, 'john_doe', 'john@example.com')
+ON CONFLICT (username) DO NOTHING
+RETURNING *;
+----
+
+# We create a conflict, with a where clause that filters out this conflict
+# Because the where clause filters it out, the DO UPDATE becomes a DO NOTHING for this row instead
+# So it does not get added to the returning clause.
+query ITT
+INSERT INTO users (id, username, email)
+VALUES (1, 'john_doe', 'john_new@example.com')
+ON CONFLICT (id) DO
+    UPDATE SET email = EXCLUDED.email
+    WHERE EXCLUDED.email != 'john_new@example.com'
+RETURNING *;
+----
+
+# Verify that the *other* tuple does get added to the returning clause
+query ITT
+INSERT INTO users (id, username, email)
+VALUES
+	(1, 'john_doe', 'john_new@example.com'),
+	(2, 'not_john_doe', 'not_john_new@example.com')
+ON CONFLICT (id) DO
+    UPDATE SET email = EXCLUDED.email
+    WHERE EXCLUDED.email != 'john_new@example.com'
+RETURNING *;
+----
+2	not_john_doe	not_john_new@example.com
+
+
+# Here we have conflicts within the inserted data
+# Only one row per conflict key is inserted and returned. Keep duplicate
+# payloads equal, since DISTINCT ON does not specify which candidate wins.
+# The UPDATE condition does not filter newly inserted rows.
+query ITT rowsort
+INSERT INTO users (id, username, email)
+VALUES
+	(3, 'inner_conflict', 'test'),
+	(4, 'a', ''),
+	(5, 'b', ''),
+	(6, 'c', ''),
+	(3, 'inner_conflict', 'test'),
+	(7, 'd', ''),
+	(8, 'e', ''),
+	(9, 'f', ''),
+	(3, 'inner_conflict', 'test')
+ON CONFLICT (id) DO
+    UPDATE SET email = EXCLUDED.email
+    WHERE EXCLUDED.email != 'test'
+RETURNING *;
+----
+3	inner_conflict	test
+4	a	(empty)
+5	b	(empty)
+6	c	(empty)
+7	d	(empty)
+8	e	(empty)
+9	f	(empty)
+
+# For an existing row, duplicate input keys update and return it once.
+# Columns outside the SET clause retain their existing values.
+query ITT
+INSERT INTO users VALUES
+    (3, 'unused_username', 'updated'),
+    (3, 'unused_username', 'updated')
+ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
+WHERE EXCLUDED.email != 'test'
+RETURNING *;
+----
+3	inner_conflict	updated
+
+# A filtered update contributes no RETURNING rows, including with duplicates.
+query ITT
+INSERT INTO users VALUES
+    (3, 'unused_username', 'test'),
+    (3, 'unused_username', 'test')
+ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
+WHERE EXCLUDED.email != 'test'
+RETURNING *;
+----
+
+query ITT
+SELECT * FROM users ORDER BY id
+----
+1	john_doe	john@example.com
+2	not_john_doe	not_john_new@example.com
+3	inner_conflict	updated
+4	a	(empty)
+5	b	(empty)
+6	c	(empty)
+7	d	(empty)
+8	e	(empty)
+9	f	(empty)
