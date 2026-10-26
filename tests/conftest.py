@@ -252,8 +252,14 @@ def _alarm_handler(_signum, _frame):
 @pytest.fixture(autouse=True)
 def test_timeout():
     if not hasattr(signal, "SIGALRM"):
-        # Windows has no SIGALRM. Preserve a hard deadline and traceback dump
-        # even when a native call prevents Python from handling an exception.
+        if sys.platform == "win32":
+            from windows_test_timeout import windows_test_timeout
+
+            # CRT exit can run DLL cleanup without the GIL. Use an external
+            # watchdog to enforce the deadline without entering that cleanup.
+            with windows_test_timeout(TEST_TIMEOUT):
+                yield
+            return
         faulthandler.dump_traceback_later(TEST_TIMEOUT, exit=True)
         try:
             yield
