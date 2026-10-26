@@ -1,0 +1,972 @@
+{
+  "meta": {
+    "schema_version": 1,
+    "generated_at_utc": "2026-07-02T10:39:31+00:00",
+    "git_commit": "ddd71963ded733c0d70841cf0a27ce3efbdb8c6f",
+    "duckdb_submodule_sha": "1da5b6c8cf6ce50ff8089aa59eb028bae8044f08",
+    "requirements_bench_sha256": "2bdfd6a766947a61559afb2799c54f0ea173b9325f55082ad809bf7b97b2c659",
+    "measurement": {
+      "tool": "valgrind callgrind",
+      "event": "Ir",
+      "pythonhashseed": "0"
+    },
+    "bench_scale": "10",
+    "gate_default_threshold_pct": 5.0,
+    "binding_fraction_cutoff": 0.25,
+    "noise_note": "callgrind Ir observed ~0.1% run-to-run; gate threshold set well above."
+  },
+  "benchmarks": {
+    "benchmarks/test_arrow_perf.py::test_read_arrow_dictionary[1000]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 13234377,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_read_arrow_dictionary[2]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 12899099,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_read_arrow_dictionary[50000]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 16808671,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_read_arrow_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 6654121,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_read_arrow_reader_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 7788904,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_read_arrow_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 16318265,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_write_arrow_reader_consumed": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 35184533,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_write_arrow_table_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 34891957,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_write_arrow_table_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 32861083,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_write_polars_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 35112605,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_arrow_perf.py::test_write_polars_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 34730605,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_df[10000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 51734481,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_df[1000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 33850667,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_df[100]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 32217517,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_df[20000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 71513957,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_fetchall[10000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 66950208,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_fetchall[1000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 34404751,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_fetchall[100]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 31383134,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_fetchall[20000]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 103824509,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_to_arrow[10000]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 43074317,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_to_arrow[1000]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 32401442,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_to_arrow[100]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 31416581,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_cardinality_perf.py::test_limit_to_arrow[20000]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 55048499,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_engine_control_perf.py::test_engine_sum_1col_100k": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 3633775,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_engine_control_perf.py::test_engine_sum_1col_200k": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 3632023,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_engine_control_perf.py::test_engine_sum_1col_small": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 3211889,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_engine_control_perf.py::test_engine_sum_2col_500k": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 37557571,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_2int": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 36895059,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_2int_gate": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 6055741,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_blob": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 54059510,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_decimal128": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 271638006,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_double": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 33349249,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_int": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 22345385,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_int_gate": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 3724222,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_mixed": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 340003609,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_mixed_wide": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 702796711,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_null_heavy": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 21094700,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_smallint": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 21409422,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_str": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 41836625,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchall_timestamptz": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 390785984,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchmany_batched": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 52492693,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_fetch_perf.py::test_fetchone_iter": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 64211821,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_native_perf.py::test_ingest_executemany_3col": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 22773135475,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_native_perf.py::test_ingest_values_dicts": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 7011565008,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_native_perf.py::test_ingest_values_scalars": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 4830766039,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_native_perf.py::test_ingest_values_tuples": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 5805088896,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_numpy_perf.py::test_bind_analyzer_object": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 22592113,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_ingest_numpy_perf.py::test_read_numpy_dict_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 6448389,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_ingest_numpy_perf.py::test_read_numpy_double_with_nan": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 4939556,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_ingest_numpy_perf.py::test_read_numpy_masked_int": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 4834310,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_ingest_numpy_perf.py::test_read_numpy_object_string_mixed": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 80120985,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_read_pandas_arrow_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 6644414,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_read_pandas_arrow_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 16303697,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_read_pandas_numpy_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 7031838,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_read_pandas_numpy_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 32692229,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_arrow_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 35531575,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_arrow_string": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 33395666,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_numpy_numeric": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 35262927,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_numpy_numeric_with_nulls": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 45978557,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_numpy_string": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 76064352,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_pandas_perf.py::test_write_pandas_numpy_timestamp": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 25492525,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_decimal128": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 14746792,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_hugeint": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 7995031,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 35256355,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_numeric_with_nulls": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 45939193,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_string": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 75962963,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_timestamp": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 25473843,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_df_uuid": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 220298436,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_fetch_df_chunk_loop": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 49712218,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_fetchnumpy_numeric": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 33944853,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_produce_numpy_perf.py::test_fetchnumpy_numeric_with_nulls": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 40658168,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_relational_construction_perf.py::test_expr_many": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 69063552,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[bool]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 3940908,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[date]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 5917219,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[decimal128]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 13682653,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[decimal64]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 6989466,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[double]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 14807454,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[hugeint]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 7044278,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[int64]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 2720419,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[list]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 12925581,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[struct]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 5744664,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[timestamp]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 12021064,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[uuid]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 13392814,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[varchar_long]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 28029946,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_arrow_table[varchar_short]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 14498290,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[bool]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 3965864,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[date]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 7406654,
+      "binding_fraction": 0.5094,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[decimal128]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 14746031,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[decimal64]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 7331242,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[double]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 15690529,
+      "binding_fraction": 0.7684,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[hugeint]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 7998654,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[int64]": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 2957718,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[list]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 99033627,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[struct]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 125117218,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[timestamp]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 12351561,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[uuid]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 220313633,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[varchar_long]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 47128590,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_col_df[varchar_short]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 31366014,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[bool]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 21042553,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[date]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 27286189,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[decimal128]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 271217448,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[decimal64]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 25532489,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[double]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 33290221,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[hugeint]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 184865901,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[int64]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 22382107,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[list]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 172332344,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[struct]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 134136017,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[timestamp]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 35722888,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[uuid]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 234289800,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[varchar_long]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 59326464,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_types_roundtrip_perf.py::test_out_row_fetchall[varchar_short]": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 39627192,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_udf_perf.py::test_udf_arrow_double": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 113267549,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_udf_perf.py::test_udf_arrow_int": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 55495884,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_udf_perf.py::test_udf_arrow_null_inputs": {
+      "marker": "informational",
+      "source_marker": "informational",
+      "auto_moved": false,
+      "instructions": 73488819,
+      "binding_fraction": null,
+      "threshold_pct": null
+    },
+    "benchmarks/test_udf_perf.py::test_udf_native_double_1arg": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 47311728,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_udf_perf.py::test_udf_native_int_1arg": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 40500454,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_udf_perf.py::test_udf_native_int_2arg": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 56305063,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_udf_perf.py::test_udf_native_null_inputs": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 30843428,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    },
+    "benchmarks/test_udf_perf.py::test_udf_native_string": {
+      "marker": "gate",
+      "source_marker": "gate",
+      "auto_moved": false,
+      "instructions": 105343681,
+      "binding_fraction": null,
+      "threshold_pct": 5.0
+    }
+  }
+}

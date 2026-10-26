@@ -1,0 +1,77 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb_python/pandas_scan.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb_python/pandas/pandas_bind.hpp"
+
+#include "duckdb_python/nb/casters.hpp"
+#include "duckdb_python/registered_py_object.hpp"
+
+namespace duckdb {
+
+//! Carried through the bind input so that SQL text can never name the dataframe
+struct PandasScanInfo : public TableFunctionInfo {
+	explicit PandasScanInfo(nb::object df_p) : df(std::move(df_p)) {
+	}
+	PyObjectHolder df;
+};
+
+struct PandasScanFunction : public TableFunction {
+public:
+	static constexpr idx_t PANDAS_PARTITION_COUNT = 50 * STANDARD_VECTOR_SIZE;
+
+public:
+	PandasScanFunction();
+
+	static unique_ptr<FunctionData> PandasScanBind(ClientContext &context, TableFunctionBindInput &input,
+	                                               vector<LogicalType> &return_types, vector<Identifier> &names);
+
+	static unique_ptr<GlobalTableFunctionState> PandasScanInitGlobal(ClientContext &context,
+	                                                                 TableFunctionInitInput &input);
+	static unique_ptr<LocalTableFunctionState>
+	PandasScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *gstate);
+
+	static idx_t PandasScanMaxThreads(ClientContext &context, const FunctionData *bind_data_p);
+
+	static bool PandasScanParallelStateNext(ClientContext &context, const FunctionData *bind_data_p,
+	                                        LocalTableFunctionState *lstate, GlobalTableFunctionState *gstate);
+
+	static double PandasProgress(ClientContext &context, const FunctionData *bind_data_p,
+	                             const GlobalTableFunctionState *gstate);
+
+	//! The main pandas scan function: note that this can be called in parallel without the GIL
+	//! hence this needs to be GIL-safe, i.e. no methods that create Python objects are allowed
+	static void PandasScanFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+
+	static unique_ptr<NodeStatistics> PandasScanCardinality(ClientContext &context, const FunctionData *bind_data);
+
+	static virtual_column_map_t PandasScanGetVirtualColumns(ClientContext &context,
+	                                                        optional_ptr<FunctionData> bind_data);
+
+	static OperatorPartitionData PandasScanGetPartitionData(ClientContext &context,
+	                                                        TableFunctionGetPartitionInput &input);
+
+	// Helper function that transform pandas df names to make them work with our binder
+	static nb::object PandasReplaceCopiedNames(const nb::object &original_df);
+	//! The frame itself when every label is already a str equal to its column name (str() of the label, deduplicated),
+	//! else a shallow copy carrying those names
+	static nb::object PandasWithBoundNames(const nb::object &df);
+
+	static void PandasBackendScanSwitch(ClientContext &context, PandasColumnBindData &bind_data, idx_t count,
+	                                    idx_t offset, Vector &out);
+
+	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+	                            const BoundTableFunction &function);
+
+	static unique_ptr<FunctionData> PandasDeserialize(Deserializer &deserializer, BoundTableFunction &function);
+};
+
+} // namespace duckdb
