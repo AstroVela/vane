@@ -15,9 +15,9 @@ video_path = media.video_path
 
 
 @pytest.mark.parametrize("capacity", [None, "", "1", "4"])
-def test_native_decoder_admission_configuration(capacity):
+@pytest.mark.parametrize("variable", ["VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"])
+def test_native_decoder_admission_configuration(capacity, variable):
     env = {**os.environ, "VANE_RUNNER": "local-fast"}
-    variable = "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES"
     if capacity is None:
         env.pop(variable, None)
     else:
@@ -42,19 +42,21 @@ def test_native_decoder_admission_configuration(capacity):
 
 
 @pytest.mark.parametrize("capacity", ["0", "-1", "1.5", " 2", "2x", str(2**64)])
-def test_native_decoder_admission_rejects_invalid_capacity(capacity):
+@pytest.mark.parametrize("variable", ["VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"])
+def test_native_decoder_admission_rejects_invalid_capacity(capacity, variable):
     result = subprocess.run(
         [sys.executable, "-I", "-c", "import vane; vane.connect()"],
-        env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": capacity},
+        env={**os.environ, "VANE_RUNNER": "local-fast", variable: capacity},
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode != 0
-    assert "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES must be a positive integer" in result.stderr
+    assert f"{variable} must be a positive integer" in result.stderr
 
 
-def test_native_video_admission_parallel_files_and_cleanup(video_path, tmp_path):
+@pytest.mark.parametrize("output_bytes", [None, "144", "288"])
+def test_native_video_admission_parallel_files_and_cleanup(video_path, tmp_path, output_bytes):
     providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
     artifact = "" if providers else str(media._artifact("video"))
     broken = tmp_path / "broken.mp4"
@@ -94,6 +96,11 @@ def run(index):
         assert len(frames(con, [broken, path], on_error="skip").fetchall()) == 12
         # LIMIT and a downstream expression error end the source before EOF.
         assert len(frames(con, path).limit(1).fetchall()) == 1
+        assert len(frames(con, [path] * 3).order("frame_index DESC").fetchall()) == 36
+        retained = frames(con, path).project("frame_index, frame.data").fetchall()
+        assert [row[0] for row in retained] == list(range(12))
+        assert all(len(row[1]) == 144 for row in retained)
+        assert retained == frames(con, path).project("frame_index, frame.data").fetchall()
         try:
             frames(con, path).project("CAST('invalid' || frame_index::VARCHAR AS BIGINT)").fetchall()
         except vane.ConversionException:
@@ -114,11 +121,49 @@ def run(index):
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     list(executor.map(run, range(3)))
 """
+    env = {**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1"}
+    if output_bytes is None:
+        env.pop("VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES", None)
+    else:
+        env["VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"] = output_bytes
     subprocess.run(
         [sys.executable, "-I", "-c", script, artifact, str(video_path), str(broken)],
-        env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1"},
+        env=env,
         check=True,
         capture_output=True,
         text=True,
         timeout=90,
+    )
+
+
+def test_native_video_output_budget_rejects_an_oversized_frame(video_path):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    script = r"""
+import sys
+import vane
+artifact, path = sys.argv[1:]
+con = vane.connect() if not artifact else vane.connect(config={"allow_unsigned_extensions": "true"})
+if artifact:
+    con.load_extension(artifact)
+else:
+    vane.load_installed_extension("native_media", connection=con)
+con.execute("SET video_backend='native'")
+for policy in ('raise', 'skip'):
+    try:
+        vane.read_video_frames(path, 6, 8, connection=con, on_error=policy).fetchall()
+    except vane.OutOfMemoryException as error:
+        assert 'VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES' in str(error), str(error)
+    else:
+        raise AssertionError('an impossible output reservation must fail without waiting')
+assert vane.read_video_frames(path, 6, 8, connection=con, frame_limit=0).fetchall() == []
+con.close()
+"""
+    subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path)],
+        env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "143"},
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )

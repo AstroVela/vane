@@ -278,28 +278,36 @@ MediaResourceSnapshot MediaResourcePool::Snapshot() const {
 	return result;
 }
 
-static idx_t NativeMediaDecoderCapacity() {
-	const auto value = FileSystem::GetEnvVariable("VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES");
+static idx_t NativeMediaCapacity(const char *variable) {
+	const auto value = FileSystem::GetEnvVariable(variable);
 	if (value.empty()) {
 		return 0;
 	}
 	idx_t result = 0;
 	for (auto ch : value) {
 		if (ch < '0' || ch > '9' || result > (std::numeric_limits<idx_t>::max() - idx_t(ch - '0')) / 10) {
-			throw InvalidInputException("VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES must be a positive integer");
+			throw InvalidInputException("%s must be a positive integer", variable);
 		}
 		result = result * 10 + idx_t(ch - '0');
 	}
 	if (result == 0) {
-		throw InvalidInputException("VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES must be a positive integer");
+		throw InvalidInputException("%s must be a positive integer", variable);
 	}
 	return result;
 }
 
 shared_ptr<MediaResourcePool> GetNativeMediaDecoderPool() {
 	static auto pool = []() -> shared_ptr<MediaResourcePool> {
-		auto capacity = NativeMediaDecoderCapacity();
+		auto capacity = NativeMediaCapacity("VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES");
 		return capacity ? make_shared_ptr<MediaResourcePool>(MediaResourceBudget(capacity, 0)) : nullptr;
+	}();
+	return pool;
+}
+
+shared_ptr<MediaResourcePool> GetNativeMediaOutputPool() {
+	static auto pool = []() -> shared_ptr<MediaResourcePool> {
+		const auto capacity = NativeMediaCapacity("VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES");
+		return capacity ? make_shared_ptr<MediaResourcePool>(MediaResourceBudget(0, capacity)) : nullptr;
 	}();
 	return pool;
 }

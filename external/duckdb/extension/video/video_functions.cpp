@@ -8,6 +8,7 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/execution/media_resource.hpp"
+#include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/database.hpp"
@@ -237,8 +238,13 @@ struct VideoGlobal : public GlobalTableFunctionState {
 		if (admission) {
 			admission->Close();
 		}
+		if (output_admission) {
+			output_admission->Close();
+		}
 	}
 	shared_ptr<MediaResourceScope> admission;
+	shared_ptr<MediaResourceScope> output_admission;
+	idx_t output_rows = STANDARD_VECTOR_SIZE;
 	std::atomic<idx_t> next_task {0};
 	idx_t thread_count = 1;
 	uint64_t emitted = 0; // Used only in the explicitly serial, globally limited scan.
@@ -248,6 +254,7 @@ struct VideoGlobal : public GlobalTableFunctionState {
 };
 struct VideoLocal : public LocalTableFunctionState {
 	unique_ptr<MediaAdmissionRequest> admission_request;
+	unique_ptr<MediaAdmissionRequest> output_request;
 	// Reverse destruction order closes the actual codec before its reservation.
 	MediaResourceLease decoder_lease;
 	unique_ptr<VideoFrameCursor> cursor;
@@ -256,6 +263,7 @@ struct VideoLocal : public LocalTableFunctionState {
 	idx_t end_file = 0;
 
 	void CloseCursor() {
+		output_request.reset();
 		cursor.reset();
 		decoder_lease.Release();
 		admission_request.reset();
@@ -270,6 +278,17 @@ static unique_ptr<GlobalTableFunctionState> InitVideo(ClientContext &context, Ta
 	auto pool = DatabaseInstance::GetDatabase(context).GetMediaDecoderPool();
 	if (pool) {
 		result->admission = pool->CreateScope();
+	}
+	auto output_pool = DatabaseInstance::GetDatabase(context).GetMediaOutputPool();
+	if (output_pool) {
+		auto &p = bind.parameters;
+		const auto frame_bytes = p[0].GetValue<uint64_t>() * p[1].GetValue<uint64_t>() * 3;
+		result->output_rows =
+		    MinValue<idx_t>(STANDARD_VECTOR_SIZE, output_pool->Snapshot().capacity.bytes / frame_bytes);
+		if (result->output_rows == 0 && !bind.files.empty() && (p[10].IsNull() || p[10].GetValue<uint64_t>() != 0)) {
+			throw OutOfMemoryException("Native video frame exceeds VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES");
+		}
+		result->output_admission = output_pool->CreateScope();
 	}
 	result->thread_count = MaxValue<idx_t>(1, bind.TaskCount());
 	return std::move(result);
@@ -288,6 +307,7 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 	auto height = p[0].GetValue<uint32_t>(), width = p[1].GetValue<uint32_t>();
 	auto frame_bytes = uint64_t(height) * width * 3;
 	auto limit = MinValue<idx_t>(STANDARD_VECTOR_SIZE, p[9].GetValue<uint64_t>() / bind.row_bytes);
+	limit = MinValue(limit, global.output_rows);
 	bool limited = !p[10].IsNull();
 	if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
 		local.CloseCursor();
@@ -295,6 +315,7 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 	}
 	idx_t row = 0;
 	uint64_t allocated_payload = 0;
+	bool output_allocated = false;
 	while (row < limit) {
 		MediaInterrupt(context);
 		if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
@@ -306,8 +327,15 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 				// A blocked poll must be empty. Deliver the previous file's tail
 				// before requesting another decoder, rather than retaining a
 				// partially filled output while waiting for admission.
-				if (global.admission && row > 0) {
+				if ((global.admission || global.output_admission) && row > 0) {
 					break;
+				}
+				if (output_allocated) {
+					// A skipped conversion may have allocated pixels without rows.
+					// Do not hold bytes while waiting to open another decoder.
+					output.Reset();
+					output_allocated = false;
+					allocated_payload = 0;
 				}
 				if (local.next_file == local.end_file) {
 					auto task = global.next_task.fetch_add(1);
@@ -351,6 +379,30 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 				auto index = bind.indexed ? bind.indexes[local.file_index] : Value(LogicalType::BLOB);
 				local.cursor = make_uniq<VideoFrameCursor>(context, bind.files[local.file_index], options,
 				                                           VideoFrameOperation::FRAMES, index);
+			}
+			if (global.output_admission && !output_allocated) {
+				if (!local.output_request) {
+					local.output_request = global.output_admission->Request({0, limit * frame_bytes});
+				}
+				auto status = local.output_request->PollOrArm(interrupt);
+				if (status == MediaAdmissionStatus::WAITING) {
+					return SourceResultType::BLOCKED;
+				}
+				if (status == MediaAdmissionStatus::CANCELLED) {
+					local.CloseCursor();
+					return SourceResultType::FINISHED;
+				}
+				if (status != MediaAdmissionStatus::GRANTED) {
+					throw InternalException("Native video output admission did not produce a grant");
+				}
+				// A fresh IMAGE prevents VectorCache from pinning the pixel lease
+				// after consumption or mutating a downstream reference on reset.
+				Vector image(output.data[9].GetType(), limit);
+				auto &pixels = *StructVector::GetEntries(image)[ImageLogicalType::DATA];
+				AllocateMediaList(pixels, limit, limit * frame_bytes, local.output_request->TakeGrant());
+				output.data[9].Reference(image);
+				local.output_request.reset();
+				output_allocated = true;
 			}
 			if (!local.cursor->Next()) {
 				local.CloseCursor();
@@ -397,6 +449,9 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 			local.CloseCursor();
 			throw;
 		}
+	}
+	if (row == 0 && output_allocated) {
+		output.Reset();
 	}
 	output.SetCardinality(row);
 	return row > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;

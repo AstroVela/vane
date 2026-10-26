@@ -219,9 +219,24 @@ requests and unclaimed grants are cancelled on scan teardown. The host installs
 the pool on `DatabaseInstance` so statically linked loadable extensions share
 the host's capacity.
 
-This first opt-in adapter covers scan decoder concurrency only. It does not
-charge output buffers, codec workspace or process RSS, and does not govern
-native scalar functions or Python decoders (`VANE_MAX_CONCURRENT_DECODES`).
+Set `VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES` to a positive integer before importing
+Vane to additionally bound the **original pixel buffers allocated by native
+video scans** across the host runtime. It is independent of decoder capacity,
+has the same unset/empty/invalid-value rules, and is also fixed at runtime
+creation. The source reserves a batch before reading its next frame and reduces
+the batch to fit the configured capacity. A single frame that cannot fit raises
+a resource error, including under `on_error='skip'`; a zero frame limit opens
+no decoder. References and slices retain the whole allocation's charge until
+its final release. Closing a query does not revoke a still-live pixel buffer.
+
+Pixel requests use a separate FIFO from decoder requests so a waiting decoder
+cannot prevent an active cursor from acquiring its next output batch. Consumed
+pipeline views are released before the next source poll. Deep copies into
+downstream operators belong to those operators' existing allocation domains;
+this setting does not charge those copies, metadata, initial vector caches,
+allocator overhead, codec workspace or process RSS. It does not govern native
+scalar functions or Python decoders (`VANE_MAX_CONCURRENT_DECODES`). It is not a
+total media-memory limit or the complete input/output flow-window protocol.
 Use it experimentally with independent video scan pipelines; execution-path
 progress reservations for interdependent media operators are still pending.
 The complete target, implementation status and remaining validation are in

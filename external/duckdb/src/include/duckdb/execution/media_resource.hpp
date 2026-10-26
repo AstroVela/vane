@@ -107,4 +107,8 @@ private:
 //! nullptr when that opt-in environment variable is unset.
 DUCKDB_API shared_ptr<MediaResourcePool> GetNativeMediaDecoderPool();
 
+//! Separate FIFO for scan pixel storage. A decoder waiter must not prevent an
+//! active decoder from obtaining output bytes and reaching EOF. Host use only.
+DUCKDB_API shared_ptr<MediaResourcePool> GetNativeMediaOutputPool();
+
 } // namespace duckdb

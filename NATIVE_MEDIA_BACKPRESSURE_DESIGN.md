@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：分阶段实现中，首批实现为公共准入原语和实验性视频扫描 decoder 准入。更新日期：2026-10-26。
+状态：分阶段实现中，decoder 准入已合入集成分支，第二批接入扫描原始像素 buffer 的字节准入。更新日期：2026-10-27。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -20,14 +20,37 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 实验开关 `VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES` 在首次创建数据库时解析并固定，必须在导入 Vane 前配置。未设置或空字符串保持关闭；正整数启用；无效值报错。它尚未实现第 13 节的完整配置系统，也没有与 Python 的 decoder 池合并。
 - [C++ 测试](external/duckdb/test/api/test_media_resource.cpp) 覆盖向量授予、取消/释放竞态、回调重入、异常隔离、真实 pipeline 暂停/恢复及取消、LIMIT/下游错误清理；[Python 测试](tests/fast/test_native_media_admission.py) 覆盖进程配置和可选 provider 的并发多文件、skip、LIMIT、错误后复用。provider 测试需要与当前 base 匹配的 native_media artifact/runtime。
 
-这还不是 M1/M2 的完整交付：bytes 目前是预留原语，尚未连接实际 allocation/buffer；flow lease、buffer ownership、物化移交、按 query 公平调度、最低推进资源、scalar 挂起和 Python/Ray/FTE 全链路验收仍待实现。decoder lease 会跨批次持有；相互依赖的媒体路径在最低推进资源完成前不属于该实验开关的支持范围。首批不得以“统一多模态字节反压”或“RSS 硬限制”对外宣称。
+首批不是 M1/M2 的完整交付：当时 bytes 仅作为预留原语，尚未连接实际 allocation/buffer；flow lease、buffer ownership、物化移交、按 query 公平调度、最低推进资源、scalar 挂起和 Python/Ray/FTE 全链路验收仍待实现。decoder lease 会跨批次持有；相互依赖的媒体路径在最低推进资源完成前不属于该实验开关的支持范围。首批不得以“统一多模态字节反压”或“RSS 硬限制”对外宣称。
 
-本次开发工作区验证记录（该工作区还含有其他未提交改动；以下结果不替代独立 PR 分支的完整构建验收）：
+首批开发工作区验证记录（该工作区还含有其他未提交改动；以下结果不替代独立 PR 分支的完整构建验收）：
 
 - C++ `[media-resource]`：默认关闭时 12 个用例、1949 条断言通过；设置 `VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES=1` 后 12 个用例、1956 条断言通过，包含宿主数据库之间实际共享容量的检查。
 - 已安装包的 admission、native_media、视频帧、视频表达式、索引及 UDF process 相关套件：108 passed、177 skipped。当前缺少匹配的 native_media SDK/runtime/provider，真实 codec 集成用例未运行；部分音频用例另因缺少 soundfile 跳过。视频 adapter 已通过 C++17 语法检查。
 - `scripts/run_release_tests.sh`：非 Ray 分片 1888 passed、76 skipped；共享 Ray 分片 72 passed、5 skipped；独立集群分片的 2 个用例因缺少 openai 包跳过。总计 1960 passed、83 skipped，无失败。本机 socket 相关检查在允许监听端口的环境中运行。
 - 格式、源码许可证和文档链接检查通过。已按非 editable 的增量流程重新安装 base；安装包 SourceID 与当时开发工作区的 DuckDB 源码树一致。
+
+### 第二批：扫描原始像素 buffer 的字节准入
+
+本批在已合入的 decoder 准入之上，接入原始像素 allocation 的所有权：
+
+实现分支为 `feature/media-output-admission`，从集成分支合入 #1095 后的 `e30ab91c0` 开始，目标仍为 `native-media-backpressure-dev`。
+
+- `VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES` 是独立、默认关闭、首次创建数据库时固定的进程级额度；通过宿主 `DatabaseInstance` 访问，覆盖该 runtime 内各扫描创建的原始像素 buffer。
+- 视频扫描在下一次 `Next()` 前取得一整批像素额度；批次按容量缩小，单帧无法容纳时明确报资源错误。不会先解码/分配整批再等待，也不会把资源错误当成 `skip`。
+- `AllocateMediaVector` 在取得等额纯 bytes lease 后创建数值存储，保留 allocator，先实际释放 allocation，再归还额度。普通引用、slice 和嵌套 IMAGE/LIST 引用共享 owner；scope 结束不撤销仍存活的 buffer。
+- 每批使用新的像素 owner，避免可复用 `VectorCache` 留住额度。普通 pipeline 与已有 batch 路径一样，在拉取下一批之前清除已消费的中间 chunk、表达式和 sink 输入引用。
+- 输出 bytes 与 decoder 使用不同的 FIFO 队列。持有 decoder 的扫描可以申请下一批 bytes，不被排在前面的 decoder 等待者挡住；等待 decoder 时不持有新的输出 bytes。
+- provider CI 已包含 `test_native_media_admission.py`；在同一入口增加一帧/两帧额度、并发文件、排序、LIMIT、失败后复用及永久超额用例。核心测试用可控 allocator 和假扫描验证释放次序、引用存活、小容量完成及取消，不依赖 provider。
+
+这是 M1/M2 的下一增量，不是完整媒体内存预算。此处精确约束原始像素 allocation 的申请容量；metadata、vector 初始化缓存、分配器开销、codec/reference frames、转换 scratch、下游 deep copy、Arrow/传输复制不属于该额度。copy 仍由接收执行域分配，并不沿用原像素 lease。统一分配/移交协议、独立 flow window、最低推进资源、scalar 挂起和 Python 权威统一仍按后续里程碑实施。相互依赖的媒体执行路径尚不属于实验开关的支持范围。
+
+本批独立分支验证记录：
+
+- 从集成分支创建独立 worktree，完整构建并非 editable 安装到独立虚拟环境；复用已安装的第三方依赖。最终安装包的 SourceID 为 `50dbb9e40364d69497f0d4acc61e85001c2dcacc`，与本批 DuckDB 源码树一致。原生测试使用 CI 相同的 `VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON` 配置。
+- C++ `[media-resource]`：默认关闭时 21 个用例、2262 条断言通过；decoder 容量 1、输出容量 64 bytes 时 21 个用例、2272 条断言通过。`[image],[output-lease],[execution_batch]`：49 个用例、162099 条断言通过。
+- 已安装包的 admission、native_media、视频帧、表达式、索引、固定形状 IMAGE、IMAGE 转 TENSOR 和 UDF process 测试：321 passed、181 skipped。admission 文件的 20 个配置用例通过，4 个真实 codec 用例因缺少匹配的 native_media provider 跳过；其余跳过主要来自可选 provider 和 soundfile。真实视频 adapter 已通过 C++17 语法检查，真实解码仍须由匹配 provider 的 CI 验证。
+- 首轮发现现有 UDF collector 清理测试在 50 ms unregister 超时后立即检查异步交接事件的竞态；改为有超时的事件等待，保留 executor 最终释放和恰好关闭一次的断言，整组复测通过。
+- 完整 release gate 和 provider CI 的结果在[跟踪 issue #1093](https://github.com/AstroVela/vane/issues/1093)关联的本批 PR 中维护。
 
 ## 1 设计结论
 

@@ -41,6 +41,7 @@ add_library_unity(
   external_block.cpp
   join_hashtable.cpp
   media_resource.cpp
+  media_buffer.cpp
   perfect_aggregate_hashtable.cpp
   physical_operator.cpp
   physical_plan_generator.cpp

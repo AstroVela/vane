@@ -84,6 +84,7 @@ DatabaseInstance::DatabaseInstance() : db_validity(*this) {
 	create_api_v1 = nullptr;
 	execution_runtime = make_uniq<ExecutionRuntime>();
 	media_decoder_pool = GetNativeMediaDecoderPool();
+	media_output_pool = GetNativeMediaOutputPool();
 }
 
 DatabaseInstance::~DatabaseInstance() {
