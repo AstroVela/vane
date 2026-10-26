@@ -116,6 +116,16 @@ class inside a pybind11 lambda caused excessive MSVC frontend memory use.
 The Bash test launchers also support Git Bash with native Windows Python;
 building a wheel does not establish compatibility of every runtime backend.
 
+Windows local UDF workers use duplicated sockets and a job object to retain
+ownership of their descendants through shutdown. Shared memory follows Windows
+handle lifetime: keep a raw descriptor alive until its receiver has adopted it,
+or release it explicitly. Production subprocess output uses parent-owned arena
+grants. Direct Arrow IPC output grows by replacing the named mapping and sending
+the new name to the parent. Exercise these paths with
+`tests/fast/test_windows_udf_transport.py`,
+`tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output`
+and `tests/fast/test_ai_image_embedding.py` through the installed test launcher.
+
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.

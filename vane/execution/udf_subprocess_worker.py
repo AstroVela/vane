@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import socket
 import struct
@@ -26,6 +27,7 @@ from vane.execution._subprocess_error import error_payload
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
     PreparedLocalShmBlock,
+    _create_shm,
     _open_existing_shm,
     _require_shm_buffer,
     make_pooled_shm_descriptor,
@@ -62,6 +64,7 @@ _MSG_OUTPUT_GRANT_FAILED = 0x12
 _MSG_STREAM_NEXT = 0x13
 _MSG_STREAM_CONTINUE = 0x14
 _MSG_INPUT_RETAINED = 0x15
+_MSG_IPC_RESULT = 0x16
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -227,15 +230,26 @@ def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory
     if required <= capacity:
         return shm
     new_size = max(required, capacity * 2, _DEFAULT_SHM_SIZE)
-    name = shm.name
-    path = f"/dev/shm/{name}"
-    fd = os.open(path, os.O_RDWR)
-    try:
-        os.ftruncate(fd, new_size)
-    finally:
-        os.close(fd)
-    shm.close()
-    return _open_existing_shm(name, track=False)
+    if sys.platform == "win32":
+        # Named Windows mappings cannot grow while either process holds one.
+        # Keep the replacement alive until the parent adopts its new name.
+        replacement = _create_shm(new_size, track=False)
+        try:
+            shm.close()
+        except BaseException:
+            replacement.close()
+            raise
+        return replacement
+    else:
+        name = shm.name
+        path = f"/dev/shm/{name}"
+        fd = os.open(path, os.O_RDWR)
+        try:
+            os.ftruncate(fd, new_size)
+        finally:
+            os.close(fd)
+        shm.close()
+        return _open_existing_shm(name, track=False)
 
 
 def _arrow_table_from_ipc_bytes(data: bytes) -> pa.Table:
@@ -625,7 +639,10 @@ def _execute_submit(
     required = _IPC_HEADER.size + len(output_ipc)
     data_shm = _resize_shm(data_shm, required)
     result_size = _write_ipc_to_shm(data_shm, output_ipc)
-    return data_shm, _MSG_OK, struct.pack("<Q", result_size)
+    if sys.platform == "win32":
+        return data_shm, _MSG_IPC_RESULT, struct.pack("<Q", result_size) + data_shm.name.encode("ascii")
+    else:
+        return data_shm, _MSG_OK, struct.pack("<Q", result_size)
 
 
 def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str, shm_fd: int) -> None:
@@ -833,7 +850,21 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
 def _main(argv: list[str]) -> int:
     if len(argv) != 6:
         return 2
-    worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4], int(argv[5]))
+    if sys.platform == "win32":
+        # Read the parent's private bootstrap pipe before loading user code.
+        shares = json.loads(sys.stdin.buffer.readline(16384))
+        if not isinstance(shares, list) or len(shares) != 2:
+            raise ValueError("invalid UDF worker socket bootstrap")
+        sockets = []
+        try:
+            for share in shares:
+                sockets.append(socket.fromshare(bytes.fromhex(share)))
+            worker_main(sockets[0].detach(), argv[2], int(argv[3]), argv[4], sockets[1].detach())
+        finally:
+            for sock in sockets:
+                sock.close()
+    else:
+        worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4], int(argv[5]))
     return 0
 
 

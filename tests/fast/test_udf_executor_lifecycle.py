@@ -3548,21 +3548,36 @@ def test_subprocess_close_is_idempotent():
     assert proc is None or proc.poll() is not None
 
 
-def test_subprocess_resizes_shared_memory_for_large_output():
-    from vane.execution.udf_subprocess import UDFExecutor
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_subprocess_resizes_shared_memory_for_large_output(backend):
+    from vane.execution.udf_subprocess import UDFExecutor, _SingleSubprocessExecutor
 
     large_value = "x" * (2 * 1024 * 1024)
 
     def expand(table):
         return pa.table({"out": [large_value for _ in range(table.num_rows)]})
 
-    executor = UDFExecutor(_subprocess_map_payload(expand))
-    try:
-        _submit_with_admission(executor, pa.table({"x": [1, 2]}))
-        output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
+    class Expand:
+        def __call__(self, table):
+            return expand(table)
 
-        assert output is not None
-        assert output.column("out").to_pylist() == [large_value, large_value]
+    executor = (
+        _SingleSubprocessExecutor(_subprocess_map_payload(Expand, execution_backend=backend, actor_number=1))
+        if backend == "subprocess_actor"
+        else UDFExecutor(_subprocess_map_payload(expand))
+    )
+    try:
+        # Reuse the executor across growth, a small result, and another growth.
+        for rows in [2, 1, 5]:
+            table = pa.table({"x": list(range(rows))})
+            if backend == "subprocess_actor":
+                executor.submit(table)
+            else:
+                _submit_with_admission(executor, table)
+            output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
+
+            assert output is not None
+            assert output.column("out").to_pylist() == [large_value] * rows
     finally:
         executor.close()
 
@@ -8664,7 +8679,11 @@ def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_mon
         for ref in refs:
             ref.release()
 
-    assert shared_registers
+    if sys.platform == "win32":
+        assert not shared_registers
+        assert not shared_unregisters
+    else:
+        assert shared_registers
     assert sorted(shared_registers) == sorted(shared_unregisters)
 
 

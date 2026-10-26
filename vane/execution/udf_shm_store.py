@@ -917,13 +917,18 @@ class ParentShmPeer:
             # A separate lifetime descriptor survives release-channel shutdown
             # and the worker's death when fork descendants still retain inputs.
             # Pass it once at startup, without adding per-batch descriptors.
-            with _fork_lock:
-                self._lifetime.read_fd, write_fd = os.pipe()
-                _fork_holds.add(self._lifetime)
-                try:
-                    socket.send_fds(self.sock, [b"L"], [write_fd])
-                finally:
-                    os.close(write_fd)
+            if os.name == "nt":
+                # Windows has no fork descendants that inherit Arrow views.
+                # close_after_exit still requires confirmed worker death.
+                self._lifetime.alive = False
+            else:
+                with _fork_lock:
+                    self._lifetime.read_fd, write_fd = os.pipe()
+                    _fork_holds.add(self._lifetime)
+                    try:
+                        socket.send_fds(self.sock, [b"L"], [write_fd])
+                    finally:
+                        os.close(write_fd)
             self._reader = threading.Thread(target=self._receive_releases, name="vane-shm-releases", daemon=True)
             self._reader.start()
         except BaseException:
@@ -1121,13 +1126,14 @@ class WorkerShmClient:
         self._error: BaseException | None = None
         try:
             with _fork_lock:
-                message, fds, flags, _ = socket.recv_fds(self.sock, 1, 1)
-                if message != b"L" or len(fds) != 1 or flags & socket.MSG_CTRUNC:
-                    for received_fd in fds:
-                        os.close(received_fd)
-                    raise RuntimeError("invalid shared-memory worker lifetime descriptor")
-                self._lifetime_fd = fds[0]
-                os.set_inheritable(self._lifetime_fd, False)
+                if os.name != "nt":
+                    message, fds, flags, _ = socket.recv_fds(self.sock, 1, 1)
+                    if message != b"L" or len(fds) != 1 or flags & socket.MSG_CTRUNC:
+                        for received_fd in fds:
+                            os.close(received_fd)
+                        raise RuntimeError("invalid shared-memory worker lifetime descriptor")
+                    self._lifetime_fd = fds[0]
+                    os.set_inheritable(self._lifetime_fd, False)
                 _worker_clients.add(self)
             self._writer = threading.Thread(target=self._send_releases, name="vane-shm-release-writer", daemon=True)
             self._writer.start()
