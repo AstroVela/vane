@@ -38,6 +38,7 @@ class LogManager;
 class ExternalFileCache;
 class ResultSetManager;
 struct ExecutionRuntime;
+class MediaResourcePool;
 
 class DatabaseInstance : public enable_shared_from_this<DatabaseInstance> {
 	friend class DuckDB;
@@ -58,6 +59,11 @@ public:
 	DUCKDB_API FileSystem &GetLocalFileSystem();
 	DUCKDB_API ExternalFileCache &GetExternalFileCache();
 	DUCKDB_API ResultSetManager &GetResultSetManager();
+	//! Return the pool installed by the host constructor. Loadable extensions
+	//! statically link engine code and must not use their own process singleton.
+	DUCKDB_API shared_ptr<MediaResourcePool> GetMediaDecoderPool() const {
+		return media_decoder_pool;
+	}
 	DUCKDB_API TaskScheduler &GetScheduler();
 	DUCKDB_API ObjectCache &GetObjectCache();
 	DUCKDB_API ConnectionManager &GetConnectionManager();
@@ -106,6 +112,7 @@ private:
 	unique_ptr<ExternalFileCache> external_file_cache;
 	unique_ptr<ResultSetManager> result_set_manager;
 	unique_ptr<ExecutionRuntime> execution_runtime;
+	shared_ptr<MediaResourcePool> media_decoder_pool;
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

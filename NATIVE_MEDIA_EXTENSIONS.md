@@ -203,6 +203,30 @@ encoded-format failures. I/O, resource limits, allocation failures, and
 cancellation propagate. Failed pixel allocations remain charged to the batch
 budget even when their row is suppressed.
 
+Native video scans have experimental decoder admission. Set
+`VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES` to a positive integer **before
+importing Vane or creating the first database** to limit concurrently open scan
+decoders across databases and connections in the same host runtime. Unset or
+empty leaves admission disabled; zero and invalid values are rejected. The
+capacity is fixed for that runtime's lifetime. Each Worker process needs its own
+setting; this is not a cluster-wide capacity.
+
+Both `native_video_frames` and native `read_video_frames` acquire a slot before
+opening a cursor. When all slots are occupied, the source returns `BLOCKED` and
+registers a scheduler wakeup. The slot remains owned while the cursor is alive,
+including across output batches, and is returned after cursor cleanup. Pending
+requests and unclaimed grants are cancelled on scan teardown. The host installs
+the pool on `DatabaseInstance` so statically linked loadable extensions share
+the host's capacity.
+
+This first opt-in adapter covers scan decoder concurrency only. It does not
+charge output buffers, codec workspace or process RSS, and does not govern
+native scalar functions or Python decoders (`VANE_MAX_CONCURRENT_DECODES`).
+Use it experimentally with independent video scan pipelines; execution-path
+progress reservations for interdependent media operators are still pending.
+The complete target, implementation status and remaining validation are in
+[Native media backpressure design](NATIVE_MEDIA_BACKPRESSURE_DESIGN.md).
+
 ## Build and package
 
 For the complete protected publication workflow, including source-rebuild and

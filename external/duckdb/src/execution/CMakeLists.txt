@@ -40,6 +40,7 @@ add_library_unity(
   expression_executor_state.cpp
   external_block.cpp
   join_hashtable.cpp
+  media_resource.cpp
   perfect_aggregate_hashtable.cpp
   physical_operator.cpp
   physical_plan_generator.cpp

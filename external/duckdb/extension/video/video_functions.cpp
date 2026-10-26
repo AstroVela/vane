@@ -7,8 +7,10 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/execution/media_resource.hpp"
 #include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/database.hpp"
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -231,6 +233,12 @@ static unique_ptr<FunctionData> BindPublicVideo(ClientContext &context, TableFun
 }
 
 struct VideoGlobal : public GlobalTableFunctionState {
+	~VideoGlobal() override {
+		if (admission) {
+			admission->Close();
+		}
+	}
+	shared_ptr<MediaResourceScope> admission;
 	std::atomic<idx_t> next_task {0};
 	idx_t thread_count = 1;
 	uint64_t emitted = 0; // Used only in the explicitly serial, globally limited scan.
@@ -239,17 +247,30 @@ struct VideoGlobal : public GlobalTableFunctionState {
 	}
 };
 struct VideoLocal : public LocalTableFunctionState {
+	unique_ptr<MediaAdmissionRequest> admission_request;
+	// Reverse destruction order closes the actual codec before its reservation.
+	MediaResourceLease decoder_lease;
 	unique_ptr<VideoFrameCursor> cursor;
 	idx_t file_index = 0;
 	idx_t next_file = 0;
 	idx_t end_file = 0;
+
+	void CloseCursor() {
+		cursor.reset();
+		decoder_lease.Release();
+		admission_request.reset();
+	}
 };
-static unique_ptr<GlobalTableFunctionState> InitVideo(ClientContext &, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> InitVideo(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<VideoBind>();
 	if (bind.worker && !bind.assigned) {
 		throw InvalidInputException("native video worker has no split assignment");
 	}
 	auto result = make_uniq<VideoGlobal>();
+	auto pool = DatabaseInstance::GetDatabase(context).GetMediaDecoderPool();
+	if (pool) {
+		result->admission = pool->CreateScope();
+	}
 	result->thread_count = MaxValue<idx_t>(1, bind.TaskCount());
 	return std::move(result);
 }
@@ -258,7 +279,8 @@ static unique_ptr<LocalTableFunctionState> InitVideoLocal(ExecutionContext &, Ta
 	return make_uniq<VideoLocal>();
 }
 
-static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &input, DataChunk &output,
+                                  const InterruptState &interrupt) {
 	auto &bind = input.bind_data->Cast<VideoBind>();
 	auto &p = bind.parameters;
 	auto &global = input.global_state->Cast<VideoGlobal>();
@@ -268,18 +290,25 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 	auto limit = MinValue<idx_t>(STANDARD_VECTOR_SIZE, p[9].GetValue<uint64_t>() / bind.row_bytes);
 	bool limited = !p[10].IsNull();
 	if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
-		return;
+		local.CloseCursor();
+		return SourceResultType::FINISHED;
 	}
 	idx_t row = 0;
 	uint64_t allocated_payload = 0;
 	while (row < limit) {
 		MediaInterrupt(context);
 		if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
-			local.cursor.reset();
+			local.CloseCursor();
 			break;
 		}
 		try {
 			if (!local.cursor) {
+				// A blocked poll must be empty. Deliver the previous file's tail
+				// before requesting another decoder, rather than retaining a
+				// partially filled output while waiting for admission.
+				if (global.admission && row > 0) {
+					break;
+				}
 				if (local.next_file == local.end_file) {
 					auto task = global.next_task.fetch_add(1);
 					if (task >= bind.TaskCount()) {
@@ -288,6 +317,24 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 					auto range = bind.FileRange(task);
 					local.next_file = range.first;
 					local.end_file = range.second;
+				}
+				if (global.admission) {
+					if (!local.admission_request) {
+						local.admission_request = global.admission->Request(MediaResourceBudget(1, 0));
+					}
+					auto status = local.admission_request->PollOrArm(interrupt);
+					if (status == MediaAdmissionStatus::WAITING) {
+						return SourceResultType::BLOCKED;
+					}
+					if (status == MediaAdmissionStatus::CANCELLED) {
+						return SourceResultType::FINISHED;
+					}
+					if (status != MediaAdmissionStatus::GRANTED) {
+						throw InternalException("Native video decoder admission did not produce a grant");
+					}
+					local.decoder_lease = local.admission_request->TakeGrant();
+					local.admission_request.reset();
+					MediaInterrupt(context);
 				}
 				local.file_index = local.next_file++;
 				VideoFrameOptions options;
@@ -306,7 +353,7 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 				                                           VideoFrameOperation::FRAMES, index);
 			}
 			if (!local.cursor->Next()) {
-				local.cursor.reset();
+				local.CloseCursor();
 				continue;
 			}
 			auto frame_index = local.cursor->FrameIndex();
@@ -336,16 +383,23 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			row++;
 			if (limited) {
 				global.emitted++;
+				if (global.emitted >= p[10].GetValue<uint64_t>()) {
+					local.CloseCursor();
+				}
 			}
 		} catch (const MediaFormatException &) {
+			local.CloseCursor();
 			MediaInterrupt(context);
 			if (p[11].GetValue<string>() != "skip") {
 				throw;
 			}
-			local.cursor.reset();
+		} catch (...) {
+			local.CloseCursor();
+			throw;
 		}
 	}
 	output.SetCardinality(row);
+	return row > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 }
 
 static string EncodeFiles(const vector<Value> &files, const vector<Value> &indexes) {
@@ -484,7 +538,8 @@ void RegisterMediaVideo(ExtensionLoader &loader) {
 	                        LogicalType::DOUBLE, LogicalType::BOOLEAN, LogicalType::DOUBLE, LogicalType::BIGINT,
 	                        LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
 	                        LogicalType::VARCHAR, LogicalType::BIGINT},
-	                       ScanVideo, BindVideo, InitVideo, InitVideoLocal);
+	                       nullptr, BindVideo, InitVideo, InitVideoLocal);
+	function.poll_function = ScanVideo;
 	function.serialize = SerializeVideo;
 	function.deserialize = DeserializeVideo;
 	TableFunctionDistributedScanCallbacks callbacks;
