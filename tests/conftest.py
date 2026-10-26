@@ -251,6 +251,15 @@ def _alarm_handler(_signum, _frame):
 
 @pytest.fixture(autouse=True)
 def test_timeout():
+    if not hasattr(signal, "SIGALRM"):
+        # Windows has no SIGALRM. Preserve a hard deadline and traceback dump
+        # even when a native call prevents Python from handling an exception.
+        faulthandler.dump_traceback_later(TEST_TIMEOUT, exit=True)
+        try:
+            yield
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        return
     prev_handler = signal.getsignal(signal.SIGALRM)
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(TEST_TIMEOUT)

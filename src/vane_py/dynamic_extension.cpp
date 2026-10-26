@@ -237,7 +237,9 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 	}
 
 	GENERIC_MAPPING file_mapping {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
-	constexpr ACCESS_MASK replacement_rights = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
+	// DuckDB undefines the Windows DELETE macro to protect its SQL enum names.
+	constexpr ACCESS_MASK delete_access = 0x00010000L;
+	constexpr ACCESS_MASK replacement_rights = delete_access | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
 	for (ULONG index = 0; !replaceable && index < entry_count; index++) {
 		auto &entry = entries[index];
 		if ((entry.grfAccessMode != GRANT_ACCESS && entry.grfAccessMode != SET_ACCESS) ||

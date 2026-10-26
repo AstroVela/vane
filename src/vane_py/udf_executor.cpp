@@ -23,6 +23,7 @@
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/udf_executor.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -51,7 +52,6 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <unistd.h>
 
 namespace duckdb {
 
@@ -89,8 +89,8 @@ static void UDFDebugLog(const string &message) {
 	if (!UDFDebugEnabled()) {
 		return;
 	}
-	std::cerr << "[vane-udf-executor pid=" << getpid() << " tid=" << std::this_thread::get_id() << "] " << message
-	          << std::endl;
+	std::cerr << "[vane-udf-executor pid=" << distributed::ResolveVaneProcessId()
+	          << " tid=" << std::this_thread::get_id() << "] " << message << std::endl;
 }
 
 // Dispatcher-delivered callbacks can synchronously destroy a query and call
