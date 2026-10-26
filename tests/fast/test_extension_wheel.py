@@ -4214,6 +4214,91 @@ def test_clean_verifier_requires_the_base_wheel_complete_dependency_metadata(
         )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_message"),
+    [
+        (None, None),
+        ("dependency", "Requires-Dist must match project metadata exactly"),
+        ("extra", "Provides-Extra must match project metadata exactly"),
+        ("entry-point", "entry_points.txt must match project metadata exactly"),
+        ("record", "invalid RECORD entry for vane/py.typed"),
+        ("project-name", "base project metadata must describe 'vane-ai'"),
+        ("project-table", "base project metadata must contain a \\[project\\] table"),
+    ],
+)
+def test_clean_verifier_validates_base_metadata_against_its_matching_runtime(
+    tmp_path, monkeypatch, synthetic_descriptor_factory, mutation, expected_message
+):
+    project_metadata = tmp_path / "runtime-pyproject.toml"
+    project_metadata.write_text(
+        '[project]\nname = "vane-ai"\ndependencies = ["numpy"]\n'
+        '[project.optional-dependencies]\nruntime-extra = ["requests"]\n'
+        '[project.scripts]\nvane = "vane:main"\n',
+        encoding="utf-8",
+    )
+    base = _write_minimal_base_wheel(tmp_path)
+
+    def runtime_metadata(metadata):
+        lines = [line for line in metadata.splitlines() if not line.startswith(("Requires-Dist:", "Provides-Extra:"))]
+        lines += [
+            "Requires-Dist: numpy",
+            'Requires-Dist: requests; extra == "runtime-extra"',
+            "Provides-Extra: runtime-extra",
+        ]
+        if mutation == "dependency":
+            lines.remove("Requires-Dist: numpy")
+        elif mutation == "extra":
+            lines.remove("Provides-Extra: runtime-extra")
+        return "\n".join(lines) + "\n"
+
+    base = _rewrite_wheel_metadata(base, tmp_path / "runtime-base", runtime_metadata)
+    with zipfile.ZipFile(base) as wheel:
+        metadata_member = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+    entry_point = "other:main" if mutation == "entry-point" else "vane:main"
+    (tmp_path / "base-with-entry-points").mkdir()
+    base = _rewrite_wheel(
+        base,
+        tmp_path / "base-with-entry-points" / base.name,
+        extra_members={
+            metadata_member.removesuffix("METADATA") + "entry_points.txt": (
+                f"[console_scripts]\nvane = {entry_point}\n".encode()
+            )
+        },
+    )
+    if mutation == "record":
+        (tmp_path / "bad-record").mkdir()
+        base = _rewrite_wheel(
+            base,
+            tmp_path / "bad-record" / base.name,
+            transforms={"vane/py.typed": lambda _contents: b"changed\n"},
+            update_record=False,
+        )
+    elif mutation == "project-name":
+        project_metadata.write_text('[project]\nname = "other"\n', encoding="utf-8")
+    elif mutation == "project-table":
+        project_metadata.write_text('[tool.example]\nname = "vane-ai"\n', encoding="utf-8")
+
+    extension = _build_sample_wheel(tmp_path)
+    commands = []
+    monkeypatch.setattr(verify_extension_wheel_module, "_run", lambda command, **kwargs: commands.append(command))
+    arguments = dict(
+        base_wheel=base,
+        extension_wheel=extension.path,
+        extension_name="sample",
+        trust_identity=TEST_TRUST_IDENTITY,
+        base_project_metadata=project_metadata,
+    )
+    if expected_message is not None:
+        with pytest.raises(RuntimeError, match=expected_message):
+            verify_extension_wheel(**arguments)
+        assert commands == []
+    else:
+        with pytest.raises(RuntimeError, match="Requires-Dist must match project metadata exactly"):
+            verify_extension_wheel(**{**arguments, "base_project_metadata": None})
+        verify_extension_wheel(**arguments)
+        assert len(commands) == 4
+
+
 def test_clean_verifier_rejects_contents_that_do_not_match_record(tmp_path, synthetic_descriptor_factory):
     built = _build_sample_wheel(tmp_path)
     with zipfile.ZipFile(built.path) as wheel:

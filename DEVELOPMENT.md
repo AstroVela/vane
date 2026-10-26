@@ -380,6 +380,9 @@ python -I scripts/verify_extension_wheel.py \
 ```
 
 Supply the same dependency closure and signer allowlist to verification.
+When the packaging tools come from a different checkout than the base runtime,
+pass `--base-project-metadata <runtime-checkout>/pyproject.toml` so dependency,
+extra and entry-point metadata are checked against that runtime's declarations.
 `tpch` is an in-tree test artifact and must not be published as an extension
 wheel. Test fixtures may use `--test-only`; they must never be published.
 
