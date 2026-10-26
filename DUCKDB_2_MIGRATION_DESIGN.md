@@ -37,8 +37,9 @@ and its [release commit](https://github.com/duckdb/duckdb-python/commit/83c71996
 The tag and client tree have been verified. Its engine gitlink selects
 `d54cbbe3df17e8e5ce68312f483b4155836112aa`, exactly the imported engine
 revision. Keep that gitlink as upstream metadata without checking out a second
-engine. Do not substitute a moving branch or allow its build to select another
-engine revision.
+engine. A root `.gitmodules` mapping allows Git metadata operations to resolve
+the nested path while disabling default updates and recursive fetches. Do not
+substitute a moving branch or allow its build to select another engine revision.
 
 Changes committed after the frozen Vane reference, and uncommitted work in other
 worktrees, are separate migration inputs. Record their source revision and

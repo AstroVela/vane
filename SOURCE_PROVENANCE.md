@@ -84,9 +84,11 @@ The client's `external/duckdb` entry is a mode-160000 gitlink at
 `d54cbbe3df17e8e5ce68312f483b4155836112aa`, matching the engine baseline
 above. Its `.gitmodules` is unchanged, including the upstream `branch = main`
 setting; that setting does not change the recorded gitlink. The nested engine
-is not checked out and is not registered as a root submodule. Vane will build
-from its existing `external/duckdb` tree. Client import does not change that
-engine's SourceID or fork revision.
+is not checked out. A root `.gitmodules` entry maps its path and upstream URL
+for Git metadata operations, with default updates and recursive fetches
+disabled. This Vane-owned mapping does not modify either imported tree. Vane
+will build from its existing `external/duckdb` tree. Client import does not
+change that engine's SourceID or fork revision.
 
 The client retains `external/duckdb-python/LICENSE` (DuckDB MIT, copyright
 2018-2026) and `external/duckdb-python/duckdb/experimental/spark/LICENSE`

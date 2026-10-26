@@ -172,6 +172,11 @@ The pure client import commit is
 - The engine tree remains `c671df12df7e48e80306cb6a42d4761417c01695`; the
   client's gitlink selects its official commit
   `d54cbbe3df17e8e5ce68312f483b4155836112aa`. The nested engine is not checked out.
+- A root `.gitmodules` mapping lets Git resolve the nested gitlink during
+  checkout and cleanup without modifying the client snapshot. Default
+  submodule updates and recursive fetches are disabled; a disposable clone
+  verifies metadata traversal and that recursive initialization leaves the
+  nested engine empty.
 - The upstream MIT license and Spark Apache-2.0 notice are retained. No
   generated engine identity manifest is added to the repository.
 - Root build configuration and old bindings are unchanged. No client/Vane

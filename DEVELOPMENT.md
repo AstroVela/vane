@@ -430,12 +430,23 @@ integration patches will intentionally diverge from the import tree and must
 remain separate, reviewable commits.
 
 Keep the upstream `.gitmodules` and `external/duckdb` gitlink inside the client
-snapshot as provenance. The nested engine is not initialized and is not a
-registered root submodule. Do not run a recursive submodule initialization to
-build Vane. P2 must point the client's `DUCKDB_SOURCE_PATH` at the repository's
-absolute `external/duckdb` directory and adapt its packaging identity resolver
-to Vane's rules. The standalone client build instructions do not replace this
-repository's non-editable build workflow.
+snapshot as provenance. The root `.gitmodules` maps that gitlink so Git's
+submodule metadata commands and `actions/checkout` cleanup can resolve it.
+Its `update = none` and `fetchRecurseSubmodules = false` settings keep the
+nested engine out of default submodule updates and recursive fetches. Do not
+override them to populate a second engine for the Vane build. P2 must point
+the client's `DUCKDB_SOURCE_PATH` at the repository's absolute
+`external/duckdb` directory and adapt its packaging identity resolver to Vane's
+rules. The standalone client build instructions do not replace this
+repository's non-editable build workflow. To verify the metadata and default
+update behavior in a disposable clone, run:
+
+```bash
+git submodule status --recursive
+git submodule foreach --recursive 'git status --porcelain'
+git submodule update --init --recursive
+test ! -e external/duckdb-python/external/duckdb/CMakeLists.txt
+```
 
 Future client updates must select an immutable official revision, verify its
 engine dependency, and preserve the squashed subtree history. Record the new
