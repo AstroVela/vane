@@ -184,6 +184,8 @@ def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, 
     sdk = install_sdk(monkeypatch.setitem)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
+    # Keep the normal publication deadline: this checks allocation failures,
+    # and the client must reach the injected fault even on a busy CI runner.
     service = EmbeddingService(
         path=str(root / "engine.json"),
         service_id="fixture-v1",
@@ -192,7 +194,6 @@ def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, 
         dimensions=2,
         options={"gpus_per_actor": 0},
         max_inflight=1,
-        publication_timeout=0.2,
     )
 
     async def run():
@@ -201,9 +202,11 @@ def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, 
         instance.configure_execution(on_error="ignore", max_retries=3, validate=lambda v: v)
         instance._zmq_client = service_transport.Client(instance)
         sockets = []
+        faults = []
         original_socket = zmq.asyncio.Context.socket
 
         def fail(*args, **kwargs):
+            faults.append(phase)
             raise wrap(OSError(errno.ENOMEM, "private socket allocation"), "diagnostic")
 
         def socket(context, *args, **kwargs):
@@ -226,6 +229,7 @@ def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, 
                     instance._validate_vector = fail
                 with pytest.raises(MemoryError, match="resources"):
                     await instance.embed_text(["query"])
+            assert faults == [phase]
             assert not instance._zmq_client.sockets
             assert all(sock.closed for sock in sockets)
             await until(lambda: not service._tasks and service.credits.inflight == 0)

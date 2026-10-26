@@ -2541,6 +2541,29 @@ void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
 	ExecuteWithRunner(write_file->context->GetContext(), nullptr, write_file, {}, connection_owner, py::object());
 }
 
+static void CreateBatchParentDirectories(FileSystem &fs, const string &path) {
+#ifdef _WIN32
+	fs.CreateDirectoriesRecursive(path);
+#else
+	// Path::FromString treats backslashes as separators even on POSIX. Walk the
+	// original path instead, so directory creation uses the same literal names
+	// as COPY. Start at the leaf to respect restricted allowed_directories.
+	vector<string> directories;
+	auto directory = path;
+	while (!fs.DirectoryExists(directory)) {
+		directories.push_back(directory);
+		auto separator = directory.find_last_of('/');
+		if (separator == string::npos || separator == 0) {
+			break;
+		}
+		directory.resize(separator);
+	}
+	for (auto entry = directories.rbegin(); entry != directories.rend(); ++entry) {
+		fs.CreateDirectory(*entry);
+	}
+#endif
+}
+
 py::dict DuckDBPyRelation::WriteFileBatch(DuckDBPyConnection &connection, const string &filename, const string &format,
                                           const py::object &compression, const vector<string> &partition_by) {
 	auto execution_lock = connection.LockForQuery();
@@ -2626,7 +2649,7 @@ py::dict DuckDBPyRelation::WriteFileBatch(DuckDBPyConnection &connection, const 
 		py::gil_scoped_release release;
 		auto &fs = FileSystem::GetFileSystem(*context);
 		if (fs.HasDirectorySemantics(output)) {
-			fs.CreateDirectoriesRecursive(target.path);
+			CreateBatchParentDirectories(fs, target.path);
 		}
 	}
 	RunnerExecutionResult execution;
