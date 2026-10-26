@@ -3202,6 +3202,8 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         )
         assert [item[2] for item in events] == ["error"]
         assert "RuntimeError: planned remote failure" in events[0][3]
+        # Error delivery does not wait for the asynchronous cleanup RPCs.
+        _wait_until(lambda: not collector.slot_has_pending(10))
         assert driver.acquire_query_output_block_lease.calls == []
         assert holder["block_ref"].future_result_calls == []
         assert fake_ray.cancel_calls == []
@@ -3366,6 +3368,8 @@ def test_malformed_metadata_fails_only_its_stream_without_output_admission():
         assert len(events) == 1
         assert events[0][2] == "error"
         assert "invalid Ray UDF stream metadata" in events[0][3]
+        # Error delivery does not wait for the asynchronous cleanup RPCs.
+        _wait_until(lambda: not collector.slot_has_pending(5))
         assert driver.acquire_query_output_block_lease.calls == []
         assert len(driver.release_query_task_lease_after_completion.calls) == 1
         assert fake_ray.cancel_calls[-1][1] == {"force": True, "recursive": True}
