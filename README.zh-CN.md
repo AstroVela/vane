@@ -35,7 +35,7 @@
 
 Vane Data 是面向 AI 工作负载的高性能、多模态原生数据引擎。它基于 [DuckDB](https://duckdb.org) 的分支构建，在核心执行引擎中加入原生多模态处理能力，并提供统一的单机与分布式执行框架。
 
-![Vane Data 多模态原生数据引擎架构](https://vane.astrovela.ai/img/blog/ai-workloads-need-a-new-data-engine/vane-data-architecture-zh-cn.png)
+![Vane Data 多模态原生数据引擎架构](assets/vane-data-zh-cn.png)
 
 ### 核心特性
 

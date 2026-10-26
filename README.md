@@ -35,7 +35,7 @@
 
 Vane Data is a high-performance, multimodal-native data engine for AI workloads. Built on a fork of [DuckDB](https://duckdb.org), it extends the core execution engine with native multimodal processing and a unified framework for local and distributed execution.
 
-![Vane Data architecture](https://vane.astrovela.ai/img/blog/ai-workloads-need-a-new-data-engine/vane-data-architecture-en.png)
+![Vane Data architecture](assets/vane-data.png)
 
 ### Key Features
 
