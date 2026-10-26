@@ -7,7 +7,7 @@ The repository also contains substantial code derived from projects with compati
 | Area | Origin | License treatment |
 | --- | --- | --- |
 | Vane-specific code under `vane/` and distributed execution changes | Vane contributors | Apache-2.0 by default |
-| `external/duckdb/` | `duckdb/duckdb` plus Vane-maintained engine customizations | DuckDB MIT license plus the licenses retained in its vendored directories |
+| `external/duckdb/` | Unmodified official `duckdb/duckdb` v2.0.0 integration baseline | DuckDB MIT license plus the licenses retained in its vendored directories |
 | DuckDB-derived modules and stubs moved under `vane/`, plus `src/vane_py/` | Derived from DuckDB's Python client and subsequently modified for Vane | Original DuckDB portions remain MIT; Vane contributions are Apache-2.0 |
 | Tests and benchmarks derived from DuckDB or other named suites | Their named upstream source | License noted in the source directory or `THIRD_PARTY.md` |
 | `vane_packaging/_vendor/auditwheel/manylinux-policy.json` | `pypa/auditwheel` 6.8.1 at commit `94e0693e0fcb444c7fe50f09a8a635e791be6174` | Unmodified MIT-licensed policy data; license retained in `LICENSES/auditwheel-LICENSE.txt` |
@@ -18,19 +18,31 @@ New Vane source files use an `Apache-2.0` SPDX identifier. Parent-repository fil
 
 Existing third-party headers are preserved. Unchanged upstream source, vendored dependencies, and generated output are not mechanically relabeled. Run `python3 scripts/check_source_license_headers.py` from the repository root to validate the applicable files.
 
+## DuckDB engine baselines
+
 The DuckDB engine is imported under `external/duckdb` as a squashed Git subtree
 from `https://github.com/duckdb/duckdb.git`. Subtree metadata records the exact
 official upstream revision, while DuckDB's original history remains in its
 upstream repository rather than becoming an ancestor of Vane's main branch.
-The squashed subtree snapshot was imported from the official v1.5.0 tag at
+
+The `integration/duckdb-2.0` baseline imports the official v2.0.0 tag at commit
+`d54cbbe3df17e8e5ce68312f483b4155836112aa`. The complete `external/duckdb` tree
+matches the official Git tree `c671df12df7e48e80306cb6a42d4761417c01695`,
+including file modes and upstream license notices. No Vane engine changes are
+included in this initial snapshot. The preceding Vane implementation remains
+available at commit `95acdea830eb1fff407f0e09f4b97ee7b0a02e83`; its Python
+bindings and other root-level integration code have not yet been migrated.
+See [the integration stages](DEVELOPMENT.md#duckdb-20-integration-baseline).
+
+The previous squashed subtree snapshot was imported from the official v1.5.0 tag at
 commit `3a3967aa8190d0a2d1931d4ca4f5d920760030b4`. The reviewed maintenance
 history through the official v1.5.5 tag at commit
-`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa` is preserved as subsequent
-commits under `external/duckdb`.
+`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa` and Vane's customizations are
+preserved in the history preceding the 2.0 import.
 
-Vane's engine customizations are retained as normal commits after that subtree
-snapshot. They include binding supplied SQL parameters on query relations for
-distributed plan transport; those engine changes retain DuckDB's MIT license.
+Those historical engine customizations include binding supplied SQL parameters
+on query relations for distributed plan transport; those changes retain
+DuckDB's MIT license. They are migration inputs, not part of the pure 2.0 tree.
 The former `AstroVela/duckdb` history maps to Vane as follows:
 
 | Former fork commit | Parent | Corresponding Vane commit |
@@ -49,6 +61,12 @@ At Vane commit `74f8d91976c69d8861262944eb61f4b8a05abd42`, the
 DuckDB-rooted subtree history is described as `v1.5.0-2-g55abe0cb9e`. That
 description is retained only as historical provenance and is no longer used as
 the runtime version.
+
+## Vane engine identity contract
+
+The following describes the existing Vane build identity contract. Its native
+build hooks still need to be adapted and verified against the pure 2.0 engine;
+the source import alone does not validate runtime or extension compatibility.
 
 Vane records the reviewed official release line in
 `DUCKDB_UPSTREAM_VERSION`. The build combines that value with the first ten
@@ -92,11 +110,12 @@ document and `DUCKDB_UPSTREAM_VERSION`. Release reviews must record the full
 fork revision and tree ID and inspect subsequent Vane engine commits since the
 previously released state.
 
-The statically linked DuckDB HTTPFS extension is fetched separately during the
-native build and pinned to commit
-`827222fb45a043a7a852d1f7aae46901492a3cda` by
+The imported DuckDB HTTPFS source configuration pins commit
+`77392a72077a85897db2519fae11e2c0da972b8a` of
+`https://github.com/duckdb/duckdb-httpfs` in
 `external/duckdb/.github/config/extensions/httpfs.cmake`. It is covered by the
-DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`.
+DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`. Building and packaging
+that extension with Vane remains part of the subsequent integration stages.
 
 The imported DuckDB tree contains upstream benchmark generators with additional terms, including TPC-H, TPC-DS, and TPC-E material. They are not part of Vane release artifacts. The sdist allowlist and artifact checker enforce this boundary.
 

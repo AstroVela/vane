@@ -2,6 +2,34 @@
 
 Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build also links Arrow Flight, gRPC, and selected DuckDB extensions.
 
+## DuckDB 2.0 integration baseline
+
+The `integration/duckdb-2.0` branch starts with an unmodified official DuckDB
+v2.0.0 subtree. Its exact commit and source tree are recorded in
+[Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines).
+Vane commit `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` preserves the preceding
+1.5.5 engine customizations and Python bindings for subsequent migration.
+
+This is a source baseline, not a buildable or releasable Vane 2.0 integration.
+The existing root build, `src/vane_py`, Python APIs, optional extension packaging,
+and release checks still describe the preceding Vane implementation. The next
+stage will import a pinned official `duckdb/duckdb-python` 2.0 baseline, followed
+by separately reviewed migrations of Vane capabilities and their tests.
+
+Validate this initial engine import by comparing its Git tree identity with the
+official tree recorded in Source provenance. Preserve upstream bytes and file
+modes; do not run formatters over the imported snapshot. Native installation,
+runtime tests, and release qualification resume after the corresponding build
+and binding integration is restored. The workflows below document those
+existing contracts and are not evidence that this baseline passes them.
+
+The retained source-license header checker still references the old 1.5.0
+baseline. The copyleft inventory also reports changed upstream libpg_query,
+Mbed TLS and Zstandard files, plus the updated third-party inventory document.
+Review and adapt those release checks before producing artifacts; this import
+preserves all upstream notices and does not refresh reviewed hashes to suppress
+the findings.
+
 ## Prerequisites
 
 - Linux x86-64 for the complete build and test path

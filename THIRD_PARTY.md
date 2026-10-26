@@ -6,6 +6,13 @@ See [COPYLEFT.md](COPYLEFT.md) for the GPL-family inventory, selected dual-licen
 alternatives, generated-parser exception, Python media dependencies, and
 source/relink delivery checks. Original upstream notices remain intact.
 
+The `integration/duckdb-2.0` branch currently contains the unmodified official
+DuckDB v2.0.0 source baseline; its earlier Vane Python bindings remain in place.
+See [Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines) for the
+exact revision. The binary dependency profile, optional extensions, and release
+allowlists below must be requalified as those integrations are migrated; this
+source baseline is not a release artifact.
+
 ## Derived source
 
 | Component | Use in Vane | License | License text |
@@ -18,8 +25,9 @@ source/relink delivery checks. Original upstream notices remain intact.
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
-The query-relation parameter binding changes under `external/duckdb` remain MIT
-licensed. Connection runner dispatch, interruption, and result ownership changes in the
+The historical query-relation parameter binding changes under `external/duckdb`
+remain MIT licensed and are preserved before the pure 2.0 import. Connection
+runner dispatch, interruption, and result ownership changes in the
 inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
 
 ## Vendored native dependencies
