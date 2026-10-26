@@ -6,16 +6,18 @@ verified steps. Existing behavior and regression tests guide the migration;
 historical commits provide implementation context rather than a patch queue
 to replay wholesale.
 
-Status as of 2026-10-26: the engine import is complete on
-`integration/duckdb-2.0`. Python client import, native build integration, and
-Vane capability migration have not started. This branch is not yet a buildable
-or releasable Vane installation.
+Status as of 2026-10-26: the pure engine and official Python client imports
+are complete on `integration/duckdb-2.0`. Native build integration and Vane
+capability migration have not started. This branch is not yet a buildable or
+releasable Vane installation.
 
 This document owns the migration decisions, roadmap, and completion record.
 [Development](DEVELOPMENT.md) owns build and test commands;
 [Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines) owns source
 identities and attribution. Existing feature documents describe behavior to
 recover, not capabilities already available on this branch.
+The [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) maps old
+implementation paths, dependencies, and tests to the remaining stages.
 
 ## Source baselines
 
@@ -25,13 +27,18 @@ recover, not capabilities already available on this branch.
 | Official DuckDB v2.0.0 | `d54cbbe3df17e8e5ce68312f483b4155836112aa` | Imported engine baseline |
 | Official engine tree | `c671df12df7e48e80306cb6a42d4761417c01695` | Verified contents and file modes of the pristine subtree |
 | Vane engine import | `d1ca8da47e8eb9298b8ecfc8d47e547e07e06d20` | Import commit with an official squash snapshot parent |
-| Official duckdb-python v2.0.0 | `83c719961098611e769dc4bab0bda2bf149a2d1e` | Selected client target; source import and tree verification pending |
+| Official duckdb-python v2.0.0 | `83c719961098611e769dc4bab0bda2bf149a2d1e` | Imported client baseline |
+| Official client tree | `b2e1819b1bd881106f5b3af31a62bc61ff8110d3` | Verified contents, file modes, and engine gitlink of the pristine client |
+| Vane client import | `362db617be3ed09a9fcba9aaf23f37372a56f899` | Pure client import, separate from build adaptation |
 
 The Python target comes from the official
 [v2.0.0 release](https://github.com/duckdb/duckdb-python/releases/tag/v2.0.0)
 and its [release commit](https://github.com/duckdb/duckdb-python/commit/83c719961098611e769dc4bab0bda2bf149a2d1e).
-Verify that tag and its engine dependency when importing it. Do not substitute
-a moving branch or allow its build to select a second engine revision.
+The tag and client tree have been verified. Its engine gitlink selects
+`d54cbbe3df17e8e5ce68312f483b4155836112aa`, exactly the imported engine
+revision. Keep that gitlink as upstream metadata without checking out a second
+engine. Do not substitute a moving branch or allow its build to select another
+engine revision.
 
 Changes committed after the frozen Vane reference, and uncommitted work in other
 worktrees, are separate migration inputs. Record their source revision and
@@ -82,15 +89,17 @@ later scheduler stages. A native SQL smoke test does not qualify that runner.
 | Area | Intended responsibility |
 | --- | --- |
 | `external/duckdb` | Engine baseline and the smallest reviewed set of Vane engine changes |
-| Proposed `external/duckdb-python` | Auditable official client snapshot, with later integration patches recorded separately |
+| `external/duckdb-python` | Auditable official client snapshot, with later integration patches recorded separately |
 | `src/vane_py` | Vane-specific native adapters after the old inherited binding implementation is retired from the build |
 | `vane` | Public API, runner policy, Python sources and sinks, AI providers, and extension resolution |
 | Root CMake and packaging | Select one engine tree, build the private module, package the intended sources and licenses |
 | `tests` and engine tests | Preserve observable contracts and qualify each migration stage |
 
-The client directory is the proposed import location; P1 must verify the
-upstream layout before adopting it. Preserve a pure client import commit, then
-make module naming, build, and registration adaptations in separate commits.
+P1 adopted this client directory after verifying the upstream layout. Preserve
+the pure import commit, then make module naming, build, and registration
+adaptations in separate commits. P2 must direct client CMake to the sibling
+engine tree and adapt the upstream packaging backend's independent submodule
+and version assumptions to Vane's identity rules.
 Do not compile both the old inherited pybind11 client and the new nanobind
 client as competing implementations of Vane connections and relations.
 
@@ -163,7 +172,7 @@ Test storage compatibility explicitly for shared data and rollback. See the
 
 ## Roadmap and acceptance criteria
 
-Only P0 is complete. Each later stage depends on the preceding accepted stage
+P0 and P1 are complete. Each later stage depends on the preceding accepted stage
 and may contain several focused commits. Completion requires the listed
 behavior and recorded evidence, not just successful compilation. Estimate
 remaining effort after P2 and P4 expose the binding and execution changes.
@@ -171,8 +180,8 @@ remaining effort after P2 and P4 expose the binding and execution changes.
 | Stage | Status | Deliverable | Exit criteria |
 | --- | --- | --- | --- |
 | P0 Pure engine import | Complete | Official 2.0 subtree, source identities, historical Vane reference | Exact upstream tree match, correct subtree metadata, preserved old history |
-| P1 Official Python client import | Next | Pinned client snapshot, source provenance, capability migration inventory | Client files match the chosen upstream tree; engine selection and source layout are documented; no Vane behavior is claimed restored |
-| P2 Minimal native Vane installation | Planned | One engine and one client implementation packaged as Vane | Non-editable wheel installs; public import and explicit native SQL work; basic result and conversion tests, engine identities, coexistence, and source-license checks pass |
+| P1 Official Python client import | Complete | Pinned client snapshot, source provenance, capability migration inventory | Client files match the chosen upstream tree; engine selection and source layout are documented; no Vane behavior is claimed restored |
+| P2 Minimal native Vane installation | Next | One engine and one client implementation packaged as Vane | Non-editable wheel installs; public import and explicit native SQL work; basic result and conversion tests, engine identities, coexistence, and source-license checks pass |
 | P3 Local Vane data and UDF semantics | Planned | FILE and Tensor contracts, local sources and sinks, UDF adapters, runner dispatch boundary | Native-path correctness, ownership, readiness, bounded buffering, and cancellation regressions pass |
 | P4 Distributed read execution | Planned | Fragment planning, transport, worker preparation, exchange, and Ray reads | Multi-worker scans, projection/filter, joins, aggregates, ordered limits, and UDF reads match their declared semantics |
 | P5 Failure recovery and local runner | Planned | Retry, resource lifecycle, worker failure handling, and local FTE execution | Fault injection, early termination, cancellation, teardown, and resource reclamation tests pass without duplicate or missing results |
@@ -185,7 +194,9 @@ remaining effort after P2 and P4 expose the binding and execution changes.
 Import the selected official Python client as a source-only change. Record its
 full commit, tree identity, notices, and any upstream engine or submodule pins.
 Keep the already imported engine tree unchanged. Inventory the affected Python
-package modules, binding entrypoints, generated stubs, tests, and build inputs.
+package modules, binding entrypoints, hand-maintained type stubs, tests, and
+build inputs. The results are recorded in the
+[P1 inventory](DUCKDB_2_MIGRATION_INVENTORY.md).
 
 For each Vane capability, record its reference files or commits, dependency on
 other capabilities, planned stage, representative tests, and disposition:
@@ -277,6 +288,7 @@ are restored, and all required release, fast, native, and artifact checks at P8.
 | --- | --- |
 | Root build still selects pybind11, C++11, and removed custom extensions | Replace those build dependencies and assumptions in P2; inspect all consumers and test targets |
 | License header checker still uses the old 1.5.0 baseline | Make the baseline and subtree path handling match the new import; preserve upstream attribution |
+| Root formatting and license tools do not yet classify the new client subtree | Exclude untouched upstream files from Vane header/format rewrites and adapt source/artifact inventories in P2; preserve the exact import |
 | Copyleft inventory detects changes in libpg_query, Mbed TLS, Zstandard, and the inventory document | Review notices and source scope before updating the reviewed hashes in P2 |
 | SQL-text relations and streaming results change ownership assumptions | Settle API behavior before porting runner dispatch and result consumers |
 | Asynchronous I/O overlaps Vane readiness and backpressure | Test cancellation and wakeup races under resource pressure; avoid duplicate scheduling mechanisms |
@@ -303,7 +315,9 @@ commit only rolls back code.
 | Stage | Evidence |
 | --- | --- |
 | P0 | Import `d1ca8da47e8eb9298b8ecfc8d47e547e07e06d20`; provenance update `3b2ad50f089cc9f58da454df9a2eb770d619bcec`; official tree `c671df12df7e48e80306cb6a42d4761417c01695`; SourceID and subtree metadata verified; existing Git history preserved |
+| P1 | Import `362db617be3ed09a9fcba9aaf23f37372a56f899`; official client tree `b2e1819b1bd881106f5b3af31a62bc61ff8110d3`; matching engine gitlink verified; engine subtree unchanged; [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) records source layout, dependencies and tests; no runtime qualification claimed |
 
-The next implementation step is P1: import and verify the pinned official
-Python client, and create the capability inventory. Build restoration and
-Vane capability porting follow in their own stages.
+The next implementation step is P2: connect the new client and single engine
+to a minimal native Vane wheel, resolve the public API differences, and verify
+identity, isolation, result ownership and source/artifact checks. Vane-specific
+data types, UDFs and distributed behavior follow in their own stages.

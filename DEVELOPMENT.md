@@ -7,19 +7,21 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 The [DuckDB 2.0 integration design and roadmap](DUCKDB_2_MIGRATION_DESIGN.md)
 owns the migration stages, acceptance criteria, and completion record.
 
-The `integration/duckdb-2.0` branch starts with an unmodified official DuckDB
-v2.0.0 subtree. Its exact commit and source tree are recorded in
-[Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines).
+The `integration/duckdb-2.0` branch contains unmodified official DuckDB
+v2.0.0 and matching duckdb-python v2.0.0 subtrees. Their exact commits, source
+trees, and matching engine pin are recorded in
+[Source provenance](SOURCE_PROVENANCE.md#duckdb-python-client-baseline).
 Vane commit `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` preserves the preceding
 1.5.5 engine customizations and Python bindings for subsequent migration.
 
 This is a source baseline, not a buildable or releasable Vane 2.0 integration.
 The existing root build, `src/vane_py`, Python APIs, optional extension packaging,
-and release checks still describe the preceding Vane implementation. The next
-stage will import a pinned official `duckdb/duckdb-python` 2.0 baseline, followed
-by separately reviewed migrations of Vane capabilities and their tests.
+and release checks still describe the preceding Vane implementation. P0 and P1
+are complete; the [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) records
+the remaining work. P2 will connect the new client to the existing engine tree
+and produce a minimal native Vane wheel before migrating Vane capabilities.
 
-Validate this initial engine import by comparing its Git tree identity with the
+Validate each initial import by comparing its Git tree identity with the
 official tree recorded in Source provenance. Preserve upstream bytes and file
 modes; do not run formatters over the imported snapshot. Native installation,
 runtime tests, and release qualification resume after the corresponding build
@@ -31,7 +33,9 @@ baseline. The copyleft inventory also reports changed upstream libpg_query,
 Mbed TLS and Zstandard files, plus the updated third-party inventory document.
 Review and adapt those release checks before producing artifacts; this import
 preserves all upstream notices and does not refresh reviewed hashes to suppress
-the findings.
+the findings. Root formatting and source-license checks also need a vendor
+classification for `external/duckdb-python`; avoid formatting selections that
+include the pure client import until P2 adapts those tools.
 
 ## Prerequisites
 
@@ -403,6 +407,41 @@ official snapshot and Vane's subsequent commits. To reconnect the split branch
 to DuckDB's complete upstream history instead, fetch `duckdb/duckdb` first and
 omit `--ignore-joins`; Git uses the recorded `git-subtree-split` revision as the
 join point.
+
+## Maintaining the DuckDB Python subtree
+
+`external/duckdb-python` is a squashed snapshot of the official Python client.
+P1 imported v2.0.0 without changing upstream bytes or file modes. Verify the
+source baselines and the client's engine pin with read-only commands:
+
+```bash
+git rev-parse HEAD:external/duckdb
+git rev-parse HEAD:external/duckdb-python
+git ls-tree HEAD:external/duckdb-python/external duckdb
+git diff --exit-code -- external/duckdb external/duckdb-python
+git diff --cached --exit-code -- external/duckdb external/duckdb-python
+git ls-files --others --exclude-standard -- external/duckdb external/duckdb-python
+```
+
+Compare the first three results with
+[Source provenance](SOURCE_PROVENANCE.md#duckdb-python-client-baseline); the
+last three commands should show no changes for a pristine checkout. Later
+integration patches will intentionally diverge from the import tree and must
+remain separate, reviewable commits.
+
+Keep the upstream `.gitmodules` and `external/duckdb` gitlink inside the client
+snapshot as provenance. The nested engine is not initialized and is not a
+registered root submodule. Do not run a recursive submodule initialization to
+build Vane. P2 must point the client's `DUCKDB_SOURCE_PATH` at the repository's
+absolute `external/duckdb` directory and adapt its packaging identity resolver
+to Vane's rules. The standalone client build instructions do not replace this
+repository's non-editable build workflow.
+
+Future client updates must select an immutable official revision, verify its
+engine dependency, and preserve the squashed subtree history. Record the new
+upstream commit and tree in Source provenance, then review integration patches
+and package notices independently of the pure source update. Never use an
+unreviewed engine submodule update to change Vane's engine selection.
 
 ## Debugging Ray workers
 

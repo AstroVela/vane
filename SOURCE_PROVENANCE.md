@@ -8,6 +8,7 @@ The repository also contains substantial code derived from projects with compati
 | --- | --- | --- |
 | Vane-specific code under `vane/` and distributed execution changes | Vane contributors | Apache-2.0 by default |
 | `external/duckdb/` | Unmodified official `duckdb/duckdb` v2.0.0 integration baseline | DuckDB MIT license plus the licenses retained in its vendored directories |
+| `external/duckdb-python/` | Unmodified official `duckdb/duckdb-python` v2.0.0 client baseline | DuckDB MIT license; Spark compatibility code retains its Apache-2.0 notices |
 | DuckDB-derived modules and stubs moved under `vane/`, plus `src/vane_py/` | Derived from DuckDB's Python client and subsequently modified for Vane | Original DuckDB portions remain MIT; Vane contributions are Apache-2.0 |
 | Tests and benchmarks derived from DuckDB or other named suites | Their named upstream source | License noted in the source directory or `THIRD_PARTY.md` |
 | `vane_packaging/_vendor/auditwheel/manylinux-policy.json` | `pypa/auditwheel` 6.8.1 at commit `94e0693e0fcb444c7fe50f09a8a635e791be6174` | Unmodified MIT-licensed policy data; license retained in `LICENSES/auditwheel-LICENSE.txt` |
@@ -17,6 +18,10 @@ The repository also contains substantial code derived from projects with compati
 New Vane source files use an `Apache-2.0` SPDX identifier. Parent-repository files that combine inherited DuckDB or DuckDB Python client source with Vane modifications use `MIT AND Apache-2.0` and retain both copyright notices. New and modified source in `external/duckdb` remains under that repository's MIT license.
 
 Existing third-party headers are preserved. Unchanged upstream source, vendored dependencies, and generated output are not mechanically relabeled. Run `python3 scripts/check_source_license_headers.py` from the repository root to validate the applicable files.
+
+On the 2.0 integration branch, P2 must first adapt its engine baseline and
+classification of the new client subtree; see
+[current build status](DEVELOPMENT.md#duckdb-20-integration-baseline).
 
 ## DuckDB engine baselines
 
@@ -62,6 +67,39 @@ At Vane commit `74f8d91976c69d8861262944eb61f4b8a05abd42`, the
 DuckDB-rooted subtree history is described as `v1.5.0-2-g55abe0cb9e`. That
 description is retained only as historical provenance and is no longer used as
 the runtime version.
+
+## DuckDB Python client baseline
+
+The official `duckdb/duckdb-python` repository is imported under
+`external/duckdb-python` as a squashed Git subtree from
+`https://github.com/duckdb/duckdb-python.git`. The v2.0.0 tag resolves to
+`83c719961098611e769dc4bab0bda2bf149a2d1e`; its tree is
+`b2e1819b1bd881106f5b3af31a62bc61ff8110d3`. The Vane import commit
+`362db617be3ed09a9fcba9aaf23f37372a56f899` retains that exact tree, including
+file modes, notices, and the engine gitlink. Squash snapshot
+`5f5292f695286827847d95ac88d162402e21a76a` records the official revision in
+`git-subtree-split`.
+
+The client's `external/duckdb` entry is a mode-160000 gitlink at
+`d54cbbe3df17e8e5ce68312f483b4155836112aa`, matching the engine baseline
+above. Its `.gitmodules` is unchanged, including the upstream `branch = main`
+setting; that setting does not change the recorded gitlink. The nested engine
+is not checked out and is not registered as a root submodule. Vane will build
+from its existing `external/duckdb` tree. Client import does not change that
+engine's SourceID or fork revision.
+
+The client retains `external/duckdb-python/LICENSE` (DuckDB MIT, copyright
+2018-2026) and `external/duckdb-python/duckdb/experimental/spark/LICENSE`
+(Apache-2.0). The MIT license text matches `LICENSES/DuckDB-MIT.txt`.
+No Vane headers or formatting changes are applied to this snapshot.
+
+This is a source-only baseline. The old inherited bindings under `src/vane_py`
+and `vane` remain as migration references; the root build does not yet use the
+new client. P2 will adapt nanobind module names, public imports, engine selection,
+and the upstream backend's repository/submodule version assumptions. The
+[capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) records the layout and
+remaining work. Source and release artifact validators must account for this
+new subtree before any artifact is qualified.
 
 ## Vane engine identity contract
 
