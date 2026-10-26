@@ -40,6 +40,7 @@ RayTaskResult = require_ray_cxx_attr(
 )
 
 from vane.event_loop import set_event_loop
+from vane.execution.admission_ledger import BoundedReplayMap
 from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import (
     FteTaskAttemptId,
@@ -48,7 +49,6 @@ from vane.runners.fte import (
 )
 from vane.runners.fte.fte_failures import _normalize_failure_payload, _safe_failure_message
 from vane.runners.progress import ProgressRenderer, progress_enabled
-from vane.runners.ray.admission_ledger import BoundedReplayMap
 from vane.runners.ray.query_runtime_protocol import (
     RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
     query_runtime_actor_name,
@@ -468,6 +468,7 @@ class _PreparedQueryResourceRegistration:
     graph: Any
     node_capacities: tuple[Any, ...]
     capacity_snapshot_started_at: float
+    max_native_task_attempts: int = 4
 
 
 def _udf_actor_init_timeout_message(query_id: str, unit_id: str, pool: UDFActorPoolBase) -> str:
@@ -498,6 +499,15 @@ class _PlanLifecycle:
     _query_connection: Any | None = None
     _startup_future: ConcurrentFuture[Any] | None = field(default=None, repr=False)
     _startup_decision: ConcurrentFuture[bool] = field(default_factory=ConcurrentFuture, repr=False)
+    _vane_fs_plans: list[Any] = field(default_factory=list, repr=False)
+
+    def retain_vane_fs_plan(self, plan: Any) -> None:
+        if not callable(getattr(plan, "_release_vane_fs_query_pins", None)):
+            return
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            self._vane_fs_plans.append(plan)
 
     def _complete_startup_decision_locked(
         self,
@@ -693,6 +703,12 @@ class _PlanLifecycle:
                 raise RuntimeError(f"query plan {self.plan_id} closed before setup reached a terminal state")
             if not self._close_requested:
                 raise RuntimeError(f"query plan {self.plan_id} closed without a close request")
+            # Cached terminal exceptions can retain both plans through their
+            # tracebacks. Release pins only after owned execution has quiesced
+            # and the query connection has closed, including on cleanup retry.
+            for plan in self._vane_fs_plans:
+                plan._release_vane_fs_query_pins()
+            self._vane_fs_plans.clear()
             self._state = "closed"
             self._condition.notify_all()
 
@@ -2833,7 +2849,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _sum_node_capacity(node_capacities: tuple[Any, ...]) -> Any:
-        from vane.runners.ray.query_resource_graph import ResourceVector
+        from vane.execution.query_resource_spec import ResourceVector
 
         total = ResourceVector()
         for node in node_capacities:
@@ -2841,23 +2857,16 @@ class RayQueryDriverActor:
         return total
 
     def _create_query_resource_coordinator(self) -> Any:
-        from vane.runners.ray.cluster_resource_coordinator import (
+        from vane.execution.cluster_resource_policy import (
             ClusterQueryResourceCoordinator,
-            read_ray_node_capacities,
+            query_coordinator_timing,
         )
+        from vane.runners.ray.node_resource_capacity import read_ray_node_capacities
 
         object_store_fraction = float(os.environ.get("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5"))
         heap_reserve = int(os.environ.get("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE", "0"))
-        heartbeat_timeout = float(os.environ.get("VANE_QUERY_HEARTBEAT_TIMEOUT_S", "30"))
-        if heartbeat_timeout <= 0:
-            raise ValueError("VANE_QUERY_HEARTBEAT_TIMEOUT_S must be positive")
+        heartbeat_timeout, maintenance_interval = query_coordinator_timing(os.environ)
         self._query_resource_heartbeat_timeout_s = heartbeat_timeout
-        default_interval = min(5.0, heartbeat_timeout / 3.0)
-        maintenance_interval = float(os.environ.get("VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S", str(default_interval)))
-        if maintenance_interval <= 0 or maintenance_interval >= heartbeat_timeout:
-            raise ValueError(
-                "VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S must be positive and less than VANE_QUERY_HEARTBEAT_TIMEOUT_S"
-            )
         self._query_resource_maintenance_interval_s = maintenance_interval
         capacities = read_ray_node_capacities(
             ray,
@@ -2872,7 +2881,7 @@ class RayQueryDriverActor:
 
     def _synchronize_query_allocations(self) -> None:
         """Commit coordinator allocations into every local query manager."""
-        from vane.runners.ray.query_resource_graph import QueryAllocation
+        from vane.execution.query_resource_spec import QueryAllocation
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         snapshot = self._query_resource_coordinator.snapshot()
@@ -2910,7 +2919,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _read_query_node_capacities() -> tuple[Any, ...]:
-        from vane.runners.ray.cluster_resource_coordinator import read_ray_node_capacities
+        from vane.runners.ray.node_resource_capacity import read_ray_node_capacities
 
         return read_ray_node_capacities(
             ray,
@@ -2930,8 +2939,8 @@ class RayQueryDriverActor:
         transiently unavailable, the last complete Ray snapshot remains valid
         for this cycle while active query heartbeats and usage still advance.
         """
-        from vane.runners.ray.query_resource_graph import ResourceVector
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
+        from vane.execution.query_resource_spec import ResourceVector
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         timestamp = time.monotonic() if now is None else float(now)
@@ -3831,7 +3840,7 @@ class RayQueryDriverActor:
 
     def _fail_query_admission_requests(self, query_id: str) -> None:
         """Resolve every pending request before its query manager disappears."""
-        from vane.runners.ray.query_resource_manager import (
+        from vane.execution.query_resource_policy import (
             OutputBlockGrant,
             TaskGrant,
         )
@@ -3886,7 +3895,7 @@ class RayQueryDriverActor:
         loop.call_soon(self._run_query_task_admission_pump, query_key)
 
     def _run_query_task_admission_pump(self, query_id: str) -> None:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -4020,7 +4029,7 @@ class RayQueryDriverActor:
         loop.call_soon(self._run_query_output_admission_pump, query_key)
 
     def _run_query_output_admission_pump(self, query_id: str) -> None:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -4165,7 +4174,7 @@ class RayQueryDriverActor:
         *,
         allow_inactive_generation: bool = False,
     ) -> tuple[str, Any, dict[str, Any], bool]:
-        from vane.runners.ray.query_resource_manager import OutputBlockRequest
+        from vane.execution.query_resource_policy import OutputBlockRequest
 
         values = self._strict_lease_request(
             payload,
@@ -4212,7 +4221,7 @@ class RayQueryDriverActor:
         self,
         payload: dict[str, Any],
     ) -> tuple[str, Any, dict[str, Any], str]:
-        from vane.runners.ray.query_resource_manager import TaskRequest
+        from vane.execution.query_resource_policy import TaskRequest
 
         raw_values = dict(payload)
         generation_capability = str(raw_values.pop("query_generation_capability", "") or "").strip()
@@ -4238,7 +4247,7 @@ class RayQueryDriverActor:
 
     async def acquire_query_task_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one task lease through the query's serialized admission pump."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
@@ -4412,7 +4421,7 @@ class RayQueryDriverActor:
 
     def _mark_query_execution_quiesced(self, query_id: str) -> None:
         """Retire only task leases explicitly transferred to query teardown."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
 
         self._ensure_query_resource_admission_state()
         query_key = str(query_id)
@@ -4447,7 +4456,7 @@ class RayQueryDriverActor:
         attempt_id: str,
     ) -> dict[str, Any]:
         """Release one lease only after its submitted Ray call is terminal."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_key = str(request_id)
@@ -4636,7 +4645,7 @@ class RayQueryDriverActor:
         attempt_id: str,
     ) -> dict[str, Any]:
         """Transfer a cancelled task without a completion ref to query teardown."""
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
 
         self._ensure_query_resource_admission_state()
         request_key = str(request_id)
@@ -4732,7 +4741,7 @@ class RayQueryDriverActor:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_capability = self._parse_task_lease_request(payload)
@@ -4861,7 +4870,7 @@ class RayQueryDriverActor:
         lease_id: str,
         attempt_id: str,
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import TaskGrant
+        from vane.execution.query_resource_policy import TaskGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         self._ensure_query_resource_admission_state()
@@ -4953,7 +4962,7 @@ class RayQueryDriverActor:
 
     async def acquire_query_output_block_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve one produced block through the query's admission pump."""
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, _generation_is_active = self._parse_output_block_lease_request(payload)
@@ -5124,7 +5133,7 @@ class RayQueryDriverActor:
         lease_id: str,
         query_id: str = "",
     ) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         self._ensure_query_resource_admission_state()
@@ -5183,7 +5192,7 @@ class RayQueryDriverActor:
         return {"released": True}
 
     async def cancel_query_output_block_lease_request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from vane.runners.ray.query_resource_manager import OutputBlockGrant
+        from vane.execution.query_resource_policy import OutputBlockGrant
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         request_id, request, identity, generation_is_active = self._parse_output_block_lease_request(
@@ -5301,8 +5310,9 @@ class RayQueryDriverActor:
         from vane.runners.ray.query_resource_graph_builder import (
             build_query_resource_graph,
         )
+        from vane.runners.ray.resource_graph_adapter import RayResourceGraphAdapter
 
-        metadata = plan.collect_query_resource_graph_metadata(conn=query_connection)
+        metadata = RayResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=query_connection)
         graph = build_query_resource_graph(metadata)
         # The session preparation step already compared the logical and
         # physical IDs. Reuse that immutable identity after handing the plan to
@@ -5316,6 +5326,14 @@ class RayQueryDriverActor:
             graph=graph,
             node_capacities=tuple(capacities),
             capacity_snapshot_started_at=capacity_snapshot_started_at,
+            # A native fragment can replay its upstream UDFs. Respect an
+            # explicit no-retry contract at both the UDF and fragment layers.
+            max_native_task_attempts=1
+            if any(
+                node["udf_payload"] is not None and node["udf_payload"].get("max_task_retries") == 0
+                for node in metadata["nodes"]
+            )
+            else 4,
         )
 
     async def _register_query_resources(
@@ -5347,7 +5365,7 @@ class RayQueryDriverActor:
         self,
         prepared: _PreparedQueryResourceRegistration,
     ) -> tuple[Any, Any]:
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
         from vane.runners.ray.query_resource_runtime import (
             register_query_resource_graph,
             release_query_resource_manager,
@@ -5374,6 +5392,7 @@ class RayQueryDriverActor:
                     graph,
                     allocation,
                     admission_open=True,
+                    max_native_task_attempts=prepared.max_native_task_attempts,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
                     on_eligible_units_change=lambda eligible, fence_epoch: self._transition_query_execution_phase(
@@ -5514,7 +5533,7 @@ class RayQueryDriverActor:
     ) -> None:
         """Retire the old phase and recompute reservation for the new frontier."""
 
-        from vane.runners.ray.query_resource_graph_builder import build_query_demand
+        from vane.execution.query_resource_demand import build_query_demand
         from vane.runners.ray.query_resource_runtime import get_query_resource_manager
 
         query_key = str(query_id)
@@ -5555,7 +5574,7 @@ class RayQueryDriverActor:
                     eligible_unit_ids=eligible,
                 )
                 observed_usage = manager.snapshot()["soft_allocation_usage"]
-                from vane.runners.ray.query_resource_graph import ResourceVector
+                from vane.execution.query_resource_spec import ResourceVector
 
                 phase_allocation = self._query_resource_coordinator.refresh_query(
                     query_key,
@@ -7135,6 +7154,7 @@ class RayQueryDriverActor:
         lifecycle: _PlanLifecycle,
     ) -> tuple[Any, str, Any]:
         """Prepare a physical plan on an owned worker thread."""
+        lifecycle.retain_vane_fs_plan(plan)
         if os.environ.get("VANE_WORKER") == "1":
             raise RuntimeError(
                 "RayQueryDriverActor.run_plan() called inside a Worker Worker. "
@@ -7169,6 +7189,7 @@ class RayQueryDriverActor:
                 query_connection,
                 session.s3_config,
             )
+            lifecycle.retain_vane_fs_plan(physical_plan)
             physical_plan_id = str(physical_plan.idx())
             if physical_plan_id != plan_id:
                 raise RuntimeError(
@@ -8432,6 +8453,7 @@ class RayQueryDriverActor:
         lifecycle: _PlanLifecycle,
     ) -> tuple[Any, Any]:
         """Build a COPY plan on an owned thread without blocking actor control RPCs."""
+        lifecycle.retain_vane_fs_plan(logical_plan)
         with session.operation_lock:
             query_connection = session.connection.cursor()
             try:
@@ -8459,6 +8481,7 @@ class RayQueryDriverActor:
                 query_connection,
                 session.s3_config,
             )
+            lifecycle.retain_vane_fs_plan(plan)
             physical_plan_id = str(plan.idx())
             if physical_plan_id != plan_id:
                 raise RuntimeError(
@@ -8744,6 +8767,7 @@ class RayQueryDriverClient:
         self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_closes_in_progress: set[str] = set()
         self._session_condition = threading.Condition()
+        self._pending_vane_fs_copy_plans: dict[tuple[str, str, int], Any] = {}
         self._client_closing = False
         self._client_close_in_progress = False
         try:
@@ -8989,6 +9013,57 @@ class RayQueryDriverClient:
             f"detach={type(cleanup_error).__name__}: {cleanup_error}"
         ) from attach_error
 
+    def _release_pending_vane_fs_copy_plan(self, key: tuple[str, str, int]) -> None:
+        with self._session_condition:
+            plan = self._pending_vane_fs_copy_plans.pop(key, None)
+        if plan is not None:
+            plan._release_vane_fs_query_pins()
+
+    def _release_pending_vane_fs_copy_plans(self, session_id: str | None = None) -> None:
+        with self._session_condition:
+            keys = [key for key in self._pending_vane_fs_copy_plans if session_id is None or key[0] == session_id]
+        for key in keys:
+            self._release_pending_vane_fs_copy_plan(key)
+
+    def _retain_pending_vane_fs_copy_plan(
+        self, session_id: str, operation_id: str, plan: Any, original_ref: Any
+    ) -> None:
+        if not callable(getattr(plan, "_release_vane_fs_query_pins", None)):
+            return
+        key = (session_id, operation_id, id(plan))
+        with self._session_condition:
+            closed = self.runner is None or session_id in self._closed_session_ids
+            if not closed:
+                self._pending_vane_fs_copy_plans[key] = plan
+        if closed:
+            plan._release_vane_fs_query_pins()
+            return
+
+        def completed(future: ConcurrentFuture[Any]) -> None:
+            if future.cancelled():
+                return
+            try:
+                outcome = future.result()
+            except ray.exceptions.RayTaskError:
+                # The actor replied after _await_copy_operation settled its
+                # owned task. Transport errors do not provide this proof.
+                pass
+            except BaseException:
+                return
+            else:
+                try:
+                    self._validate_copy_outcome(outcome, operation_id)
+                except BaseException:
+                    return
+            self._release_pending_vane_fs_copy_plan(key)
+
+        try:
+            original_ref.future().add_done_callback(completed)
+        except BaseException:
+            # Keep ownership until session cleanup if no completion observer
+            # could be installed; never turn an uncertain write into a retry.
+            pass
+
     def _complete_session_close_locally(self, session_key: str) -> None:
         with self._session_condition:
             self._session_closes_in_progress.discard(session_key)
@@ -8997,6 +9072,7 @@ class RayQueryDriverClient:
             self._closed_session_ids[session_key] = True
             self._closing_session_ids.discard(session_key)
             self._session_condition.notify_all()
+        self._release_pending_vane_fs_copy_plans(session_key)
 
     def _complete_client_close_locally(self) -> None:
         with self._session_condition:
@@ -9008,6 +9084,7 @@ class RayQueryDriverClient:
             self._client_closing = False
             self._client_close_in_progress = False
             self._session_condition.notify_all()
+        self._release_pending_vane_fs_copy_plans()
         self._stop_client_heartbeat()
 
     def _ensure_session(self, plan: Any) -> tuple[str, dict[str, str], Any]:
@@ -9502,6 +9579,7 @@ class RayQueryDriverClient:
 
         _t0 = _time.time()
         reconciliation_timeout_s = _copy_reconciliation_timeout_s()
+        future = None
 
         try:
             session_id, _, runner = self._ensure_session(plan)
@@ -9585,6 +9663,8 @@ class RayQueryDriverClient:
                 None,
             )
             if unknown_outcome is not None:
+                if future is not None:
+                    self._retain_pending_vane_fs_copy_plan(session_id, plan_id, plan, future)
                 raise unknown_outcome
             cleanup_failure = next(
                 (

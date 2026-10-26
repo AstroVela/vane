@@ -1,0 +1,165 @@
+{
+  "status": "PASS",
+  "build_argv": [
+    "c++",
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG",
+    "-I/home/kaka/astrovela_vane-fs/vane_fs/include",
+    "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_edges/allocation_probe.cpp",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/build/python-release/libvane_fs.a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+    "-ldl",
+    "-pthread",
+    "-Wl,--wrap=pwrite",
+    "-Wl,--wrap=pwrite64",
+    "-o",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/baseline-allocation"
+  ],
+  "samples": [
+    {
+      "mode": "aligned",
+      "logical_bytes": 33554432,
+      "live_payload_lengths": [
+        [
+          8,
+          8192
+        ]
+      ],
+      "wal_write_bytes": 4964600,
+      "database_write_bytes": 0,
+      "payload_write_bytes": 33554432,
+      "other_write_bytes": 8192,
+      "content_verified": true
+    },
+    {
+      "mode": "split",
+      "logical_bytes": 33554432,
+      "live_payload_lengths": [
+        [
+          8,
+          1020
+        ],
+        [
+          4096,
+          7172
+        ]
+      ],
+      "wal_write_bytes": 38373680,
+      "database_write_bytes": 33112064,
+      "payload_write_bytes": 4194304,
+      "other_write_bytes": 16400,
+      "content_verified": true
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-allocation-soivspg7",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "397e115a98e5bd91aa4b21dfa0751dd9053bfd8b19aea9776692941de17a6222"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ba3645fe8884f3d19cbfad6605d795b8c0120e6fb55f1e423156b3646ba069c9"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite-wal",
+          "bytes": 5158272,
+          "sha256": "5a56c2ab8c4544bc1b1faba5aaec1512657591d9f9db60a9fc57d3f9d6740167"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "4a1c0fc773ea919fe1d82acbdb67988fe1c14375f5d47948a3482e20f176005c"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-soivspg7/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-allocation-v6m5v3mn",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "c70889a12bc73c55fcc7337e0522cf5c0a67c6e937209d5478e6597b3a5b3de6"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite-shm",
+          "bytes": 98304,
+          "sha256": "e2c2b5d4ecec36c8ea1f40380275492884ab3eccb48b530cf8e40f63cbcdd987"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite-wal",
+          "bytes": 38567352,
+          "sha256": "17aeac5dfae1320482e10af0e86063ecee5f539c9da8bda28807a99ea406d4b5"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.payload",
+          "bytes": 4198400,
+          "sha256": "ba5d56ce9b8f078a7f463d0653cfd3cc917cb3cc1cc2f08666adcc70aa4696ea"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite",
+          "bytes": 33013760,
+          "sha256": "2272a6cb319a6bd2425ab7c07bd27ca0601bbb8d6663a21b6aa53c8a32fdbeaa"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-allocation-v6m5v3mn/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    }
+  ],
+  "binary_sha256": "d9a7ea8d2c58b7105d135910d65b5b3548be4dcbfaf5c523b2e6e3eefb40e8ba",
+  "baseline_workspace_sha256": "df06abb94bdecbcce00684e54dac00d41d415d43e164a64ce5505eecbf07d285",
+  "timing_interpretation": "Counts only; native API reproduces already traced 8 MiB/FUSE buffer-offset-48 request sizes.",
+  "started_epoch": 1791707513.6079326,
+  "ended_epoch": 1791707515.5895157
+}

@@ -1,0 +1,98 @@
+{
+  "status": "PASS",
+  "started_epoch": 1791698109.1957963,
+  "runs": [
+    {
+      "label": "baseline-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791698109.1958473,
+      "ended_epoch": 1791698118.5361812
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791698118.5369737,
+      "ended_epoch": 1791698127.7761042
+    },
+    {
+      "label": "module-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791698127.7770128,
+      "ended_epoch": 1791698127.8416095
+    },
+    {
+      "label": "updated-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/owned-updated-python",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests"
+      ],
+      "returncode": 1,
+      "expected": 0,
+      "started_epoch": 1791698127.8423696,
+      "ended_epoch": 1791698127.875198,
+      "setup_failure": "pytest module was absent; no test collected",
+      "superseded_by": "updated-python-environment-retry"
+    },
+    {
+      "label": "updated-python-environment-retry",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/owned-updated-python-retry",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791698370.8966348,
+      "ended_epoch": 1791698462.5403678
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/owned-updated-python-retry",
+      "removed": true,
+      "mounts_absent": true
+    }
+  ],
+  "error": "AssertionError(('updated-python', 1))",
+  "ended_epoch": 1791698127.8758993
+}

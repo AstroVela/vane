@@ -1,0 +1,16 @@
+check yaml...........................................(no files to check)Skipped
+check toml...........................................(no files to check)Skipped
+check for added large files..............................................Passed
+detect private key.......................................................Passed
+check for merge conflicts................................................Passed
+forbid new submodules................................(no files to check)Skipped
+ruff check...........................................(no files to check)Skipped
+ruff format.............................................................Skipped
+clang-format............................................................Skipped
+cmake-format............................................................Skipped
+Validate Dependabot Config (v2)......................(no files to check)Skipped
+Validate GitHub issue config.........................(no files to check)Skipped
+Validate GitHub issue forms..........................(no files to check)Skipped
+Validate GitHub Workflows............................(no files to check)Skipped
+mypy.................................................(no files to check)Skipped
+shfmt...................................................................Skipped

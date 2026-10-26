@@ -7,7 +7,6 @@
 
 #include <pybind11/pybind11.h>
 #include <Python.h>
-#include <array>
 #include <condition_variable>
 #include <mutex>
 #include <memory>
@@ -56,13 +55,7 @@ static void VaneRunnerClosePyObject(py::object &obj) {
 }
 
 // ------------------ Runner wrappers ------------------ //
-class RunnerBase {
-public:
-	virtual ~RunnerBase() = default;
-	virtual py::object to_pyobj() const = 0;
-};
-
-class RayRunner : public RunnerBase {
+class RayRunner {
 public:
 	static constexpr const char *NAME = "ray";
 	explicit RayRunner(py::object pyobj_) : pyobj(pyobj_) {
@@ -85,126 +78,31 @@ public:
 		return std::unique_ptr<RayRunner>(new RayRunner(instance));
 	}
 
-	py::object to_pyobj() const override {
+	py::object to_pyobj() const {
 		return pyobj;
 	}
 
 private:
 	py::object pyobj;
-};
-
-class LocalRunner : public RunnerBase {
-public:
-	static constexpr const char *NAME = "local";
-	explicit LocalRunner(py::object pyobj_) : pyobj(pyobj_) {
-	}
-
-	~LocalRunner() {
-		VaneRunnerReleasePyObject(pyobj);
-	}
-
-	static std::unique_ptr<LocalRunner> try_new() {
-		duckdb::PythonGILWrapper gil;
-		py::module_ mod = py::module_::import("vane.runners.local.runner");
-		py::object LocalRunnerClass = mod.attr("LocalRunner");
-		py::object instance = LocalRunnerClass();
-		return std::unique_ptr<LocalRunner>(new LocalRunner(instance));
-	}
-
-	static std::unique_ptr<LocalRunner> try_new(py::object num_workers, py::object max_running_tasks,
-	                                            py::object execution_mode) {
-		duckdb::PythonGILWrapper gil;
-		py::module_ mod = py::module_::import("vane.runners.local.runner");
-		py::object LocalRunnerClass = mod.attr("LocalRunner");
-		py::dict kwargs;
-		if (!num_workers.is_none()) {
-			kwargs["num_workers"] = num_workers;
-		}
-		if (!max_running_tasks.is_none()) {
-			kwargs["max_running_tasks"] = max_running_tasks;
-		}
-		if (!execution_mode.is_none()) {
-			kwargs["execution_mode"] = execution_mode;
-		}
-		py::object instance = LocalRunnerClass(**kwargs);
-		return std::unique_ptr<LocalRunner>(new LocalRunner(instance));
-	}
-
-	py::object to_pyobj() const override {
-		return pyobj;
-	}
-
-private:
-	py::object pyobj;
-};
-
-// Variant wrapper
-class Runner {
-public:
-	enum class Type { Ray, Local };
-
-	explicit Runner(std::unique_ptr<RayRunner> r) : type(Type::Ray), ray(std::move(r)) {
-	}
-	explicit Runner(std::unique_ptr<LocalRunner> l) : type(Type::Local), local(std::move(l)) {
-	}
-
-	Type get_type() const {
-		return type;
-	}
-
-	// call run_iter_tables on the underlying Python runner object
-	// lp_builder is expected to be a Python LogicalPlanBuilder-compatible object
-	py::iterator run_iter_tables(py::object py_builder) const {
-		duckdb::PythonGILWrapper gil;
-		py::object runner_obj = get_pyobj();
-		py::object result = runner_obj.attr("run_iter_tables")(py_builder);
-		return py::iterator(result);
-	}
-
-	py::object get_pyobj() const {
-		duckdb::PythonGILWrapper gil;
-		if (type == Type::Ray) {
-			return ray->to_pyobj();
-		}
-		return local->to_pyobj();
-	}
-
-private:
-	Type type;
-	std::unique_ptr<RayRunner> ray;
-	std::unique_ptr<LocalRunner> local;
 };
 
 // ---------------- RunnerConfig ---------------- //
 struct RunnerConfig {
-	enum class Which { Local, Ray } which;
 	// Ray config
 	std::pair<bool, std::string> address;
 	std::pair<bool, size_t> max_task_backlog;
 
-	RunnerConfig()
-	    : which(Which::Local), address(std::make_pair(false, std::string())),
-	      max_task_backlog(std::make_pair(false, size_t(0))) {
+	RunnerConfig() : address(std::make_pair(false, std::string())), max_task_backlog(std::make_pair(false, size_t(0))) {
 	}
 
 	static RunnerConfig RayCfg(std::pair<bool, std::string> addr, std::pair<bool, size_t> backlog) {
 		RunnerConfig rc;
-		rc.which = Which::Ray;
 		rc.address = std::move(addr);
 		rc.max_task_backlog = backlog;
 		return rc;
 	}
-	static RunnerConfig LocalCfg() {
-		RunnerConfig rc;
-		rc.which = Which::Local;
-		return rc;
-	}
-
-	std::unique_ptr<Runner> create_runner() const {
-		if (which == Which::Local) {
-			return std::unique_ptr<Runner>(new Runner(LocalRunner::try_new()));
-		}
-		return std::unique_ptr<Runner>(new Runner(RayRunner::try_new(address, max_task_backlog)));
+	std::unique_ptr<RayRunner> create_runner() const {
+		return RayRunner::try_new(address, max_task_backlog);
 	}
 };
 
@@ -236,13 +134,9 @@ static RunnerConfig get_ray_runner_config_from_env() {
 
 static RunnerConfig get_runner_config_from_env_or_default() {
 	auto rt = duckdb::ResolveRunnerTypeFromEnvironment();
-	if (rt == "local-fast") {
-		throw std::runtime_error(
-		    "The configured internal direct execution mode does not create a runner. "
-		    "Use relation APIs directly, set VANE_RUNNER=local for the local runner, or leave it empty for Ray.");
+	if (rt == "local") {
+		throw std::runtime_error("Local execution does not create a runner. Use connection or relation APIs directly.");
 	}
-	if (rt == LocalRunner::NAME)
-		return RunnerConfig::LocalCfg();
 	if (rt == RayRunner::NAME)
 		return get_ray_runner_config_from_env();
 	throw duckdb::InternalException("normalized runner type '%s' has no runner implementation", rt);
@@ -252,32 +146,23 @@ static RunnerConfig get_runner_config_from_env_or_default() {
 enum class VaneRunnerState { UNINITIALIZED, INITIALIZING, INITIALIZED };
 
 struct RunnerSlot {
-	std::shared_ptr<Runner> runner;
+	std::shared_ptr<RayRunner> runner;
 	VaneRunnerState state = VaneRunnerState::UNINITIALIZED;
 	std::thread::id initializer_thread;
 };
 
-static std::array<RunnerSlot, 2> VANE_RUNNERS;
+static RunnerSlot VANE_RUNNER_SLOT;
 static std::mutex VANE_RUNNER_MUTEX;
 static std::condition_variable VANE_RUNNER_CONDITION;
 
-static RunnerSlot &runner_slot(Runner::Type type) {
-	return VANE_RUNNERS[type == Runner::Type::Ray ? 0 : 1];
-}
-
-// Called with the registry mutex held. Do not let a Python factory wait on
-// another initialization while it owns one itself (including across types).
+// Called with the registry mutex held.
 static bool current_thread_initializes_runner() {
-	for (const auto &slot : VANE_RUNNERS) {
-		if (slot.state == VaneRunnerState::INITIALIZING && slot.initializer_thread == std::this_thread::get_id()) {
-			return true;
-		}
-	}
-	return false;
+	return VANE_RUNNER_SLOT.state == VaneRunnerState::INITIALIZING &&
+	       VANE_RUNNER_SLOT.initializer_thread == std::this_thread::get_id();
 }
 
 struct RunnerInitializationResult {
-	std::shared_ptr<Runner> runner;
+	std::shared_ptr<RayRunner> runner;
 	bool created;
 };
 
@@ -292,8 +177,8 @@ static void wait_for_runner_initialization(RunnerSlot &slot) {
 }
 
 template <class FACTORY>
-static RunnerInitializationResult initialize_runner(Runner::Type type, FACTORY &&factory) {
-	auto &slot = runner_slot(type);
+static RunnerInitializationResult initialize_runner(FACTORY &&factory) {
+	auto &slot = VANE_RUNNER_SLOT;
 	for (;;) {
 		bool should_initialize = false;
 		{
@@ -338,91 +223,64 @@ static RunnerInitializationResult initialize_runner(Runner::Type type, FACTORY &
 	}
 }
 
-// Initialize once per type, preserving any explicitly configured instance.
-static std::shared_ptr<Runner> get_or_create_runner_cpp() {
+// Initialize the Ray runner once, preserving any explicitly configured instance.
+static std::shared_ptr<RayRunner> get_or_create_runner_cpp() {
 	RunnerConfig cfg = get_runner_config_from_env_or_default();
-	auto type = cfg.which == RunnerConfig::Which::Ray ? Runner::Type::Ray : Runner::Type::Local;
-	auto result = initialize_runner(type, [&] { return std::shared_ptr<Runner>(cfg.create_runner()); });
+	auto result = initialize_runner([&] { return std::shared_ptr<RayRunner>(cfg.create_runner()); });
 	return std::move(result.runner);
 }
 
-// Configure Ray independently of the local FTE runner.
+// Configure the shared Ray runner.
 static py::object set_runner_ray_py(py::object address_py = py::none(), bool noop_if_initialized = false,
                                     std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0))) {
-	auto result = initialize_runner(Runner::Type::Ray, [&] {
+	auto result = initialize_runner([&] {
 		std::pair<bool, std::string> address = std::make_pair(false, std::string());
 		if (!address_py.is_none()) {
 			address = std::make_pair(true, address_py.cast<std::string>());
 		}
 		auto runner = RayRunner::try_new(address, max_task_backlog);
-		return std::make_shared<Runner>(std::move(runner));
+		return std::shared_ptr<RayRunner>(std::move(runner));
 	});
 	if (!result.created && !noop_if_initialized) {
 		throw std::runtime_error("Cannot set Ray runner more than once");
 	}
-	return result.runner->get_pyobj();
+	return result.runner->to_pyobj();
 }
 
-static py::object set_runner_local_py(py::object num_workers = py::none(), py::object max_running_tasks = py::none(),
-                                      py::object execution_mode = py::none()) {
-	auto result = initialize_runner(Runner::Type::Local, [&] {
-		auto runner = LocalRunner::try_new(num_workers, max_running_tasks, execution_mode);
-		return std::make_shared<Runner>(std::move(runner));
-	});
-	return result.runner->get_pyobj();
-}
-
-// Close both initialized types, including when the current environment changed.
+// Close the Ray runner, including when the current environment selects local.
 static void teardown_runner_cpp() {
-	std::array<std::shared_ptr<Runner>, 2> runners;
+	std::shared_ptr<RayRunner> runner;
 	for (;;) {
-		RunnerSlot *pending = nullptr;
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
 			if (current_thread_initializes_runner()) {
 				throw std::runtime_error("Cannot tear down a runner while initializing it");
 			}
-			for (auto &slot : VANE_RUNNERS) {
-				if (slot.state == VaneRunnerState::INITIALIZING) {
-					pending = &slot;
-					break;
-				}
-			}
-			if (!pending) {
-				for (size_t i = 0; i < VANE_RUNNERS.size(); i++) {
-					runners[i] = std::move(VANE_RUNNERS[i].runner);
-					VANE_RUNNERS[i].state = VaneRunnerState::UNINITIALIZED;
-				}
+			if (VANE_RUNNER_SLOT.state != VaneRunnerState::INITIALIZING) {
+				runner = std::move(VANE_RUNNER_SLOT.runner);
+				VANE_RUNNER_SLOT.state = VaneRunnerState::UNINITIALIZED;
 				break;
 			}
 		}
-		wait_for_runner_initialization(*pending);
+		wait_for_runner_initialization(VANE_RUNNER_SLOT);
 	}
-	for (auto &runner : runners) {
-		if (!runner) {
-			continue;
-		}
-		try {
-			duckdb::PythonGILWrapper gil;
-			py::object runner_obj = runner->get_pyobj();
-			VaneRunnerClosePyObject(runner_obj);
-		} catch (const py::error_already_set &) {
-			PyErr_Clear();
-		} catch (...) {
-		}
+	if (runner) {
+		duckdb::PythonGILWrapper gil;
+		py::object runner_obj = runner->to_pyobj();
+		VaneRunnerClosePyObject(runner_obj);
 	}
 }
 
 // Global convenience functions use the current configuration; connection
-// dispatch calls the explicit per-type factories above instead.
+// dispatch initializes Ray independently of that configuration.
 static py::object get_runner_py() {
 	auto type = duckdb::ResolveRunnerTypeFromEnvironment();
-	if (type == "local-fast") {
+	if (type == "local") {
 		return py::none();
 	}
-	auto &slot = runner_slot(type == RayRunner::NAME ? Runner::Type::Ray : Runner::Type::Local);
+	auto &slot = VANE_RUNNER_SLOT;
 	for (;;) {
-		std::shared_ptr<Runner> runner;
+		std::shared_ptr<RayRunner> runner;
 		bool uninitialized = false;
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
@@ -440,7 +298,7 @@ static py::object get_runner_py() {
 			return py::none();
 		}
 		if (runner) {
-			return runner->get_pyobj();
+			return runner->to_pyobj();
 		}
 		wait_for_runner_initialization(slot);
 	}
@@ -448,7 +306,7 @@ static py::object get_runner_py() {
 
 static py::object get_or_create_runner_py() {
 	auto r = get_or_create_runner_cpp();
-	return r->get_pyobj();
+	return r->to_pyobj();
 }
 
 static py::object get_or_infer_runner_type_py() {
@@ -483,14 +341,6 @@ void register_vane_runners(py::module_ &m) {
 	    },
 	    py::arg("address") = py::none(), py::arg("noop_if_initialized") = false,
 	    py::arg("max_task_backlog") = py::none());
-
-	m.def(
-	    "set_runner_local",
-	    [](py::object num_workers, py::object max_running_tasks, py::object execution_mode) -> py::object {
-		    return set_runner_local_py(num_workers, max_running_tasks, execution_mode);
-	    },
-	    py::arg("num_workers") = py::none(), py::arg("max_running_tasks") = py::none(),
-	    py::arg("execution_mode") = py::none());
 
 	// Expose teardown helper and register it with atexit so teardown runs
 	// while Python is still fully initialized (avoids destructor races).

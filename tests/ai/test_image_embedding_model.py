@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import vane
-from vane.ai import embed, embed_image
+from vane.ai import ImageInput, embed
 from vane.execution.udf_file_contract import FileUDFContract
 
 
@@ -28,7 +28,12 @@ def test_clip_text_and_images_share_a_vector_space():
     with vane.connect() as conn:
         source = conn.from_arrow(pa.table({"id": [0, 1], "image": images}))
         vectors = (
-            source.select(vane.col("id"), embed_image(vane.col("image"), model=model, normalize=True).alias("vector"))
+            source.select(
+                vane.col("id"),
+                embed(ImageInput(vane.col("image")), model=model, normalize=True, provider="transformers").alias(
+                    "vector"
+                ),
+            )
             .order("id")
             .fetchall()
         )

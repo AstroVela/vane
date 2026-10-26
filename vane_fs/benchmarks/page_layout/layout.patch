@@ -1,0 +1,43 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -29 +29,7 @@
+-constexpr int WAL_CHECKPOINT_PAGES = 4096;
++// Isolated page-layout experiment: override only the initial SQLite page size.
++#ifndef VANE_FS_PAGE_BYTES
++#define VANE_FS_PAGE_BYTES 4096
++#endif
++static_assert(VANE_FS_PAGE_BYTES == 4096 || VANE_FS_PAGE_BYTES == 8192 || VANE_FS_PAGE_BYTES == 16384 ||
++              VANE_FS_PAGE_BYTES == 32768);
++constexpr int64_t CACHE_BYTES = 2 * 1024 * 1024;
+@@ -768,0 +775,9 @@
++			bool empty;
++			{
++				Statement pages(db, "PRAGMA page_count");
++				pages.Step();
++				empty = pages.Integer(0) == 0;
++			}
++			// Existing databases keep their recorded page size; never VACUUM here.
++			if (empty)
++				Exec(db, "PRAGMA page_size=" + std::to_string(VANE_FS_PAGE_BYTES));
+@@ -769,0 +785 @@
++			Exec(db, "PRAGMA cache_size=-" + std::to_string(CACHE_BYTES / 1024));
+@@ -776,3 +792,8 @@
+-			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
+-			// Strict mode also synchronizes every WAL commit before returning.
+-			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
++			// Compare the same WAL byte budget, including frame headers, at every page size.
++			{
++				Statement pages(db, "PRAGMA page_size");
++				pages.Step();
++				auto frame_bytes = pages.Integer(0) + 24;
++				auto frames = (Checkpointer::START_BYTES - 32 + frame_bytes - 1) / frame_bytes;
++				Check(db, sqlite3_wal_autocheckpoint(db, int(frames)));
++			}
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -33,2 +33,3 @@
+-			Check(sqlite3_exec(db, "PRAGMA synchronous=NORMAL; SELECT count(*) FROM sqlite_master", nullptr, nullptr,
+-			                   nullptr));
++			Check(sqlite3_exec(db,
++			                   "PRAGMA synchronous=NORMAL; PRAGMA cache_size=-2048; SELECT count(*) FROM sqlite_master",
++			                   nullptr, nullptr, nullptr));

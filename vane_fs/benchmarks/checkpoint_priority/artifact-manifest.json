@@ -1,0 +1,1712 @@
+{
+  "artifact_root": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z",
+  "artifact_count": 341,
+  "artifacts": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/.cache/fuse-sdk/root/usr/lib/x86_64-linux-gnu/libfuse3.so",
+      "bytes": 256184,
+      "sha256": "f1e75247f42d414df611ee554c8399bfe74565f89eed7c4501e2d97c48f21eab"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/analyze.py",
+      "bytes": 8017,
+      "sha256": "97eff738b14acf891acdc47cd9841a190ef1bd2bf39ce76396614ab61f624985"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/plan.json",
+      "bytes": 2521,
+      "sha256": "3fabf9e2d526eada8b854fa88c3b5da07f777c8fda50035b91810bd427a6597c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/prepare.py",
+      "bytes": 10015,
+      "sha256": "94a203b571395af44872a8d6bcb00cc9c8868911cd9db7c4d07065ba24f88a6d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/priority.patch",
+      "bytes": 1942,
+      "sha256": "4af313eb54b34c4d6224a5fed6262509071b7d2b33c17cfb9c920ff83c123808"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/run.py",
+      "bytes": 5235,
+      "sha256": "8c9001f72ac97484c0d65dcc58ceb762fdc709128b2a4d76ae65b063af2efdb0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/test_priority.cpp",
+      "bytes": 5076,
+      "sha256": "c48eedee67b8fc7436b5b2920da6b7ff03ad5e34a197fb4d9ecab630a752613c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/io_interference/monitor.py",
+      "bytes": 1467,
+      "sha256": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/native_probe.cpp",
+      "bytes": 3126,
+      "sha256": "020f392d95837cd3191a5f24fa941f643a6a4045ad1362dcfe07c4af02524e65"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/run_controls.py",
+      "bytes": 3271,
+      "sha256": "67bf66909152d36d4e0be7cfaaa2fab3bfcb5626538fc28c0694ea687c320cf8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/run_fuse.py",
+      "bytes": 8776,
+      "sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/validate.py",
+      "bytes": 2795,
+      "sha256": "7aa0931df3d4bfaca8df2e41c834ac38ac38ff4cb397e371f904629e5108314d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/workload.py",
+      "bytes": 21620,
+      "sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/alignment_probe.cpp",
+      "bytes": 11684,
+      "sha256": "ee30e3537925ca342fdf2a58125bf70f5fcc50d1ef9b5ecf6f797ba8a46d2800"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/block_sync/timeline.cpp",
+      "bytes": 8889,
+      "sha256": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/analyzer-validation.json",
+      "bytes": 208,
+      "sha256": "160c670bf1c2dbc509720123a5f5a4c5f7a6abdc88b3a701d6f26fbaa5b3f4c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/audit.json",
+      "bytes": 73706,
+      "sha256": "e0611690a30b573ff8f7347adb59f7a9e4385b29416975df832f4fbcc2078228"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/CMakeLists.txt",
+      "bytes": 5031,
+      "sha256": "e23d3a656f811125dd032dd65adec38c65348fb28549c9010d496af006fa5748"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/DESIGN.md",
+      "bytes": 30252,
+      "sha256": "9e63ae5cf2ba4a68d903657bdc12e882cd1e1ce58189312a68c2fc6a6e83c294"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/LICENSES/SQLite.txt",
+      "bytes": 69,
+      "sha256": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/README.md",
+      "bytes": 30631,
+      "sha256": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/CMakeCache.txt",
+      "bytes": 22193,
+      "sha256": "00a1dfe452b9b6b7c51bcc9a917dd5de6f901758d5cf81a7592139c23f1463f7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/libvane_fs.a",
+      "bytes": 472276,
+      "sha256": "8ff0010dd3af6765f7ed7dceb3d93f59534075c368ca2674356e1adfd179f248"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane-fs",
+      "bytes": 1726856,
+      "sha256": "1ffec3f00d13d0fe05b3f168e287ca9aebc0bad0fc606a103fe6c9578c9766b6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane-fs-benchmark",
+      "bytes": 1812200,
+      "sha256": "329bfa9160f8d5a183c8a812f8a7b329ebd3f122e60c50ca379be36e1235689f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane-fs-mount",
+      "bytes": 1763784,
+      "sha256": "2275479eb0a02a59c31d37d3399a71a560d99d759da23c83ddc2d2b66f427639"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_checkpoint_test",
+      "bytes": 1768440,
+      "sha256": "aa28360785be521a2261bb5cdcecc407d5e0a7ec0ec348d495bf12172efe4c72"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_crash_test",
+      "bytes": 1745272,
+      "sha256": "b5f9123de3af8cf25f6eafc1e79016bc60c43181e16ca19cbfbcad723bd714df"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_durability_test",
+      "bytes": 1749888,
+      "sha256": "d54db01507ba64040c0b522f3b562a6bb97498d839eb16b7b775c501bee529b2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_inode_refs_test",
+      "bytes": 1735680,
+      "sha256": "0d7936f36f87d847926d7bd30d6aac2c8d5757020872cafa246f665606ab7021"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_sync_syscalls_test",
+      "bytes": 1736224,
+      "sha256": "25146d8c13ddc8fa26cad301c015b58ecb3d65631638b7518e7c5bf577bc151a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/build/python-release/vane_fs_test",
+      "bytes": 1759280,
+      "sha256": "2dc645359e843d619b9433c5f9cf5b800712478ecf51126ed34ad9e6fe1a8952"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/include/vane_fs/reader_abi.h",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/include/vane_fs/workspace.hpp",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/pyproject.toml",
+      "bytes": 1075,
+      "sha256": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/python/vane_fs/__init__.py",
+      "bytes": 788,
+      "sha256": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/python/vane_fs/fsspec.py",
+      "bytes": 5016,
+      "sha256": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/python/vane_fs/vane.py",
+      "bytes": 1674,
+      "sha256": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/benchmark.cpp",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/checkpoint.hpp",
+      "bytes": 5761,
+      "sha256": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/cli.cpp",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/fuse.cpp",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/native_reader.cpp",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/native_reader.hpp",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/owner_lock.hpp",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/python.cpp",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/src/workspace.cpp",
+      "bytes": 81778,
+      "sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/conftest.py",
+      "bytes": 1236,
+      "sha256": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_checkpoint.cpp",
+      "bytes": 16229,
+      "sha256": "cd298919190e5e784c17e554dc7ed540dcc226ffe5d006a171f91156e908148e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_core.cpp",
+      "bytes": 11769,
+      "sha256": "68d3470bf7fee352f0a221ec5760b0495327d39e662a28f39c9d3385410e763b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_crash.cpp",
+      "bytes": 5099,
+      "sha256": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_durability.cpp",
+      "bytes": 7915,
+      "sha256": "9c3c0e30aaa4f8997ce8aaf995f0f32166f0efd3d54f38d2118f02d90f84ce80"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_fsspec.py",
+      "bytes": 4409,
+      "sha256": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_fuse.py",
+      "bytes": 29264,
+      "sha256": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_inode_refs.cpp",
+      "bytes": 6436,
+      "sha256": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_recovery.py",
+      "bytes": 7595,
+      "sha256": "0f9dc3f5723fcd77b13a5c33e033fa24966dd6b1103914fd900c26a4870e76a0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_sync_syscalls.cpp",
+      "bytes": 4122,
+      "sha256": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_vane.py",
+      "bytes": 16918,
+      "sha256": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/tests/test_workspace.py",
+      "bytes": 32793,
+      "sha256": "57acebd0b5e292b0f15b862bfa61a9636de6c70d6cc5df0fb86ccca142950099"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/triplets/x64-linux-fdatasync-release.cmake",
+      "bytes": 470,
+      "sha256": "73c311a00ab58a255df215d74765cec643ad55b7edf46bd272bfb0b75fde4428"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/vcpkg.json",
+      "bytes": 187,
+      "sha256": "14723a31d36ec981814663fca70a073b1f3d6f7884c63dfdb12717d196025da4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline/venv/pyvenv.cfg",
+      "bytes": 143,
+      "sha256": "97284ab39cf4bbcee74286be6770acb1f5facdc13445f8d85261da5f40a1670c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-alignment-probe",
+      "bytes": 1779248,
+      "sha256": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-alignment.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-build.log",
+      "bytes": 1327,
+      "sha256": "c45fc54ef36db08d1bcc426d8b948f0b893dcbbcb088eeccf8871b13c5f30387"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-configure.log",
+      "bytes": 788,
+      "sha256": "7332458a180080556d45dd46ee82bb1ee398a8db3e181cc6860b816513ade649"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-native-probe",
+      "bytes": 1731544,
+      "sha256": "99edbbc9fa01e51cb792cd268184cc227eb5bff310ecf9a0e04daaf9d09258dd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-native.log",
+      "bytes": 802,
+      "sha256": "c9737719259c43f8fe6571ba768e6514f0a97bbab71821960344550df0af1f12"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-plain.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-scheduling-build.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-scheduling-busy.log",
+      "bytes": 160,
+      "sha256": "1931091bc3c6a52f8a5b364d775bb8a88fa5b971764e6c2414eb266e60cd9ced"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-scheduling-restart.log",
+      "bytes": 164,
+      "sha256": "07e076669ab2c1916026c9f2d86132f320361b88d367dbb2ea29ef5ff57c14d5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-scheduling-success.log",
+      "bytes": 164,
+      "sha256": "ebd0aea2cffe84816061dd0888aa5bc3adb6142dd9abbfd3efce316a0b713068"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/baseline-workspace.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/build.json",
+      "bytes": 11831,
+      "sha256": "49455c1dbc7e651151f0f265aa777d31a3865ceb7f38fc42c4faba8eca7899da"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/candidate-install.log",
+      "bytes": 537,
+      "sha256": "dc3127871b1c6e87f2efbc92292d65b02cb048ddd97f12dcf7df6d69c1da8683"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/candidate-venv.log",
+      "bytes": 251,
+      "sha256": "bb5f76f09ac00df5717f1afdff058e3880c8784dc0e4ddec74f3c1c183c5d374"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/component-validation.log",
+      "bytes": 466,
+      "sha256": "66043b5fee33ea7a86aac47a3a551f3d3ea8eb0a152bd520c993da64734e5f26"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-0-timeline.json",
+      "bytes": 84094,
+      "sha256": "2e93ff6bbfb72ff1156369c6229048bac72624b1e48e74576f8915f131216086"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-0.stdout",
+      "bytes": 4146,
+      "sha256": "b3a9ad72ddbd49db5ab269063980078d5ca7584d6ce97004bbbc939d7e24979d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-1-timeline.json",
+      "bytes": 9543,
+      "sha256": "49ab9bb3a10d60e580a1c6af75600ecc172515e27fbc994fc7cc72dddc741bd0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/0-1.stdout",
+      "bytes": 4138,
+      "sha256": "16afa867b112adf502a1039e493f6bd692b37a592d525adeaa9b6a8ad2da200a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-0-timeline.json",
+      "bytes": 101746,
+      "sha256": "ae3706544a292ea916f5199ae4c6ede3ac9f6eafb9c385f8d08a1e4bf168db94"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-0.stdout",
+      "bytes": 4151,
+      "sha256": "7ddb8a7d12fc572f6fa39161aaf7c7e17555509d0c0f108d5651b589f85c4b0f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-1-timeline.json",
+      "bytes": 9540,
+      "sha256": "8721f6d7d0cd5a284a7a7c5b65743fe64f0c95d334ab27ca6a3e3fa870764154"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/1-1.stdout",
+      "bytes": 4134,
+      "sha256": "8bfa59a58eb947655bd1dfeec3af6cbb4d45456fb253cf4f3f854ef8a2a390e2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-0-timeline.json",
+      "bytes": 82407,
+      "sha256": "75f3e27adf1cad4a43bf5f0f428b86e23e0d2af6a285606d714d069e8bba70a9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-0.stdout",
+      "bytes": 4139,
+      "sha256": "a6e9a117a87ebc301f611974f8f9ff583c13852655184a30363925d89797a005"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-1-timeline.json",
+      "bytes": 9540,
+      "sha256": "0da31f7c04f38bf207c548cf4b48c61a1525ef13994bddb603f96918a69427a7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/2-1.stdout",
+      "bytes": 4145,
+      "sha256": "89d8e4fba3cad4791022effd2ca6584bace42e113be01dbedd3e098e0d4cd3f1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after/results.json",
+      "bytes": 56103,
+      "sha256": "7683004d8e1554cd6d3b7bd27c976adecab512643c4253edaa2d28dc5d8e48b5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-after.log",
+      "bytes": 133,
+      "sha256": "024d71458d378947753cda99ff66b5986235ac1780e13565fc70c3e84115eb8d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-0-timeline.json",
+      "bytes": 92983,
+      "sha256": "9bba3c3cfbf39bc7d2111a373d9cea26f5496bdf1a2d99ab387c2ee5b1c53f5e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-0.stdout",
+      "bytes": 4134,
+      "sha256": "f89225b8937d2cadaad735a706d91ef1d5494df30334a31d06edcfb6e693bf61"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-1-timeline.json",
+      "bytes": 9552,
+      "sha256": "0764434350c1ac5e3f212749fca754727998bb35e4770221bb51b2d3f2f206a5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/0-1.stdout",
+      "bytes": 4144,
+      "sha256": "785cca29b027f5b865af31f64c9ab610649072a05cbce107bf7157b48a23b2a2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-0-timeline.json",
+      "bytes": 98960,
+      "sha256": "42b8a0757069683c6e62fb8fd5e1488f95985a30e9c1710f4d6397ab7e7cd261"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-0.stdout",
+      "bytes": 4142,
+      "sha256": "f8b4a2974691640a8b4f8ed44af1be465d4240998ad9a242439c058cfbac6918"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-1-timeline.json",
+      "bytes": 9552,
+      "sha256": "18c40d032419bd1f81fdeace567e5d1b3caf9beef5a8aaaccc7fed58b1c01809"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/1-1.stdout",
+      "bytes": 4148,
+      "sha256": "76121d5801c882d0c89624209d6bc8412013dd7c9cbb9df07be16dcdda8756be"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-0-timeline.json",
+      "bytes": 97896,
+      "sha256": "187db61e16c9001c7737d396d9ef23a945a0480d6040ecb78e963b8eb4405293"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-0.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-0.stdout",
+      "bytes": 4136,
+      "sha256": "608ebd69531e4a8ecf66a6f117b976d566274bab86b085640644f5401b76e921"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-1-timeline.json",
+      "bytes": 9564,
+      "sha256": "d8fff7a9e207e976d5d63eaa42e06fa0ef639962e8bd2ac0e2d20e25dd5f2c6a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-1.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/2-1.stdout",
+      "bytes": 4138,
+      "sha256": "285be814f96e0d857b1af78e9ededfc4b9b6a3b64f61a7aa63c02aae0b52d9d9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before/results.json",
+      "bytes": 56123,
+      "sha256": "1db988fae022a305e04fd200eaeffc8a494c17a132d2b2067567811590a07573"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/control-before.log",
+      "bytes": 138,
+      "sha256": "91fa1548ef26b677c8ff70c97ee35f57df058ca05c419ad040544822e14e10d3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/build/vane-fs-mount",
+      "bytes": 1797048,
+      "sha256": "f242c009e8aea24c8602838e5f1a2f4c4640ca522a1a7aa2a1fca8f2d88dc219"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/benchmark.cpp",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/checkpoint.hpp",
+      "bytes": 6163,
+      "sha256": "c380949fc0508a035783ba8c952bf24ae82cb41aff59f654e0f0ffacfb9144c3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/cli.cpp",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/fuse.cpp",
+      "bytes": 17193,
+      "sha256": "e3dd753a257d8730e58e0dd41f97aabebcbb6ae957ff0a2d76a7dcda052a27df"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/native_reader.cpp",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/native_reader.hpp",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/owner_lock.hpp",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/python.cpp",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/src/workspace.cpp",
+      "bytes": 81778,
+      "sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/baseline/workspace.o",
+      "bytes": 457760,
+      "sha256": "d2b4b4c7940520f0136a597572555f1917a8423618acb9533a4751e84cccc638"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/build/vane-fs-mount",
+      "bytes": 1796864,
+      "sha256": "f1f4d563f3626e255005f235e14d3d9dafff3af10bf345ccfbba8658b2924bca"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/benchmark.cpp",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/checkpoint.hpp",
+      "bytes": 7042,
+      "sha256": "7c03d2ef75399bcbcc3e9a11f4cdf263b192a6f471f6796c5ba39187e895a92e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/cli.cpp",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/fuse.cpp",
+      "bytes": 17193,
+      "sha256": "e3dd753a257d8730e58e0dd41f97aabebcbb6ae957ff0a2d76a7dcda052a27df"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/native_reader.cpp",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/native_reader.hpp",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/owner_lock.hpp",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/python.cpp",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/src/workspace.cpp",
+      "bytes": 81778,
+      "sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/diagnostic/updated/workspace.o",
+      "bytes": 458048,
+      "sha256": "f22dfd78a6bd924dfb83eccdc3c98d6221765520ffdba0f168803f0276caebd7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/aged-fuse-baseline-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/aged-fuse-baseline-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/aged-fuse-updated-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/aged-fuse-updated-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/fuse-baseline-0.log",
+      "bytes": 33,
+      "sha256": "8378a0872b292792057b28e21b1aa872945137ed3b23338f39d8a83b171b6e35"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/fuse-baseline-1.log",
+      "bytes": 33,
+      "sha256": "749b4363f8ac8bd7b764544080c218921ede63cdc75b2dbf1b75d524bebfba22"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/fuse-updated-0.log",
+      "bytes": 33,
+      "sha256": "440a227bdd4924bc68ae9eedc6cb879711b01ee63b72982f18916f550ad5ad2f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/fuse-updated-1.log",
+      "bytes": 33,
+      "sha256": "fa5fb69239c45e82381783d7ab33d02fcd7e4f8f35797944fa7af6c3f8debb1b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/host.jsonl",
+      "bytes": 201347,
+      "sha256": "e1a21f7aea575cad891908eca429000bfc486fb5b2553051d6712ec657e5ad48"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/results.json",
+      "bytes": 406552,
+      "sha256": "ce5039659385134561eb9ef5ff46b2689c2f283f88499dc47b2d9482c458c098"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-aged-5p44dg6e-timeline.json",
+      "bytes": 2594188,
+      "sha256": "e0324ff18fde8f18342f25dba0aff0def6734614bc68b28f43a0d5335710399f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-aged-cus1c9ve-timeline.json",
+      "bytes": 2599372,
+      "sha256": "7f856e3c04c218fa819e2a0ecdde203a79d33b0aae335315903efd604f91da93"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-aged-ouc7fkno-timeline.json",
+      "bytes": 2646562,
+      "sha256": "eba66788426a7c86621b354d03abd73ac61225cf87f07371f3eb184dd33d8409"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-aged-wazlmdkv-timeline.json",
+      "bytes": 2648465,
+      "sha256": "1ce81ff49ebb209ad8871ca4ce3ba9354e780dee093ad1810020a68552a25194"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-fuse-dy11atj0-timeline.json",
+      "bytes": 801384,
+      "sha256": "98dca1e54984e1a18287cae3055c63dfe35bd3cfd3645468c6ee20d2345c9055"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-fuse-nzfcgrd8-timeline.json",
+      "bytes": 815554,
+      "sha256": "2aa7da89ea66b2d95d1846c2be786e07544d8c1fdb56f83f5bc96ae2e0d77d74"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-fuse-qi3t524w-timeline.json",
+      "bytes": 811423,
+      "sha256": "3cdae1125eb1cf34e7c52715722edc78286e4c6df1b70ccbba8f40ff5c08d575"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic/vane-partial-owned-fuse-uv89lzas-timeline.json",
+      "bytes": 803682,
+      "sha256": "a027e425415a673220b64ca8e4f57f1a82f0b4e7f4f84d815536814a9b63b726"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-diagnostic.log",
+      "bytes": 1732,
+      "sha256": "6f6b239cf4c3fd0abba1ef55abea6f624900b2db6c07228aa5d29075ec751708"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-3.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-baseline-5.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-3.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/aged-fuse-updated-5.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-0.log",
+      "bytes": 33,
+      "sha256": "8d607ef80e35bea35b36ac8e9856c63ac4bd1797d4b8906826d01752062186a5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-1.log",
+      "bytes": 33,
+      "sha256": "0a07206242efda17e2598098fa0752fd43c15370eba541a0693e1a756deab8ab"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-2.log",
+      "bytes": 33,
+      "sha256": "4d46f5cf184704573de1a66d27ae2de49ee92c06fc605a858bcc1d0cc35e4bb8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-3.log",
+      "bytes": 33,
+      "sha256": "e34ccc46da82c1d923ffee826f3a808d0cd8d34b6be51d0e7f49c13511237c89"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-4.log",
+      "bytes": 33,
+      "sha256": "cb34e4942a7013c5ee9624d0172d59bb30689d3ee9f85d068b822f8827b2977d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-baseline-5.log",
+      "bytes": 33,
+      "sha256": "e4671f6250e52f2e223ec364b2c182d409f4b7f6fd788ea791389309e5292489"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-0.log",
+      "bytes": 33,
+      "sha256": "3f34d273b6bfb9156bd7c206e2ee9a7d5799abda7c9810d60ec2d47c2ef2dfa6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-1.log",
+      "bytes": 33,
+      "sha256": "4e544777f9bca17a30c7a9b1f16778ba9732595c39bd07d5eeaf8c7e02323b20"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-2.log",
+      "bytes": 33,
+      "sha256": "265ab9ec2362968c2ed2d77bd40364ca8204e3d17f43f34a630c20e9ae74e1bd"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-3.log",
+      "bytes": 33,
+      "sha256": "ccc4ca1b06d5d63a5981ad22904c3369f338d7ab045e4dbb0c9cb52892f2540d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-4.log",
+      "bytes": 33,
+      "sha256": "cbabdac6dec97d728dcf8233d9cdbf255199e700998413d29d862a212e20956e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/fuse-updated-5.log",
+      "bytes": 33,
+      "sha256": "76b02541565f8ee743bb008494e77c7f7ffe7e62fc6d2824f01dd2c859b9b270"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/host.jsonl",
+      "bytes": 546164,
+      "sha256": "42ae01fb6177771b554b784df52e8eafda3c7cd0cc690b75fab3f5253e3cd066"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain/results.json",
+      "bytes": 1203466,
+      "sha256": "acb140018ba14aa748f0bdd4f966a01b421773aba48eaf02d207003626fa736c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/ext4-plain.log",
+      "bytes": 5198,
+      "sha256": "f18568fd4092dabcab97182d2333504acf2fced60e08493f54a03ae20a527bef"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/acceptance-prepare.py",
+      "bytes": 8262,
+      "sha256": "88ba007a57a8d579a2875bb4c1dc5beb227211c38b8cab154c4fff998ea317f7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/measured-prepare.py",
+      "bytes": 9737,
+      "sha256": "4fbfaa673ac744c291bcfd4d6279d5babd43f6a5c2cfafae5448c9ca80daf263"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/priority-probes.py",
+      "bytes": 8577,
+      "sha256": "ea1211960551216ddd356820520de8405d5d81aa89737d3ca56d3e457279ed18"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/analyze.py",
+      "bytes": 8017,
+      "sha256": "97eff738b14acf891acdc47cd9841a190ef1bd2bf39ce76396614ab61f624985"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/plan.json",
+      "bytes": 2521,
+      "sha256": "3fabf9e2d526eada8b854fa88c3b5da07f777c8fda50035b91810bd427a6597c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/prepare.py",
+      "bytes": 10015,
+      "sha256": "94a203b571395af44872a8d6bcb00cc9c8868911cd9db7c4d07065ba24f88a6d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/priority.patch",
+      "bytes": 1942,
+      "sha256": "4af313eb54b34c4d6224a5fed6262509071b7d2b33c17cfb9c920ff83c123808"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/run.py",
+      "bytes": 5235,
+      "sha256": "8c9001f72ac97484c0d65dcc58ceb762fdc709128b2a4d76ae65b063af2efdb0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/checkpoint_priority/test_priority.cpp",
+      "bytes": 5076,
+      "sha256": "c48eedee67b8fc7436b5b2920da6b7ff03ad5e34a197fb4d9ecab630a752613c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/io_interference/monitor.py",
+      "bytes": 1467,
+      "sha256": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/partial_write/acceptance/run_controls.py",
+      "bytes": 3271,
+      "sha256": "67bf66909152d36d4e0be7cfaaa2fab3bfcb5626538fc28c0694ea687c320cf8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/partial_write/acceptance/run_fuse.py",
+      "bytes": 8776,
+      "sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/partial_write/acceptance/validate.py",
+      "bytes": 2795,
+      "sha256": "7aa0931df3d4bfaca8df2e41c834ac38ac38ff4cb397e371f904629e5108314d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/frozen/runners/vane_fs/benchmarks/partial_write/acceptance/workload.py",
+      "bytes": 21620,
+      "sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/module-identity.log",
+      "bytes": 170,
+      "sha256": "a05c3d9a2e3a85f5d8bcdde17da5ae6c78d65eec56e964d98850c81a816d0147"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/patch.log",
+      "bytes": 33,
+      "sha256": "5c0f522a33676ef56da73a39deeefb5de13ce6cd5f2695c17ba208564af6c72b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/plan.json",
+      "bytes": 2521,
+      "sha256": "3fabf9e2d526eada8b854fa88c3b5da07f777c8fda50035b91810bd427a6597c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/preparer-validation.json",
+      "bytes": 126,
+      "sha256": "f54a0ac6a3949ef3e900f4eefb0646df5afb113b89970db00590ed3f59a3bd96"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/previous-windows.json",
+      "bytes": 4692,
+      "sha256": "4fdf6a6dc32bda009a894ff03fdc7b386193185a38d3911bb6a4ff97897f4541"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/probe-build.json",
+      "bytes": 12848,
+      "sha256": "34d4c3b950477b740d3583b0500db627793544427a98b1d7cf795af28fba4bcb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/probe-build.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/python-environment-fix.json",
+      "bytes": 861,
+      "sha256": "7a10960ba5f39645588ab5fe97630067efe383f4304a5c70c7757f6892cc03c9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/reproducer-validation.json",
+      "bytes": 2017,
+      "sha256": "4a88ce986cf3230f44c00b0685952011d1a3b3d3660c6a69c7ca52e415b191eb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/scheduling/baseline/checkpoint.hpp",
+      "bytes": 5873,
+      "sha256": "ecebb255df81fdcc83abd75c6a8abc18290eec16a8ff14bbdae70f4e83ba3889"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/scheduling/baseline/priority-test",
+      "bytes": 1453384,
+      "sha256": "e26acd09e14ae049412cda71a4e8edcad43ab88ecece6190c1bb560af4f30459"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/scheduling/updated/checkpoint.hpp",
+      "bytes": 6716,
+      "sha256": "81c27ea34c2415574bf456654962fb0f9969807c5de0819fb9845fe90b770b38"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/scheduling/updated/priority-test",
+      "bytes": 1453384,
+      "sha256": "bd3011d030f4e7a2f900af595c69cf674afa44b2feeb3dcdb7e1017ba0faffb8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/summary.json",
+      "bytes": 260678,
+      "sha256": "e5ac4a1189b15483249c4e40d9e05d01b285d717fad4f98235c41d6e4eba8bed"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_acknowledged_write_surviv0/mount-branch-main.log",
+      "bytes": 796,
+      "sha256": "eaf46b86bc62150fd5ebc16d264f79d8055893024028d12d47fa2c9ccf7e6a2c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_acknowledged_write_surviv1/mount-branch-main.log",
+      "bytes": 1331,
+      "sha256": "07c19d5ce923ba0290ffa69c3b35cce4151a8c8d096cea9083aea5284de090a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_acknowledged_write_surviv2/mount-branch-main.log",
+      "bytes": 3475,
+      "sha256": "a08298278bad5c9f018d627b7b1554686159efe7204129bc72323919b1b2eecc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_cached_atime_alias_tracks0/mount-branch-main.log",
+      "bytes": 1283,
+      "sha256": "4d9e4c8f4183d932d1a5df16a40a04c20964bbb71a3942f82117b0252aef2fb8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_cached_atime_alias_tracks1/mount-branch-main.log",
+      "bytes": 1316,
+      "sha256": "72d798cef12a9387c8ce18ad22c84b36c52afbc840d85d30678e05c58f85cddb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_cached_metadata_observes_0/mount-branch-main.log",
+      "bytes": 10300,
+      "sha256": "1d3371dbb70da84c2c52edd43d8fd246856be3f6a4e16f3e3a448326cbd8bf7e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_directory_listing_is_capt0/mount-branch-main.log",
+      "bytes": 3784,
+      "sha256": "98a39888b7348464310443e7de561562637ac6ecf544bf9a61ff31838a55f28d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_directory_lists_belong_to0/mount-branch-main.log",
+      "bytes": 3497,
+      "sha256": "308d8194897ec3d1f3f6395f002d2b28d72246b716068c85008bdeb6349b3eeb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_directory_pagination_is_s0/mount-branch-main.log",
+      "bytes": 716049,
+      "sha256": "4cfd9784dd4ed72745c768fb6bd84017813f6f60b60db5809af99b08b3801ad2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_directory_pagination_is_s1/mount-branch-main.log",
+      "bytes": 847768,
+      "sha256": "e7453b655e20c5e23689b6b3fd8e47fd0b9af386109021dc154f49348b7aac89"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_directory_pagination_is_s2/mount-branch-main.log",
+      "bytes": 33122,
+      "sha256": "0ac40c5ca7e85b8c76c3c0debd71972e4dd7ab6680d32c3a7c0e52a43f018d36"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_failed_final_commit_makes0/mount-branch-main.log",
+      "bytes": 1170,
+      "sha256": "d21ad56b231dd8bca55386e15ac1e9cc2c8433ad41cbbcd01a6917d498eed2b6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_barriers_and_r0/mount-branch-main.log",
+      "bytes": 9700,
+      "sha256": "b808674bfe9b33f78accc431d631312341cf012b9cc7e095abbc6efe7dedb941"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_barriers_and_r1/mount-branch-main.log",
+      "bytes": 9700,
+      "sha256": "b808674bfe9b33f78accc431d631312341cf012b9cc7e095abbc6efe7dedb941"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_barriers_and_r2/mount-branch-main.log",
+      "bytes": 9954,
+      "sha256": "421d05cd7307627a777280d11ef5accc259ce4434c6d47b4ee3652ee07c86ff6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_barriers_and_r3/mount-branch-main.log",
+      "bytes": 9281,
+      "sha256": "5ee50e6ba3a7d510ec9cc7a54a226fac6627f60124f6d3710d51c751d55efafb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_barriers_and_r4/mount-branch-main.log",
+      "bytes": 9281,
+      "sha256": "5ee50e6ba3a7d510ec9cc7a54a226fac6627f60124f6d3710d51c751d55efafb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_clean_unmount_0/mount-branch-main.log",
+      "bytes": 18984,
+      "sha256": "762b993168d6e3e3aca429711e6d32882a7ceecde26c1c60e7d088056109053f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_failed_barrier0/mount-branch-main.log",
+      "bytes": 1882,
+      "sha256": "6f06830b3ef80432147c759bc765b1c160f1b03ae9ec08173aa5c06118ffedf4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_fsync_mode_failed_barrier1/mount-branch-main.log",
+      "bytes": 1684,
+      "sha256": "028c97523d2c21d7bee43f95a3ecb83db71d90f8c7ca71343475533ab021b443"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_live_handles_observe_othe0/mount-branch-main.log",
+      "bytes": 21281,
+      "sha256": "8823e56d4f9923338b48f12fd5c34262aae0a45182ac60b84168f80498ccb719"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_live_handles_observe_othe1/mount-branch-main.log",
+      "bytes": 21497,
+      "sha256": "71bc013188d72faddbefa4efe19d6affe3191aab31a2f7a71459134927677ab4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_live_mount_namespace_meta0/mount-branch-311aef549747a482209ddcd5a2bfefc3.log",
+      "bytes": 5655,
+      "sha256": "f381313e4f85451105f6d27322a8b353598165edacd4380e5c1379b31e799dcc"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_mount_crash_reclaims_orph0/mount-branch-main.log",
+      "bytes": 1782,
+      "sha256": "403657b4a1cc2a5e327ef074a233f3fd30e77661d41ea5cd7340bf7950bd1194"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_open_handles_survive_unli0/mount-branch-main.log",
+      "bytes": 7404,
+      "sha256": "2ed65a017686489bbfccd547400462af888336edc86e67a90bc3f93ceafb13c1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_open_handles_survive_unli1/mount-branch-main.log",
+      "bytes": 7404,
+      "sha256": "2ed65a017686489bbfccd547400462af888336edc86e67a90bc3f93ceafb13c1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_repeated_open_release_doe0/mount-branch-main.log",
+      "bytes": 28260,
+      "sha256": "d97fb7b0c03d17ee5505543ca1a41dd490ed031f68beb81ebe062047b724f790"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_snapshot_mount_is_pinned_0/mount-snapshot-061817a220bb9415f5a880564918f546.log",
+      "bytes": 1927,
+      "sha256": "56cec1bc67e6907bf49d971d86c69438b2f2b55f4bafef8b0d860c953ab1ba86"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_unread_directory_handle_s0/mount-branch-main.log",
+      "bytes": 1227,
+      "sha256": "0bd67f424127220361d0d581e34d00f7bbb9715f4cba86d00b54aeb533b0c6a1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_warm_stat_reuses_kernel_m0/mount-branch-main.log",
+      "bytes": 635,
+      "sha256": "6e6c01ab2d01b588e507d4ca5133e6b2933bb29a7737a1ad918e24780461422e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/test-logs/owned-updated-python-retry/test_warm_stat_reuses_kernel_m1/mount-snapshot-b9b244be491e2d47ea75fc5782a5c148.log",
+      "bytes": 635,
+      "sha256": "6e6c01ab2d01b588e507d4ca5133e6b2933bb29a7737a1ad918e24780461422e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tests-before-env-fix.json",
+      "bytes": 2327,
+      "sha256": "ab0302503426b50eefc829ba01e844b006aa90d7d436fa5f4fe89f9a298ec628"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tests.json",
+      "bytes": 3524,
+      "sha256": "e1790dd7b036ac1e90dc6c6bc46f311372ab6c98d1abfef86f21a2e448a0c458"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/timeline.cpp",
+      "bytes": 9473,
+      "sha256": "092b0b2b219974452b013a4a428b19c640b401b476440ec344c16a0d0a52fcb4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-3.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-baseline-5.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-0.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-3.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/aged-fuse-updated-5.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-0.log",
+      "bytes": 33,
+      "sha256": "6f6a7c4d2276fa5328584df6d809babce4952695dd69ae70012320b7c196ece0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-1.log",
+      "bytes": 33,
+      "sha256": "17201a3a0cc2a02afa3d9d50b18026308336dff25ed54066e69795a941e946a2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-2.log",
+      "bytes": 33,
+      "sha256": "6c5a4313308eb199ad751d6a23601f78b31535e6c887d27c07794f4612821cf1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-3.log",
+      "bytes": 33,
+      "sha256": "08d58504f8642d701fc4eb793477775640d29d33ce571fafc5849ed3d32a4db3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-4.log",
+      "bytes": 33,
+      "sha256": "09f4a7f7b9a7aef59039643c0a6c6fd91ab3dc69cb8ba45c490c611cde510e61"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-baseline-5.log",
+      "bytes": 33,
+      "sha256": "a45f64cd171f53e32f1d0a3c2d709d8134dab579cde87853154eb7171c3999cb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-0.log",
+      "bytes": 33,
+      "sha256": "3e5e09b1f2aaa717cc63ffade6b4bd9111a764c894db5a71221750e126e974af"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-1.log",
+      "bytes": 33,
+      "sha256": "c882f148c36fbf860a2316dd4b009397018567d214c767f27f8781695409e44a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-2.log",
+      "bytes": 33,
+      "sha256": "ade6c986e0c763d6d479d726ca99a6b929448e6adb9f705bfa408b809af27fe5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-3.log",
+      "bytes": 33,
+      "sha256": "0831da72865cf8ec3f831925ac1f84b9d43006f4c3e908eee80c440e35271161"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-4.log",
+      "bytes": 33,
+      "sha256": "7174b2f07b98c3801eaeb2e527b9b837a5a218db8da6b3b2d4d69828e72647c4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/fuse-updated-5.log",
+      "bytes": 33,
+      "sha256": "1dec2316c8bf40f5d855b71b76114bcdd71968ff7199e236cc6a5627acf85c16"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/host.jsonl",
+      "bytes": 347132,
+      "sha256": "50bcc7ae8573c56110278d5022407a73363f5897541f9762f04dd8bfadbefab9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain/results.json",
+      "bytes": 1197463,
+      "sha256": "fe4019fc85f8a8616e5b2328cc33dc63956632256b5a6d4fafe8a3bb52867d92"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/tmpfs-plain.log",
+      "bytes": 5264,
+      "sha256": "a65f464b12591b69d900476f1941b6abf30ee195ad919c0f7463abdf316cfb43"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/CMakeLists.txt",
+      "bytes": 5031,
+      "sha256": "e23d3a656f811125dd032dd65adec38c65348fb28549c9010d496af006fa5748"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/DESIGN.md",
+      "bytes": 30252,
+      "sha256": "9e63ae5cf2ba4a68d903657bdc12e882cd1e1ce58189312a68c2fc6a6e83c294"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/LICENSES/SQLite.txt",
+      "bytes": 69,
+      "sha256": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/README.md",
+      "bytes": 30631,
+      "sha256": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/CMakeCache.txt",
+      "bytes": 26160,
+      "sha256": "7cf7116269da5ad85af8a182d6c2c3461e7b9618e0d0e7b2c9677be75e925047"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/libvane_fs.a",
+      "bytes": 472332,
+      "sha256": "f1d3b9a76066300869a1bc60deddce686ed0b3ac8178bfc073b6838a989bf05f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane-fs",
+      "bytes": 1726776,
+      "sha256": "305c43f4b6de0dc71f331261a88ead1553853864fe2a14ee4d1ee9aefb7b33fa"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane-fs-benchmark",
+      "bytes": 1812112,
+      "sha256": "80a5e3c9e3a9ce3ea38ef4c1a009dd8c6da74dc3fc68611ee1501d20d96e3391"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane-fs-mount",
+      "bytes": 1763704,
+      "sha256": "c8096f70755ef2a6e6f54e24b3468122608acfcb0b347dc1086efb67e1ca15a8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_checkpoint_test",
+      "bytes": 1768360,
+      "sha256": "c7cfcb70afd3f6151d6e7f00d22fb4d3f0b4a3baaf7889a025d6fcc7536ad9b9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_crash_test",
+      "bytes": 1745184,
+      "sha256": "ca460d85eb0addfd0ff3390be4094729d451348e634b955931356e93dcca18bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_durability_test",
+      "bytes": 1749800,
+      "sha256": "cd348726221321fb8a85c2fca6134494ee47b93066d1223f230d1e61c2bab695"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_inode_refs_test",
+      "bytes": 1735600,
+      "sha256": "b496ae4d8bf348cb2bd116995ae14f3808cab16d51d911ce0f784f5d30b47567"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_sync_syscalls_test",
+      "bytes": 1736144,
+      "sha256": "28102260308133b0294adaf9202aa95709c3f121a3e6799f31e74f11d5d338e4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/build/python-release/vane_fs_test",
+      "bytes": 1759200,
+      "sha256": "bf8827f36e754c84fc278576345d28ddd81d09425f8e4ebbeef8d09d9954fb41"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/include/vane_fs/reader_abi.h",
+      "bytes": 1646,
+      "sha256": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/include/vane_fs/workspace.hpp",
+      "bytes": 6323,
+      "sha256": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/pyproject.toml",
+      "bytes": 1075,
+      "sha256": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/python/vane_fs/__init__.py",
+      "bytes": 788,
+      "sha256": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/python/vane_fs/fsspec.py",
+      "bytes": 5016,
+      "sha256": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/python/vane_fs/vane.py",
+      "bytes": 1674,
+      "sha256": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/benchmark.cpp",
+      "bytes": 8987,
+      "sha256": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/checkpoint.hpp",
+      "bytes": 6571,
+      "sha256": "c91ecfad7e3efed5427d962f6e7f97c831d0068090334bdcc1e6ccacce3b3c9c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/cli.cpp",
+      "bytes": 1689,
+      "sha256": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/fuse.cpp",
+      "bytes": 16745,
+      "sha256": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/native_reader.cpp",
+      "bytes": 4556,
+      "sha256": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/native_reader.hpp",
+      "bytes": 189,
+      "sha256": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/owner_lock.hpp",
+      "bytes": 2814,
+      "sha256": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/python.cpp",
+      "bytes": 8917,
+      "sha256": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/src/workspace.cpp",
+      "bytes": 81778,
+      "sha256": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/conftest.py",
+      "bytes": 1236,
+      "sha256": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_checkpoint.cpp",
+      "bytes": 16229,
+      "sha256": "cd298919190e5e784c17e554dc7ed540dcc226ffe5d006a171f91156e908148e"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_core.cpp",
+      "bytes": 11769,
+      "sha256": "68d3470bf7fee352f0a221ec5760b0495327d39e662a28f39c9d3385410e763b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_crash.cpp",
+      "bytes": 5099,
+      "sha256": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_durability.cpp",
+      "bytes": 7915,
+      "sha256": "9c3c0e30aaa4f8997ce8aaf995f0f32166f0efd3d54f38d2118f02d90f84ce80"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_fsspec.py",
+      "bytes": 4409,
+      "sha256": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_fuse.py",
+      "bytes": 29264,
+      "sha256": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_inode_refs.cpp",
+      "bytes": 6436,
+      "sha256": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_recovery.py",
+      "bytes": 7595,
+      "sha256": "0f9dc3f5723fcd77b13a5c33e033fa24966dd6b1103914fd900c26a4870e76a0"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_sync_syscalls.cpp",
+      "bytes": 4122,
+      "sha256": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_vane.py",
+      "bytes": 16918,
+      "sha256": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/tests/test_workspace.py",
+      "bytes": 32793,
+      "sha256": "57acebd0b5e292b0f15b862bfa61a9636de6c70d6cc5df0fb86ccca142950099"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/triplets/x64-linux-fdatasync-release.cmake",
+      "bytes": 470,
+      "sha256": "73c311a00ab58a255df215d74765cec643ad55b7edf46bd272bfb0b75fde4428"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/vcpkg.json",
+      "bytes": 187,
+      "sha256": "14723a31d36ec981814663fca70a073b1f3d6f7884c63dfdb12717d196025da4"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/lib/python3.12/site-packages/build-support.pth",
+      "bytes": 148,
+      "sha256": "281ed8d95c579156dc0d57ca5ca87aec7da13832f36d7e32d9e6f5b51a6a64a9"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "bytes": 1911656,
+      "sha256": "c82dbdd62086877fba903b2a52c454fb92843c2b722bacc72d7e02dd8f44e0ce"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/pyvenv.cfg",
+      "bytes": 143,
+      "sha256": "97284ab39cf4bbcee74286be6770acb1f5facdc13445f8d85261da5f40a1670c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-alignment-probe",
+      "bytes": 1779168,
+      "sha256": "86f8ac8845a7bc71c10ec1233a9817073cc794d5cde7d846eef68f768f0a2e64"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-alignment.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-mount.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-native-probe",
+      "bytes": 1731464,
+      "sha256": "62f80b1c316b2372d08c8467ef24d824e11007d3b8e002cd50a64ad300794b3b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-native.log",
+      "bytes": 801,
+      "sha256": "b7660bccc11d7f6d2314c9793e19d754f5cbf78213e5daa57bc00369bd5faa3c"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-plain.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-python-before-env-fix.log",
+      "bytes": 128,
+      "sha256": "bbf2b81f31109ebf91a9aa5ccd7a2733791a79c6c2bc9b74c8d2bf312a474d02"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-python-retry.log",
+      "bytes": 684,
+      "sha256": "0bbe387055472d4cc8391d1c9ebaeb3440eb7b2465568b03d21dcecdb08e5870"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-python.log",
+      "bytes": 128,
+      "sha256": "bbf2b81f31109ebf91a9aa5ccd7a2733791a79c6c2bc9b74c8d2bf312a474d02"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-scheduling-build.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-scheduling-busy.log",
+      "bytes": 99,
+      "sha256": "182d6606be30d9974701f08fd897d182cd42bf4df0b35e2b95f38e1b103292d1"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-scheduling-restart.log",
+      "bytes": 103,
+      "sha256": "3e262b53b0f13ab5622e0722c917dd16dcd79079c9b78d53404a20d60f44dbc3"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-scheduling-success.log",
+      "bytes": 103,
+      "sha256": "e3b51bbccbf389673d3b65fa08c4a18337bf01e6e2f7f329e2be7c725be33c3d"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated-workspace.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/windows.json",
+      "bytes": 4804,
+      "sha256": "c0cd8830578498adf9d1ec4194ff86a5c534f6dc5c6edf0cb8a96b120f6fec9b"
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+      "bytes": 1713626,
+      "sha256": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+    }
+  ],
+  "generated_payloads_removed": true
+}

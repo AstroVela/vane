@@ -1,0 +1,6 @@
+{
+  "failure": "Initial analyzer required enqueue markers, but the reused recorder intentionally filters spans below 1 ms.",
+  "repair": "Use a 1 ms bound for absent short spans and compare only retained thread markers; forced-blocking tests independently verify foreground progress.",
+  "native_and_measurement_changes": false,
+  "diagnostic_samples_reused_without_rerun_or_discard": 8
+}

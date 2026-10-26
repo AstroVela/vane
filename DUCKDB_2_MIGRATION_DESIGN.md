@@ -16,14 +16,15 @@ This document owns the migration decisions, roadmap, and completion record.
 [Source provenance](SOURCE_PROVENANCE.md#duckdb-engine-baselines) owns source
 identities and attribution. Existing feature documents describe behavior to
 recover, not capabilities already available on this branch.
-The [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) maps old
+The [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) maps reference
 implementation paths, dependencies, and tests to the remaining stages.
 
 ## Source baselines
 
 | Component | Immutable reference | Migration role |
 | --- | --- | --- |
-| Previous Vane implementation | `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` | Reference implementation, tests, and committed 1.5.5 customizations |
+| Current Vane migration reference | `06cfbd5cc39f8b2c19531676f2bdcfff64e1a6e4` | Main synchronized on 2026-10-26; reference implementation, tests, and committed 1.5.5 customizations |
+| Original import starting point | `95acdea830eb1fff407f0e09f4b97ee7b0a02e83` | Historical branch origin; superseded as the migration reference |
 | Official DuckDB v2.0.0 | `d54cbbe3df17e8e5ce68312f483b4155836112aa` | Imported engine baseline |
 | Official engine tree | `c671df12df7e48e80306cb6a42d4761417c01695` | Verified contents and file modes of the pristine subtree |
 | Vane engine import | `d1ca8da47e8eb9298b8ecfc8d47e547e07e06d20` | Import commit with an official squash snapshot parent |
@@ -41,10 +42,20 @@ engine. A root `.gitmodules` mapping allows Git metadata operations to resolve
 the nested path while disabling default updates and recursive fetches. Do not
 substitute a moving branch or allow its build to select another engine revision.
 
-Changes committed after the frozen Vane reference, and uncommitted work in other
-worktrees, are separate migration inputs. Record their source revision and
-tests before adopting them. They are not included merely because they exist
-in another checkout.
+The initial integration branch was created from the older 2026-10-12 Vane
+commit above. The baseline correction merges the 45 subsequent main commits
+through `06cfbd5cc39f8b2c19531676f2bdcfff64e1a6e4` without rewriting the
+published branch. Vane-owned implementation, tests, and build configuration
+follow that main revision; both vendor subtrees retain their exact official
+2.0 trees. Main's 1.5.5 engine changes stay available in the merged history
+for later capability migration. This synchronization does not qualify them
+on 2.0.
+
+Changes committed after the current pinned Vane reference, and uncommitted
+work in other worktrees, are separate migration inputs. Record their source
+revision and tests before adopting them. Future main synchronizations must
+update this reference and the capability inventory together, preserving the
+accepted engine/client migration work rather than importing 1.5 engine files.
 
 The pristine tree check applies to the initial import. Once Vane engine patches
 resume, retain that import as the comparison baseline and derive a new SourceID
@@ -76,16 +87,21 @@ flowchart TD
     A["vane public API"] --> B["Bindings based on duckdb-python 2.0"]
     B --> C["DuckDB 2.0 binding and planning"]
     C --> D["Vane execution selection"]
-    D --> E["Native execution"]
+    D --> E["Native local execution and shared runtime"]
     D --> F["Fragment planning and Ray scheduling"]
     F --> G["Worker engine and matching extensions"]
     E --> H["Owned result stream"]
     G --> H
 ```
 
-Here, **native execution** means DuckDB's in-process execution. Vane's
-`local` runner uses its fault-tolerant execution machinery and belongs to the
-later scheduler stages. A native SQL smoke test does not qualify that runner.
+Here, **native execution** means DuckDB's in-process execution. At the current
+Vane reference, `local` selects this path; `local-fast` is a compatibility alias.
+The former public local FTE runner was removed in
+[#1040](https://github.com/AstroVela/vane/pull/1040). Restore the shared local
+runtime, admission, model ownership, and managed result contracts in P3, after
+the basic P2 bindings. A native SQL smoke test alone does not qualify those
+contracts. Ray fragment execution and recovery belong to P4/P5. See
+[local runtime](LOCAL_MODEL_RUNTIME.md#selecting-local-execution).
 
 | Area | Intended responsibility |
 | --- | --- |
@@ -130,7 +146,15 @@ the selected execution path.
 Result streams must own the resources they need until exhaustion, close, or
 cancellation. Define connection reuse, partial consumption, iterator teardown,
 Arrow release callbacks, and error propagation before exposing the migrated
-fetch methods. Distributed plans and fragments need an explicit versioned
+fetch methods. P2 must establish callback entry and connection locking rules
+for the migrated input/result APIs. P3 extends that boundary to the shared
+local runtime: request/task/data admission, retained input/output leases,
+resident models, and cancellation must share the owning session's lifetime.
+Preserve database runtime ownership across Vane's private execution engines
+without admitting foreign official DuckDB objects. Use the current
+[local runtime contract](LOCAL_MODEL_RUNTIME.md) and its regression tests.
+
+Distributed plans and fragments need an explicit versioned
 transport contract; the old physical-operator serialization format is not
 assumed compatible with 2.0.
 
@@ -183,9 +207,9 @@ remaining effort after P2 and P4 expose the binding and execution changes.
 | P0 Pure engine import | Complete | Official 2.0 subtree, source identities, historical Vane reference | Exact upstream tree match, correct subtree metadata, preserved old history |
 | P1 Official Python client import | Complete | Pinned client snapshot, source provenance, capability migration inventory | Client files match the chosen upstream tree; engine selection and source layout are documented; no Vane behavior is claimed restored |
 | P2 Minimal native Vane installation | Next | One engine and one client implementation packaged as Vane | Non-editable wheel installs; public import and explicit native SQL work; basic result and conversion tests, engine identities, coexistence, and source-license checks pass |
-| P3 Local Vane data and UDF semantics | Planned | FILE and Tensor contracts, local sources and sinks, UDF adapters, runner dispatch boundary | Native-path correctness, ownership, readiness, bounded buffering, and cancellation regressions pass |
+| P3 Local Vane data and UDF semantics | Planned | FILE and Tensor contracts, local sources and sinks, UDF adapters, native local runtime and runner selection | Native-path correctness, shared admission, callback safety, managed result ownership, readiness, bounded buffering, and cancellation regressions pass |
 | P4 Distributed read execution | Planned | Fragment planning, transport, worker preparation, exchange, and Ray reads | Multi-worker scans, projection/filter, joins, aggregates, ordered limits, and UDF reads match their declared semantics |
-| P5 Failure recovery and local runner | Planned | Retry, resource lifecycle, worker failure handling, and local FTE execution | Fault injection, early termination, cancellation, teardown, and resource reclamation tests pass without duplicate or missing results |
+| P5 Ray recovery and resource lifecycle | Planned | Retry, worker failure handling, bounded resources, and progress observation | Fault injection, early termination, cancellation, teardown, and resource reclamation tests pass without duplicate or missing results |
 | P6 Distributed writes and extension integration | Planned | COPY, DataSink and extension write paths; catalog and provider integration | Attempt outputs are committed through the coordinator; retries and failures preserve write contracts; identity mismatches fail before execution |
 | P7 Multimodal and application parity | Planned | Optional native media, AI inference paths, and remaining supported integrations | Representative image/audio/video and provider workflows pass with explicit optional dependencies and matching artifacts |
 | P8 Release qualification | Planned | Supported platform wheels, extension wheels, migration guide, and complete acceptance record | Required release and fast suites, native tests, artifact validation, coexistence, and selected workload comparisons pass on the declared support matrix |
@@ -229,10 +253,15 @@ including the upstream typed vector iterators and writers. Recover native
 source, sink, and scalar/batch UDF behavior before
 enabling their distributed forms. Keep asynchronous dispatch, output schema,
 NULL handling, ownership, and memory limits with their regression tests.
+P3 also restores native local runtime configuration, session and cursor
+ownership, resource graphs, resident model pools, and managed result delivery.
+Qualify bounded input/output retention and callback reentry before exposing
+these APIs. The current main tests, including the local serving acceptance
+scenario, define these contracts; the removed local FTE entrypoint does not.
 
 P4 restores the shared fragment execution architecture and first qualifies
-successful distributed reads. P5 qualifies recovery and the local FTE runner
-on those same primitives; it must not introduce a temporary second scheduler.
+successful distributed reads. P5 qualifies Ray recovery, resource cleanup,
+and progress on those same primitives. Local execution remains native.
 Compare ordered queries with their specified order and unordered results by
 their contents and multiplicities. Include empty inputs, nested values, partial
 result consumption, and failures while tasks are blocked.
@@ -244,10 +273,14 @@ catalog-backed writes. Rebuild static and optional extensions against the
 actual modified engine SourceID; binaries from the pristine upstream or 1.5
 line are not interchangeable with the Vane build.
 
-Restore storage connectors, including Gravitino and the VaneFS adapter, within
-their existing documented access boundaries. Qualify media and AI paths after
+Restore storage connectors, including Gravitino Fileset batch writes and the
+VaneFS adapter's durability and same-host Ray contracts, within their existing
+documented access boundaries. Qualify media and AI paths after
 their types, I/O, UDFs, and provider dependencies are available. External-service
 and GPU checks remain separate from the base CPU release gate.
+Include typed multimodal embeddings, resident MLX/LiteRT-LM engines, HTTP
+providers, and the persistent embedding service with its PyZMQ/shared-memory
+ownership boundaries. Their current main sources and tests are migration inputs.
 
 Before P8 completes, account for every capability in the P1 inventory, including
 any intentional exclusions. Run the complete applicable gates and record
@@ -265,11 +298,13 @@ Keep the non-Ray, shared-Ray, and cluster-owning test processes separate.
 | Area | Existing starting points |
 | --- | --- |
 | Package and process isolation | [package metadata](tests/fast/test_package_metadata.py), [coexistence validator](scripts/verify_duckdb_coexistence.py), [teardown](tests/fast/test_vane_teardown.py) |
+| Native local runtime and callbacks | [local runtime](tests/fast/test_local_query_runtime.py), [resource graph](tests/fast/test_local_resource_graph.py), [managed results](tests/fast/test_local_query_results.py), [input callbacks](tests/fast/test_python_callback_entry.py), [serving acceptance](LOCAL_SERVING_ACCEPTANCE.md) |
 | Local values and UDFs | [FILE](tests/fast/test_file.py), [Tensor](tests/fast/test_variable_tensor.py), [process UDF](tests/fast/test_udf_process.py), [source readiness](tests/fast/test_datasource_readiness.py) |
 | Planning and read semantics | [runner dispatch](tests/fast/test_bound_plan_runner.py), [distributed plans](tests/fast/test_ray_relation_to_distributed_plan.py), [aggregates](tests/fast/test_distributed_aggregates.py), [ordered limits](tests/fast/test_ray_ordered_limit.py) |
 | Failures and resource ownership | [FTE fault injection](tests/fast/test_ray_fte_fault_injection.py), [UDF lifecycle](tests/fast/test_ray_udf_resource_lifecycle.py), [result contracts](tests/fast/test_ray_result_contract.py) |
-| Writes and extension identity | [DataSink](tests/fast/test_datasink.py), [ordered COPY](tests/fast/test_ray_ordered_copy.py), [provider resolution](tests/fast/test_dynamic_extension_resolver.py), [extension wheels](tests/fast/test_extension_wheel.py), [Gravitino](tests/fast/test_gravitino.py) |
+| Writes and extension identity | [DataSink](tests/fast/test_datasink.py), [ordered COPY](tests/fast/test_ray_ordered_copy.py), [provider resolution](tests/fast/test_dynamic_extension_resolver.py), [extension wheels](tests/fast/test_extension_wheel.py), [Gravitino writes](tests/fast/test_gravitino_write.py), [VaneFS on Ray](tests/fast/test_vane_fs_ray.py) |
 | Optional media | [native media](tests/fast/test_native_media_extensions.py), [Ray media](tests/fast/test_ray_native_media_extensions.py), [multimodal values](tests/fast/test_native_multimodal.py) |
+| Embeddings and resident services | [outputs](tests/fast/test_embedding_outputs.py), [service transport](tests/fast/test_embedding_service_transport.py), [MLX service](tests/fast/test_mlx_service_runtime.py), [LiteRT service](tests/fast/test_litert_service.py) |
 
 These are migration inputs, not a complete acceptance suite. Add regressions
 for changed ownership, binding, and scheduling behavior where existing coverage
@@ -290,12 +325,12 @@ are restored, and all required release, fast, native, and artifact checks at P8.
 | Root build still selects pybind11, C++11, and removed custom extensions | Replace those build dependencies and assumptions in P2; inspect all consumers and test targets |
 | License header checker still uses the old 1.5.0 baseline | Make the baseline and subtree path handling match the new import; preserve upstream attribution |
 | Root formatting and license tools do not yet classify the new client subtree | Exclude untouched upstream files from Vane header/format rewrites and adapt source/artifact inventories in P2; preserve the exact import |
-| Copyleft inventory detects changes in libpg_query, Mbed TLS, Zstandard, and the inventory document | Review notices and source scope before updating the reviewed hashes in P2 |
+| Copyleft inventory references removed libpg_query files and changed Mbed TLS, Zstandard, and inventory content | Review notices and source scope before updating the reviewed hashes in P2 |
 | SQL-text relations and streaming results change ownership assumptions | Settle API behavior before porting runner dispatch and result consumers |
 | Asynchronous I/O overlaps Vane readiness and backpressure | Test cancellation and wakeup races under resource pressure; avoid duplicate scheduling mechanisms |
 | Clean merges or successful builds can miss semantic regressions | Require behavior and failure tests at each execution stage |
 | Old and new native extensions have incompatible identities | Rebuild and validate providers; keep every query's driver and workers on matching artifacts |
-| Existing feature work continues outside the frozen baseline | Track later changes explicitly in the capability inventory and migrate their tests with them |
+| Main continues after the pinned migration reference | Record each synchronization and update the inventory; retain later engine changes as migration inputs until explicitly ported |
 
 ## Working sequence and rollback
 
@@ -317,6 +352,7 @@ commit only rolls back code.
 | --- | --- |
 | P0 | Import `d1ca8da47e8eb9298b8ecfc8d47e547e07e06d20`; provenance update `3b2ad50f089cc9f58da454df9a2eb770d619bcec`; official tree `c671df12df7e48e80306cb6a42d4761417c01695`; SourceID and subtree metadata verified; existing Git history preserved |
 | P1 | Import `362db617be3ed09a9fcba9aaf23f37372a56f899`; official client tree `b2e1819b1bd881106f5b3af31a62bc61ff8110d3`; matching engine gitlink verified; engine subtree unchanged; [capability inventory](DUCKDB_2_MIGRATION_INVENTORY.md) records source layout, dependencies and tests; no runtime qualification claimed |
+| Main baseline correction | Merge main `06cfbd5cc39f8b2c19531676f2bdcfff64e1a6e4` into the P0/P1 branch after `dbb66351138ba54a76d38b0cf6cafc2d05e9eccc`; preserve both official subtree identities and import ancestry; update the reference contracts to current main, including native local execution; source verification only, P2 remains next |
 
 The next implementation step is P2: connect the new client and single engine
 to a minimal native Vane wheel, resolve the public API differences, and verify

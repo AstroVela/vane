@@ -453,6 +453,33 @@ def test_clip_initializes_video_properties_from_bitstream(tmp_path, duckdb_curso
         assert all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
 
 
+@pytest.mark.parametrize("sar", [Fraction(1281, 1280), Fraction(1000, 333)])
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_preserves_constant_sar_beyond_the_mpeg4_codec_precision(tmp_path, duckdb_cursor, sar, audio, facade):
+    source = make_av_video(
+        tmp_path / "precise-sar.mp4", codec="libx264", rate=10, b_frames=2, sample_aspect_ratio=sar, audio=audio
+    )
+    with av.open(source.url) as container:
+        assert container.streams.video[0].sample_aspect_ratio == sar
+    if facade == "python":
+        clip = source.clip(0.1, 0.6)
+        data, has_audio = clip.data, clip.has_audio
+    else:
+        clip = duckdb_cursor.execute("SELECT video_clip($1, 0.1, 0.6)", [source]).fetchone()[0]
+        data, has_audio = clip["data"], clip["has_audio"]
+    assert has_audio is audio
+    with av.open(io.BytesIO(data)) as container:
+        video = container.streams.video[0]
+        assert video.codec_context.name == "mpeg4"
+        assert video.sample_aspect_ratio == sar
+        # The container's exact ratio defines displayed geometry; the MPEG-4
+        # bitstream may carry a reduced approximation of that ratio.
+        assert Fraction(video.width, video.height) * video.sample_aspect_ratio == Fraction(4, 3) * sar
+        assert video.duration * video.time_base == Fraction(1, 2)
+        assert len(list(container.decode(video))) == 5
+
+
 def test_clip_rejects_changing_sample_aspect_ratio(source, monkeypatch):
     original_video_frame = clipping._ClipEncoder.video_frame
 
@@ -934,4 +961,32 @@ def test_partial_boundary_pictures_below_output_precision_do_not_fail(source, st
     clip = source.clip(start, end, include_audio=False)
     frames, duration = decode_video(clip.data)
     assert len(frames) == clip.frame_count == count
+    assert duration == pytest.approx(end - start, abs=1 / 60000)
+
+
+@pytest.mark.parametrize("overrun", [False, True])
+def test_fractional_start_reconstruction_keeps_the_requested_stream_end(tmp_path, overrun):
+    path = tmp_path / "fractional-rate.mp4"
+    rate = Fraction(30000, 1001)
+    with av.open(str(path), mode="w", format="mp4") as output:
+        stream = output.add_stream("mpeg4", rate=rate)
+        stream.width, stream.height, stream.pix_fmt = 16, 12, "yuv420p"
+        for index in range(960):
+            frame = av.VideoFrame.from_ndarray(np.zeros((12, 16, 3), dtype=np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, 1 / rate
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    end = float(Fraction(960, 1) / rate)
+    start = float(Fraction(640, 1) / rate)
+    source = vane.VideoFile(str(path))
+    if overrun:
+        with pytest.raises(vane.VideoFileFormatError, match="end exceeds"):
+            source.clip(start, end + 1 / 60000, include_audio=False)
+        return
+    clip = source.clip(start, end, include_audio=False)
+    frames, duration = decode_video(clip.data)
+    assert len(frames) == clip.frame_count == 320
+    assert clip.end_time == pytest.approx(end, abs=1 / 60000)
     assert duration == pytest.approx(end - start, abs=1 / 60000)

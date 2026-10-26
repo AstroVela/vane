@@ -3,14 +3,14 @@
 
 import pytest
 
-from vane.runners.ray.query_resource_graph import (
+from vane.execution.query_resource_policy import TaskRequest
+from vane.execution.query_resource_spec import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from vane.runners.ray.query_resource_manager import TaskRequest
 from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
@@ -92,7 +92,7 @@ def test_runtime_accepts_a_soft_budget_smaller_than_one_concrete_task():
     manager = register_query_resource_graph(graph, too_small)
 
     assert manager.allocation.resources == too_small_resources
-    assert query_resource_manager_snapshot("q")["ray_core_owns_placement"] is True
+    assert query_resource_manager_snapshot("q")["backend_owns_placement"] is True
 
 
 def test_runtime_can_publish_pending_query_before_minimum_bundle_is_feasible():

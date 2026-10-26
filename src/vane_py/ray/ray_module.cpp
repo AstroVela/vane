@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "vane_python/native_resource_graph.hpp"
+#include "vane_python/vane_fs.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "task.hpp"
@@ -14,6 +16,8 @@
 #include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_objects.hpp"
+#include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/physical_plan_traversal.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/pandas/pandas_scan.hpp"
@@ -625,7 +629,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def(
 	        "_wait_fte_query_streaming_for_test",
 	        [](RayWorkerManager &self, const string &query_id, double timeout_s, int64_t fail_after,
-	           int64_t throw_after) {
+	           int64_t throw_after, bool preserve_task_order) {
 		        size_t output_count = 0;
 		        auto on_output = [&output_count, fail_after,
 		                          throw_after](const duckdb::distributed::MaterializedOutput &) {
@@ -641,14 +645,16 @@ void register_ray_bindings(py::module_ &mod) {
 		        };
 		        auto res = [&]() {
 			        py::gil_scoped_release release;
-			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output),
+			                                             preserve_task_order);
 		        }();
 		        if (res.is_err()) {
 			        throw duckdb::InternalException(res.error().what());
 		        }
 		        return output_count;
 	        },
-	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1)
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1,
+	        py::arg("preserve_task_order") = true)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {
@@ -766,7 +772,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // worker admits any task that can deserialize this physical plan.
 		    auto connection = CreateConnectionFromBootstrapSnapshot(
 		        LookupBootstrapSnapshot(snapshot), RunnerTypeFromSnapshot(snapshot), false, true, true);
-		    PrepareConnectionSnapshotExtensions(connection, snapshot);
+		    PrepareConnectionSnapshotExtensions(connection, snapshot, LookupQueryVaneFSPins(query_id));
 		    return connection;
 	    },
 	    py::arg("query_id"));
@@ -781,6 +787,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    // Admission is verification-only for dynamic artifacts. Provider
 		    // discovery and dynamic loading are confined to preparation above.
 		    ValidateConnectionSnapshotExtensions(connection, snapshot, true);
+		    if (snapshot.cast<py::dict>().contains("vane_fs_workspaces")) {
+			    ApplyVaneFSWorkspaces(ExtractPyConnectionWrapper(connection),
+			                          snapshot.cast<py::dict>()["vane_fs_workspaces"], LookupQueryVaneFSPins(query_id));
+		    }
 	    },
 	    py::arg("connection"), py::arg("query_id"));
 
@@ -799,7 +809,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
 		                                          plan.memory_source_refs_, plan.connection_snapshot_,
-		                                          plan.worker_connection_);
+		                                          plan.worker_connection_, plan.vane_fs_query_pins_);
 	    },
 	    py::arg("query_id"), py::arg("plan"));
 
@@ -974,6 +984,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyPhysicalPlanWrapper::session_id)
 	    .def("session_config", &PyPhysicalPlanWrapper::session_config)
 	    .def("has_explicit_s3_credentials", &PyPhysicalPlanWrapper::has_explicit_s3_credentials)
+	    .def("_release_vane_fs_query_pins",
+	         [](PyPhysicalPlanWrapper &plan) { plan.vane_fs_query_pins_ = CreateVaneFSQueryPins(); })
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
 	    .def("_memory_source_ref_count_for_test",
 	         [](const PyPhysicalPlanWrapper &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
@@ -985,10 +997,16 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("scan_split_batch_map", &PyPhysicalPlanWrapper::scan_split_batch_map)
 	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
 	         py::arg("conn") = py::none())
+	    .def("collect_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_resource_graph_metadata,
+	         py::arg("conn") = py::none())
+	    .def("collect_local_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_local_resource_graph_metadata,
+	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
 	         py::arg("conn") = py::none())
+	    .def("set_local_udf_executor_options", &PyPhysicalPlanWrapper::set_local_udf_executor_options,
+	         py::arg("options_map"), py::arg("conn") = py::none())
 	    .def(
 	        "_validate_serializable_for_submission",
 	        [](const PyPhysicalPlanWrapper &p) { p.validate_serializable_for_submission(); },
@@ -1219,6 +1237,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
+	    .def("_release_vane_fs_query_pins",
+	         [](PyLogicalPlan &plan) { plan.vane_fs_query_pins_ = CreateVaneFSQueryPins(); })
 	    .def("_memory_source_ref_count_for_test",
 	         [](const PyLogicalPlan &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
 	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none(),
@@ -1518,7 +1538,10 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
-	           py::object effective_session_config_obj) {
+	           py::object effective_session_config_obj, py::object native_execution_started_obj) {
+		        if (!native_execution_started_obj.is_none() && !PyCallable_Check(native_execution_started_obj.ptr())) {
+			        throw py::type_error("native_execution_started must be callable");
+		        }
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
 		        auto parse_node_id = [](py::handle key, const char *map_name) -> idx_t {
 			        if (!py::isinstance<py::str>(key)) {
@@ -1842,7 +1865,8 @@ void register_ray_bindings(py::module_ &mod) {
 				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
 				            scan_split_batch_map_ptr, exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
 				            fte_scan_source_queue_map_ptr, fte_exchange_source_queue_map_ptr, copy_output_info_ptr,
-				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj);
+				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj,
+				            native_execution_started_obj);
 				        return result;
 			        } catch (...) {
 				        throw;
@@ -1858,7 +1882,8 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
-	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
+	        py::arg("effective_session_config") = py::none(), py::arg("native_execution_started") = py::none(),
+	        "Execute physical plan using DuckDB's native Executor");
 
 	// Merge the independently scheduled splits assigned to one worker attempt
 	// into its transport batch.

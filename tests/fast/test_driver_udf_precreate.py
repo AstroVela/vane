@@ -343,6 +343,7 @@ def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
     client._closed_session_ids = driver_module.BoundedReplayMap(capacity=65_536)
     client._session_closes_in_progress = set()
     client._session_condition = threading.Condition()
+    client._pending_vane_fs_copy_plans = {}
     client._client_closing = False
     client._client_close_in_progress = False
 
@@ -2630,6 +2631,7 @@ def _build_simple_ray_udf_plan(con):
         relation,
         f"udf-executor-options-{uuid.uuid4().hex[:8]}",
     ).to_physical_plan(con)
+    plan.collect_query_resource_graph_metadata(conn=con)
     assert len(plan.collect_udf_nodes(conn=con)) == 1
     return plan
 
@@ -2714,6 +2716,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     try:
         plan = _build_simple_ray_udf_plan(con)
         query_driver_handle = object()
+        plan.collect_query_resource_graph_metadata(conn=con)
         plan.set_udf_actor_handles(
             {
                 "0": {
@@ -2839,6 +2842,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
             relation,
             f"udf-cleanup-gil-{uuid.uuid4().hex[:8]}",
         ).to_physical_plan(con)
+        plan.collect_query_resource_graph_metadata(conn=con)
         plan.set_udf_actor_handles(
             {
                 "0": {
@@ -2894,10 +2898,8 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
-        plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
-
-        with pytest.raises(ValueError, match="udf executor options must be a dict"):
-            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+        with pytest.raises(vane.InvalidInputException, match="UDF executor options must be a dict"):
+            plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
     finally:
         con.close()
 
@@ -3538,3 +3540,19 @@ def test_first_initializer_failure_is_terminal_even_with_pending_or_ready_actors
     else:
         assert caught.value.__cause__ is failure
         assert pool.actors == []
+
+
+def test_distributed_udf_options_use_stable_resource_identity():
+    import vane
+
+    with vane.connect() as con:
+        plan = _build_simple_ray_udf_plan(con)
+        node = plan.collect_udf_nodes(conn=con)[0]
+        options = {
+            "session_config": {},
+            "actor_pool_locator": {"resource_unit_id": node["payload"]["resource_unit_id"]},
+        }
+        plan.set_udf_actor_handles({str(node["node_id"]): options}, conn=con)
+        state = plan.__getstate__()
+        assert len(state) == 8  # The existing transport format is unchanged.
+        assert state[5] == {node["payload"]["resource_unit_id"]: options}

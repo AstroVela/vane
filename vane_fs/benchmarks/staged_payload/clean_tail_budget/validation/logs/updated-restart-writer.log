@@ -1,0 +1,1 @@
+writer PASS passive=1 restart=1 success=0 busy=1 partial=0 bad_timeout=0

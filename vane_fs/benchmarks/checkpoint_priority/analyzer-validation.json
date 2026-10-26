@@ -1,0 +1,6 @@
+{
+  "status": "PASS",
+  "reference": "partial-acceptance-20261011T043725Z/summary.json",
+  "comparisons": 280,
+  "lifecycle_metric": "original monotonic lifecycle_seconds, not wall-clock epoch subtraction"
+}

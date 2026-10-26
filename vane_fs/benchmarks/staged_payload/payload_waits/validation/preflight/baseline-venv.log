@@ -1,0 +1,3 @@
+Using CPython 3.12.13 interpreter at: .venv/bin/python
+Creating virtual environment at: vane_fs/build/payload-waits-20261018/diagnostic/baseline/venv
+Activate with: source vane_fs/build/payload-waits-20261018/diagnostic/baseline/venv/bin/activate

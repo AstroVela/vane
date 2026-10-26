@@ -1,0 +1,6 @@
+{
+  "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/validate.py": "78a24e43de2b2b98f792526794465ed57bee124fe39e1e024c33f6f080f82de1",
+  "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/validate.py": "4777262914a3ae6fe9f4802e65362fb306a1acc4e94d0bb95f5b607faec7dbea",
+  "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/test_budget.cpp": "549b6f28aafdb03099853a63ae1d7008e27de0068d167734b205914239944179",
+  "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/validate-generator.py": "480db62187a646689adc868134abd795adf2a543f68327c3096d548629c25f81"
+}

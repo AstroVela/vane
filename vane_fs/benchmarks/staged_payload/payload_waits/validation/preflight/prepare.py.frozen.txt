@@ -1,0 +1,326 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build matched, reversible publication-hold diagnostics for the frozen payload trial."""
+
+import argparse
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TRACE = HERE.parent / "fuse_waits"
+spec = importlib.util.spec_from_file_location("wait_helpers", TRACE / "prepare.py")
+helpers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helpers)
+digest, save = helpers.digest, helpers.save
+
+
+def changed(text, pairs):
+    original = text
+    for before, after in pairs:
+        assert text.count(before) == 1, before
+        text = text.replace(before, after)
+    reverse = text
+    for before, after in reversed(pairs):
+        assert reverse.count(after) == 1, after
+        reverse = reverse.replace(after, before)
+    assert reverse == original
+    return text
+
+
+def recorder(file):
+    original = (TRACE / file).read_text()
+    if file.endswith(".hpp"):
+        pairs = [("\tCheckpoint,\n\tCount", "\tCheckpoint,\n\tPublicationHold,\n\tCount")]
+    else:
+        pairs = [
+            ('"checkpoint"};', '"checkpoint", "publication_hold"};'),
+            ("\tif ((stage == DatabaseWait", "\tif (stage == PublicationHold || ((stage == DatabaseWait"),
+            ("end - begin >= 1000000) {", "end - begin >= 1000000)) {"),
+        ]
+    return changed(original, pairs), pairs
+
+
+def instrument(source, name):
+    text, reverse, pairs = helpers.instrument(source, name)
+    assert reverse == source
+    extra = []
+    if name == "src/staging.hpp":
+        extra = [
+            (
+                "thread(fuse_waits::Lock(fuse_waits::PublicationWait, stage.mutex)), file(stage.publication.fd, LOCK_EX, stage.timeout)",
+                "thread(fuse_waits::Lock(fuse_waits::PublicationWait, stage.mutex)), hold(fuse_waits::PublicationHold), file(stage.publication.fd, LOCK_EX, stage.timeout)",
+            ),
+            (
+                "\t\tstd::unique_lock<std::mutex> thread;\n\t\tLock file;",
+                "\t\tstd::unique_lock<std::mutex> thread;\n\t\tfuse_waits::Span hold;\n\t\tLock file;",
+            ),
+        ]
+        text = changed(text, extra)
+    return text, [*pairs, *[(a, b, 1) for a, b in extra]]
+
+
+def validate(trace):
+    result = helpers.validate(trace)
+    index = trace["stages"].index("publication_hold")
+    count = 0
+    for thread in trace["threads"]:
+        for root in thread["roots"]:
+            held = [e for e in thread["events"] if e[0] == "publication_hold" and e[2] == root[1]]
+            assert len(held) == root[10][index][0]
+            assert sum(e[4] - e[3] for e in held) == root[10][index][1]
+            assert sum(e[5] for e in held) == root[10][index][3]
+            assert all(a[4] <= b[3] for a, b in zip(held, held[1:]))
+            count += len(held)
+    return dict(result, publication_holds=count)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    parser.add_argument("--comparison", type=Path, required=True)
+    args = parser.parse_args()
+    out, comparison, repo = args.artifacts.resolve(), args.comparison.resolve(), HERE.parents[3]
+    prior = json.loads((comparison / "build.json").read_text())
+    component = json.loads((Path(prior["component"]) / "build.json").read_text())
+    source = component["source_manifest"]
+    assert prior["status"] == component["status"] == "PASS"
+    inputs = dict(prior["inputs"], **component["binaries"], **component["inputs"])
+    assert all(digest(Path(p)) == sha for p, sha in inputs.items())
+    assert shutil.disk_usage(comparison).free > 8 * 1024**3
+    out.mkdir()
+    sdk = Path(source["sdk"])
+    report = dict(
+        status="RUNNING",
+        started_epoch=time.time(),
+        parent=str(comparison),
+        template=str(comparison / "full"),
+        sdk=str(sdk),
+        commands=[],
+        cleanup=[],
+        inputs=inputs,
+        sources={},
+        binaries={},
+        reverse_proof={},
+        recorder_reverse_proof={},
+        held_interval="From local publication mutex acquisition through file-lock release; before mutex unlock.",
+        scheduling_and_durability_unchanged=True,
+        original_plain_failed_checks=11,
+    )
+
+    def run(label, argv, cwd=None, env=None):
+        log, begin = out / (label + ".log"), time.time()
+        with log.open("w") as stream:
+            result = subprocess.run(argv, cwd=cwd, env=env, stdout=stream, stderr=stream, timeout=900)
+        report["commands"].append(
+            dict(
+                label=label,
+                argv=argv,
+                cwd=str(cwd),
+                started_epoch=begin,
+                ended_epoch=time.time(),
+                returncode=result.returncode,
+                log=str(log),
+                log_sha256=digest(log),
+            )
+        )
+        save(out / "build.json", report)
+        assert result.returncode == 0, log
+        print(label, "PASS", flush=True)
+
+    try:
+        for name, core in dict(baseline=Path(source["original"]), updated=Path(source["candidate"])).items():
+            target = out / "diagnostic" / name
+            target.mkdir(parents=True)
+            for item in (
+                "src",
+                "include",
+                "python",
+                "tests",
+                "LICENSES",
+                "triplets",
+                "CMakeLists.txt",
+                "pyproject.toml",
+                "README.md",
+                "LICENSE",
+                "vcpkg.json",
+            ):
+                path = core / item
+                if path.is_dir():
+                    shutil.copytree(path, target / item, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                elif path.is_file():
+                    shutil.copy2(path, target / item)
+            for relative in (
+                "CMakeLists.txt",
+                "src/workspace.cpp",
+                "src/checkpoint.hpp",
+                "src/staging.hpp",
+                "src/fuse.cpp",
+            ):
+                plain = (core / relative).read_text()
+                text, pairs = instrument(plain, relative)
+                reverse = text
+                for before, after, count in reversed(pairs):
+                    assert reverse.count(after) == count
+                    reverse = reverse.replace(after, before)
+                assert reverse == plain
+                (target / relative).write_text(text)
+                report["reverse_proof"][str(target / relative)] = dict(
+                    original_path=str(core / relative),
+                    original_sha256=digest(core / relative),
+                    instrumented_sha256=digest(target / relative),
+                    exact_reverse=True,
+                    changes=pairs,
+                )
+            for file in ("wait_trace.hpp", "wait_trace.cpp"):
+                text, pairs = recorder(file)
+                (target / "src" / file).write_text(text)
+                report["recorder_reverse_proof"][str(target / "src" / file)] = dict(
+                    original_path=str(TRACE / file),
+                    original_sha256=digest(TRACE / file),
+                    changes=pairs,
+                    exact_reverse=True,
+                )
+            python = target / "venv/bin/python"
+            run(name + "-venv", ["uv", "venv", "--python", str(repo / ".venv/bin/python"), str(target / "venv")])
+            (target / "venv/lib/python3.12/site-packages/support.pth").write_text(
+                "".join(
+                    str(path / "venv/lib/python3.12/site-packages") + "\n"
+                    for path in [Path(source["dependency_support"]), core]
+                )
+                + str(repo / ".venv/lib/python3.12/site-packages")
+                + "\n"
+            )
+            fuse = repo / ".cache/fuse-sdk/root/usr"
+            run(
+                name + "-install",
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python),
+                    ".",
+                    "--no-build-isolation",
+                    "-Ccmake.define.unofficial-sqlite3_DIR=" + str(sdk / "share/unofficial-sqlite3"),
+                    "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+                    "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+                    "-Ccmake.define.VANE_FS_BUILD_TESTS=OFF",
+                ],
+                target,
+                dict(
+                    os.environ,
+                    SKBUILD_BUILD_DIR=str(target / "build/python-release"),
+                    SKBUILD_CMAKE_BUILD_TYPE="Release",
+                    CMAKE_BUILD_PARALLEL_LEVEL="2",
+                    PKG_CONFIG_PATH=str(fuse / "lib/x86_64-linux-gnu/pkgconfig"),
+                    PKG_CONFIG_SYSROOT_DIR=str(fuse.parent),
+                ),
+            )
+            for path in target.rglob("*"):
+                if path.is_file() and not any(
+                    p in ("build", "venv", "__pycache__") for p in path.relative_to(target).parts
+                ):
+                    report["sources"][str(path)] = digest(path)
+            for path in [
+                *(target / "build/python-release").glob("vane-fs*"),
+                target / "build/python-release/libvane_fs.a",
+                *target.glob("venv/lib/python3.12/site-packages/vane_fs/_native*.so"),
+            ]:
+                if path.is_file():
+                    report["binaries"][str(path)] = digest(path)
+            alias = out / name
+            alias.mkdir()
+            (alias / "venv").symlink_to(target / "venv", target_is_directory=True)
+        for mode in ("release", "asan"):
+            core = out / "diagnostic/updated"
+            binary = out / ("trace-test-" + mode)
+            flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if mode == "asan" else []
+            run(
+                mode + "-compile",
+                [
+                    "c++",
+                    "-std=c++17",
+                    "-O1",
+                    "-I" + str(sdk / "include"),
+                    "-I" + str(core / "include"),
+                    "-I" + str(core / "src"),
+                    str(HERE / "test_hold.cpp"),
+                    str(core / "src/workspace.cpp"),
+                    str(core / "src/wait_trace.cpp"),
+                    str(sdk / "lib/libsqlite3.a"),
+                    "-ldl",
+                    "-pthread",
+                    *["-Wl,--wrap=" + n for n in helpers.WRAPS],
+                    *flags,
+                    "-o",
+                    str(binary),
+                ],
+            )
+            owned = Path(tempfile.mkdtemp(prefix="owned-payload-wait-", dir="/dev/shm"))
+            try:
+                run(
+                    mode + "-trace",
+                    [str(binary), str(owned / "test")],
+                    env=dict(
+                        os.environ,
+                        ASAN_OPTIONS="detect_leaks=1:halt_on_error=1",
+                        UBSAN_OPTIONS="halt_on_error=1",
+                    ),
+                )
+                trace = json.loads((owned / "test.waits.json").read_text())
+                assert validate(trace)["roots"] == validate(trace)["publication_holds"] == 2
+                thread = next(t for t in trace["threads"] if any(r[0] == "test" for r in t["roots"]))
+                root = next(r for r in thread["roots"] if r[0] == "test")
+                assert root[10][trace["stages"].index("checkpoint_wait")][1] >= 2500000 and root[9] > 0
+                errors = [e for t in trace["threads"] for e in t["events"] if e[0] == "fsync" and e[6] < 0]
+                assert len(errors) == 1 and errors[0][6:8] == [-1, 9]
+                syncs = [e for e in thread["events"] if e[1] == "payload" and e[2] == root[1]]
+                holds = [e for e in thread["events"] if e[0] == "publication_hold" and e[2] == root[1]]
+                assert len(syncs) == len(holds) == 1 and holds[0][3] <= syncs[0][3] <= syncs[0][4] <= holds[0][4]
+                save(out / (mode + "-trace.json"), trace)
+            finally:
+                files = {
+                    str(p.relative_to(owned)): dict(bytes=p.stat().st_size, sha256=digest(p))
+                    for p in owned.rglob("*")
+                    if p.is_file()
+                }
+                shutil.rmtree(owned)
+                report["cleanup"].append(
+                    dict(path=str(owned), files=files, removed=not owned.exists(), processes_stopped=True)
+                )
+            report["binaries"][str(binary)] = digest(binary)
+        report["inputs"].update(
+            {
+                str(p): digest(p)
+                for p in [
+                    Path(__file__),
+                    HERE / "run.py",
+                    HERE / "test_hold.cpp",
+                    TRACE / "prepare.py",
+                    TRACE / "wait_trace.hpp",
+                    TRACE / "wait_trace.cpp",
+                    comparison / "build.json",
+                    Path(prior["component"]) / "build.json",
+                    sdk / "lib/libsqlite3.a",
+                ]
+            }
+        )
+        assert all(digest(Path(p)) == sha for p, sha in inputs.items())
+        report["status"] = "PASS"
+    except BaseException as error:
+        report.update(status="FAIL", error=repr(error))
+        raise
+    finally:
+        report["ended_epoch"] = time.time()
+        save(out / "build.json", report)
+
+
+if __name__ == "__main__":
+    main()

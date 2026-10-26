@@ -1,0 +1,2 @@
+/usr/bin/ld: cannot open output file /home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-progress-20261012T153141Z/restart-control/test_progress: No such file or directory
+collect2: error: ld returned 1 exit status

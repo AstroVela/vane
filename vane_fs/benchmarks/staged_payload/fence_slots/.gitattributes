@@ -1,0 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+# Unified-diff context prefixes source tabs with a required space.
+materialize.patch whitespace=-space-before-tab

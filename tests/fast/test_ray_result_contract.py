@@ -43,7 +43,7 @@ def _registered_low_level_plan(
     refresh_phase_allocation=False,
 ):
     """Exercise the internal C++ runner under the mandatory graph contract."""
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         ResourceVector,
     )
@@ -346,6 +346,7 @@ def _initialize_test_query_driver_client(client, opened_sessions=None):
     client._closed_session_ids = driver.BoundedReplayMap(capacity=65_536)
     client._session_closes_in_progress = set()
     client._session_condition = threading.Condition()
+    client._pending_vane_fs_copy_plans = {}
     client._client_closing = False
     client._client_close_in_progress = False
 
@@ -480,13 +481,13 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
 
 
 def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_policy import TaskRequest
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
         ResourceVector,
     )
-    from vane.runners.ray.query_resource_manager import TaskRequest
     from vane.runners.ray.query_resource_runtime import (
         register_query_resource_graph,
         release_query_resource_manager,
@@ -734,7 +735,7 @@ def _bind_test_query_resource_owner(
     *,
     query_id: str | None = None,
 ):
-    from vane.runners.ray.query_resource_graph import (
+    from vane.execution.query_resource_spec import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
@@ -1967,7 +1968,11 @@ def test_query_driver_datasink_cleanup_retry_ignores_reused_plan_identity():
 def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-committed-cleanup-retry"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+    logical_plan._release_vane_fs_query_pins = lambda: released_pins.append("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: released_pins.append("physical")
     plan_calls = 0
     teardown_calls = 0
 
@@ -1995,6 +2000,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
     first = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    assert released_pins == []
     recovered = asyncio.run(
         cls.recover_copy_plan(
             runner,
@@ -2020,6 +2026,7 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     assert replayed == cleaned
     assert plan_calls == 1
     assert teardown_calls == 2
+    assert released_pins == ["logical", "physical"]
 
 
 def test_query_driver_pending_copy_cleanup_survives_terminal_replay_eviction(monkeypatch):
@@ -2137,12 +2144,22 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
 
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
-    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    physical_plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    logical_plan = _FakeLogicalPlan(physical_plan)
+    released_pins = []
+
+    def release_pins(kind):
+        assert runner._test_session_connection.cursors[-1].closed is True
+        released_pins.append(kind)
+
+    logical_plan._release_vane_fs_query_pins = lambda: release_pins("logical")
+    physical_plan._release_vane_fs_query_pins = lambda: release_pins("physical")
     plan_calls = 0
 
     class _PlanRunner:
         def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
+            assert released_pins == []
             plan_calls += 1
             on_execution_started()
             if late_init:
@@ -2188,6 +2205,7 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch, 
         assert isinstance(recovered.error, ValueError)
         assert str(recovered.error) == "planned failure before commit"
     assert plan_calls == 1
+    assert released_pins == ["logical", "physical"]
 
 
 @pytest.mark.parametrize("late_init", [False, True])
@@ -2938,6 +2956,140 @@ def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(mo
             },
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "completion", ["committed", "task_error", "transport_error", "cancelled", "invalid", "observer_error"]
+)
+def test_uncertain_copy_retains_native_pins_until_completion_or_confirmed_close(monkeypatch, completion):
+    import gc
+    import weakref
+    from concurrent.futures import Future
+
+    from vane.runners.ray.runner import RayRunner
+
+    plan_id = "copy-pending-native-pins"
+    plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    plan_ref = weakref.ref(plan)
+    released = []
+    plan._release_vane_fs_query_pins = lambda: released.append(plan_id)
+    original = Future()
+
+    class OriginalRef:
+        def future(self):
+            if completion == "observer_error":
+                raise RuntimeError("completion observer unavailable")
+            return original
+
+    reference = OriginalRef()
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=SimpleNamespace(remote=lambda *_: reference),
+        recover_copy_plan=SimpleNamespace(remote=lambda *_: "recover"),
+        close_session=SimpleNamespace(remote=lambda *_: "close"),
+    )
+    close_attempts = 0
+
+    def resolve(ref, **_kwargs):
+        nonlocal close_attempts
+        if ref is reference:
+            raise FutureTimeoutError("COPY response wait timed out")
+        if ref == "recover":
+            raise driver.CopyOutcomeUnknownError(plan_id)
+        assert ref == "close"
+        close_attempts += 1
+        if close_attempts == 1:
+            raise FutureTimeoutError("session cleanup not confirmed")
+
+    client._runtime_is_unavailable_or_replaced = lambda: False
+    runner = object.__new__(RayRunner)
+    runner._client_for_session = lambda _session: client
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    with pytest.raises(driver.CopyOutcomeUnknownError):
+        runner.run_write(plan)
+    del plan
+    gc.collect()
+    assert plan_ref() is not None
+    assert not released
+    assert len(client._pending_vane_fs_copy_plans) == 1
+
+    outcome = driver.CopyPlanOutcome(
+        operation_id=plan_id if completion != "invalid" else "another-operation",
+        result=_committed_copy_result(rows_copied=11),
+        final_progress_snapshot=None,
+    )
+    if completion in {"committed", "invalid"}:
+        original.set_result(outcome)
+    elif completion == "task_error":
+        original.set_exception(driver.ray.exceptions.RayTaskError("copy", "remote task failed", ValueError("failed")))
+    elif completion == "transport_error":
+        original.set_exception(RuntimeError("transport did not confirm completion"))
+    elif completion == "cancelled":
+        original.cancel()
+    if completion in {"committed", "task_error"}:
+        assert released == [plan_id]
+        assert not client._pending_vane_fs_copy_plans
+    else:
+        assert not released
+        with pytest.raises(FutureTimeoutError, match="cleanup not confirmed"):
+            client.close_session(_TEST_SESSION_ID)
+        assert not released
+        assert len(client._pending_vane_fs_copy_plans) == 1
+        client.close_session(_TEST_SESSION_ID)
+        assert released == [plan_id]
+        assert not client._pending_vane_fs_copy_plans
+
+
+@pytest.mark.parametrize("close_client", [False, True])
+def test_pending_copy_pins_follow_session_close_and_client_close_retry(monkeypatch, close_client):
+    from concurrent.futures import Future
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {"session-a": {}, "session-b": {}})
+    client.runner = SimpleNamespace(
+        close_session=SimpleNamespace(remote=lambda *_: None),
+        detach_client=SimpleNamespace(remote=lambda *_: None),
+    )
+    client._runtime_is_unavailable_or_replaced = lambda: False
+    released = []
+    futures = []
+    for session in ("session-a", "session-b"):
+        plan = _FakePhysicalPlanWithoutPlanAttr(session, session_id=session)
+        plan._release_vane_fs_query_pins = lambda session=session: released.append(session)
+        future = Future()
+        futures.append((session, future))
+        client._retain_pending_vane_fs_copy_plan(
+            session, session, plan, SimpleNamespace(future=lambda future=future: future)
+        )
+
+    fail_close = close_client
+
+    def resolve(*_args, **_kwargs):
+        nonlocal fail_close
+        if fail_close:
+            fail_close = False
+            raise FutureTimeoutError("client cleanup not confirmed")
+
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    if close_client:
+        with pytest.raises(FutureTimeoutError, match="cleanup not confirmed"):
+            client.close()
+        assert not released
+        assert len(client._pending_vane_fs_copy_plans) == 2
+    else:
+        client.close_session("session-a")
+        assert released == ["session-a"]
+        assert len(client._pending_vane_fs_copy_plans) == 1
+    client.close()
+    assert released == ["session-a", "session-b"]
+    assert not client._pending_vane_fs_copy_plans
+    for operation_id, future in futures:
+        future.set_result(driver.CopyPlanOutcome(operation_id, _committed_copy_result(rows_copied=11), None))
+    assert released == ["session-a", "session-b"]
 
 
 def test_ray_query_driver_client_bounds_pending_copy_recovery_without_resubmission(monkeypatch):
@@ -10783,7 +10935,8 @@ def test_streaming_wait_does_not_publish_loser_after_selected_attempt_was_publis
         manager.shutdown()
 
 
-def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(monkeypatch):
+@pytest.mark.parametrize("preserve_task_order", [True, False])
+def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(monkeypatch, preserve_task_order):
     class _UnselectedHandle:
         worker_id = "worker-empty-selection"
 
@@ -10869,7 +11022,7 @@ def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(mo
         manager.worker_snapshots()
         manager.register_query_owner(query_id, query_id)
 
-        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0, preserve_task_order=preserve_task_order) == 0
         assert worker.handle is not None
         assert worker.handle.get_result_sync_calls == 1
         assert worker.handle.ack_calls == 0
@@ -10896,8 +11049,10 @@ def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(mo
         (-1, -1, 1, "failed to finalize streamed FTE result handle", [1, 1], [1, 1], [1, 2]),
     ],
 )
+@pytest.mark.parametrize("preserve_task_order", [True, False])
 def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalization_failure(
     monkeypatch,
+    preserve_task_order,
     fail_after,
     throw_after,
     release_failures,
@@ -10912,6 +11067,7 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
         worker_id = "worker-streaming-callback-failure"
 
         def __init__(self, task_id, value, *, release_failures=0):
+            self.value = value
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self._result = vane.ray_cxx.RayTaskResult.success([pa.table({"value": [value]})], [], None)
@@ -10921,7 +11077,9 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
             self.release_failures = release_failures
 
         def done(self):
-            return True
+            # Fix the failure position through readiness, independent of the
+            # manager's handle iteration order in unordered mode.
+            return self.value == 1 or worker.handles[0].ack_calls > 0
 
         def get_result_sync(self):
             self.get_result_sync_calls += 1
@@ -11019,18 +11177,118 @@ def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalizatio
         manager.worker_snapshots()
         manager.register_query_owner(query_id, query_id)
         with pytest.raises(Exception, match=message):
-            manager._wait_fte_query_streaming_for_test(query_id, 1.0, fail_after, throw_after)
+            manager._wait_fte_query_streaming_for_test(
+                query_id, 1.0, fail_after, throw_after, preserve_task_order=preserve_task_order
+            )
         assert [handle.ack_calls for handle in worker.handles] == expected_ack_calls
         assert [handle.release_calls for handle in worker.handles] == expected_release_calls_before_cleanup
         assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
 
         # Retrying the wait may finish pending handles, but must never invoke
         # publication again for the handle whose callback outcome was ambiguous.
-        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0, preserve_task_order=preserve_task_order) == 0
         assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
 
         manager.drop_query_fragments(query_id)
         assert [handle.release_calls for handle in worker.handles] == expected_release_calls_after_cleanup
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("late_selection", [False, True])
+def test_completion_order_drain_skips_pending_handles_and_refreshes_selection(monkeypatch, late_selection):
+    pa = pytest.importorskip("pyarrow")
+    acknowledged = []
+
+    class Handle:
+        worker_id = "worker-completion-order"
+
+        def __init__(self, query_id, partition):
+            self.partition = partition
+            self.task_id = _fake_task_attempt_id(
+                {
+                    "query_id": query_id,
+                    "fragment_execution_id": 0,
+                    "partition_id": partition,
+                    "attempt_id": 0,
+                }
+            )
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self.result_calls = self.release_calls = 0
+
+        def done(self):
+            return self.partition == 1 or 1 in acknowledged
+
+        def get_result_sync(self):
+            self.result_calls += 1
+            return vane.ray_cxx.RayTaskResult.success([pa.table({"value": [self.partition]})], [], None)
+
+        def ack(self):
+            acknowledged.append(self.partition)
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Worker:
+        def __init__(self):
+            self.status_calls = 0
+            self.handles = []
+
+        def fte_query_status(self, query_id):
+            self.status_calls += 1
+            selected = [0] if late_selection and self.status_calls == 1 else [0, 1]
+            return {
+                "failed": False,
+                "finished": len(acknowledged) == 2,
+                "selected_attempt_task_ids": [f"{query_id}.0.{partition}.0" for partition in selected],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            if self.handles:
+                return []
+            self.handles = [Handle(query_id, 0), Handle(query_id, 1)]
+            return list(self.handles)
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            pass
+
+        def finish_shutdown(self):
+            pass
+
+        def abort_shutdown(self):
+            pass
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-completion-order", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-completion-order"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+        assert manager._wait_fte_query_streaming_for_test(query_id, 2.0, preserve_task_order=False) == 2
+        assert acknowledged == [1, 0]
+        assert [handle.result_calls for handle in worker.handles] == [1, 1]
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
+        manager.drop_query_fragments(query_id)
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
     finally:
         manager.shutdown()
 

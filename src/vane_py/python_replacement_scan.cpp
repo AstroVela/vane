@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_replacement_scan.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/main/db_instance_cache.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb/main/client_properties.hpp"
@@ -24,9 +25,41 @@
 
 namespace duckdb {
 
+thread_local ScopedPythonReplacementScanFrame *ScopedPythonReplacementScanFrame::current = nullptr;
+
+ScopedPythonReplacementScanFrame::ScopedPythonReplacementScanFrame(const ClientContext &context_p)
+    : context(context_p), previous(current) {
+	D_ASSERT(py::gil_check());
+	auto caller = PyEval_GetFrame();
+	if (!caller && PyErr_Occurred()) {
+		throw py::error_already_set();
+	}
+	frame = caller ? py::reinterpret_borrow<py::object>(reinterpret_cast<PyObject *>(caller)) : py::none();
+	current = this;
+}
+
+ScopedPythonReplacementScanFrame::~ScopedPythonReplacementScanFrame() {
+	D_ASSERT(py::gil_check());
+	D_ASSERT(current == this);
+	current = previous;
+	PythonInputCallbackScope callback(nullptr);
+	frame = py::object();
+}
+
+py::object ScopedPythonReplacementScanFrame::GetFrame(const ClientContext &context) {
+	D_ASSERT(py::gil_check());
+	for (auto scope = current; scope; scope = scope->previous) {
+		if (&scope->context == &context) {
+			return scope->frame;
+		}
+	}
+	return py::object();
+}
+
 static void CreateArrowScan(const string &name, py::object entry, TableFunctionRef &table_function,
                             vector<unique_ptr<ParsedExpression>> &children, ClientProperties &client_properties,
                             PyArrowObjectType type, DatabaseInstance &db, py::object source_identity = py::none()) {
+	PythonTableArrowArrayStreamFactory::ValidateLocalRuntimeInput(entry, type, *client_properties.client_context);
 	shared_ptr<ExternalDependency> external_dependency = make_shared_ptr<ExternalDependency>();
 	if (type == PyArrowObjectType::MessageReader) {
 		if (!db.ExtensionIsLoaded("nanoarrow")) {
@@ -91,6 +124,7 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 }
 
 static void ThrowScanFailureError(const py::object &entry, const string &name, const string &location = "") {
+	PythonInputCallbackScope callback(nullptr);
 	string error;
 	auto py_object_type = string(py::str(py::type::of(entry).attr("__name__")));
 	error += StringUtil::Format("Python Object \"%s\" of type \"%s\"", name, py_object_type);
@@ -116,6 +150,7 @@ unique_ptr<TableRef> PythonReplacementScan::ReplacementObject(const py::object &
 
 unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::object &entry, const string &name,
                                                                  ClientContext &context, bool relation) {
+	PythonInputCallbackScope callback(context.shared_from_this());
 	auto client_properties = context.GetClientProperties();
 	auto table_function = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
@@ -244,6 +279,10 @@ static unique_ptr<TableRef> TryReplacement(py::dict &dict, const string &name, C
 }
 
 static unique_ptr<TableRef> ReplaceInternal(ClientContext &context, const string &table_name) {
+	// Frame lookup includes Python type probes before TryReplacementObject and
+	// error formatting afterwards. Its temporary references also need to retire
+	// while callback entry is fenced.
+	PythonInputCallbackScope callback(context.shared_from_this());
 	Value result;
 	auto lookup_result = context.TryGetCurrentSetting("python_enable_replacements", result);
 	D_ASSERT((bool)lookup_result);
@@ -258,9 +297,11 @@ static unique_ptr<TableRef> ReplaceInternal(ClientContext &context, const string
 	auto scan_all_frames = result.GetValue<bool>();
 
 	PythonGILWrapper acquire;
-	py::object current_frame;
+	auto current_frame = ScopedPythonReplacementScanFrame::GetFrame(context);
 	try {
-		current_frame = py::module::import("inspect").attr("currentframe")();
+		if (!current_frame) {
+			current_frame = py::module::import("inspect").attr("currentframe")();
+		}
 	} catch (py::error_already_set &e) {
 		//! Likely no call stack exists, just safely return
 		return nullptr;

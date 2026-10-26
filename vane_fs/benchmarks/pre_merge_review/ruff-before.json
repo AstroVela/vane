@@ -1,0 +1,212 @@
+[
+  {
+    "cell": null,
+    "code": "I001",
+    "end_location": {
+      "column": 15,
+      "row": 16
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/lookup_reads/run.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "import argparse\nimport hashlib\nimport json\nimport shutil\nimport sqlite3\nimport statistics\nimport subprocess\nimport tempfile\nimport time\nfrom contextlib import closing\nfrom pathlib import Path\n\n\n",
+          "end_location": {
+            "column": 1,
+            "row": 19
+          },
+          "location": {
+            "column": 1,
+            "row": 6
+          }
+        }
+      ],
+      "message": "Organize imports"
+    },
+    "location": {
+      "column": 1,
+      "row": 6
+    },
+    "message": "Import block is un-sorted or un-formatted",
+    "name": "unsorted-imports",
+    "noqa_row": 6,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unsorted-imports"
+  },
+  {
+    "cell": null,
+    "code": "F401",
+    "end_location": {
+      "column": 11,
+      "row": 12
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/performance_closeout/shipping.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "",
+          "end_location": {
+            "column": 1,
+            "row": 13
+          },
+          "location": {
+            "column": 1,
+            "row": 12
+          }
+        }
+      ],
+      "message": "Remove unused import: `sys`"
+    },
+    "location": {
+      "column": 8,
+      "row": 12
+    },
+    "message": "`sys` imported but unused",
+    "name": "unused-import",
+    "noqa_row": 12,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unused-import"
+  },
+  {
+    "cell": null,
+    "code": "I001",
+    "end_location": {
+      "column": 33,
+      "row": 12
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "import json\nimport statistics\nimport sys\nimport time\nfrom pathlib import Path\n\nfrom prepare import digest, save\n\n",
+          "end_location": {
+            "column": 1,
+            "row": 15
+          },
+          "location": {
+            "column": 1,
+            "row": 6
+          }
+        }
+      ],
+      "message": "Organize imports"
+    },
+    "location": {
+      "column": 1,
+      "row": 6
+    },
+    "message": "Import block is un-sorted or un-formatted",
+    "name": "unsorted-imports",
+    "noqa_row": 6,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unsorted-imports"
+  },
+  {
+    "cell": null,
+    "code": "F401",
+    "end_location": {
+      "column": 14,
+      "row": 7
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "",
+          "end_location": {
+            "column": 1,
+            "row": 8
+          },
+          "location": {
+            "column": 1,
+            "row": 7
+          }
+        }
+      ],
+      "message": "Remove unused import: `struct`"
+    },
+    "location": {
+      "column": 8,
+      "row": 7
+    },
+    "message": "`struct` imported but unused",
+    "name": "unused-import",
+    "noqa_row": 7,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unused-import"
+  },
+  {
+    "cell": null,
+    "code": "I001",
+    "end_location": {
+      "column": 33,
+      "row": 8
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/paced_request_waits/run.py",
+    "fix": {
+      "applicability": "safe",
+      "edits": [
+        {
+          "content": "from pathlib import Path\n\nfrom prepare import digest, save\n\n",
+          "end_location": {
+            "column": 1,
+            "row": 11
+          },
+          "location": {
+            "column": 1,
+            "row": 6
+          }
+        }
+      ],
+      "message": "Organize imports"
+    },
+    "location": {
+      "column": 1,
+      "row": 6
+    },
+    "message": "Import block is un-sorted or un-formatted",
+    "name": "unsorted-imports",
+    "noqa_row": 6,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/unsorted-imports"
+  },
+  {
+    "cell": null,
+    "code": "E731",
+    "end_location": {
+      "column": 6,
+      "row": 245
+    },
+    "filename": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py",
+    "fix": {
+      "applicability": "unsafe",
+      "edits": [
+        {
+          "content": "def selected(field):\n        return [\n            dict(rank=index, **row)\n            for index, row in enumerate(sorted(field, key=lambda c: c[\"wall_ns\"], reverse=True)[:12])\n        ]",
+          "end_location": {
+            "column": 6,
+            "row": 245
+          },
+          "location": {
+            "column": 5,
+            "row": 242
+          }
+        }
+      ],
+      "message": "Rewrite `selected` as a `def`"
+    },
+    "location": {
+      "column": 5,
+      "row": 242
+    },
+    "message": "Do not assign a `lambda` expression, use a `def`",
+    "name": "lambda-assignment",
+    "noqa_row": 242,
+    "severity": "error",
+    "url": "https://docs.astral.sh/ruff/rules/lambda-assignment"
+  }
+]

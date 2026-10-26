@@ -1,0 +1,994 @@
+{
+  "status": "FAIL",
+  "runs": [
+    {
+      "label": "baseline-normal",
+      "returncode": 1,
+      "expected": 1,
+      "started_epoch": 1791725210.942573,
+      "ended_epoch": 1791725216.0212057
+    },
+    {
+      "label": "baseline-small",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725216.208411,
+      "ended_epoch": 1791725216.3232312
+    },
+    {
+      "label": "updated-normal",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725216.3381274,
+      "ended_epoch": 1791725216.6036272
+    },
+    {
+      "label": "updated-small",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725216.7900853,
+      "ended_epoch": 1791725216.9047947
+    },
+    {
+      "label": "updated-unsupported",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725216.9180357,
+      "ended_epoch": 1791725217.2337067
+    },
+    {
+      "label": "updated-invalid",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725217.5784574,
+      "ended_epoch": 1791725217.8939605
+    },
+    {
+      "label": "updated-not_supported",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725218.2385592,
+      "ended_epoch": 1791725218.553905
+    },
+    {
+      "label": "updated-interrupt",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725218.888667,
+      "ended_epoch": 1791725219.1539106
+    },
+    {
+      "label": "updated-io_error",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725219.3318703,
+      "ended_epoch": 1791725219.647233
+    },
+    {
+      "label": "updated-no_space",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725219.8317769,
+      "ended_epoch": 1791725220.1471343
+    },
+    {
+      "label": "updated-barrier_error",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725220.3494868,
+      "ended_epoch": 1791725220.6148744
+    },
+    {
+      "label": "updated-blocked",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725220.8009987,
+      "ended_epoch": 1791725221.0665076
+    },
+    {
+      "label": "updated-coalesce",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725221.2410486,
+      "ended_epoch": 1791725221.606668
+    },
+    {
+      "label": "updated-close_blocked",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725221.9431136,
+      "ended_epoch": 1791725222.2584312
+    },
+    {
+      "label": "updated-close_error",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725222.443605,
+      "ended_epoch": 1791725222.7591581
+    },
+    {
+      "label": "updated-fork",
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791725222.9434965,
+      "ended_epoch": 1791725223.3092518
+    },
+    {
+      "label": "updated-gc",
+      "returncode": 1,
+      "expected": 0,
+      "started_epoch": 1791725223.4957244,
+      "ended_epoch": 1791725223.8613358
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-vane-writeback-01bv_0ft",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "628453640e94f912737aaf910b2cfa88c2d616837bc940d062100126236e7841"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "8284cbbb31a7920602e329da812f24fb9e3d85b7041e244e58df9c9397ff5234"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite-wal",
+          "bytes": 2579152,
+          "sha256": "2cce453c674f1b887cf4cc74d00cc8601c7d31a1f85bbb7043595a10555be4b0"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "bdadfa760748a15130c851996af9c197e45667893c7f1cf321d4c17bdcb13d56"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-01bv_0ft/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-2vllx3bs",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "bb4bd5d141666e1cce823496a79716f021b6fb4fc947ccf3bb5b268bcd6539b1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "01c0d3ae95c90fdc18c9e7e6f5cfdb8003bc00291dcf782e7a9a5e105082be46"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite-wal",
+          "bytes": 391432,
+          "sha256": "8e59824594740364595498a15b535456a2d0ad38f18144679a2ee01d3f379370"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.payload",
+          "bytes": 1052672,
+          "sha256": "cf64d083b3aa47c5874358ab4ca4a2c910b2db5728d26f3bee4f61dbe55d8830"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-2vllx3bs/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-pvf7joub",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "8c085cd0041514a846ade5fe8e5c6a6c0ef59a76f0511304890ebb91926891b0"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "de9dfd9a6174de8dd67e6d77401bbe62bfeb4876ca3b83165ee2c6fc3141880a"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite-wal",
+          "bytes": 2624472,
+          "sha256": "51e51fa2d2f5e8072df4a1d4d71164d447c73427e43db74bafde526c698bcceb"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "c9ece13958b4efd1c2a1cc0d5a776bff59e28fbff21ae404d90f08a8134ef271"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-pvf7joub/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-1o3azh9t",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "0e28343c7a3fde4a0a40467d9189b23320020140d7e282848f0edf9ad5322c71"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "604d2a13a59a35adb640d97ef30ed038eb68c30858ee841425a06f06dd0640a1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite-wal",
+          "bytes": 391432,
+          "sha256": "f753d814bef7db0777a2443be58dd0c39aa4db9554e83865db653273d2040a6a"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.payload",
+          "bytes": 1052672,
+          "sha256": "966259e13b33daf640a314217d25bd41dd3ebbe98fde91fe20d9318fcb4d2ee8"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-1o3azh9t/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-cuuyxhgt",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "04277cb3dcd994d47834034c838414bad1f8260dce9b7547f60a2107b47b73e8"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "7714475ded79fbe7384aef97a7f89e4de38994f4a18e685a5f578496b35919c3"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite-wal",
+          "bytes": 5112952,
+          "sha256": "6cb5eb570e2004e10485ef61115814e001e81a724685538b886af573c9c9db09"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.payload",
+          "bytes": 67112960,
+          "sha256": "9d7a470c25dd92f28eb2683cfe1520f96bab1c4b65eff5ae317c17254c75360f"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-cuuyxhgt/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-ib794h8k",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "66ad85f19469faa94af37e81acd33ca988e9462283181a056d5236bc9e798174"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "157f677e32ca2c96e5cc602d8dc2464e12d02177c12260f72c790cbfb6292eaf"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite-wal",
+          "bytes": 5112952,
+          "sha256": "db5b0759a55cb73e28349fee2b279f4907e9e61835c9759dda2751acb81d2dc6"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.payload",
+          "bytes": 67112960,
+          "sha256": "7726ae12827b0493eeef44232b5939898e1ac8b2c3df580ef9e76f3fffdd1723"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-ib794h8k/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-rm7qk2sk",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "4446919692e2c9a1217f309b36727bb8bcca0d0e729314702b1ee2ffd2fa6a21"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "92cf517d8c3f45e81318f5afa547db9fe6e4aa910d73ac9a58a012226e7992a1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite-wal",
+          "bytes": 5112952,
+          "sha256": "725d2322b28c8def9b5bc650719dd11f113a1253a60d66245c89037bf051958c"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.payload",
+          "bytes": 67112960,
+          "sha256": "17f16e8f534a1dc0336b5b486a3ece0c56188ecfb8d760e16773150c91f605be"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-rm7qk2sk/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-tshfyg5g",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "7daee062f0304c0cb74cc09c9d310c7684ae681a4dd9b85409866660785deb34"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "25f67498a76589fa2e8643c0f77a9331b1468f424a1dbfcade43832c2bc6b876"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite-wal",
+          "bytes": 2624472,
+          "sha256": "3a912d0cd735ae3d6f9c3f4e912736ce301dc1c91ac954295a443886c9d56aa9"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "77f39ecccf55ba5971ec1a5db499739335c1a3af0918981b2d9349c0d255048e"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-tshfyg5g/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-f11x50ct",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "85cf6fb557e14a42e7bba3b206f611f86f5f6ff2cf9dfccc87e666ecc00d7772"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ae492b5302fae71e0cf6067ccf3a62c37716837ada1bce3aa8e50ec4d807c58a"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite-wal",
+          "bytes": 2624472,
+          "sha256": "6782faa7b9bba953985978bd390ae0fcabd6f82779fa165733d2da0aa0d717b0"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "615d99ff29e3bb27bd6d2b517dc0d75d6bf1d2b08a8621a2988cc9ae1c75787f"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-f11x50ct/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-qz805byv",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "ea7ca3c125b7dd5849e9e44ceca52298f4f1fb98c443761db7746363b37cb20a"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "d0e6df2ff76605a051d84ef4a469f9f14944aebb0874cc47e5d4394e3feec08e"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite-wal",
+          "bytes": 2624472,
+          "sha256": "339094c64ca8b4f6b49395430f287d191a751df6e4bea98afb90737a9637c4ec"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "d48509198a77969bc4fd65ec74ad06a0d1ec36a8dfbff6d3c572c9d2034cb097"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qz805byv/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-dx2zr7qc",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "db4173b23fabad65d6a1215c4a19e4b2b3121649418b374ee17b71260b55161c"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "f6f58097e8a2b2fe16c9041a0a6f54e37841cc6a3976c7e930119d21fbd6c117"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite-wal",
+          "bytes": 2624472,
+          "sha256": "5dd1c0a5aefedc0ba9f6a7a4a18165545b7a042bf7f622a56f0d4e25e06b312f"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "06115cefb1b2164c3526b14fc7eaa5ed77dbf01e604a7ca82d0c31f9444c5459"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-dx2zr7qc/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-5l82yzfn",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "93a68dfd742546b043db870299800f57d6f9d1db8b8c6746b46118508211b8e6"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "c73e21e1c7eb2a02659809b60172ad953aee97f10c40eff9181763045ac70935"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite-wal",
+          "bytes": 2628592,
+          "sha256": "88d77155d01d2e834b9c29957ff559793b165282cd0b276a5f8a953178a6a846"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "e89790b39655658a33a8f381dfcff3518f4f2c159867bc4aa1208b6eb5be97e8"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-5l82yzfn/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-w7k39b76",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "ef71ddb929cecb84c8189765676544ed4100b3c781b34b371aef6c861dfaa691"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "819e46eeeb8e2efb4bbdf0d57f0fd9edf31f1137ebc308c0a2a4cbb4cca343cf"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite-wal",
+          "bytes": 5112952,
+          "sha256": "b61c8b36dfbf58c213834f98d5536b53b11102d13699ed1f1c483461e64eb808"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.payload",
+          "bytes": 67112960,
+          "sha256": "fd7e66a0a2ba4c86e81c244685a75a6c79d703a334f2578f35595a9440c0160f"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-w7k39b76/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-6tkrugq1",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "9c9054e42b96b92f0c07d6c5ec8d281b380b1c9c6d3973e7e244b0801c640fec"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "a06b6db37fac0c377762556eaacded51fdba20ac3a590c05aaf2629dfb3af8fb"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite-wal",
+          "bytes": 2595632,
+          "sha256": "e2d95fe992e710c7d0cf2c156a3d041b71339c00f806b9b1fe912c262203f45e"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "ae2d0b1809cf5dc988feecf803478e8a00dd714747c3ab3eb3a423bce52f5275"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-6tkrugq1/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-jt23ut_s",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "3ba3e03be702df113c461dbbe07db9e2090a49c14d7d9360e8836765eb60fe3b"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "91e3ef9dbf6180c29e0cab2c98af4cfcf267f34072016e7923e8c8b277900a49"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite-wal",
+          "bytes": 2628592,
+          "sha256": "5bb896f06b8917069485af7b1735fab20168f2d239fd458a5a72f559354ae76a"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "f0267dfcdacd0d389956917ebc72bca2eec8e35e556efa13d13201b976d7f4e9"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-jt23ut_s/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-qsfrmit_",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "091ba9c002a06ffe9038f62a292dad459ebbca9450b0bc4760a4f23050e84eda"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "1a5971f2f6be08bb242acec37a184e2b043c75ab780f8e0b88b99abf0467c9f1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite-wal",
+          "bytes": 2645072,
+          "sha256": "7086d9605bdb0dd47e1f0d7284730ab74d31f781a0c916aaec134329a51b97b1"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "14cee7821554abe67cf9bf5f813dc36d26ddf61725b429fdbcd62afa659911c5"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-qsfrmit_/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "path": "/dev/shm/owned-vane-writeback-_wwy5yrx",
+      "removed": true,
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "538fde6218001ea641d5902b79c982cf577dbd98df9fd3e26c4c9fce389c1fca"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "a96e99c30a2b26d5328f542f4267bcee990bc857c0b6597a8cb215ce4c8704f8"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite-wal",
+          "bytes": 5001712,
+          "sha256": "70360b7ef03a607f2cc2a3fa4140f8361a0604f348473791c32dc0e5e00b0414"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.payload",
+          "bytes": 4096,
+          "sha256": "1b865df71feed9b710a1f0a735f2c11025da8f552e7c19ad788ee9b27df8ee72"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-writeback-_wwy5yrx/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    }
+  ],
+  "error": "AssertionError('updated-gc')"
+}

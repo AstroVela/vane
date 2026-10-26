@@ -1,0 +1,6 @@
+Using Python 3.12.13 environment at: vane_fs/build/native-write-costs-20261017/borrowed/venv
+Resolved 9 packages in 144ms
+Uninstalled 1 package in 13ms
+Installed 1 package in 35ms
+ - pyarrow==22.0.0
+ + pyarrow==25.0.0

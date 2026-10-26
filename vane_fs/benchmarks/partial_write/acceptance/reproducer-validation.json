@@ -1,0 +1,74 @@
+{
+  "status": "PASS",
+  "binaries": [
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/baseline-native-probe",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/baseline-native-probe",
+      "measured_sha256": "99edbbc9fa01e51cb792cd268184cc227eb5bff310ecf9a0e04daaf9d09258dd",
+      "rebuilt_sha256": "99edbbc9fa01e51cb792cd268184cc227eb5bff310ecf9a0e04daaf9d09258dd",
+      "byte_identical": true
+    },
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/baseline-alignment-probe",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/baseline-alignment-probe",
+      "measured_sha256": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d",
+      "rebuilt_sha256": "644e4f884658dcd1eedadfb735a77473bcb8774f3c54d42cd0c9eb2453e0835d",
+      "byte_identical": true
+    },
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/diagnostic/baseline/build/vane-fs-mount",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/diagnostic/baseline/build/vane-fs-mount",
+      "measured_sha256": "f242c009e8aea24c8602838e5f1a2f4c4640ca522a1a7aa2a1fca8f2d88dc219",
+      "rebuilt_sha256": "f242c009e8aea24c8602838e5f1a2f4c4640ca522a1a7aa2a1fca8f2d88dc219",
+      "byte_identical": true
+    },
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated-native-probe",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/updated-native-probe",
+      "measured_sha256": "25ff76dec88d40cbbd334feff9f08286bbb6c6ea225d01b83e818b7546d64cfb",
+      "rebuilt_sha256": "25ff76dec88d40cbbd334feff9f08286bbb6c6ea225d01b83e818b7546d64cfb",
+      "byte_identical": true
+    },
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated-alignment-probe",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/updated-alignment-probe",
+      "measured_sha256": "96859ef32abfbf7273f0e8f39c0e971391ac1ef3feeaa557ff68cc12eb6ead5d",
+      "rebuilt_sha256": "96859ef32abfbf7273f0e8f39c0e971391ac1ef3feeaa557ff68cc12eb6ead5d",
+      "byte_identical": true
+    },
+    {
+      "measured": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/diagnostic/updated/build/vane-fs-mount",
+      "rebuilt": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/reproducer-check/diagnostic/updated/build/vane-fs-mount",
+      "measured_sha256": "551210b931b756bf8073cbcfbccbd3b0a9488ac10cdf899b1ec058cd743cac8a",
+      "rebuilt_sha256": "551210b931b756bf8073cbcfbccbd3b0a9488ac10cdf899b1ec058cd743cac8a",
+      "byte_identical": true
+    }
+  ],
+  "runners": {
+    "run_native.py": {
+      "measured_sha256": "7361531f0b03d5046fc57f673e90396b802a83fa870d6e9d268889af8f8d5362",
+      "published_sha256": "07d76678c02fd832d4a415dc3adcbc67c8c5a2d49829f184062adef6f4382dd3",
+      "AST_equal": true,
+      "function_bodies_equal_after_bound_variable_normalization": true
+    },
+    "run_fuse.py": {
+      "measured_sha256": "62cf7f0b31f8c5d0e2f550aa5aa31be8b5d1a719bd4ed83b85e37b1a81eab450",
+      "published_sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948",
+      "AST_equal": true,
+      "function_bodies_equal_after_bound_variable_normalization": true
+    },
+    "run_controls.py": {
+      "measured_sha256": "9960349cf8b14d4320c0288e6605478c819354d10b24f6017f674c4c584ae55d",
+      "published_sha256": "67bf66909152d36d4e0be7cfaaa2fab3bfcb5626538fc28c0694ea687c320cf8",
+      "AST_equal": true,
+      "function_bodies_equal_after_bound_variable_normalization": true
+    },
+    "workload.py": {
+      "measured_sha256": "35de67b7d88deba4c4657e8d2a84fd71bcfbb15ef87608f031d1a49385e5ad2b",
+      "published_sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37",
+      "AST_equal": false,
+      "function_bodies_equal_after_bound_variable_normalization": true
+    }
+  },
+  "published_runner_changes": "Formatting and import cleanup; workload adds the same defaults already assigned by run_fuse and renames one comprehension variable. Measured source files remain frozen."
+}

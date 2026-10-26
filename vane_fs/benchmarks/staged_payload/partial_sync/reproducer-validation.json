@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "completed_epoch": 1791714608.2665591,
+  "published_writeback_analyzer_exact_summary": true,
+  "all_frozen_gate_decisions_preserved": true,
+  "original_diagnostic_analysis_unchanged": true,
+  "helpers_load": true,
+  "decision": "REJECT"
+}

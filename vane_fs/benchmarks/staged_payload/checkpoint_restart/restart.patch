@@ -1,0 +1,31 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -171,8 +171,27 @@
+ 							staging.Publish(db);
+ 						}
+ 					}
+-					if (lease)
++					if (lease) {
+ 						code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++						if (code == SQLITE_OK && frames == copied && Bytes(frames) >= START_BYTES) {
++							// Finish a concurrently appended tail while excluding writers,
++							// so the next writer can reuse this WAL generation. Never wait
++							// for a reader/writer lock: an external writer may hold SQLite's
++							// writer lock while waiting for our checkpoint lease. Real I/O
++							// is still synchronous, with the same publication lease held.
++							Check(sqlite3_busy_timeout(db, 0));
++							int remaining = -1, backfilled = -1;
++							auto restarted = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_RESTART,
++							                                          &remaining, &backfilled);
++							Check(sqlite3_busy_timeout(db, timeout_ms));
++							if (restarted != SQLITE_BUSY)
++								code = restarted;
++							if (remaining >= 0 && backfilled >= 0) {
++								frames = remaining;
++								copied = backfilled;
++							}
++						}
++					}
+ 				} catch (const Error &failure) {
+ 					code = failure.code == ErrorCode::Busy ? SQLITE_BUSY : SQLITE_IOERR;
+ 				} catch (...) {

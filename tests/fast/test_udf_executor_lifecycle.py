@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import os
 import socket
 import struct
 import sys
@@ -14,13 +15,29 @@ import threading
 import time
 import types
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import pytest
+
+from tests.local_admission_helpers import linear_metadata
 
 pytest.importorskip("pyarrow")
 
 import pyarrow as pa
+
+from vane.execution.resources import ResourceVector
+
+
+def _set_task_resource_limit(monkeypatch, cpus):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    subprocess_exec._shutdown_global_task_runtime()
+    monkeypatch.setattr(
+        subprocess_exec,
+        "_GLOBAL_TASK_RUNTIME",
+        subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=cpus, heap_bytes=64 * 1024**3)),
+    )
 
 
 def _packed_native_vllm_options(options):
@@ -127,15 +144,17 @@ def _subprocess_map_payload(fn, **extra):
         "function_pickle": _pickle_function(fn),
         "call_mode": "map_batches",
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
     }
     payload.update(extra)
     return payload
 
 
 def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, SUBMIT_RESULT_MARKER
+
     deadline = time.monotonic() + timeout_s
     results = []
+    stream_blocks = {}
     wakeup_event = threading.Event()
     previous_wakeup = getattr(executor, "_wakeup", None)
 
@@ -150,6 +169,31 @@ def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
         while len(results) < count:
             item = executor.take_ready_result()
             if item is not None:
+                # These lifecycle tests count completed submissions. Dedicated
+                # streaming tests consume individual blocks before completion.
+                tagged = isinstance(item, tuple) and len(item) in (3, 4) and item[0] == SUBMIT_RESULT_MARKER
+                untagged = isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool)
+                submit_id = item[1] if tagged else None
+                partial = (tagged and len(item) == 4 and not item[3]) or (untagged and not item[1])
+                if partial:
+                    stream_blocks.setdefault(submit_id, []).append(item[2] if tagged else item[0])
+                    continue
+                blocks = stream_blocks.pop(submit_id, [])
+                if blocks:
+                    terminal = item[2] if tagged else item[0] if untagged else item
+                    if isinstance(terminal, BaseException):
+                        for block in blocks:
+                            for ref in block[1]:
+                                ref.release()
+                    else:
+                        assert terminal is None
+                        result = (
+                            REF_BUNDLE_RESULT_MARKER,
+                            [ref for block in blocks for ref in block[1]],
+                            [meta for block in blocks for meta in block[2]],
+                            blocks[0][3],
+                        )
+                        item = (SUBMIT_RESULT_MARKER, submit_id, result) if tagged else result
                 results.append(item)
                 continue
             remaining = deadline - time.monotonic()
@@ -158,6 +202,10 @@ def _wait_for_results(executor, count: int, timeout_s: float = 5.0):
             wakeup_event.wait(timeout=remaining)
             wakeup_event.clear()
     finally:
+        for blocks in stream_blocks.values():
+            for block in blocks:
+                for ref in block[1]:
+                    ref.release()
         if hasattr(executor, "register_wakeup"):
             executor.register_wakeup(previous_wakeup)
     return results
@@ -248,7 +296,6 @@ def _subprocess_scalar_payload(fn, **extra):
         "function_pickle": _pickle_function(fn),
         "call_mode": "map",
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
     }
     payload.update(extra)
     return payload
@@ -261,7 +308,7 @@ def _make_subprocess_actor_executor(
     pool_size=None,
     name="test-local-subprocess-actor",
 ):
-    size = int(pool_size or payload.get("actor_number") or payload.get("udf_worker_slots") or 1)
+    size = int(pool_size or payload.get("actor_number") or 1)
     pool = subprocess_exec.LocalSubprocessActorPool(payload, size, name=name)
     try:
         executor = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
@@ -2063,7 +2110,9 @@ def test_subprocess_actor_local_actor_pool_requires_full_runtime_contract():
 
 def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_admission import LocalTaskProgress
 
+    _set_task_resource_limit(monkeypatch, 8)
     created_args = []
 
     class FakeLocalActorPool:
@@ -2079,8 +2128,15 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     class FakePlan:
         def __init__(self):
             self.set_calls = []
+            self.described = False
+
+        def collect_query_resource_graph_metadata(self, conn=None):
+            assert conn == "conn"
+            self.described = True
+            return {"nodes": []}
 
         def collect_udf_nodes(self, conn=None):
+            assert self.described
             return [
                 {
                     "node_id": 7,
@@ -2095,12 +2151,14 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
                     "node_id": 8,
                     "payload": {
                         "execution_backend": "subprocess_task",
-                        "udf_worker_slots": 3,
                         "function_pickle": b"unused",
                         "call_mode": "map_batches",
                     },
                 },
             ]
+
+        def collect_local_resource_graph_metadata(self, conn=None):
+            return linear_metadata(self.collect_udf_nodes(conn))
 
         def set_udf_actor_handles(self, handles_map, conn=None):
             self.set_calls.append((handles_map, conn))
@@ -2110,16 +2168,29 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
 
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_plan(plan, conn="conn")
 
-    assert len(created) == 1
-    assert created_args[0][1] == 3
-    assert set(handles_map) == {"7"}
-    assert handles_map["7"] == {"local_actor_pool": created[0]}
-    assert plan.set_calls == [(handles_map, "conn")]
+    try:
+        assert len(created) == 4
+        assert created_args[0][1] == 3
+        assert isinstance(created[2], LocalTaskProgress)
+        assert set(handles_map) == {"7", "8"}
+        assert handles_map["7"]["local_actor_pool"] is created[1]
+        binding = handles_map["8"]["local_task_progress"]
+        assert binding.query is created[2]
+        assert binding.node_id == "8"
+        assert plan.set_calls == [(handles_map, "conn")]
+    finally:
+        for resource in reversed(created):
+            resource.shutdown(kill=True)
+    assert (
+        subprocess_exec._global_task_runtime().execution_capacity.resource_snapshot()["task_progress"]["queries"] == 0
+    )
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_admission import LocalTaskProgress
 
+    _set_task_resource_limit(monkeypatch, 8)
     created_args = []
     injected = []
 
@@ -2164,21 +2235,34 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
 
     created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(
         nodes,
+        resource_graph=linear_metadata(nodes),
         plan_identity="direct-plan",
         set_handles=inject,
     )
 
-    assert len(created) == 1
-    assert created_args[0][1] == 2
-    assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
-    assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
-    assert handles_map == {
-        "4": {
-            "local_actor_pool": created[0],
+    try:
+        assert len(created) == 4
+        assert created_args[0][1] == 2
+        assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
+        assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
+        assert isinstance(created[2], LocalTaskProgress)
+        assert set(handles_map) == {"4", "5"}
+        assert handles_map["4"] == {
+            "local_actor_pool": created[1],
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
+            "local_query_admission": handles_map["4"]["local_query_admission"],
+            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
         }
-    }
-    assert injected == [handles_map]
+        binding = handles_map["5"]["local_task_progress"]
+        assert binding.query is created[2]
+        assert binding.node_id == "5"
+        assert injected == [handles_map]
+    finally:
+        for resource in reversed(created):
+            resource.shutdown(kill=True)
+    assert (
+        subprocess_exec._global_task_runtime().execution_capacity.resource_snapshot()["task_progress"]["queries"] == 0
+    )
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monkeypatch):
@@ -2235,13 +2319,19 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create a duplicate pool")),
     )
 
-    created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+    created, handles_map = subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(
+        nodes, resource_graph=linear_metadata(nodes)
+    )
 
-    assert created == []
+    assert len(created) == 2
+    for resource in reversed(created):
+        resource.shutdown()
     assert handles_map == {
         "4": {
             "session_config": session_config,
             "local_actor_pool": existing_pool,
+            "local_query_admission": handles_map["4"]["local_query_admission"],
+            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
         }
     }
 
@@ -2290,7 +2380,7 @@ def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reus
     ]
 
     with pytest.raises(ValueError, match="belongs to a different Vane session"):
-        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes, resource_graph=linear_metadata(nodes))
 
 
 def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
@@ -2336,10 +2426,16 @@ def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
         subprocess_exec.UDFExecutor(payload, options)
 
 
-def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors():
+@pytest.mark.parametrize("failure", ["resources", "udf_nodes"])
+def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors(failure):
     import vane.execution.udf_subprocess as subprocess_exec
 
     class BrokenPlan:
+        def collect_query_resource_graph_metadata(self, conn=None):
+            if failure == "resources":
+                raise RuntimeError("collect failed")
+            return {"nodes": []}
+
         def collect_udf_nodes(self, conn=None):
             raise RuntimeError("collect failed")
 
@@ -2364,6 +2460,9 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
             self.shutdown_calls.append({"kill": kill})
 
     class BrokenPlan:
+        def collect_query_resource_graph_metadata(self, conn=None):
+            return {"nodes": []}
+
         def collect_udf_nodes(self, conn=None):
             return [
                 {
@@ -2376,6 +2475,9 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
                     },
                 },
             ]
+
+        def collect_local_resource_graph_metadata(self, conn=None):
+            return linear_metadata(self.collect_udf_nodes(conn))
 
         def set_udf_actor_handles(self, handles_map, conn=None):
             raise RuntimeError("inject failed")
@@ -2857,7 +2959,9 @@ def test_udf_runtime_close_does_not_transport_raw_oversized_provider_failure():
     with pytest.raises(RuntimeError, match="error text exceeds") as exc_info:
         executor.close()
 
-    assert type(exc_info.value) is RuntimeError
+    from vane.ai._errors import DiagnosticError
+
+    assert type(exc_info.value) is DiagnosticError
     assert len(str(exc_info.value).encode("utf-8")) <= MAX_CLOSE_ERROR_BYTES
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
@@ -3417,14 +3521,15 @@ def test_subprocess_error_propagates_and_closes_worker():
         assert isinstance(result, RuntimeError)
         assert "bad edge udf" in str(result)
         assert original_proc.poll() is not None
-        replacement_proc = executor._proc
-        assert replacement_proc is not None
-        assert replacement_proc.poll() is None
-        assert replacement_proc.pid != original_pid
+        assert executor._proc is None
 
         _submit_with_admission(executor, pa.table({"x": [2]}))
         replacement_result = _wait_for_results(executor, 1, timeout_s=10.0)[0]
         assert replacement_result.to_pydict() == {"y": [2]}
+        replacement_proc = executor._proc
+        assert replacement_proc is not None
+        assert replacement_proc.poll() is None
+        assert replacement_proc.pid != original_pid
     finally:
         executor.close(kill=True)
         pool.shutdown(kill=True)
@@ -3597,6 +3702,62 @@ def test_local_shm_multi_block_descriptor_splits_single_output_grant_budget(monk
                 ref_bundle._unlink_shared_memory_name(ref_desc["shm_name"])
 
 
+def test_local_shm_multi_block_adoption_rolls_back_on_invalid_last_mapping():
+    from vane.execution import ref_bundle
+
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    first = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [1]}))
+    last = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [2]}))
+    grant = ref_bundle.request_local_shm_output_grant(
+        first["block_refs"][0]["ipc_size_bytes"] + last["block_refs"][0]["ipc_size_bytes"]
+    )
+    descriptor = dict(
+        first,
+        block_refs=first["block_refs"] + [dict(last["block_refs"][0], ipc_size_bytes=8)],
+        metadata=first["metadata"] + last["metadata"],
+        grant_id=grant,
+    )
+    try:
+        with pytest.raises(ref_bundle.InvalidLocalShmReferenceError, match="exceeds descriptor size"):
+            ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+        assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+        assert not ref_bundle.local_shm_budget_manager().output_grant_pending(grant)
+    finally:
+        ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+        ref_bundle.release_local_shm_output_grant(grant)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("ipc_metadata", ["declared", "missing", "none"])
+def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty, ipc_metadata):
+    import os
+
+    from vane.execution import ref_bundle
+
+    table = pa.table({"x": pa.array([] if empty else [1], type=pa.int64())})
+    descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(table)
+    if ipc_metadata == "missing":
+        descriptor["metadata"][0].pop("ipc_size_bytes")
+    elif ipc_metadata == "none":
+        descriptor["metadata"][0]["ipc_size_bytes"] = None
+    shm = ref_bundle._open_existing_shm(descriptor["block_refs"][0]["shm_name"], track=False)
+    result = None
+    try:
+        os.ftruncate(shm._fd, shm.size + 64)
+        shm.close()
+        result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+        assert (
+            ref_bundle.estimate_local_shm_ref_bundle_ipc_size(result) == descriptor["block_refs"][0]["ipc_size_bytes"]
+        )
+        assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).equals(table)
+    finally:
+        shm.close()
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+
+
 def test_materialize_ref_bundle_accepts_ray_object_ref(monkeypatch):
     import vane.execution.ref_bundle as ref_bundle
 
@@ -3720,6 +3881,7 @@ def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
     import vane.execution.ref_bundle as ref_bundle
 
     monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
+    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 100 * ref_bundle._GIB)
     monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 80 * ref_bundle._GIB)
 
@@ -3735,33 +3897,42 @@ def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monke
     from vane.execution import ref_bundle
 
     shm_capacity = 256 * ref_bundle._MIB
+    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 80 * ref_bundle._GIB)
     monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: shm_capacity)
 
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() <= shm_capacity
+    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(shm_capacity * 0.95) // 2
 
 
-def test_local_shm_ref_bundle_acquires_budget_before_creating_shm(monkeypatch):
+def test_local_shm_auto_budget_respects_explicit_small_arena(monkeypatch):
     from vane.execution import ref_bundle
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64m")
+    assert ref_bundle._auto_local_shm_ref_budget_bytes() == 32 * ref_bundle._MIB
+
+
+def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypatch):
+    from vane.execution import ref_bundle
+    from vane.execution.udf_shm_store import LocalShmStore
 
     events = []
     acquire = ref_bundle._acquire_local_shm_ref_budget
-    create = ref_bundle._create_shm
+    allocate = LocalShmStore.allocate
 
-    def record_acquire(size, *, name=""):
+    def record_acquire(size, **kwargs):
         events.append(("acquire", size))
-        return acquire(size, name=name)
+        return acquire(size, **kwargs)
 
-    def record_create(size, *, track):
-        events.append(("create", size))
-        return create(size, track=track)
+    def record_allocate(store, size, **kwargs):
+        events.append(("allocate", size))
+        return allocate(store, size, **kwargs)
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
     monkeypatch.setattr(ref_bundle, "_acquire_local_shm_ref_budget", record_acquire)
-    monkeypatch.setattr(ref_bundle, "_create_shm", record_create)
+    monkeypatch.setattr(LocalShmStore, "allocate", record_allocate)
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2, 3]}))
     try:
-        assert [event[0] for event in events[:2]] == ["acquire", "create"]
+        assert [event[0] for event in events[:2]] == ["acquire", "allocate"]
     finally:
         for ref in refs:
             ref.release()
@@ -3797,49 +3968,6 @@ def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(mo
 
     manager.release_allocation(80, name="existing")
     assert ref_bundle.can_claim_local_shm_ref_output_budget(200)
-
-
-def test_local_shm_ref_bundle_submit_admission_allows_small_consumer_when_hard_budget_full(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(995, name="full")
-
-    assert not ref_bundle.can_claim_local_shm_ref_output_budget(10)
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(10)
-
-
-def test_local_shm_ref_bundle_submit_admission_throttles_large_producer_at_soft_watermark(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(700, name="backlog")
-
-    assert ref_bundle.can_claim_local_shm_ref_output_budget(100)
-    assert not ref_bundle.can_admit_local_shm_ref_output_submit(100)
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(10)
-
-
-def test_local_shm_ref_bundle_submit_admission_counts_projected_inflight_output(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES", 100)
-    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION", 0.75)
-
-    manager.acquire_allocation(600, name="backlog")
-
-    assert ref_bundle.can_admit_local_shm_ref_output_submit(100)
-    assert not ref_bundle.can_admit_local_shm_ref_output_submit(100, projected_output_bytes=100)
 
 
 def test_local_shm_ref_output_budget_cancel_wait_is_event_driven(monkeypatch):
@@ -4070,15 +4198,20 @@ def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
         executor.close(kill=True)
 
 
-def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch, error_type, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
+    allocation = pooled_shm_worker.reserve_write(77, 128)
+    slot = pooled_shm_worker._writes[77].allocation
     descriptor = {
         "block_refs": [
             {
                 "provider": "local_shm",
-                "shm_name": "failed-result-shm",
+                "shm_name": f"{slot.identity}:0",
+                "allocation": allocation,
+                "allocation_offset": 0,
                 "ipc_size_bytes": 128,
             }
         ],
@@ -4088,6 +4221,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     }
     scope = ExecutionCancellationScope("test-executor", 1)
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._closed = False
     executor._broken_error = None
     executor._execution_scope_lock = threading.Lock()
@@ -4103,7 +4237,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     released = []
 
     def fail_descriptor_wrap(*_args, **_kwargs):
-        raise RuntimeError("descriptor wrap failed")
+        raise error_type("descriptor wrap failed")
 
     monkeypatch.setattr(
         subprocess_exec,
@@ -4121,7 +4255,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
         lambda grant_id, *, name="": released.append(("grant", grant_id, name)),
     )
 
-    with pytest.raises(RuntimeError, match="descriptor wrap failed"):
+    with pytest.raises(error_type, match="descriptor wrap failed"):
         executor._recv_submit_result()
 
     assert released == [
@@ -4270,7 +4404,6 @@ def test_subprocess_task_rejects_callable_instance():
             _subprocess_map_payload(
                 StatefulBatchUDF(),
                 execution_backend="subprocess_task",
-                udf_worker_slots=1,
             )
         )
 
@@ -4319,7 +4452,7 @@ def test_subprocess_actor_reuses_callable_class_state():
         pool.shutdown(kill=True)
 
 
-def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
+def test_subprocess_tasks_reuse_an_idle_worker(monkeypatch):
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from vane.execution.udf_subprocess import UDFExecutor
 
@@ -4334,7 +4467,6 @@ def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
         _subprocess_map_payload(
             worker_pid,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -4356,10 +4488,10 @@ def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
         executor.close()
 
 
-def test_subprocess_task_stats_report_worker_slot_admission():
+def test_subprocess_task_stats_report_worker_slot_admission(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
-    subprocess_exec._shutdown_global_task_runtime()
+    _set_task_resource_limit(monkeypatch, 3)
 
     def sleeper(table):
         import time
@@ -4371,7 +4503,9 @@ def test_subprocess_task_stats_report_worker_slot_admission():
         _subprocess_map_payload(
             sleeper,
             execution_backend="subprocess_task",
-            udf_worker_slots=3,
+            # This tests the CPU slot ceiling; observed-memory calibration has
+            # its own first-task gate when the working set is undeclared.
+            memory_bytes=64 * 1024**2,
         )
     )
     try:
@@ -4414,7 +4548,6 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
     payload = _subprocess_map_payload(
         make_output,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
         output_schema=[
@@ -4429,7 +4562,6 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
     )
     executor = subprocess_exec.UDFExecutor(payload)
     try:
-        assert executor._output_budget_estimate(2) >= 2 * 3 * 4 * 4
         _submit_with_admission(executor, pa.table({"x": [1, 2]}), submit_id=175)
         wrapped = _wait_for_results(executor, 1, timeout_s=10.0)[0]
 
@@ -4450,15 +4582,10 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget():
         subprocess_exec._shutdown_global_task_runtime()
 
 
-def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypatch):
+def test_subprocess_ref_bundle_output_stats_report_physical_budget(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
-    monkeypatch.setattr(
-        subprocess_exec,
-        "can_admit_local_shm_ref_output_submit",
-        lambda _size, *, projected_output_bytes=0: False,
-    )
     monkeypatch.setattr(
         subprocess_exec,
         "local_shm_ref_budget_snapshot",
@@ -4479,7 +4606,6 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
         _subprocess_map_payload(
             make_output,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
             output_schema=[
@@ -4494,10 +4620,8 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
         )
     )
     try:
-        assert executor._output_budget_estimate(2) >= 2 * 3 * 4 * 4
         stats = executor.stats()
-        assert stats["udf_output_budget_available"] == 0
-        assert stats["udf_output_budget_estimated_bytes"] >= 2 * 3 * 4 * 4
+        assert "udf_output_budget_available" not in stats
         assert stats["udf_output_budget_limit_bytes"] == 100
         assert stats["udf_output_budget_usage_bytes"] == 99
     finally:
@@ -4505,42 +4629,13 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
         subprocess_exec._shutdown_global_task_runtime()
 
 
-def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
-    from vane.execution.udf_subprocess import UDFExecutor
-
-    def make_output(table):
-        return pa.table({"blob": table.column("x")})
-
-    executor = UDFExecutor(
-        _subprocess_map_payload(
-            make_output,
-            execution_backend="subprocess_task",
-            udf_worker_slots=1,
-            produce_ref_bundle_output=True,
-            streaming_output_mode="local_shm_ref_bundle",
-            output_schema=[
-                {
-                    "name": "blob",
-                    "kind": "duckdb_type",
-                    "type": "BLOB",
-                    "dtype": "",
-                    "shape": [],
-                }
-            ],
-        )
-    )
-    try:
-        assert executor._output_budget_estimate(64) >= 64 * (1 << 20)
-    finally:
-        executor.close(kill=True)
-
-
-def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch):
+def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     parent_sock, child_sock = subprocess_exec.socket.socketpair()
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._closed = False
     executor._broken_error = None
     executor._sock = parent_sock
@@ -4554,12 +4649,16 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
 
     captured: dict[str, object] = {}
 
-    def fake_request(size, *, name="", priority="producer", input_lease_id=None, cancel_event=None):
+    def fake_request(
+        size, *, name="", priority="producer", input_lease_id=None, owner_id=None, cancel_event=None, wait_context=None
+    ):
         captured["size"] = size
         captured["name"] = name
         captured["priority"] = priority
         captured["input_lease_id"] = input_lease_id
+        captured["owner_id"] = owner_id
         captured["cancel_event"] = cancel_event
+        assert callable(wait_context)
         return 77
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", fake_request)
@@ -4571,6 +4670,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
                 "size_bytes": 128,
                 "priority": "consumer",
                 "input_lease_id": 123,
+                "input_tokens": [],
             }
         )
         assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
@@ -4585,6 +4685,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
             "priority": "consumer",
             "input_lease_id": 123,
             "cancel_event": scope,
+            "owner_id": scope.owner_id,
         }
     finally:
         parent_sock.close()
@@ -4597,6 +4698,7 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
 
     events: list[object] = []
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._proc = None
     executor._sock = None
@@ -4612,11 +4714,11 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
     executor._active_output_grants = {}
     executor._active_output_grants_lock = threading.Lock()
 
-    monkeypatch.setattr(
-        subprocess_exec,
-        "cancel_local_shm_input_lease",
-        lambda lease_id, *, name="": events.append(("cancel-lease", lease_id, name)),
-    )
+    def cancel_input_lease(lease_id, *, name=""):
+        events.append(("cancel-lease", lease_id, name))
+        return 0
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
     monkeypatch.setattr(
         subprocess_exec,
         "wake_local_shm_ref_budget_waiters",
@@ -4654,6 +4756,9 @@ def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_w
             events.append("admission-close")
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.name = "pool"
     pool._closed = False
     pool._lock = threading.RLock()
@@ -4720,6 +4825,9 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     failed_worker = FakeWorker("failed")
     replacement = FakeWorker("replacement")
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "replacement-shutdown-race"
@@ -4738,7 +4846,7 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     pool._executor = FakeExecutor()
     pool.admission_slots = FakeAdmissionSlots()
 
-    def spawn_worker(worker_idx):
+    def spawn_worker(worker_idx, *, startup_cancellation=None):
         assert worker_idx == 0
         spawn_entered.set()
         assert allow_spawn_return.wait(timeout=5.0)
@@ -4841,6 +4949,9 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     failed_worker = FailedWorker()
     provisional_worker = ProvisionalWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "provisional-replacement-shutdown"
@@ -4862,7 +4973,7 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     pool._executor = FakeExecutor()
     pool.admission_slots = FakeAdmissionSlots()
 
-    def spawn_worker(worker_idx):
+    def spawn_worker(worker_idx, *, startup_cancellation=None):
         assert worker_idx == 0
         pool._track_replacing_executor(worker_idx, provisional_worker)
         startup_observed.set()
@@ -4913,6 +5024,9 @@ def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(mon
             pass
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "unpublished-replacement-shutdown"
@@ -4975,6 +5089,9 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
     pool.name = "abort-cleanup-failure"
@@ -5033,6 +5150,9 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_scope_cancel_failu
 
     scope = FailingScope()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "scope-cancel-failure"
@@ -5087,6 +5207,9 @@ def test_local_subprocess_actor_pool_reports_graceful_quiescence_timeout(monkeyp
             return None
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "graceful-quiescence-timeout"
@@ -5122,6 +5245,9 @@ def test_local_subprocess_actor_pool_bounds_replacement_cleanup_errors():
     import vane.execution.udf_subprocess as subprocess_exec
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool._closed = True
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
@@ -5158,6 +5284,9 @@ def test_local_subprocess_actor_pool_closes_idle_workers_concurrently():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 2
     pool.name = "concurrent-graceful-close"
@@ -5207,6 +5336,13 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    from vane.execution.udf_admission import LocalExecutionCapacity
+
+    capacity = LocalExecutionCapacity(max_slots=None, resource_limit=ResourceVector(cpu=1, heap_bytes=100))
+    reserved = ResourceVector(cpu=1, heap_bytes=80)
+    pool._resident_release = capacity.reserve_resident(reserved)
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "retry-retained-cleanup"
@@ -5232,6 +5368,7 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
     with pytest.raises(RuntimeError, match="planned first close failure"):
         pool.shutdown(kill=False)
 
+    assert capacity.resource_snapshot()["usage"] == reserved.to_dict()
     assert pool.cleanup_pending()
     assert pool._workers == []
     assert pool._cleanup_pending_workers == [worker]
@@ -5240,6 +5377,7 @@ def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
 
     assert close_calls == [False, True]
     assert not pool.cleanup_pending()
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
     assert pool._cleanup_pending_workers == []
 
 
@@ -5272,6 +5410,9 @@ def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_unti
     provisional_worker = FakeWorker("provisional")
     admission_slots = FakeAdmissionSlots()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "failed-provisional-replacement"
@@ -5295,7 +5436,7 @@ def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_unti
     pool._cleanup_pending_executor = None
     pool.admission_slots = admission_slots
 
-    def fail_spawn(worker_idx):
+    def fail_spawn(worker_idx, *, startup_cancellation=None):
         pool._track_replacing_executor(worker_idx, provisional_worker)
         raise subprocess_exec._SubprocessStartupCleanupError("planned provisional cleanup failure")
 
@@ -5332,6 +5473,9 @@ def test_local_subprocess_actor_pool_retries_retained_executor_cleanup():
 
     executor = FakeExecutor()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "retry-retained-executor"
@@ -5384,6 +5528,9 @@ def test_local_subprocess_actor_pool_aborts_active_workers_concurrently():
             close_barrier.wait(timeout=1.0)
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
     pool._active_scopes = {0: scopes[0], 1: scopes[1]}
@@ -5419,6 +5566,9 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     lost_worker = FakeWorker("lost", reusable=True)
     replacement = FakeWorker("replacement", reusable=True)
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {"udf_name": "reconstructible_local_actor"}
     pool.pool_size = 1
     pool.name = "reconstructible-local-actor"
@@ -5435,7 +5585,7 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     pool._aborting_workers = set()
     pool._idle_workers = deque([(0, 0)])
     pool._workers = [lost_worker]
-    pool._spawn_worker = lambda worker_idx: replacement
+    pool._spawn_worker = lambda worker_idx, **kwargs: replacement
 
     def lose_actor(worker):
         worker.reusable = False
@@ -5447,19 +5597,24 @@ def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
 
     assert first_scope.finished
     assert lost_worker.close_calls == [True]
-    assert pool._workers == [replacement]
-    assert pool._worker_generations == [1]
-    assert list(pool._idle_workers) == [(0, 1)]
+    assert pool._workers == [lost_worker]
+    assert pool._worker_generations == [0]
+    assert list(pool._idle_workers) == [(0, 0)]
     assert pool._terminal_error is None
 
     second_scope = ExecutionCancellationScope("test-executor", 2)
     assert pool._run(lambda worker: worker.name, second_scope) == "replacement"
     assert second_scope.finished
+    assert pool._workers == [replacement]
+    assert pool._worker_generations == [1]
     assert list(pool._idle_workers) == [(0, 1)]
 
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_failure(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
 
     class Identity:
         def __call__(self, table):
@@ -5500,9 +5655,14 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_f
 
     assert events == ["close:w0:True"]
 
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_init_failure(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
 
     class Identity:
         def __call__(self, table):
@@ -5542,9 +5702,14 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
 
     assert events == ["close:w1:True", "close:w0:True"]
 
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
 
 def test_local_subprocess_actor_pool_init_cleanup_failure_carries_retry_owner(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
+
+    _set_task_resource_limit(monkeypatch, 2)
+    capacity = subprocess_exec._global_task_runtime().execution_capacity
 
     workers = []
 
@@ -5589,12 +5754,15 @@ def test_local_subprocess_actor_pool_init_cleanup_failure_carries_retry_owner(mo
     assert len(exc_info.value.owned_actor_pools) == 1
     pool = exc_info.value.owned_actor_pools[0]
     assert pool.cleanup_pending()
+    assert capacity.resource_snapshot()["usage"]["cpu"] == 2
     assert [worker.close_calls for worker in workers] == [1, 1]
 
     pool.shutdown(kill=True)
 
     assert not pool.cleanup_pending()
     assert [worker.close_calls for worker in workers] == [2, 1]
+
+    assert capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
 
 
 def test_local_subprocess_actor_pool_rollback_preserves_owned_constructor_failure(monkeypatch):
@@ -5636,7 +5804,7 @@ def test_local_subprocess_actor_pool_rollback_preserves_owned_constructor_failur
     ]
 
     with pytest.raises(subprocess_exec._OwnedLocalSubprocessActorPoolsError) as exc_info:
-        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes, resource_graph=linear_metadata(nodes))
 
     assert exc_info.value.creation_error is creation_error
     assert exc_info.value.owned_actor_pools == [pending_pool]
@@ -5668,19 +5836,23 @@ def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_exe
 
     idle_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("idle"))
     active_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("active"))
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
     runtime.closed = False
     runtime.total_workers = 2
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = FakeExecutor()
     pool.runtime = runtime
     pool.key = "pool"
     pool.closing = False
     pool.kill_on_release = False
     pool.idle = [idle_wrapper]
     pool._active_wrappers = {active_wrapper}
+    pool._retiring_workers = {}
     pool._spawning_workers = set()
     pool.active = 1
     pool.total = 2
@@ -5730,19 +5902,23 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
 
     idle_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("idle", fail=True))
     active_wrapper = subprocess_exec._PooledTaskWorker(FakeWorker("active"))
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
     runtime.closed = False
     runtime.total_workers = 2
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = FakeExecutor()
     pool.runtime = runtime
     pool.key = "pool"
     pool.closing = False
     pool.kill_on_release = False
     pool.idle = [idle_wrapper]
     pool._active_wrappers = {active_wrapper}
+    pool._retiring_workers = {}
     pool._spawning_workers = set()
     pool.active = 1
     pool.total = 2
@@ -5763,6 +5939,13 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
         "close:active:True",
     ]
 
+    assert runtime.stats()["retiring_workers"] == 1
+    assert runtime.total_workers == 2
+    idle_wrapper.worker.fail = False
+    runtime.close(kill=True)
+    assert runtime.stats()["retiring_workers"] == 0
+    assert runtime.total_workers == 1
+
 
 def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
     import vane.execution.udf_subprocess as subprocess_exec
@@ -5778,10 +5961,14 @@ def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
             shutdown_started.set()
             assert allow_shutdown.wait(timeout=5.0)
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
-    runtime.executor = FakeExecutor()
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.cond = threading.Condition()
-    runtime.pools = {}
+    pool = subprocess_exec._TaskWorkerPool(runtime, "close-test", {"execution_backend": "subprocess_task"}, 1)
+    pool.executor.shutdown(wait=False)
+    pool.executor = FakeExecutor()
+    runtime.pools = {"close-test": pool}
     runtime.total_workers = 0
     runtime.closed = False
     runtime._close_finished = True
@@ -5830,6 +6017,7 @@ def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails
         total = 1
         active = 1
         idle = []
+        memory = None
 
         def acquire_worker(self, _scope):
             events.append("acquire")
@@ -5839,9 +6027,10 @@ def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails
             assert released is wrapper
             events.append(f"release:{reusable}")
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.total_workers = 1
-    runtime.max_workers = 1
     monkeypatch.setattr(subprocess_exec, "_should_debug_submit", lambda _seq: True)
 
     def fail_debug_log(_message):
@@ -5876,18 +6065,13 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     executor._ref_bundle_output = False
     executor._task_futures_cv = threading.Condition()
     executor._task_futures_lock = executor._task_futures_cv
-    executor._task_futures = {future}
-    executor._task_future_meta = {
-        future: (
-            73,
-            1,
-            time.perf_counter(),
-            FakeAdmission(),
-            scope,
-        )
-    }
+    executor._task_futures = set()
+    executor._task_future_meta = {}
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
@@ -5904,7 +6088,7 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
 
     monkeypatch.setattr(subprocess_exec, "_subprocess_debug_log", fail_debug_log)
 
-    executor._complete_task_submit(73, future)
+    executor._track_task_future(future, 73, 1, time.perf_counter(), FakeAdmission(), scope)
 
     assert events == ["debug", "release-admission"]
     assert executor._pending_batches == 0
@@ -5914,6 +6098,113 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
     assert scope.finished
     assert isinstance(executor._wakeup_error, RuntimeError)
     assert "planned completion debug failure" in str(executor._wakeup_error)
+
+
+@pytest.mark.parametrize("submit_id", [None, 7], ids=["plain", "with-id"])
+@pytest.mark.parametrize("primary_failure", [False, True], ids=["success", "execution-error"])
+@pytest.mark.parametrize("input_failure", [False, True], ids=["input-clean", "input-error"])
+@pytest.mark.parametrize("execution_failure", [False, True], ids=["capacity-clean", "capacity-error"])
+def test_subprocess_completion_preserves_diagnostics_and_result_ownership(
+    submit_id, primary_failure, input_failure, execution_failure
+):
+    import errno
+
+    import vane
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+    from vane.execution.udf import build_executor
+    from vane.execution.udf_admission import AdmissionLease
+
+    events = []
+
+    class InputCleanup:
+        def finish(self):
+            events.append("input-finished")
+            if input_failure:
+                raise OSError(errno.EBUSY, "private input cleanup")
+
+    def complete_execution():
+        events.append("execution-finished")
+        if execution_failure:
+            raise OSError(errno.ENOSPC, "private execution cleanup")
+
+    admission = AdmissionLease(
+        "diagnostic-test",
+        0,
+        {},
+        _execution_finished_callback=complete_execution,
+        _release_callback=lambda: events.append("slot-released"),
+    )
+    executor = build_executor(_subprocess_map_payload(lambda table: table, execution_backend="subprocess_task"))
+    result = item = None
+    refs = ()
+    try:
+        future = Future()
+        scope = executor._new_execution_scope()
+        executor._pending_batches = 1
+        executor._track_task_future(future, submit_id, 1, time.perf_counter(), admission, scope, InputCleanup())
+        if primary_failure:
+            future.set_exception(OSError(errno.EIO, "private execution error"))
+        else:
+            result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+            refs = tuple(result[1])
+            future.set_result(result)
+
+        # Completion returns execution capacity; consuming the terminal result
+        # still owns the buffered-result slot, including when cleanup fails.
+        assert events == ["input-finished", "execution-finished"]
+        assert executor._pending_batches == 0
+        assert not executor._task_futures
+        assert not executor._task_future_meta
+        assert not executor._execution_scopes
+        assert scope.finished
+        assert executor._wakeup_error is None
+        assert list(executor._result_admissions) == [admission]
+        item = executor.take_ready_result()
+        assert events == ["input-finished", "execution-finished", "slot-released"]
+        if submit_id is not None:
+            assert item[:2] == (ref_bundle.SUBMIT_RESULT_MARKER, submit_id)
+            item = item[2]
+        errors = [
+            number
+            for present, number in (
+                (primary_failure, errno.EIO),
+                (input_failure, errno.EBUSY),
+                (execution_failure, errno.ENOSPC),
+            )
+            if present
+        ]
+        if errors:
+            assert isinstance(item, DiagnosticError)
+            native = vane.InvalidInputException("streaming UDF async error: " + str(item))
+            summary = summarize_error(native)
+            primary, _, cleanup = summary.partition("; cleanup: ")
+            assert f"OSError (errno={errors[0]})" in primary
+            for number in errors[1:]:
+                assert f"OSError (errno={number})" in cleanup
+            assert summary.count("cleanup:") == int(len(errors) > 1)
+            assert "private" not in summary
+            if result is not None:
+                assert all(ref._closed for ref in refs)
+        else:
+            # The consumer owns a new container with the same underlying
+            # blocks; the producer's Future no longer retains their refs.
+            assert item[0] == result[0]
+            assert result[1] == []
+            assert len(item[1]) == len(refs)
+            assert all(actual is expected for actual, expected in zip(item[1], refs))
+            assert item[2:] == result[2:]
+            assert not any(ref._closed for ref in refs)
+            assert item[1][0].to_table().to_pydict() == {"x": [1, 2]}
+        assert executor.take_ready_result() is None
+        assert not executor._result_admissions
+        executor.stats()
+    finally:
+        local._release_local_ref_bundle_result(item)
+        local._release_local_ref_bundle_result(result)
+        executor.close(kill=True)
+        local._shutdown_global_task_runtime()
 
 
 def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure():
@@ -5929,7 +6220,7 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
     class FakeActorPool:
         pool_size = 1
 
-        def submit(self, _fn, scope, _debug_seq):
+        def submit(self, _fn, scope, _debug_seq, *, admission=None, input_preparation=None):
             events.append(f"submit:{scope.generation}")
             raise RuntimeError("planned actor submit failure")
 
@@ -5956,6 +6247,34 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
     assert events == ["submit:1", "release-admission"]
     assert executor._pending_batches == 0
     assert executor._execution_scopes == set()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_subprocess_input_preparation_failure_returns_admission_without_scheduling(cleanup_fails):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    releases = []
+
+    class FakeAdmission:
+        def release(self):
+            releases.append(True)
+            if cleanup_fails:
+                raise RuntimeError("planned admission cleanup failure")
+
+    def fail_preparation():
+        raise RuntimeError("planned input preparation failure")
+
+    def unexpected_schedule(*args, **kwargs):
+        pytest.fail("failed input preparation must not schedule a worker")
+
+    executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
+    executor._schedule_async = unexpected_schedule
+    message = "planned input preparation failure"
+    if cleanup_fails:
+        message += ".*planned admission cleanup failure"
+    with pytest.raises(RuntimeError, match=message):
+        executor._submit_async(75, lambda _worker: None, FakeAdmission(), prepare_inputs=fail_preparation)
+    assert releases == [True]
 
 
 def test_udf_executor_close_without_kill_cancels_local_shm_waits_before_waiting(monkeypatch):
@@ -6011,6 +6330,9 @@ def test_subprocess_wakeup_callback_errors_are_reported_on_ready_result_take():
     executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
     executor._wakeup = lambda: (_ for _ in ()).throw(RuntimeError("wakeup failed"))
     executor._queue = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._wakeup_error = None
 
@@ -6047,57 +6369,12 @@ def test_subprocess_submit_without_worker_owner_fails_fast():
     assert executor._task_futures == set()
 
 
-def test_subprocess_ref_bundle_output_stats_include_pending_projected_bytes(monkeypatch):
-    import vane.execution.udf_subprocess as subprocess_exec
+def test_subprocess_stats_do_not_add_a_second_task_output_gate():
+    from vane.execution.udf_subprocess import UDFExecutor
 
-    calls = []
-
-    def fake_admit(size, *, projected_output_bytes=0):
-        calls.append((int(size), int(projected_output_bytes)))
-        return projected_output_bytes == 0
-
-    monkeypatch.setattr(subprocess_exec, "can_admit_local_shm_ref_output_submit", fake_admit)
-    monkeypatch.setattr(
-        subprocess_exec,
-        "local_shm_ref_budget_snapshot",
-        lambda: {
-            "limit_bytes": 1000,
-            "usage_bytes": 600,
-            "reserved_bytes": 600,
-            "pending_output_bytes": 0,
-        },
-    )
-
-    def make_output(table):
-        return pa.table({"blob": table.column("x")})
-
-    executor = subprocess_exec.UDFExecutor(
-        _subprocess_map_payload(
-            make_output,
-            execution_backend="subprocess_task",
-            udf_worker_slots=1,
-            produce_ref_bundle_output=True,
-            streaming_output_mode="local_shm_ref_bundle",
-            output_schema=[
-                {
-                    "name": "blob",
-                    "kind": "duckdb_type",
-                    "type": "BLOB",
-                    "dtype": "",
-                    "shape": [],
-                }
-            ],
-        )
-    )
-    try:
-        estimated = executor._output_budget_estimate(64)
-        with executor._pending_lock:
-            executor._pending_batches = 3
-        stats = executor.stats()
-        assert stats["udf_output_budget_available"] == 0
-        assert calls[-1] == (estimated, 3 * estimated)
-    finally:
-        executor.close(kill=True)
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._ref_bundle_output = True
+    assert "udf_output_budget_available" not in executor._output_budget_stats()
 
 
 def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
@@ -6116,7 +6393,6 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
     payload = _subprocess_map_payload(
         sleeper,
         execution_backend="subprocess_task",
-        udf_worker_slots=2,
     )
     executor_a = subprocess_exec.UDFExecutor(payload)
     executor_b = subprocess_exec.UDFExecutor(payload)
@@ -6124,19 +6400,26 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
         assert len(executor_a._workers) == 0
         assert len(executor_b._workers) == 0
         assert executor_a._task_pool is not None
-        assert executor_a._task_pool.pool_size == 2
+        assert executor_a._task_pool.pool_size == 1
         assert subprocess_exec._global_task_runtime().stats()["max_workers"] == 1
 
         _submit_with_admission(executor_a, pa.table({"x": [1]}), submit_id=171)
-        _submit_with_admission(executor_b, pa.table({"x": [2]}), submit_id=172)
-
         observed_stats = _wait_for_runtime_stats(
             subprocess_exec._global_task_runtime(),
             lambda stats: stats["total_workers"] >= 1 and stats["active_workers"] >= 1,
             timeout_s=10.0,
         )
+        ready = threading.Event()
+        executor_b.register_wakeup(ready.set)
+        second_table = pa.table({"x": [2]})
+        assert executor_b.request_task_admission(second_table.nbytes)
+        results = _wait_for_results(executor_a, 1, timeout_s=10.0)
+        if not executor_b.task_admission_state()["available"]:
+            assert ready.wait(10)
+        assert executor_b.task_admission_state()["available"]
+        executor_b.submit_with_id(172, second_table)
 
-        results = _wait_for_results(executor_a, 1, timeout_s=10.0) + _wait_for_results(
+        results += _wait_for_results(
             executor_b,
             1,
             timeout_s=10.0,
@@ -6187,6 +6470,117 @@ def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
         runtime.close(kill=True)
 
 
+@pytest.mark.parametrize("kill", [False, True])
+def test_subprocess_task_pool_final_release_closes_workers_concurrently_and_waits(kill):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
+    close_barrier = threading.Barrier(3)
+    allow_close = [threading.Event(), threading.Event()]
+    close_calls = []
+    close_errors = []
+
+    class FakeWorker:
+        def __init__(self, index):
+            self.index = index
+
+        def close(self, *, kill):
+            close_calls.append((self.index, kill))
+            close_barrier.wait(timeout=5.0)
+            assert allow_close[self.index].wait(timeout=5.0)
+
+    pool = subprocess_exec._TaskWorkerPool(runtime, "concurrent-task-close", {}, 2)
+    runtime.pools[pool.key] = pool
+    runtime.total_workers = pool.total = 2
+    wrappers = [subprocess_exec._PooledTaskWorker(FakeWorker(index)) for index in range(2)]
+    pool.idle = list(wrappers)
+    pool.acquire_ref()
+    pool.acquire_ref()
+
+    def release_last_ref():
+        try:
+            pool.release_ref(kill=kill)
+        except BaseException as error:
+            close_errors.append(error)
+
+    close_thread = threading.Thread(target=release_last_ref, daemon=True)
+    try:
+        pool.release_ref(kill=kill)
+        assert close_calls == []
+        assert not pool.closing
+
+        close_thread.start()
+        close_barrier.wait(timeout=5.0)
+        assert sorted(close_calls) == [(0, kill), (1, kill)]
+        with runtime.cond:
+            assert runtime.total_workers == pool.total == 2
+            assert set(pool._retiring_workers) == set(wrappers)
+            assert set(runtime._retiring_workers) == set(wrappers)
+
+        allow_close[0].set()
+        with runtime.cond:
+            assert runtime.cond.wait_for(lambda: pool.total == 1, timeout=5.0)
+            assert runtime.total_workers == 1
+            assert list(pool._retiring_workers) == [wrappers[1]]
+            assert list(runtime._retiring_workers) == [wrappers[1]]
+        assert close_thread.is_alive()
+    finally:
+        for event in allow_close:
+            event.set()
+        if close_thread.ident is not None:
+            close_thread.join(timeout=10.0)
+        runtime.close(kill=True)
+
+    assert not close_thread.is_alive()
+    assert close_errors == []
+    assert runtime.total_workers == pool.total == 0
+    assert pool._retiring_workers == runtime._retiring_workers == {}
+
+
+@pytest.mark.parametrize("failure", ["init", "submit"])
+def test_subprocess_task_pool_close_thread_failure_preserves_retirement_cleanup(monkeypatch, failure):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
+    close_calls = []
+
+    class FakeWorker:
+        def __init__(self, index):
+            self.index = index
+
+        def close(self, *, kill):
+            close_calls.append((self.index, kill))
+
+    class FailingCloseExecutor(subprocess_exec.ThreadPoolExecutor):
+        def __init__(self, **kwargs):
+            if failure == "init":
+                raise RuntimeError("planned close thread init failure")
+            super().__init__(**kwargs)
+            self.submit_count = 0
+
+        def submit(self, fn, *args, **kwargs):
+            self.submit_count += 1
+            if self.submit_count == 2:
+                raise RuntimeError("planned close thread submit failure")
+            return super().submit(fn, *args, **kwargs)
+
+    pool = subprocess_exec._TaskWorkerPool(runtime, "close-thread-failure", {}, 2)
+    runtime.pools[pool.key] = pool
+    runtime.total_workers = pool.total = 2
+    pool.idle = [subprocess_exec._PooledTaskWorker(FakeWorker(index)) for index in range(2)]
+    pool.acquire_ref()
+    monkeypatch.setattr(subprocess_exec, "ThreadPoolExecutor", FailingCloseExecutor)
+    try:
+        with pytest.raises(RuntimeError, match=f"planned close thread {failure} failure"):
+            pool.release_ref(kill=False)
+
+        assert sorted(close_calls) == [(0, False), (1, False)]
+        assert runtime.total_workers == pool.total == 0
+        assert pool._retiring_workers == runtime._retiring_workers == {}
+    finally:
+        runtime.close(kill=True)
+
+
 def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_failure():
     import vane.execution.udf_subprocess as subprocess_exec
 
@@ -6199,9 +6593,8 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
             self.fail = fail
 
         def close(self, *, kill):
-            assert not kill
             calls.append(self.name)
-            if self.fail:
+            if self.fail and not kill:
                 raise RuntimeError(f"{self.name} cleanup failed")
 
     class FakeAdmissionSlots:
@@ -6223,10 +6616,17 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
         with pytest.raises(RuntimeError, match="admission cleanup failed.*second cleanup failed"):
             pool.release_ref(kill=False)
 
-        assert calls == ["admission", "second", "first"]
-        assert runtime.total_workers == 0
+        assert calls[0] == "admission"
+        assert sorted(calls[1:]) == ["first", "second"]
+        assert runtime.total_workers == 1
+        assert runtime.stats()["retiring_workers"] == 1
+        assert pool.total == 1
+        assert [wrapper.worker.name for wrapper in pool._retiring_workers] == ["second"]
+        assert list(runtime._retiring_workers) == list(pool._retiring_workers)
     finally:
         runtime.close(kill=True)
+    assert runtime.total_workers == 0
+    assert runtime.stats()["retiring_workers"] == 0
 
 
 def test_subprocess_task_pool_abort_fences_worker_from_idle_reuse(monkeypatch):
@@ -6317,6 +6717,8 @@ def test_subprocess_task_pool_abort_attempts_every_matching_worker_after_failure
     wrapper_b.active_scope = scope_b
 
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = types.SimpleNamespace(shutdown=lambda **_kwargs: None)
     pool.runtime = types.SimpleNamespace(cond=threading.Condition())
     pool._active_wrappers = {wrapper_a, wrapper_b}
 
@@ -6337,6 +6739,8 @@ def test_subprocess_task_pool_nonfinal_release_does_not_join_shared_worker_spawn
         total_workers=1,
     )
     pool = subprocess_exec._TaskWorkerPool.__new__(subprocess_exec._TaskWorkerPool)
+    pool.resources = ResourceVector(cpu=1)
+    pool.executor = types.SimpleNamespace(shutdown=lambda **_kwargs: None)
     pool.runtime = runtime
     pool.key = "shared-spawn"
     pool.ref_count = 2
@@ -6617,6 +7021,7 @@ def test_subprocess_task_releases_result_cancelled_after_worker_call():
         total = 1
         active = 1
         idle = []
+        memory = None
 
         def acquire_worker(self, _scope):
             return wrapper
@@ -6625,9 +7030,10 @@ def test_subprocess_task_releases_result_cancelled_after_worker_call():
             assert released_wrapper is wrapper
             events.append(f"release:{reusable}")
 
-    runtime = subprocess_exec._GlobalSubprocessTaskRuntime.__new__(subprocess_exec._GlobalSubprocessTaskRuntime)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(
+        resource_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**3)
+    )
     runtime.total_workers = 1
-    runtime.max_workers = 1
 
     with pytest.raises(ExecutionCancelledError, match="subprocess task result cancelled"):
         runtime._run_task(FakePool(), lambda _worker: result, scope)
@@ -6666,6 +7072,9 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._owner_pid = os.getpid()
+    pool._gpu_reservation = None
+    pool._resident_release = None
     pool.payload = {}
     pool.pool_size = 1
     pool.name = "post-call-cancel"
@@ -6680,7 +7089,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
     pool._aborting_workers = set()
     pool._idle_workers = deque()
     pool._workers = [worker]
-    pool._acquire_worker = lambda _scope: (0, 0, worker)
+    pool._acquire_worker = lambda _scope, *, replica=None: (0, 0, worker)
 
     with pytest.raises(ExecutionCancelledError, match="local subprocess actor result cancelled"):
         pool._run(lambda _worker: result, scope)
@@ -6695,7 +7104,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
-    subprocess_exec._shutdown_global_task_runtime()
+    _set_task_resource_limit(monkeypatch, 1)
 
     def sleeper(table):
         import os
@@ -6707,7 +7116,6 @@ def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypat
     payload = _subprocess_map_payload(
         sleeper,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
     )
     executor_a = subprocess_exec.UDFExecutor(payload)
     executor_b = subprocess_exec.UDFExecutor(payload)
@@ -6754,7 +7162,6 @@ def test_subprocess_task_pool_identity_includes_session_config():
 
     payload = {
         "execution_backend": "subprocess_task",
-        "udf_worker_slots": 1,
         "function_pickle": b"same-function",
     }
 
@@ -6929,7 +7336,6 @@ def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materializ
         _subprocess_map_payload(
             add_one,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
         )
     )
     try:
@@ -6954,8 +7360,6 @@ def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materializ
 
 
 def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
-    from multiprocessing import shared_memory
-
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
     from vane.execution.udf_subprocess import UDFExecutor
 
@@ -6971,12 +7375,13 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         return pa.table({"y": [value + 1 for value in values]})
 
     _marker, refs, metadata, names = make_local_shm_ref_bundle_result(pa.table({"x": [1], "sleep_ms": [0]}))
-    shm_name = refs[0].name
+    store = refs[0]._allocation_lease.store
+    allocation = refs[0]._allocation_lease.allocation
     executor = UDFExecutor(
         _subprocess_map_payload(
             maybe_sleep_add_one,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
+            memory_bytes=64 * 1024**2,
         )
     )
     try:
@@ -6999,15 +7404,8 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
         assert by_id[302] == {"y": [2]}
     finally:
         executor.close(kill=True)
-        try:
-            shm = shared_memory.SharedMemory(name=shm_name)
-        except FileNotFoundError:
-            pass
-        else:
-            try:
-                shm.unlink()
-            finally:
-                shm.close()
+        with store._lock:
+            assert allocation.generation not in store._live
 
 
 def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
@@ -7021,7 +7419,6 @@ def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
         _subprocess_map_payload(
             identity,
             execution_backend="subprocess_task",
-            udf_worker_slots=2,
         )
     )
 
@@ -7077,8 +7474,6 @@ def test_subprocess_zero_row_ref_bundle_releases_input_lease(monkeypatch):
         "active_input_ref_holds": 0,
         "active_input_ref_hold_count": 0,
         "input_lease_bytes": 0,
-        "active_output_credits": 0,
-        "output_credit_bytes": 0,
     }
 
     def lease_state():
@@ -7144,6 +7539,7 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", synchronized_cancel)
 
     worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._shm_peer = None
     outer = object.__new__(subprocess_exec.UDFExecutor)
     outer._active_input_leases = {lease_id}
     outer._active_input_leases_lock = threading.Lock()
@@ -7178,7 +7574,12 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
 
     assert not submit_thread.is_alive()
     assert not close_thread.is_alive()
-    assert errors == []
+    for error in errors:
+        assert isinstance(error, RuntimeError)
+        assert "input transport cleanup is still in progress" in str(error)
+    # A close that overlaps the actual release retains its owner for retry.
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", original_cancel)
+    outer._cancel_active_input_leases()
     assert results == [None]
     assert set(cancel_calls) == {
         (lease_id, "udf-input-zero-row"),
@@ -7191,13 +7592,13 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
     assert snapshot["active_input_ref_holds"] == 0
     assert snapshot["active_input_ref_hold_count"] == 0
     assert snapshot["input_lease_bytes"] == 0
-    assert snapshot["active_output_credits"] == 0
-    assert snapshot["output_credit_bytes"] == 0
 
 
-def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed():
+def test_subprocess_admission_returns_worker_slot_before_completed_result_is_consumed(monkeypatch):
     from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
     from vane.execution.udf_subprocess import UDFExecutor
+
+    _set_task_resource_limit(monkeypatch, 1)
 
     def identity(table):
         return table
@@ -7206,7 +7607,6 @@ def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consum
         _subprocess_map_payload(
             identity,
             execution_backend="subprocess_task",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -7222,7 +7622,7 @@ def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consum
                     break
             time.sleep(0.005)
 
-        assert executor.task_admission_state()["state"] == "requested"
+        assert executor.task_admission_state()["state"] == "ready"
         first = executor.take_ready_result()
         assert first == (SUBMIT_RESULT_MARKER, 401, pa.table({"x": [1]}))
         assert executor.task_admission_state()["state"] == "ready"
@@ -7340,22 +7740,155 @@ def test_subprocess_task_worker_env_preserves_explicit_omp_num_threads(monkeypat
     assert env["VANE_TORCH_NUM_THREADS"] == "8"
 
 
-def test_subprocess_actor_worker_env_defaults_omp_num_threads(monkeypatch):
+@pytest.mark.parametrize("cpus, expected", [(None, "1"), (0.0, "1"), (0.25, "1"), (2.75, "2"), (3.0, "3")])
+def test_subprocess_actor_worker_env_only_defaults_omp_num_threads(monkeypatch, cpus, expected):
     from vane.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_threading import _THREAD_ENV_VARS
 
-    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    for name in (*_THREAD_ENV_VARS, "VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS"):
         monkeypatch.delenv(name, raising=False)
 
     env = _worker_env_for_pool_index(
-        {"execution_backend": "subprocess_actor", "cpus": 3.0},
+        {"execution_backend": "subprocess_actor", "cpus": cpus},
         0,
         4,
     )
 
-    assert env["OMP_NUM_THREADS"] == "3"
-    assert env["OPENBLAS_NUM_THREADS"] == "3"
-    assert env["MKL_NUM_THREADS"] == "3"
-    assert env["NUMEXPR_NUM_THREADS"] == "3"
+    assert env == {
+        "OMP_NUM_THREADS": expected,
+        "VANE_SUBPROCESS_WORKER_INDEX": "0",
+        "VANE_SUBPROCESS_POOL_SIZE": "4",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_torch",
+    [
+        ({}, (8, 18)),
+        ({"VANE_TORCH_NUM_THREADS": "3"}, (3, 18)),
+        ({"VANE_TORCH_INTEROP_THREADS": "2"}, (8, 2)),
+        (
+            {
+                "OMP_NUM_THREADS": "4",
+                "OPENBLAS_NUM_THREADS": "5",
+                "MKL_NUM_THREADS": "6",
+                "NUMEXPR_NUM_THREADS": "7",
+                "VECLIB_MAXIMUM_THREADS": "8",
+                "RAYON_NUM_THREADS": "9",
+                "VANE_TORCH_NUM_THREADS": "3",
+                "VANE_TORCH_INTEROP_THREADS": "2",
+            },
+            (3, 2),
+        ),
+    ],
+)
+def test_subprocess_actor_preserves_native_and_explicit_threads(monkeypatch, overrides, expected_torch):
+    import json
+
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_threading import _THREAD_ENV_VARS
+
+    names = (*_THREAD_ENV_VARS, "VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS")
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+
+    class InspectThreads:
+        def __init__(self):
+            # Model a library loaded and configured by the constructor without
+            # requiring PyTorch in CPU-only CI. Startup must not reset it.
+            class TorchThreads:
+                num_threads = 8
+                interop_threads = 18
+
+                def get_num_threads(self):
+                    return self.num_threads
+
+                def get_num_interop_threads(self):
+                    return self.interop_threads
+
+                def set_num_threads(self, value):
+                    self.num_threads = value
+
+                def set_num_interop_threads(self, value):
+                    self.interop_threads = value
+
+            self.torch = TorchThreads()
+            sys.modules["torch"] = self.torch
+            self.constructor_env = {name: os.environ.get(name) for name in names}
+
+        def warm_up(self):
+            self.warmup_threads = (self.torch.get_num_threads(), self.torch.get_num_interop_threads())
+
+        def __call__(self, table):
+            return pa.table(
+                {
+                    "env": [json.dumps(self.constructor_env)],
+                    "warmup_threads": [list(self.warmup_threads)],
+                    "call_threads": [[self.torch.get_num_threads(), self.torch.get_num_interop_threads()]],
+                }
+            )
+
+    _set_task_resource_limit(monkeypatch, 1)
+    payload = _subprocess_map_payload(InspectThreads, execution_backend="subprocess_actor", actor_number=1)
+    executor, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    try:
+        _submit_with_admission(executor, pa.table({"x": [1]}))
+        result = _wait_for_results(executor, 1, timeout_s=10.0)[0].to_pydict()
+        expected_env = dict.fromkeys(names)
+        expected_env.update({"OMP_NUM_THREADS": "1", **overrides})
+        assert json.loads(result["env"][0]) == expected_env
+        assert result["warmup_threads"] == [list(expected_torch)]
+        assert result["call_threads"] == [list(expected_torch)]
+    finally:
+        try:
+            executor.close()
+        finally:
+            pool.shutdown(kill=True)
+
+
+@pytest.mark.parametrize("name", ["VANE_TORCH_NUM_THREADS", "VANE_TORCH_INTEROP_THREADS"])
+@pytest.mark.parametrize("value", ["", "0", "-1", "invalid"])
+def test_native_actor_rejects_invalid_explicit_torch_threads_before_mutation(monkeypatch, name, value):
+    from vane.execution import udf_threading
+
+    def unexpected_access():
+        raise AssertionError("invalid overrides must be rejected before accessing either pool")
+
+    monkeypatch.setattr(udf_threading, "_TORCH_THREADS_CONFIGURED", False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(get_num_threads=unexpected_access, get_num_interop_threads=unexpected_access),
+    )
+    monkeypatch.setenv("VANE_TORCH_NUM_THREADS", "3")
+    monkeypatch.setenv("VANE_TORCH_INTEROP_THREADS", "2")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        udf_threading.configure_loaded_torch_threads(explicit_only=True)
+    assert udf_threading._TORCH_THREADS_CONFIGURED is False
+
+
+def test_native_actor_torch_thread_overrides_wait_for_library_import(monkeypatch):
+    from vane.execution import udf_threading
+
+    monkeypatch.setattr(udf_threading, "_TORCH_THREADS_CONFIGURED", False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setenv("VANE_TORCH_NUM_THREADS", "3")
+    monkeypatch.delenv("VANE_TORCH_INTEROP_THREADS", raising=False)
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is False
+    assert udf_threading._TORCH_THREADS_CONFIGURED is False
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(get_num_threads=lambda: 8, set_num_threads=calls.append),
+    )
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is True
+    assert calls == [3]
+    assert udf_threading.configure_loaded_torch_threads(explicit_only=True) is False
 
 
 def test_udf_threading_configures_loaded_torch_once(monkeypatch):
@@ -7497,7 +8030,8 @@ def test_subprocess_worker_receives_worker_env_without_cuda_assignment(monkeypat
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
-    executor = UDFExecutor(_subprocess_map_payload(worker_env, udf_worker_slots=1, gpus=1.0))
+    _set_task_resource_limit(monkeypatch, 1)
+    executor = UDFExecutor(_subprocess_map_payload(worker_env))
     try:
         _submit_with_admission(executor, pa.table({"x": [1]}))
         output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
@@ -7818,13 +8352,11 @@ def test_local_shm_budget_manager_input_lease_is_diagnostic_only(monkeypatch):
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 0
     assert snapshot["input_lease_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 400
-    assert snapshot["usage_bytes"] == 400
-    assert snapshot["available_bytes"] == 624
+    assert snapshot["usage_bytes"] == 0
+    assert snapshot["available_bytes"] == 1024
 
     manager.cancel_input_lease(lease_id, name="lease-a")
     snapshot = manager.snapshot()
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 0
     assert snapshot["available_bytes"] == 1024
 
@@ -7890,7 +8422,7 @@ def test_local_shm_input_ack_does_not_fallback_to_destructive_release():
     assert ref.release_count == 0
 
 
-def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(monkeypatch):
+def test_local_shm_input_ack_keeps_borrowed_descriptor_and_physical_charge(monkeypatch):
     from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
@@ -7899,26 +8431,25 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
     ref = refs[0]
     try:
         assert getattr(ref, "_closed", False) is False
-        assert getattr(ref, "_budget_bytes", 0) > 0
+        assert ref._pooled_budget.size == ref.size
+        assert not ref._pooled_budget.released
 
         lease_id = ref_bundle.create_local_shm_input_lease(
             refs,
             name="input",
-            reserve_output_credit=False,
         )
         ref_bundle.consume_local_shm_input_lease(lease_id, name="input")
 
         assert getattr(ref, "_closed", False) is False
         assert getattr(ref, "_budget_bytes", 0) == 0
+        assert not ref._pooled_budget.released
         assert ref_bundle.materialize_ref_bundle(refs, None, metadata, names).to_pydict() == {"x": [1, 2, 3]}
     finally:
         for ref in refs:
             ref.release()
 
 
-def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
-    import threading
-
+def test_local_shm_budget_manager_ack_returns_actual_capacity_without_reserving_outputs():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -7931,44 +8462,18 @@ def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
 
     manager.acquire_allocation(650, name="backlog")
     manager.acquire_allocation(300, name="input")
-    lease_id = manager.create_input_lease((BudgetedRef(),), 300, name="input")
-
-    manager.consume_input_lease(lease_id, name="input")
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 650
-    assert snapshot["output_credit_bytes"] == 300
-    assert snapshot["usage_bytes"] == 950
-
-    producer_grants = []
-
-    def request_producer_grant():
-        producer_grants.append(manager.request_output_grant(100, name="producer", priority="producer"))
-
-    producer_thread = threading.Thread(target=request_producer_grant)
-    producer_thread.start()
-    threading.Event().wait(0.05)
-    assert producer_grants == []
-
-    consumer_grant = manager.request_output_grant(
-        200,
-        name="consumer",
-        priority="consumer",
-        input_lease_id=lease_id,
-    )
-    assert isinstance(consumer_grant, int)
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 650
-    assert snapshot["output_grant_bytes"] == 200
-    assert snapshot["output_credit_bytes"] == 0
-    assert snapshot["usage_bytes"] == 850
-
-    producer_thread.join(timeout=2)
-    assert len(producer_grants) == 1
+    lease = manager.create_input_lease([BudgetedRef()], 300)
+    manager.consume_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 650
+    grant = manager.request_output_grant(100, priority="producer")
+    assert manager.snapshot()["usage_bytes"] == 750
+    manager.release_output_grant(grant)
+    manager.release_allocation(650)
+    manager.cancel_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_credits():
-    import threading
-
+def test_local_shm_budget_manager_consumed_inputs_cannot_block_expanding_output():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -7979,54 +8484,22 @@ def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_cr
         def release(self):
             manager.release_allocation(self.size, name="input")
 
-    manager.acquire_allocation(400, name="input-a")
-    manager.acquire_allocation(400, name="input-b")
-    lease_a = manager.create_input_lease((BudgetedRef(),), 400, name="input-a")
-    lease_b = manager.create_input_lease((BudgetedRef(),), 400, name="input-b")
-
-    manager.consume_input_lease(lease_a, name="input-a")
-    manager.consume_input_lease(lease_b, name="input-b")
-    snapshot = manager.snapshot()
-    assert snapshot["allocated_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 800
-
-    cancel_event = threading.Event()
-    grants = []
-    errors = []
-
-    def request_matching_output():
-        try:
-            grants.append(
-                manager.request_output_grant(
-                    700,
-                    name="consumer-a",
-                    priority="consumer",
-                    input_lease_id=lease_a,
-                    cancel_event=cancel_event,
-                )
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=request_matching_output)
-    thread.start()
-    thread.join(timeout=0.2)
-    assert grants == []
-    assert thread.is_alive()
-
-    manager.cancel_input_lease(lease_b, name="input-b")
-    thread.join(timeout=2)
-
-    assert len(grants) == 1
-    assert errors == []
-    snapshot = manager.snapshot()
-    assert snapshot["usage_bytes"] == 700
-    assert snapshot["usage_bytes"] <= snapshot["limit_bytes"]
-    manager.release_output_grant(grants[0], name="consumer-a")
-    manager.cancel_input_lease(lease_a, name="input-a")
+    leases = []
+    for _ in range(2):
+        manager.acquire_allocation(400)
+        leases.append(manager.create_input_lease([BudgetedRef()], 400))
+    for lease in leases:
+        manager.consume_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
+    grant = manager.request_output_grant(700, priority="consumer", input_lease_id=leases[0])
+    assert manager.snapshot()["usage_bytes"] == 700
+    manager.release_output_grant(grant)
+    for lease in leases:
+        manager.cancel_input_lease(lease)
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit():
+def test_local_shm_budget_manager_cancel_after_ack_does_not_release_unrelated_bytes():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8042,16 +8515,14 @@ def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit()
     lease_id = manager.create_input_lease((BudgetedRef(),), 300, name="input")
 
     manager.consume_input_lease(lease_id, name="input")
-    assert manager.snapshot()["output_credit_bytes"] == 300
 
     manager.cancel_input_lease(lease_id, name="input-error")
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 500
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 500
 
 
-def test_local_shm_budget_manager_can_consume_input_without_output_credit():
+def test_local_shm_budget_manager_input_consumption_returns_released_capacity():
     from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
@@ -8067,13 +8538,11 @@ def test_local_shm_budget_manager_can_consume_input_without_output_credit():
         (BudgetedRef(),),
         300,
         name="legacy-output-input",
-        reserve_output_credit=False,
     )
 
     manager.consume_input_lease(lease_id, name="legacy-output-input")
     snapshot = manager.snapshot()
     assert snapshot["allocated_bytes"] == 0
-    assert snapshot["output_credit_bytes"] == 0
     assert snapshot["usage_bytes"] == 0
 
 
@@ -8214,7 +8683,6 @@ def test_subprocess_ref_bundle_input_ack_releases_upstream_before_result(monkeyp
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -8255,7 +8723,6 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
             output_schema=[{"name": "y", "kind": "tensor", "dtype": "UINT8", "shape": [tensor_width]}],
         )
     )
@@ -8281,6 +8748,7 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
 
 def _timeout_test_executor(subprocess_exec, sock):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._broken_error = None
     executor._sock = sock
@@ -8417,6 +8885,7 @@ def _decode_control_messages(data: bytes, header) -> list[tuple[int, bytes]]:
 
 def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._closed = False
     executor._broken_error = None
     executor._actor_lost = False
@@ -8562,6 +9031,7 @@ def test_single_subprocess_reported_error_survives_unprintable_cleanup_failure(m
             raise RuntimeError("planned repr failure")
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
 
     def fail_cleanup(*_args, **_kwargs):
         raise _UnprintableCleanupError()
@@ -8721,6 +9191,54 @@ def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
     assert sock.closed
 
 
+def test_task_pool_commits_retirement_after_acknowledged_exit_timeout():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    ack = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    proc = _FakeShutdownProcess(exits_on_wait=False)
+    worker = _bare_shutdown_executor(subprocess_exec, _GracefulShutdownSocket(ack), proc)
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    pool = runtime.acquire_pool({"execution_backend": "subprocess_task"}, 1)
+    wrapper = subprocess_exec._PooledTaskWorker(worker)
+    pool.total = runtime.total_workers = 1
+    pool._retire_worker_locked(wrapper)
+    try:
+        pool._close_retiring_worker(wrapper, kill=False)
+        assert proc.kill_calls == 1
+        assert worker._cleanup_finished
+        assert worker._proc is None
+        assert pool.total == runtime.total_workers == 0
+        assert not pool._retiring_workers and not runtime._retiring_workers
+    finally:
+        runtime.close(kill=True)
+
+
+@pytest.mark.parametrize("failure", ["ack_error", "resource_cleanup"])
+def test_task_pool_does_not_hide_shutdown_failures_after_exit(failure, monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    kind = subprocess_exec._MSG_ERROR if failure == "ack_error" else subprocess_exec._MSG_ACK
+    proc = _FakeShutdownProcess(exits_on_wait=False)
+    worker = _bare_shutdown_executor(
+        subprocess_exec, _GracefulShutdownSocket(subprocess_exec._HEADER.pack(kind, 0)), proc
+    )
+    if failure == "resource_cleanup":
+        monkeypatch.setattr(worker, "_close_data_shm", lambda: (_ for _ in ()).throw(RuntimeError("cleanup failure")))
+    runtime = subprocess_exec._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=1024**3))
+    pool = runtime.acquire_pool({"execution_backend": "subprocess_task"}, 1)
+    wrapper = subprocess_exec._PooledTaskWorker(worker)
+    pool.total = runtime.total_workers = 1
+    pool._retire_worker_locked(wrapper)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            pool._close_retiring_worker(wrapper, kill=False)
+        assert not isinstance(caught.value, subprocess_exec._SubprocessExitDeadlineExceeded)
+        assert wrapper in pool._retiring_workers and pool.total == 1
+    finally:
+        monkeypatch.setattr(worker, "_close_data_shm", lambda: None)
+        runtime.close(kill=True)
+
+
 def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
@@ -8764,7 +9282,7 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
     assert sock.closed
 
 
-def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds():
+def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds(pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
 
     class RetryableShutdownProcess:
@@ -8788,6 +9306,8 @@ def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds
 
     proc = RetryableShutdownProcess()
     executor = _bare_shutdown_executor(subprocess_exec, _FakeControlSocket(), proc)
+    executor._shm_peer = pooled_shm_worker
+    pooled_shm_worker.reserve_write(1, 64)
 
     with pytest.raises(RuntimeError, match="planned first kill failure"):
         executor.close(kill=True)
@@ -8795,15 +9315,19 @@ def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds
     assert executor._closed
     assert not executor._cleanup_finished
     assert executor._proc is proc
+    assert executor._shm_peer is pooled_shm_worker
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 1
 
     executor.close(kill=True)
 
     assert proc.kill_calls == 2
     assert executor._cleanup_finished
     assert executor._proc is None
+    assert executor._shm_peer is None
+    assert pooled_shm_worker.store.snapshot()["live_allocations"] == 0
 
 
-def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
+def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane import pickle as vane_pickle
     from vane.execution import ref_bundle
@@ -8812,6 +9336,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     before = ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"]
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = pooled_shm_worker
     executor._queue = deque()
     executor._finished_submitting = False
     executor._closed = False
@@ -8834,7 +9359,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     executor._sock = _FakeControlSocket()
     executor._proc = None
 
-    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer", "input_tokens": []})
     assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] >= before + 4096
 
@@ -8919,6 +9444,7 @@ def test_single_subprocess_execution_scope_is_cleared_after_cleanup_failure():
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -8952,6 +9478,7 @@ def test_single_subprocess_execution_scope_releases_post_call_cancelled_result()
             released += 1
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     executor._cancel_scope_resources = lambda _scope, *, cancel_scope: None
@@ -8973,6 +9500,7 @@ def test_single_subprocess_execution_scope_is_cleared_when_wakeup_registration_f
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -8998,6 +9526,7 @@ def test_single_subprocess_cancel_wakeup_cleanup_failure_breaks_worker():
     import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    executor._shm_peer = None
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -9096,7 +9625,7 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
     assert executor._cleanup_finished
 
 
-def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch):
+def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9107,14 +9636,14 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
         def drain_outputs(self):
             return [pa.table({"y": [1]})]
 
-    def fail_descriptor(_table, *, grant_id=None):
-        assert grant_id is None
+    def fail_descriptor(_blocks, *, allocation, grant_id):
+        assert grant_id == 99
         raise RuntimeError("descriptor failed")
 
-    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99})
+    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
-    monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", fail_descriptor)
+    monkeypatch.setattr(worker, "make_pooled_shm_descriptor", fail_descriptor)
 
     with pytest.raises(RuntimeError, match="descriptor failed"):
         worker._execute_submit(
@@ -9146,7 +9675,7 @@ def test_subprocess_worker_formats_fully_unprintable_exception():
     assert worker._format_exception(_UnprintableError()) == "<unprintable _UnprintableError>"
 
 
-def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):
+def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9160,7 +9689,9 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
                 pa.table({"payload": [b"b" * 64]}),
             ]
 
-    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101})
+    required = sum(worker.prepare_local_shm_block(t).ipc_size_bytes for t in FakeExecutor().drain_outputs())
+    allocation = pooled_shm_worker.reserve_write(101, required)
+    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101, "allocation": allocation})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
 
@@ -9191,7 +9722,9 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
 
 
 @pytest.mark.parametrize("call_mode", ["map", "map_batches_rows"])
-def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(monkeypatch, call_mode):
+def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(
+    monkeypatch, call_mode, pooled_shm_worker
+):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9214,7 +9747,8 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
 
     captured: list[pa.Table] = []
 
-    def make_descriptor(tables, *, grant_id=None):
+    def make_descriptor(blocks, *, allocation, grant_id):
+        tables = [block.table for block in blocks]
         captured.extend(tables)
         return {
             "block_refs": [],
@@ -9223,7 +9757,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
             "grant_id": grant_id,
         }
 
-    grant_payload = vane_pickle.dumps({"request_id": 12, "grant_id": 102})
+    grant_payload = vane_pickle.dumps({"request_id": 12, "grant_id": 102, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "_make_local_shm_ref_bundle_descriptor_for_tables", make_descriptor)
@@ -9248,7 +9782,7 @@ def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces
     assert [table.column("keep").to_pylist() for table in captured] == [["a", "b"], ["c"]]
 
 
-def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
+def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch, pooled_shm_worker):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
@@ -9275,28 +9809,28 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
                 raise RuntimeError("compute tail was not flushed")
             return [pa.table({"rows": [self.input_rows]})]
 
-    def make_descriptor(table, *, grant_id=None):
-        assert grant_id is None
+    def make_descriptor(blocks, *, allocation, grant_id):
+        table = blocks[0].table
+        assert grant_id == 88
         return {
+            "grant_id": grant_id,
             "block_refs": [{"provider": "local_shm", "shm_name": "fake-shm", "ipc_size_bytes": 1}],
             "metadata": [{"rows": table.column("rows").to_pylist(), "num_rows": table.num_rows, "ipc_size_bytes": 1}],
             "names": list(table.schema.names),
         }
 
-    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88})
+    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88, "allocation": {}})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
-    monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
-    monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", make_descriptor)
-    monkeypatch.setattr(worker, "configure_loaded_torch_threads", lambda: None)
+    monkeypatch.setattr(worker, "make_pooled_shm_descriptor", make_descriptor)
 
-    _data_shm, msg_type, payload = worker._execute_task_submit(
-        {"call_mode": "map_batches"},
+    _data_shm, msg_type, payload = worker._execute_submit(
+        FakeRuntimeExecutor({"call_mode": "map_batches"}),
         pa.table({"x": [1, 2, 3]}),
         data_shm=None,
         produce_ref_bundle_output=True,
         submit_count=3,
-        log_submit=False,
+        finish_before_drain=True,
         sock=sock,
     )
 
@@ -9306,7 +9840,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     assert descriptor["metadata"] == [{"rows": [3], "num_rows": 1, "ipc_size_bytes": 1}]
     assert descriptor["names"] == ["rows"]
     assert created and created[0].finished
-    assert created[0].closed
+    assert not created[0].closed  # The worker control loop owns task cleanup.
 
 
 @pytest.mark.parametrize(
@@ -9326,52 +9860,49 @@ def test_subprocess_worker_row_preserving_ref_bundle_requires_scalar_arg_count(p
 
 def test_subprocess_executor_close_escalates_scoped_pending_work(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
-
-    class FakeWorker:
-        def __init__(self) -> None:
-            self.cancelled = False
-            self.closed: list[bool] = []
-
-        def cancel_output_grants(self) -> None:
-            self.cancelled = True
-
-        def close(self, *, kill: bool = False) -> None:
-            self.closed.append(kill)
-
-    class FakeThreadPool:
-        def __init__(self) -> None:
-            self.shutdown_calls = []
-
-        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-            self.shutdown_calls.append({"wait": wait, "cancel_futures": cancel_futures})
+    from vane.execution.udf_lifecycle import ExecutionCancelledError
 
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.01")
-    executor = object.__new__(subprocess_exec.UDFExecutor)
-    executor._closed = False
-    executor._budget_wakeup_unregister = None
-    executor._task_futures_cv = threading.Condition()
-    executor._task_futures = {Future()}
-    executor._task_future_meta = {}
-    executor._execution_scopes_lock = threading.Lock()
-    scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
-    executor._execution_scopes = {scope}
-    executor._active_input_leases = set()
-    executor._active_input_leases_lock = threading.Lock()
-    executor._actor_pool = None
-    executor._task_pool = None
-    thread_pool = FakeThreadPool()
-    executor._executor = thread_pool
-    executor._workers = [FakeWorker()]
+    executor = subprocess_exec.UDFExecutor(
+        _subprocess_map_payload(lambda table: table, execution_backend="subprocess_task")
+    )
+    pool = executor._task_pool
+    release_pool = pool.release_ref
+    future = Future()
+    assert future.set_running_or_notify_cancel()
+    scope = executor._new_execution_scope()
+    executor._pending_batches = 1
+    executor._track_task_future(future, 1, 1, time.perf_counter(), None, scope)
+    events = []
 
-    done = threading.Event()
-    thread = threading.Thread(target=lambda: (executor.close(kill=False), done.set()), daemon=True)
-    thread.start()
+    def abort(scopes):
+        assert scopes == {scope}
+        assert scope.is_set()
+        events.append("abort")
+        # The backend terminates its invocation; normal completion cleanup
+        # must retire the future before close can drop this pool reference.
+        future.set_exception(ExecutionCancelledError("worker aborted"))
 
-    assert done.wait(timeout=1.0)
-    assert scope.is_set()
-    assert not executor._workers[0].cancelled
-    assert executor._workers[0].closed == [True]
-    assert thread_pool.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    def release(*, kill):
+        assert kill
+        assert not executor._task_futures
+        assert not executor._execution_scopes
+        assert scope.finished
+        events.append("release")
+        release_pool(kill=kill)
+
+    monkeypatch.setattr(pool, "abort_scopes", abort)
+    monkeypatch.setattr(pool, "release_ref", release)
+    try:
+        executor.close(kill=False)
+        assert events == ["abort", "release"]
+        assert executor._cleanup_finished
+        assert not executor.cleanup_pending()
+        assert executor._task_pool is None
+    finally:
+        if not future.done():
+            future.set_exception(ExecutionCancelledError("test cleanup"))
+        executor.close(kill=True)
 
 
 def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
@@ -9395,6 +9926,9 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9415,9 +9949,10 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
     assert executor._task_pool is None
 
 
-def test_subprocess_executor_close_continues_after_front_half_cleanup_failures():
+def test_subprocess_executor_close_continues_after_front_half_cleanup_failures(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.01")
     events: list[str] = []
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
 
@@ -9452,6 +9987,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
 
     executor = object.__new__(subprocess_exec.UDFExecutor)
     executor._closed = False
+    executor._cleanup_finished = False
     executor._lifecycle_lock = threading.RLock()
     executor._admission_authority = FakeAuthority()
     executor._queue = deque()
@@ -9461,6 +9997,9 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
             FakeAdmission("second"),
         ]
     )
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = lambda: events.append("unregister")
     executor._execution_scopes_lock = threading.Lock()
@@ -9494,6 +10033,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
             ".*planned budget wakeup failure"
             ".*planned abort failure"
             ".*planned future cancellation failure"
+            ".*pending UDF cleanup"
         ),
     ):
         executor.close(kill=True)
@@ -9506,9 +10046,147 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
         "cancel-waits",
         "abort",
         "cancel-future",
-        "release:True",
     ]
+    assert executor._task_pool is not None
+    assert executor._task_futures
+    assert not executor._cleanup_finished
+    assert executor._close_cleanup_pending
+
+    # Once the backend callback has retired, other cleanup errors must still
+    # be reported and must not prevent the remaining pool cleanup attempt.
+    executor._task_futures.clear()
+    executor._active_input_leases.clear()
+    with pytest.raises(RuntimeError, match="planned authority cleanup failure.*planned abort failure"):
+        executor.close(kill=True)
+    assert events[-1] == "release:True"
     assert executor._task_pool is None
+
+
+@pytest.mark.parametrize("ack", ["_MSG_INPUT_CONSUMED", "_MSG_INPUT_CONSUME_FAILED"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_input_ack_during_worker_close_retains_pending_cleanup_owner(monkeypatch, ack, fails):
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    gc.collect()
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    # Exercise real control-message and close bookkeeping without spawning a
+    # process: the events below fix the exact ACK/cancellation interleaving.
+    monkeypatch.setattr(local._SingleSubprocessExecutor, "_start_worker", lambda *args, **kwargs: None)
+    worker = local._SingleSubprocessExecutor({})
+    worker._track_input_lease(lease)
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+
+    def blocked_release(ref):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if fails:
+            raise RuntimeError("planned concurrent input release failure")
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            closing = threads.submit(worker.close, kill=True)
+            try:
+                assert entered.wait(timeout=5)
+                assert worker._handle_submit_control_message(
+                    getattr(local, ack), vane_pickle.dumps({"input_lease_id": lease})
+                )
+                assert lease in worker._active_input_leases
+                assert not worker._cleanup_finished
+                assert budget.input_lease_pending(lease)
+            finally:
+                proceed.set()
+            if fails:
+                with pytest.raises(RuntimeError, match="planned concurrent input release failure"):
+                    closing.result(timeout=5)
+                assert not worker._cleanup_finished
+                assert lease in worker._active_input_leases
+            else:
+                closing.result(timeout=5)
+        worker.close(kill=True)
+        assert worker._cleanup_finished
+        assert not worker._active_input_leases
+        assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == ref.size
+        ref.release()
+        assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        proceed.set()
+        worker.close(kill=True)
+        ref.release()
+
+
+@pytest.mark.parametrize("owner", ["worker", "executor"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_close_during_input_ack_keeps_executor_cleanup_retryable(monkeypatch, owner, fails):
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    gc.collect()
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    if owner == "worker":
+        monkeypatch.setattr(local._SingleSubprocessExecutor, "_start_worker", lambda *args, **kwargs: None)
+        executor = local._SingleSubprocessExecutor({})
+    else:
+        executor = local.UDFExecutor(
+            dict(
+                function_pickle=vane_pickle.dumps(lambda table: table),
+                execution_backend="subprocess_task",
+            ),
+            {},
+        )
+    executor._track_input_lease(lease)
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+
+    def blocked_release(ref):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if fails:
+            raise RuntimeError("planned concurrent input release failure")
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            ack = threads.submit(budget.consume_input_lease, lease)
+            try:
+                assert entered.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="input transport cleanup is still in progress"):
+                    executor.close(kill=True)
+                assert lease in executor._active_input_leases
+                # A concurrently finishing submit must not remove this owner.
+                executor._untrack_input_lease(lease)
+                assert lease in executor._active_input_leases
+                assert budget.snapshot()["input_lease_bytes"] == ref.size
+            finally:
+                proceed.set()
+            if fails:
+                with pytest.raises(RuntimeError, match="planned concurrent input release failure"):
+                    ack.result(timeout=5)
+            else:
+                ack.result(timeout=5)
+        executor.close(kill=True)
+        assert not executor._active_input_leases
+        assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == ref.size
+        ref.release()
+        assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        proceed.set()
+        executor.close(kill=True)
+        ref.release()
 
 
 def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_failure(monkeypatch):
@@ -9566,6 +10244,9 @@ def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypa
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9594,7 +10275,7 @@ def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypa
     assert executor._active_input_leases == set()
 
 
-def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_release():
+def test_subprocess_executor_timeout_retains_task_pool_until_cleanup_retry():
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -9610,10 +10291,16 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
 
     executor = object.__new__(subprocess_exec.UDFExecutor)
     executor._closed = False
+    executor._cleanup_finished = False
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
     executor._lifecycle_lock = threading.RLock()
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._task_futures_cv = threading.Condition()
@@ -9629,13 +10316,13 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
         nonlocal cancel_wait_calls
         cancel_wait_calls += 1
         events.append(f"cancel-waits:{cancel_wait_calls}")
-        if cancel_wait_calls == 1:
-            return {scope}, []
-        return set(), [RuntimeError("planned escalation cleanup failure")]
+        errors = [RuntimeError("planned escalation cleanup failure")] if cancel_wait_calls == 2 else []
+        return {scope}, errors
 
     def cancel_futures():
         events.append("cancel-futures")
-        raise RuntimeError("planned future cancellation failure")
+        if events.count("cancel-futures") == 1:
+            raise RuntimeError("planned future cancellation failure")
 
     executor._cancel_local_shm_waits = cancel_waits
     executor._wait_for_pending_futures = lambda _timeout_s=None: False
@@ -9652,9 +10339,18 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
         "abort",
         "cancel-futures",
         "cancel-waits:2",
-        "release:True",
     ]
+    assert executor._task_pool is not None
+    assert not executor._cleanup_finished
+    assert executor._close_cleanup_pending
+
+    executor._wait_for_pending_futures = lambda _timeout_s=None: True
+    executor.close(kill=True)
+
+    assert events[-4:] == ["cancel-waits:3", "abort", "cancel-futures", "release:True"]
     assert executor._task_pool is None
+    assert executor._cleanup_finished
+    assert not executor._close_cleanup_pending
 
 
 def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
@@ -9678,6 +10374,9 @@ def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
     executor._admission_authority = None
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9724,7 +10423,7 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
         def stats(self):
             return {"active_workers": 0, "idle_workers": 1}
 
-        def submit(self, _fn, _scope, _debug_seq):
+        def submit(self, _fn, _scope, _debug_seq, *, admission=None, input_preparation=None):
             submit_started.set()
             assert release_submit.wait(timeout=5.0)
             return submitted_future
@@ -9753,6 +10452,9 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     executor._task_future_meta = {}
     executor._pending_lock = threading.Lock()
     executor._pending_batches = 0
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._queue = deque()
     executor._result_admissions = deque()
@@ -9791,6 +10493,54 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
     assert actor_pool.aborted and len(actor_pool.aborted[0]) == 1
 
 
+@pytest.mark.parametrize("submit_id", [None, 73])
+@pytest.mark.parametrize("producer_cleanup", [False, True])
+def test_subprocess_result_handoff_preserves_consumer_and_retires_producer(submit_id, producer_cleanup):
+    import vane.execution.udf_subprocess as local
+    from vane.execution import ref_bundle
+    from vane.execution.udf_data_lease import RuntimeDataLedger
+
+    ledger = RuntimeDataLedger()
+    query = ledger.open_query()
+    task = query.open_task()
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    ref_bundle.track_local_shm_output(task, result)
+    task.finish()
+    query.shutdown()
+    future = Future()
+    future.set_result(result)
+
+    executor = object.__new__(local.UDFExecutor)
+    executor._queue = deque([local.UDFExecutor._submit_result_item(submit_id, result)])
+    executor._queue_lock = threading.Lock()
+    executor._result_admissions = deque()
+    executor._result_reads = deque()
+    executor._result_streams = deque()
+    executor._output_reads = {}
+    executor._request_cancellation = None
+    executor._request_cancel_unregister = None
+    executor._wakeup_error = None
+    executor._closed = True
+    executor._cleanup_finished = True
+    executor._active_input_leases = set()
+    executor._active_input_leases_lock = threading.Lock()
+    del result
+
+    taken = executor.take_ready_result()
+    output = taken if submit_id is None else taken[2]
+    if producer_cleanup:
+        local._release_local_ref_bundle_result(future.result())
+    table = output[1][0].to_table()
+    del output, taken
+    assert table.to_pydict() == {"x": [1, 2]}
+    # The exported Arrow view is the sole remaining data owner, even while the
+    # producer retains its Future or performs late result cleanup.
+    assert ledger.snapshot()["leases"] == 1
+    del table
+    assert ledger.snapshot()["retained_bytes"] == 0
+    assert future.done()
+
+
 def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution import ref_bundle
@@ -9806,19 +10556,22 @@ def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
     executor._ref_bundle_output = False
     executor._queue = deque()
     executor._result_admissions = deque()
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._pending_batches = 1
     executor._pending_lock = threading.Lock()
     executor._task_futures_cv = threading.Condition()
     executor._task_futures_lock = executor._task_futures_cv
-    executor._task_futures = {future}
-    executor._task_future_meta = {future: (None, 1, time.perf_counter(), None, scope)}
+    executor._task_futures = set()
+    executor._task_future_meta = {}
     executor._execution_scopes_lock = threading.Lock()
     executor._execution_scopes = {scope}
     executor._wakeup = None
     executor._wakeup_error = None
 
-    executor._complete_task_submit(None, future)
+    executor._track_task_future(future, None, 1, time.perf_counter(), None, scope)
 
     assert not executor._queue
     assert executor._pending_batches == 0
@@ -9853,6 +10606,9 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
     executor._admission_authority = FakeAuthority()
     executor._queue = deque([(ref_bundle.SUBMIT_RESULT_MARKER, 41, result)])
     executor._result_admissions = deque([admission])
+    executor._result_streams = deque()
+    executor._result_reads = deque()
+    executor._output_reads = {}
     executor._queue_lock = threading.Lock()
     executor._budget_wakeup_unregister = None
     executor._execution_scopes_lock = threading.Lock()
@@ -9913,7 +10669,7 @@ def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):
         pool.shutdown(kill=True)
 
     after = ref_bundle.local_shm_ref_budget_snapshot()["reserved_bytes"]
-    assert after < before
+    assert after == before  # The caller still owns the pooled descriptor.
     for ref in refs:
         ref.release()
 
@@ -9929,7 +10685,6 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
             identity,
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
-            udf_worker_slots=1,
         )
     )
     try:
@@ -9938,11 +10693,9 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
             "udf_local_shm_budget_limit_bytes",
             "udf_local_shm_allocated_bytes",
             "udf_local_shm_output_grant_bytes",
-            "udf_local_shm_output_credit_bytes",
             "udf_local_shm_input_lease_bytes",
             "udf_local_shm_available_bytes",
             "udf_local_shm_active_input_leases",
-            "udf_local_shm_active_output_credits",
             "udf_local_shm_waiting_output_grants",
             "udf_local_shm_input_consumed_count",
             "udf_local_shm_refs_released_by_input_ack",
@@ -10019,7 +10772,9 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
         name="",
         priority="producer",
         input_lease_id=None,
+        owner_id=None,
         cancel_event=None,
+        wait_context=None,
     ):
         captured_cancel_events.append(cancel_event)
         if len(captured_cancel_events) == 1:
@@ -10032,7 +10787,9 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
             name=name,
             priority=priority,
             input_lease_id=input_lease_id,
+            owner_id=owner_id,
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)
@@ -10043,7 +10800,6 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
     payload = _subprocess_map_payload(
         add_one,
         execution_backend="subprocess_task",
-        udf_worker_slots=1,
         produce_ref_bundle_output=True,
         streaming_output_mode="local_shm_ref_bundle",
     )
@@ -10098,7 +10854,9 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
         name="",
         priority="producer",
         input_lease_id=None,
+        owner_id=None,
         cancel_event=None,
+        wait_context=None,
     ):
         captured_cancel_events.append(cancel_event)
         if len(captured_cancel_events) == 1:
@@ -10111,7 +10869,9 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
             name=name,
             priority=priority,
             input_lease_id=input_lease_id,
+            owner_id=owner_id,
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)
@@ -10235,3 +10995,424 @@ def test_unready_actor_is_killed_without_close_rpc_even_after_partial_cleanup(mo
     pool.shutdown()
     assert pool.actors == []
     assert closed == [True]
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "copy_failure", "cleanup_failure"])
+def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypatch, tmp_path, outcome):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.execution import ref_bundle
+
+    entered = tmp_path / "entered"
+    release = tmp_path / "release"
+
+    class GatedActor:
+        def __call__(self, table):
+            value = table.column("x")[0].as_py()
+            if value == 1:
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first actor call was never released")
+                    time.sleep(0.01)
+            return table
+
+    payload = _subprocess_map_payload(GatedActor, execution_backend="subprocess_actor", actor_number=1)
+    first, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    second = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    prepared = threading.Event()
+    original = subprocess_exec.make_local_shm_ref_bundle_result
+    captured = []
+    cleanup_allowed = threading.Event()
+
+    def observe(table, **kwargs):
+        if table.column("x")[0].as_py() != 2:
+            return original(table, **kwargs)
+        if outcome == "copy_failure":
+            prepared.set()
+            raise ValueError("planned input copy failure")
+        result = original(table, **kwargs)
+        captured.extend(result[1])
+        if outcome == "cleanup_failure":
+            ref = result[1][0]
+            release_ref = ref.release
+
+            def fail_until_retry():
+                if not cleanup_allowed.is_set():
+                    raise RuntimeError("planned prefetched cleanup failure")
+                release_ref()
+
+            monkeypatch.setattr(ref, "release", fail_until_retry)
+        prepared.set()
+        return result
+
+    monkeypatch.setattr(subprocess_exec, "make_local_shm_ref_bundle_result", observe)
+    try:
+        _submit_with_admission(first, pa.table({"x": [1]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        pid = pool.worker_pids()[0]
+        _submit_with_admission(second, pa.table({"x": [2]}))
+        # The actor is still computing the first call; preparation must finish
+        # without acquiring it, including across separate query executors.
+        assert prepared.wait(5)
+        assert not release.exists()
+        if outcome == "cleanup_failure":
+            with pytest.raises(RuntimeError, match="cleanup"):
+                second.close(kill=True)
+            assert second.cleanup_pending()
+            assert second._active_input_leases
+            cleanup_allowed.set()
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            assert all(ref._closed for ref in captured)
+        elif outcome == "cancel":
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            assert captured and all(ref._closed for ref in captured)
+            assert not second._active_input_leases
+        elif outcome == "copy_failure":
+            results = _wait_for_results(second, 1)
+            assert len(results) == 1 and isinstance(results[0], DiagnosticError)
+            assert summarize_error(results[0]) == "ValueError"
+            assert "planned input copy failure" in str(results[0])
+        release.touch()
+        assert _wait_for_results(first, 1)[0].column("x").to_pylist() == [1]
+        if outcome == "complete":
+            assert _wait_for_results(second, 1)[0].column("x").to_pylist() == [2]
+        assert pool.worker_pids() == [pid]
+    finally:
+        cleanup_allowed.set()
+        release.touch()
+        second.close(kill=True)
+        first.close(kill=True)
+        pool.shutdown(kill=True)
+    assert all(ref._closed for ref in captured)
+    assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
+
+
+@pytest.mark.parametrize("budget", ["auto", "0"])
+@pytest.mark.parametrize("input_kib,output_kib,cancel_prefetch", [(32, 32, False), (8, 64, False), (32, 32, True)])
+def test_prefetch_preserves_running_calls_output_capacity(
+    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch
+):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", budget)
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    # Auto limits are cached per manager. Use a new query budget so preceding
+    # tests cannot leave this case using a much larger arena's cached limit.
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("prefetch-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    entered, release = tmp_path / "entered", tmp_path / "release"
+
+    class Actor:
+        def __call__(self, table):
+            value = table["x"][0].as_py()
+            if value.startswith(b"1"):
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first call was never released")
+                    time.sleep(0.01)
+            return pa.table({"x": [value[:1] * (output_kib * 1024)]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    first, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+    second = subprocess_exec.UDFExecutor(payload, options={"local_actor_pool": pool})
+    prepared = threading.Event()
+    captured = []
+    original = subprocess_exec.make_local_shm_ref_bundle_result
+    reclaimed, output_allowed = threading.Event(), threading.Event()
+    original_reclaim = store.reclaim_prefetched_inputs
+
+    def reclaim():
+        original_reclaim()
+        reclaimed.set()
+        assert output_allowed.wait(10), "test did not release output allocation"
+
+    if cancel_prefetch:
+        monkeypatch.setattr(store, "reclaim_prefetched_inputs", reclaim)
+
+    def observe(table, **kwargs):
+        if not table["x"][0].as_py().startswith(b"2"):
+            return original(table, **kwargs)
+        try:
+            result = original(table, **kwargs)
+            captured.extend(result[1])
+            return result
+        finally:
+            prepared.set()
+
+    monkeypatch.setattr(subprocess_exec, "make_local_shm_ref_bundle_result", observe)
+    try:
+        _submit_with_admission(first, pa.table({"x": [b"1" * (input_kib * 1024)]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        _submit_with_admission(second, pa.table({"x": [b"2" * (input_kib * 1024)]}))
+        assert prepared.wait(5), "prefetch did not finish or defer"
+        assert manager.snapshot()["limit_bytes"] == (40 * 1024 if budget == "auto" else 0)
+        if budget == "0":
+            assert captured and not captured[0]._closed
+        elif input_kib == 32:
+            assert not captured, "prefetch spent the running call's progress allowance"
+        release.touch()
+        if cancel_prefetch:
+            assert reclaimed.wait(5)
+            assert all(ref._closed for ref in captured)
+            second.close(kill=True)
+            assert not second.cleanup_pending()
+            output_allowed.set()
+        for index, executor in enumerate((first,) if cancel_prefetch else (first, second), 1):
+            result = _wait_for_results(executor, 1)[0]
+            assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+            try:
+                values = [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()]
+                assert values == [str(index).encode() * (output_kib * 1024)]
+            finally:
+                for ref in result[1]:
+                    ref.release()
+            del result
+    finally:
+        release.touch()
+        output_allowed.set()
+        second.close(kill=True)
+        first.close(kill=True)
+        pool.shutdown(kill=True)
+        store.remove_client("prefetch-test")
+    assert all(ref._closed for ref in captured)
+    assert store.snapshot()["live_allocations"] == 0
+    assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path):
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("reclaim-race-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    entered, release = tmp_path / "entered", tmp_path / "release"
+
+    class Actor:
+        def __call__(self, table):
+            if table["x"][0].as_py().startswith(b"A"):
+                entered.touch()
+                deadline = time.monotonic() + 15
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("first call was never released")
+                    time.sleep(0.01)
+                return table
+            return pa.table({"x": [b"B"]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    registered, allow_prepare, waiting, reclaimed = (threading.Event() for _ in range(4))
+    original_register = store.register_prefetch
+    original_wait = store.wait_for_capacity
+
+    def register(reclaim):
+        def paused_reclaim():
+            # The output thread already holds a snapshot of this callback.
+            # Let the other actor claim its input and wait for memory before
+            # entering the callback, even though it has been unregistered.
+            allow_prepare.set()
+            assert waiting.wait(10), "second input did not wait for capacity"
+            reclaim()
+            reclaimed.set()
+
+        unregister = original_register(paused_reclaim)
+        registered.set()
+        assert allow_prepare.wait(10), "output did not snapshot the reclaimer"
+        return unregister
+
+    def wait_for_capacity(size, *args):
+        if size > 60 * 1024:
+            waiting.set()
+        return original_wait(size, *args)
+
+    executors, pools = [], []
+    try:
+        for _ in range(2):
+            executor, pool = _make_subprocess_actor_executor(subprocess_exec, payload)
+            executors.append(executor)
+            pools.append(pool)
+        _submit_with_admission(executors[0], pa.table({"x": [b"A" * (32 * 1024)]}))
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, "first actor did not start"
+            time.sleep(0.01)
+        assert manager.snapshot()["limit_bytes"] == 40 * 1024
+        monkeypatch.setattr(store, "register_prefetch", register)
+        monkeypatch.setattr(store, "wait_for_capacity", wait_for_capacity)
+        _submit_with_admission(executors[1], pa.table({"x": [b"B" * (64 * 1024)]}))
+        assert registered.wait(5)
+        release.touch()
+        assert reclaimed.wait(5), "input capacity wait blocked the output's snapshotted reclaimer"
+        for executor, expected in zip(executors, (b"A" * (32 * 1024), b"B")):
+            result = _wait_for_results(executor, 1)[0]
+            assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+            try:
+                assert [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()] == [expected]
+            finally:
+                for ref in result[1]:
+                    ref.release()
+    finally:
+        allow_prepare.set()
+        waiting.set()
+        release.touch()
+        # A failing implementation needs its waiting input cancelled before
+        # the output thread can finish its snapshotted callback.
+        for executor in reversed(executors):
+            executor.close(kill=True)
+        for pool in pools:
+            pool.shutdown(kill=True)
+        store.remove_client("reclaim-race-test")
+    assert store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("reclaim_first", [False, True])
+def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeypatch, tmp_path, reclaim_first):
+    import vane.execution.udf_subprocess as local
+    from vane.execution import ref_bundle, udf_shm_store
+
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    manager = ref_bundle.LocalShmBudgetManager()
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    store = udf_shm_store.LocalShmStore(80 * 1024)
+    store.add_client("inflight-reclaim-test")
+    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+
+    def wait_for(path):
+        deadline = time.monotonic() + 15
+        while not path.exists():
+            assert time.monotonic() < deadline, str(path)
+            time.sleep(0.01)
+
+    class Actor:
+        def __call__(self, table):
+            label = table["x"][0].as_py()[:1].decode()
+            (tmp_path / f"entered-{label}").touch()
+            if label in ("A", "B"):
+                wait_for(tmp_path / f"release-{label}")
+            size = {"A": 48 * 1024, "B": 64 * 1024, "Q": 1}[label]
+            return pa.table({"x": [label.encode() * size]})
+
+    payload = _subprocess_map_payload(
+        Actor,
+        execution_backend="subprocess_actor",
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    prepared, reclaim_started, resume, waiting = (threading.Event() for _ in range(4))
+    materialize = local.make_local_shm_ref_bundle_result
+    register = store.register_prefetch
+    wait_for_capacity = store.wait_for_capacity
+
+    def observe(table, **kwargs):
+        result = materialize(table, **kwargs)
+        if table["x"][0].as_py().startswith(b"Q"):
+            prepared.set()
+        return result
+
+    def register_paused(reclaim):
+        def paused():
+            reclaim_started.set()
+            assert resume.wait(10), "reclaim was not resumed"
+            reclaim()
+
+        return register(paused)
+
+    def observe_wait(size, *args):
+        if size > 60 * 1024:
+            waiting.set()
+        return wait_for_capacity(size, *args)
+
+    def drain(executor, expected):
+        result = _wait_for_results(executor, 1)[0]
+        assert isinstance(result, tuple) and result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER, result
+        try:
+            assert [value for ref in result[1] for value in ref.to_table()["x"].to_pylist()] == [expected]
+        finally:
+            local._release_local_ref_bundle_result(result)
+
+    executors, pools = [], []
+    try:
+        for label in ("B", "A"):
+            executor, pool = _make_subprocess_actor_executor(local, payload, name=f"reclaim-{label}")
+            executors.append(executor)
+            pools.append(pool)
+        queued = local.UDFExecutor(payload, options={"local_actor_pool": pools[0]})
+        executors.append(queued)
+        for executor, label, size in zip(executors, ("B", "A"), (8 * 1024, 4 * 1024)):
+            _submit_with_admission(executor, pa.table({"x": [label.encode() * size]}))
+            wait_for(tmp_path / f"entered-{label}")
+        assert manager.snapshot()["limit_bytes"] == 40 * 1024
+        monkeypatch.setattr(local, "make_local_shm_ref_bundle_result", observe)
+        monkeypatch.setattr(store, "register_prefetch", register_paused)
+        monkeypatch.setattr(store, "wait_for_capacity", observe_wait)
+        _submit_with_admission(queued, pa.table({"x": [b"Q" * (24 * 1024)]}))
+        assert prepared.wait(5)
+        (tmp_path / "release-A").touch()
+        assert reclaim_started.wait(5)
+        with ThreadPoolExecutor(max_workers=2) as consumers:
+            try:
+                output_a = consumers.submit(drain, executors[1], b"A" * (48 * 1024))
+                if reclaim_first:
+                    resume.set()
+                    output_a.result(timeout=10)
+                (tmp_path / "release-B").touch()
+                output_b = consumers.submit(drain, executors[0], b"B" * (64 * 1024))
+                if not reclaim_first:
+                    assert waiting.wait(5), "second actor did not wait for physical capacity"
+                    with pytest.raises(FutureTimeoutError):
+                        output_b.result(timeout=0.05)
+                    resume.set()
+                output_a.result(timeout=10)
+                output_b.result(timeout=10)
+                drain(queued, b"Q")
+            finally:
+                resume.set()
+    finally:
+        resume.set()
+        for label in ("A", "B"):
+            (tmp_path / f"release-{label}").touch()
+        for executor in reversed(executors):
+            executor.close(kill=True)
+        for pool in pools:
+            pool.shutdown(kill=True)
+        store.remove_client("inflight-reclaim-test")
+    assert store.snapshot()["live_allocations"] == 0
+    assert manager.snapshot()["active_input_leases"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0

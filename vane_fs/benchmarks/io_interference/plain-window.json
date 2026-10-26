@@ -1,0 +1,645 @@
+{
+  "status": "PASS",
+  "config": {
+    "orders": [
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ]
+    ],
+    "durability": "fsync",
+    "application_write_bytes": [1048576,8388608],
+    "read_fixture_application_write_bytes": 1048576,
+    "logical_block_bytes": 4096,
+    "page_bytes": 4096,
+    "cache_configuration": "production defaults",
+    "strict_wal_trigger_frames": 4096,
+    "external_threshold_bytes": null,
+    "wake_mib": 16,
+    "admission_mib": 64,
+    "retained_wal_mib": 16,
+    "global_drop_caches": false,
+    "owned_concurrent_tests_or_builds": false,
+    "fresh_fuse_rounds": 6,
+    "aged_fuse_rounds": 6,
+    "native_rounds": 0,
+    "aged_guard_bytes": 33554432,
+    "aged_guard_write_bytes": 1048576,
+    "aged_guard_zero_stride": 8192,
+    "aged_fuse_read_fixture_bytes": 67108864,
+    "aged_native_read_fixture_bytes": 16777216,
+    "format_version": 2,
+    "sqlite_primitive": "original SDK fsync",
+    "scope": "Same-window alternating production v2 BLOB fsync mounts. Admit at 16 MiB instead of 64 MiB; keep the background start threshold at 16 MiB. Each mount compares 1MiB and 8MiB application writes, each at 64 and 256MiB total; preserve reads, overwrites, small-file fsync, metadata and aged GC guard. No format, durability, cache, SQL or SDK change; only the admission limit changes. All samples retained; diagnostics run separately."
+  },
+  "native": [],
+  "space": [],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-6d5odjmo",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-6d5odjmo/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "d05c8c0d8fc26dcfd05d1a2087c0790c3e55d2c2aa0736769e8a6d7b12891d87"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-6d5odjmo/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-6d5odjmo/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1682993,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-mrr4i5em",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-mrr4i5em/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "2bf0c66537e744c8b68211b08e75bf3db61f115ee73902de9741c9ba492a7f79"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-mrr4i5em/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-mrr4i5em/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1683808,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-947conak",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-947conak/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "de6f3437c2e9f9403ef356c891979d446bf4b6694f4a141eb2c7c644de543204"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-947conak/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-947conak/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1684783,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-ed9d9ha2",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-ed9d9ha2/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "a190786e3307879eaedc91651ab73aafd41acb30e735658ca7ab56c524baa06e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-ed9d9ha2/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-ed9d9ha2/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1685688,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5rvfnklx",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5rvfnklx/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "749223a91eaa3c564e6e5ecb5bf2d145b074ca831b91682987ee4f0c7893afbd"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5rvfnklx/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5rvfnklx/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1686338,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-p6tld3py",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-p6tld3py/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "3bc9f2c18f4ef753d933c657c32169bf876fea55c32a76d017eaf1f82e4700b4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-p6tld3py/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-p6tld3py/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1687071,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-jvj73u40",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-jvj73u40/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "ba7a5f6306b1a8ddb0f4f35dabcb796de6817e4feca98444a59f733ef2bf9483"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-jvj73u40/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-jvj73u40/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1688047,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-43lzf4ou",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-43lzf4ou/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "800c87e2328d72120fdae575636854d4687dc896c110dc41686f288005d78f33"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-43lzf4ou/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-43lzf4ou/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1688852,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-3w1qtulm",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-3w1qtulm/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "4c6d284062cdbc486754a3e27b99393371b7fd90bfcf1d011316c4eba3e75289"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-3w1qtulm/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-3w1qtulm/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1689870,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-cuw7hbog",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-cuw7hbog/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "8cebe7fb205fd7b1b49877f5215be003b19a288504f3d66f953bcea95d89cde8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-cuw7hbog/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-cuw7hbog/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1690594,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5gonhgdi",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5gonhgdi/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "866dc857e03c9dd9115e87e7b6dd0a4f1e9be27ebfaf7387ef34950a48620093"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5gonhgdi/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-5gonhgdi/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1691516,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-l8l8jlt6",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-l8l8jlt6/db.sqlite",
+          "bytes": 885768192,
+          "sha256": "d32e1d6688aab3207da653be11528e0fe5ad69ad36de32814056721f38ecdfb2"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-l8l8jlt6/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-fuse-l8l8jlt6/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1692438,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-3y07vbiv",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-3y07vbiv/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "4b665a9d00f5249038bf2a3c9e2063359dc1cb2501e536e06d912bd42cee1099"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-3y07vbiv/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-3y07vbiv/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1693156,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-dfx_ksyg",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-dfx_ksyg/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "0d496f9047e1ea59ab0d3e98d8c0a09dd936cf784e559b9f79ba345805119435"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-dfx_ksyg/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-dfx_ksyg/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1694155,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-bpxtxjhg",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-bpxtxjhg/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "da159ce7367ef0dc7e60aa9af5d3433408dcc6ac60f23806d8667ad645471238"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-bpxtxjhg/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-bpxtxjhg/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1695232,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-jn5un753",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-jn5un753/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "deaba6ca94f0d1a2cce60baed33f36ef68308978eae9257c291c2951670f79c6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-jn5un753/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-jn5un753/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1696214,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-i5219ihi",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-i5219ihi/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "8ace4c4090ec4bbb92f481b73e9fe11866aa39663f4e435b9407b91202399e9d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-i5219ihi/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-i5219ihi/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1697390,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-5v_wag2d",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-5v_wag2d/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "70330d9e0d15f5d8febd1f0471b36b2e54ccbb68a80dbd1b133930df972a507d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-5v_wag2d/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-5v_wag2d/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1698309,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-j6trn0z1",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-j6trn0z1/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "2422f345b271ac5b749edc5c558a468765410bd2709f7bdbbb2d18fc926a3dbf"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-j6trn0z1/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-j6trn0z1/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1699671,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-cvutqcze",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-cvutqcze/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "52dadc3dba7a1deea02a82eb0b9f16918f0a858472ca5fad1d3a9e2405f93ccf"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-cvutqcze/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-cvutqcze/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1700725,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-atgc3ho2",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-atgc3ho2/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "a2f78f5a816832a2cd8a4d69e9587d80c7028d4aa0ad061ca42c9227b48278df"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-atgc3ho2/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-atgc3ho2/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1701500,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-6cl59xjo",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-6cl59xjo/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "e737a1286117379a1057cd9c65402a91213373857e48e6eefa01c353b8027af7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-6cl59xjo/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-6cl59xjo/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1702380,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-slxix6pc",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-slxix6pc/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "74db21047aeefa55c077c962d518ede0ce76110afb227d72e58106694947669f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-slxix6pc/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-slxix6pc/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1703368,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-vcj_74sw",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-vcj_74sw/db.sqlite",
+          "bytes": 908132352,
+          "sha256": "1be068e206cd18129d0ce9382a72436d7977ac82fa8517f2ee3fca3c3944a4fd"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-vcj_74sw/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/io-interference-20261010T164716Z/measure-plain/owned-aged-vcj_74sw/db.sqlite-wal",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "pid": 1704549,
+      "process_stopped": true,
+      "mount_absent": true
+    }
+  ],
+  "started_epoch": 1791651721.6637573,
+  "ended_epoch": 1791652629.095322,
+  "monitor_stopped": true,
+  "free_bytes_after": 101795090432,
+  "sample_files": [
+    "plain-fuse-baseline.json",
+    "plain-fuse-updated.json",
+    "plain-aged_fuse-baseline.json",
+    "plain-aged_fuse-updated.json"
+  ]
+}

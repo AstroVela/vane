@@ -7,6 +7,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/vane-ai/">
     <img src="https://img.shields.io/pypi/v/vane-ai?logo=pypi" alt="PyPI">
   </a>
@@ -64,9 +68,15 @@ Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/qui
 For encoded video intervals with synchronized audio and source timestamps, see
 the [video clipping example](examples/video_clip.py). It covers `VideoFile.clip`,
 the `video_clip` Python/SQL expression, output codecs, and resource limits.
+Clips preserve constant sample aspect ratios in MP4 metadata, including ratios
+that require more precision than the output video codec can represent.
 
 The [multimodal provider example](examples/multimodal_providers.py) covers native
 vLLM/SGLang Python engines with configurable models and multimodal embeddings.
+
+The [Qwen3-VL SQR example](examples/qwen3_vl_sqr.py) documents the opt-in
+`qwen3_vl` provider, its fixed text/image/video encoding contract, and selection
+through Vane Context's models configuration.
 
 ### More Resources
 

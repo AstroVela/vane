@@ -1,0 +1,81 @@
+{
+  "media": [
+    "tmpfs",
+    "ext4"
+  ],
+  "orders": [
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ]
+  ],
+  "states": [
+    "fresh",
+    "post_gc"
+  ],
+  "large_sequence": [
+    {
+      "mib": 256,
+      "application_mib": 8
+    },
+    {
+      "mib": 64,
+      "application_mib": 1
+    }
+  ],
+  "buffer_page_offset": 48,
+  "durability": "fsync",
+  "runner_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/run_fuse.py",
+  "runner_source_sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948",
+  "prepared_runner_sha256": "6e4ee94b5658ce6cd5e4b4bbfa22d0f5108a7e7146be48331c3c261cf69a433b",
+  "workload_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/workload.py",
+  "workload_source_sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37",
+  "prepared_workload_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+  "gc_preparation": "Identical CollectGarbage code/format; candidate wheel supplies GC for both daemons.",
+  "status": "FROZEN_BEFORE_PLAIN_COMPARISON",
+  "baseline": "Previously measured partial-edge candidate, format 1004",
+  "candidate": "Same partial-edge source plus one coalesced pending range and one active range on a separate payload-hint thread; no SQLite/publication/payload/queue locks during the syscall; retain pre-append error observer through final fdatasync",
+  "primary_gates": {
+    "ext4_combined_large_write_aggregate_ratio_minimum": 1.1,
+    "ext4_combined_large_write_paired_wins_minimum": 5
+  },
+  "regression_gates": {
+    "all_workloads_median_and_aggregate_ratio_minimum": 0.95,
+    "pooled_p99_ratio_maximum": 1.2,
+    "pooled_p99_absolute_increase_allowance_seconds": 0.001,
+    "lifecycle_median_ratio_maximum": 1.05
+  },
+  "owned_build_or_test_overlap": false,
+  "global_cache_eviction": false,
+  "writeback_range_bytes": 16777216,
+  "early_writeback_flags": "SYNC_FILE_RANGE_WRITE only",
+  "measurement_scope": "Complete first-256 plus subsequent-64 writes are the combined ext4 target; tmpfs only checks software regressions; all other gates include every slow sample",
+  "queue_memory": "Constant: two ranges, independent of append count",
+  "foreground_sync_file_range": false,
+  "frozen_epoch": 1791725908.4468365,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/background_writeback/background.patch": "dfed42138d85862ab30c163da50034be8f8ff57ce2764c77d93eed57c755be3d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/partial_edges/run.py": "1df72ab8565ab394ad13c5b3b70a0dad421ba1bcdae4a985bed9b99c40007aa9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/checkpoint_priority/analyze.py": "97eff738b14acf891acdc47cd9841a190ef1bd2bf39ce76396614ab61f624985"
+  }
+}

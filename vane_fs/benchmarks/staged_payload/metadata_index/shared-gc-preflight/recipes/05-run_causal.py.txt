@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Compare block high-index removal against preceding orphan batching without replacing the adoption gates."""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    args = parser.parse_args()
+    parent = args.artifacts.resolve()
+    build = json.loads((parent / "build.json").read_text())
+    assert json.loads((parent / "index-tests.json").read_text())["status"] == "PASS"
+    here = Path(__file__).resolve().parent
+    out = parent / "causal"
+    out.mkdir()
+    sources = {"baseline": Path(build["orphan_parent"]) / "updated", "updated": parent / "updated"}
+    expected = {"baseline": build["source_inputs"]["orphan-control"], "updated": build["source_inputs"]["updated"]}
+
+    def check():
+        assert all(digest(sources[n] / p) == h for n, entries in expected.items() for p, h in entries.items())
+        assert all(digest(parent / p) == h for p, h in build["binaries"].items())
+        assert all(digest(Path(p)) == h for p, h in build["inputs"].items())
+        assert digest(Path(build["sdk"]["sqlite"]) / "lib/libsqlite3.a") == build["sdk"]["sqlite_sha256"]
+
+    check()
+    for name, source in sources.items():
+        (out / name / "build").mkdir(parents=True)
+        (out / name / "build/python-release").symlink_to(source / "build/python-release", target_is_directory=True)
+        (out / name / "venv").symlink_to(parent / "updated/venv", target_is_directory=True)
+    for name in ("tests.json", "sanitize.json"):
+        (out / name).write_bytes((parent / name).read_bytes())
+    (out / "build.json").write_text(
+        json.dumps(dict(status="PASS", source_bindings={n: str(p) for n, p in sources.items()}), indent=2) + "\n"
+    )
+    plan = json.loads((parent / "plan.json").read_text())
+    plan.update(
+        status="FROZEN_BEFORE_CAUSAL_COMPARISON",
+        frozen_epoch=time.time(),
+        role="Causal comparison only; does not replace no-hint adoption gates",
+        baseline="Preceding no-hint orphan batching, with the original block high index",
+        media=["ext4"],
+        source_bindings={n: str(p) for n, p in sources.items()},
+    )
+    (out / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    subprocess.run(
+        [sys.executable, str(here.parent / "partial_edges/run.py"), str(out), "--medium", "ext4"], check=True
+    )
+    check()
+    (out / "input-check.json").write_text(json.dumps(dict(status="PASS")) + "\n")
+
+
+if __name__ == "__main__":
+    main()

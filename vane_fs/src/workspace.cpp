@@ -3,6 +3,7 @@
 
 #include "vane_fs/workspace.hpp"
 #include "owner_lock.hpp"
+#include "checkpoint.hpp"
 
 #include <sqlite3.h>
 
@@ -15,6 +16,7 @@
 #include <random>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #if SQLITE_VERSION_NUMBER < 3051003
@@ -24,6 +26,7 @@
 namespace vane_fs {
 namespace {
 constexpr int64_t BLOCK_SIZE = 4096;
+constexpr int WAL_CHECKPOINT_PAGES = 4096;
 constexpr int APPLICATION_ID = 0x56465331;
 
 [[noreturn]] void Fail(ErrorCode code, const std::string &message) {
@@ -99,13 +102,40 @@ struct Coordinate {
 	}
 };
 
+// Access is serialized by Database::mutex. A slot holds at most one idle
+// statement; nested uses of the same SQL prepare their own active statement.
+struct StatementCache {
+	std::unordered_map<std::string, sqlite3_stmt *> idle;
+	~StatementCache() {
+		Clear();
+	}
+	void Clear() {
+		for (auto &entry : idle) {
+			sqlite3_finalize(entry.second);
+		}
+		idle.clear();
+	}
+};
+constexpr const char *STATEMENT_CACHE = "vane_fs.statement_cache";
+
 class Statement {
 public:
 	Statement(sqlite3 *db, const std::string &sql) : db(db) {
-		Check(db, sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr));
+		if (auto cache = static_cast<StatementCache *>(sqlite3_get_clientdata(db, STATEMENT_CACHE))) {
+			// References to unordered_map elements survive rehashing.
+			slot = &cache->idle[sql];
+			statement = std::exchange(*slot, nullptr);
+		}
+		if (!statement) {
+			Check(db, sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr));
+		}
 	}
 	~Statement() {
-		sqlite3_finalize(statement);
+		if (slot && !*slot && sqlite3_reset(statement) == SQLITE_OK && sqlite3_clear_bindings(statement) == SQLITE_OK) {
+			*slot = statement;
+		} else {
+			sqlite3_finalize(statement);
+		}
 	}
 	Statement(const Statement &) = delete;
 	Statement &operator=(const Statement &) = delete;
@@ -132,13 +162,22 @@ public:
 	int64_t Integer(int index) const {
 		return sqlite3_column_int64(statement, index);
 	}
+	bool IsNull(int index) const {
+		return sqlite3_column_type(statement, index) == SQLITE_NULL;
+	}
 	std::string Text(int index) const {
 		auto value = sqlite3_column_text(statement, index);
 		return value ? std::string(reinterpret_cast<const char *>(value), sqlite3_column_bytes(statement, index)) : "";
 	}
 	std::string Bytes(int index) const {
-		auto value = sqlite3_column_blob(statement, index);
-		return value ? std::string(static_cast<const char *>(value), sqlite3_column_bytes(statement, index)) : "";
+		auto value = BytesData(index);
+		return value ? std::string(value, BytesSize(index)) : "";
+	}
+	const char *BytesData(int index) const {
+		return static_cast<const char *>(sqlite3_column_blob(statement, index));
+	}
+	int BytesSize(int index) const {
+		return sqlite3_column_bytes(statement, index);
 	}
 	Coordinate Point(int index) const {
 		if (sqlite3_column_type(statement, index) != SQLITE_BLOB || sqlite3_column_bytes(statement, index) != 32) {
@@ -152,6 +191,7 @@ public:
 private:
 	sqlite3 *db;
 	sqlite3_stmt *statement = nullptr;
+	sqlite3_stmt **slot = nullptr;
 };
 
 std::string NewId() {
@@ -440,6 +480,45 @@ std::string Block(sqlite3 *db, int64_t inode, int64_t block, const View &view) {
 	                                                               : std::string(BLOCK_SIZE, '\0');
 }
 
+std::string ReadBytes(sqlite3 *db, int64_t inode, int64_t offset, int64_t length, const View &view) {
+	std::string result(size_t(length), '\0');
+	if (!length) {
+		return result;
+	}
+	// Keep absent blocks as zeroes. A LEFT JOIN must expose a missing payload
+	// as corruption, rather than silently turning a dangling reference into a hole.
+	Statement blocks(db, "SELECT b.block,p.data FROM block_versions b "
+	                     "LEFT JOIN block_payloads p ON p.id=b.payload "
+	                     "WHERE b.inode=? AND b.block>=? AND b.block<=? "
+	                     "AND b.low<=? AND b.high>? AND b.deleted=0 ORDER BY b.block");
+	blocks.Bind(1, inode);
+	blocks.Bind(2, offset / BLOCK_SIZE);
+	blocks.Bind(3, (offset + length - 1) / BLOCK_SIZE);
+	blocks.Bind(4, view.point);
+	blocks.Bind(5, view.point);
+	int64_t previous = -1;
+	while (blocks.Step()) {
+		auto block = blocks.Integer(0);
+		if (block == previous) {
+			Fail(ErrorCode::Storage, "Overlapping visible versions");
+		}
+		previous = block;
+		auto bytes = blocks.BytesData(1);
+		if (!bytes) {
+			Fail(ErrorCode::Storage, "Missing block payload");
+		}
+		if (blocks.BytesSize(1) != BLOCK_SIZE) {
+			Fail(ErrorCode::Storage, "Invalid block payload size");
+		}
+		auto start = std::max(offset, block * BLOCK_SIZE);
+		auto source_offset = start - block * BLOCK_SIZE;
+		auto target_offset = start - offset;
+		auto amount = std::min(BLOCK_SIZE - source_offset, length - target_offset);
+		std::memcpy(&result[size_t(target_offset)], bytes + source_offset, size_t(amount));
+	}
+	return result;
+}
+
 void StoreBlock(sqlite3 *db, int64_t inode, int64_t block, const std::string &data, const View &view) {
 	Key key {inode, {}, block};
 	Record old;
@@ -457,6 +536,38 @@ void StoreBlock(sqlite3 *db, int64_t inode, int64_t block, const std::string &da
 	statement.BindBytes(1, data);
 	statement.Step();
 	Put(db, BLOCKS, key, {sqlite3_last_insert_rowid(db)}, view);
+}
+
+void InsertNewBlocks(sqlite3 *db, int64_t inode, std::vector<std::pair<int64_t, std::string>> &blocks,
+                     int64_t &last_payload, const View &view) {
+	if (blocks.empty()) {
+		return;
+	}
+	std::string payload_sql = "INSERT INTO block_payloads(id,data) VALUES ";
+	std::string version_sql = "INSERT INTO block_versions(inode,block,low,high,writer,deleted,payload) VALUES ";
+	for (size_t i = 0; i < blocks.size(); ++i) {
+		if (i) {
+			payload_sql += ',';
+			version_sql += ',';
+		}
+		payload_sql += "(?,?)";
+		version_sql += "(?1,?" + std::to_string(5 + 2 * i) + ",?2,?3,?4,0,?" + std::to_string(6 + 2 * i) + ")";
+	}
+	Statement payloads(db, payload_sql), versions(db, version_sql);
+	versions.Bind(1, inode);
+	versions.Bind(2, view.point);
+	versions.Bind(3, view.high);
+	versions.Bind(4, view.writer);
+	for (size_t i = 0; i < blocks.size(); ++i) {
+		auto payload = ++last_payload;
+		payloads.Bind(int(1 + 2 * i), payload);
+		payloads.BindBytes(int(2 + 2 * i), blocks[i].second);
+		versions.Bind(int(5 + 2 * i), blocks[i].first);
+		versions.Bind(int(6 + 2 * i), payload);
+	}
+	payloads.Step();
+	versions.Step();
+	blocks.clear();
 }
 
 void RequireFile(const Record &node) {
@@ -495,15 +606,60 @@ void WriteBytes(sqlite3 *db, Record &node, const std::string &data, int64_t offs
 	if (data.empty()) {
 		return;
 	}
+	bool vacant = false;
+	int64_t last_payload = 0;
+	if (data.size() >= 2 * BLOCK_SIZE) {
+		// Check the entire replacement interval, including tombstones and
+		// versions beyond the current view point, before bypassing Put.
+		Statement occupied(db, "SELECT 1 FROM block_versions WHERE inode=? AND block>=? AND block<=? "
+		                       "AND low<? AND high>? LIMIT 1");
+		auto first = offset / BLOCK_SIZE;
+		auto last = (offset + int64_t(data.size()) - 1) / BLOCK_SIZE;
+		occupied.Bind(1, node.key.inode);
+		occupied.Bind(2, first);
+		occupied.Bind(3, last);
+		occupied.Bind(4, view.high);
+		occupied.Bind(5, view.point);
+		vacant = !occupied.Step();
+		if (vacant) {
+			// The enclosing IMMEDIATE transaction serializes payload allocation.
+			// Explicit IDs keep batches mapped without relying on RETURNING order.
+			Statement maximum(db, "SELECT coalesce(max(id),0) FROM block_payloads");
+			maximum.Step();
+			last_payload = std::max<int64_t>(0, maximum.Integer(0));
+			// Preserve SQLite's automatic rowid allocation at the integer limit.
+			vacant = last - first + 1 <= std::numeric_limits<int64_t>::max() - last_payload;
+		}
+	}
+	constexpr size_t BATCH_BLOCKS = 64;
+	std::vector<std::pair<int64_t, std::string>> new_blocks;
+	if (vacant) {
+		new_blocks.reserve(BATCH_BLOCKS);
+	}
 	size_t consumed = 0;
 	while (consumed < data.size()) {
 		int64_t position = offset + int64_t(consumed);
-		auto bytes = Block(db, node.key.inode, position / BLOCK_SIZE, view);
 		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, data.size() - consumed);
-		bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
-		StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
+		std::string bytes;
+		if (amount == BLOCK_SIZE) {
+			bytes.assign(data.data() + consumed, amount);
+		} else {
+			bytes = vacant ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, position / BLOCK_SIZE, view);
+			bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
+		}
+		if (vacant) {
+			if (!std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == 0; })) {
+				new_blocks.emplace_back(position / BLOCK_SIZE, std::move(bytes));
+				if (new_blocks.size() == BATCH_BLOCKS) {
+					InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
+				}
+			}
+		} else {
+			StoreBlock(db, node.key.inode, position / BLOCK_SIZE, bytes, view);
+		}
 		consumed += amount;
 	}
+	InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
 	node.fields[1] = std::max<int64_t>(node.fields[1], offset + data.size());
 	node.fields[3] = Now();
 	Put(db, INODES, node.key, node.fields, view);
@@ -578,12 +734,15 @@ PinRegistry &Pins() {
 class Database {
 public:
 	sqlite3 *db = nullptr;
+	StatementCache statements;
 	std::mutex mutex;
 	std::string uuid, owner = NewId();
 	OwnerLock owner_lock;
 	int64_t process = OwnerLock::Process();
+	const Durability durability;
+	std::unique_ptr<Checkpointer> checkpointer;
 
-	explicit Database(const std::string &path, int timeout_ms) {
+	explicit Database(const std::string &path, int timeout_ms, Durability durability) : durability(durability) {
 		if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos || timeout_ms < 0) {
 			Fail(ErrorCode::Invalid, "A durable database path and nonnegative timeout are required");
 		}
@@ -593,10 +752,12 @@ public:
 		int code = sqlite3_open_v2(
 		    path.c_str(), &db,
 		    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, nullptr);
+		bool owner_committed = false;
 		try {
 			Check(db, code);
 			Check(db, sqlite3_busy_timeout(db, timeout_ms));
 			Check(db, sqlite3_extended_result_codes(db, 1));
+			Check(db, sqlite3_set_clientdata(db, STATEMENT_CACHE, &statements, nullptr));
 			Check(db, sqlite3_create_function_v2(
 			              db, "vane_fs_owner", 0, SQLITE_UTF8, &owner,
 			              [](sqlite3_context *context, int, sqlite3_value **) {
@@ -605,13 +766,16 @@ public:
 			              },
 			              nullptr, nullptr, nullptr));
 			ValidateIdentity();
-			Exec(db, "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL");
+			Exec(db, "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY");
 			{
 				Statement mode(db, "PRAGMA journal_mode=WAL");
 				if (!mode.Step() || mode.Text(0) != "wal") {
 					Fail(ErrorCode::Storage, "Could not enable SQLite WAL");
 				}
 			}
+			// Amortize checkpoint syncs over 16 MiB with the default 4 KiB pages.
+			// Strict mode also synchronizes every WAL commit before returning.
+			Check(db, sqlite3_wal_autocheckpoint(db, WAL_CHECKPOINT_PAGES));
 			Exec(db, "BEGIN IMMEDIATE");
 			ValidateIdentity();
 			Initialize();
@@ -621,10 +785,14 @@ CREATE TABLE IF NOT EXISTS mounts(branch TEXT PRIMARY KEY REFERENCES branches(id
 CREATE TABLE IF NOT EXISTS open_inodes(owner TEXT NOT NULL REFERENCES owners(id), branch TEXT NOT NULL REFERENCES branches(id),
  inode INTEGER NOT NULL REFERENCES inode_ids(id), refs INTEGER NOT NULL CHECK(refs>0), PRIMARY KEY(owner,branch,inode)) STRICT;
 CREATE INDEX IF NOT EXISTS opened_inodes ON open_inodes(branch,inode);
+CREATE TEMP TABLE inode_references(branch TEXT NOT NULL, inode INTEGER NOT NULL,
+ refs INTEGER NOT NULL CHECK(refs>0), PRIMARY KEY(branch,inode)) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS orphans(branch TEXT NOT NULL REFERENCES branches(id), inode INTEGER NOT NULL REFERENCES inode_ids(id),
  PRIMARY KEY(branch,inode)) STRICT;
 CREATE INDEX IF NOT EXISTS dirent_targets ON dirent_versions(inode,low,high);
 CREATE INDEX IF NOT EXISTS block_payload_references ON block_versions(payload);
+CREATE TABLE IF NOT EXISTS sync_barrier(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL CHECK(value IN(0,1))) STRICT;
+INSERT OR IGNORE INTO sync_barrier VALUES(1,0);
 UPDATE format SET version=2;
 )SQL");
 			owner_lock.Create(sqlite3_db_filename(db, "main"), owner);
@@ -637,12 +805,30 @@ UPDATE format SET version=2;
 				insert.Step();
 			}
 			Exec(db, "COMMIT");
+			owner_committed = true;
+			if (durability == Durability::Fsync) {
+				Exec(db, "PRAGMA synchronous=NORMAL");
+				// Reuse a modest WAL allocation after restart, including after a
+				// single transaction temporarily exceeds the admission budget.
+				Exec(db, "PRAGMA journal_size_limit=" + std::to_string(Checkpointer::START_BYTES));
+				Statement pages(db, "PRAGMA page_size");
+				pages.Step();
+				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms);
+				sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+			}
 		} catch (...) {
+			checkpointer.reset();
 			if (db) {
+				statements.Clear();
 				sqlite3_close_v2(db);
 				db = nullptr;
 			}
-			owner_lock.Remove();
+			// Worker creation can fail after registration committed. Preserve
+			// its unlocked file so RecoverOwners can retire that durable row.
+			if (owner_committed)
+				owner_lock.Close();
+			else
+				owner_lock.Remove();
 			throw;
 		}
 	}
@@ -650,7 +836,11 @@ UPDATE format SET version=2;
 		try {
 			Close();
 		} catch (...) {
+			if (db)
+				sqlite3_wal_hook(db, nullptr, nullptr);
+			checkpointer.reset();
 			if (db) {
+				statements.Clear();
 				sqlite3_close_v2(db);
 			}
 		}
@@ -677,7 +867,9 @@ UPDATE format SET version=2;
 namespace {
 class Transaction {
 public:
-	Transaction(Database &database, bool write) : database(database), lock(database.mutex, std::defer_lock) {
+	Transaction(Database &database, bool write, bool synchronous = false, bool barrier = false)
+	    : database(database), lock(database.mutex, std::defer_lock),
+	      restore_normal(write && synchronous && database.durability == Durability::Fsync) {
 		if (database.process != OwnerLock::Process()) {
 			Fail(ErrorCode::Closed, "Reopen the workspace after fork");
 		}
@@ -685,6 +877,16 @@ public:
 		if (!database.db) {
 			Fail(ErrorCode::Closed, "Workspace is closed");
 		}
+		if (write && database.checkpointer) {
+			if (barrier)
+				database.checkpointer->CheckError();
+			else
+				database.checkpointer->BeforeWrite(database.db);
+		}
+		// SQLite requires changing synchronous outside a transaction. On failure
+		// leave FULL enabled until a subsequent successful synchronous commit.
+		if (restore_normal)
+			Exec(database.db, "PRAGMA synchronous=FULL");
 		Exec(database.db, write ? "BEGIN IMMEDIATE" : "BEGIN");
 		try {
 			if (write) {
@@ -721,6 +923,8 @@ public:
 		for (const auto &pin : retired_pins) {
 			Pins().Forget(pin);
 		}
+		if (restore_normal)
+			Exec(database.db, "PRAGMA synchronous=NORMAL");
 	}
 
 private:
@@ -728,6 +932,7 @@ private:
 	std::unique_lock<std::mutex> lock;
 	std::vector<std::shared_ptr<SnapshotPin>> retired_pins;
 	bool committed = false;
+	bool restore_normal;
 };
 
 void CheckMount(sqlite3 *db, const std::string &branch, bool require_unmounted = false) {
@@ -882,11 +1087,22 @@ CREATE TABLE block_payloads(id INTEGER PRIMARY KEY, data BLOB NOT NULL CHECK(len
 	Exec(db, "PRAGMA application_id=" + std::to_string(APPLICATION_ID));
 }
 
-Workspace::Workspace(const std::string &path, int timeout_ms) : database(std::make_shared<Database>(path, timeout_ms)) {
+Workspace::Workspace(const std::string &path, int timeout_ms, Durability durability)
+    : database(std::make_shared<Database>(path, timeout_ms, durability)) {
 }
 Workspace::~Workspace() = default;
 void Workspace::Close() {
 	database->Close();
+}
+void Workspace::Sync() {
+	// Even under WAL backpressure, callers must be able to persist writes
+	// that have already committed. Only this small barrier bypasses admission.
+	Transaction tx(*database, true, true, true);
+	// An empty transaction need not write or synchronize the WAL. Changing
+	// this page forces a FULL commit, covering every earlier WAL commit, even
+	// when another connection used NORMAL and this connection uses Strict.
+	Exec(database->db, "UPDATE sync_barrier SET value=1-value WHERE id=1");
+	tx.Commit();
 }
 std::string Workspace::Id() const {
 	return database->uuid;
@@ -916,6 +1132,8 @@ void Session::Close() {
 		return;
 	}
 	if (database->db && pin) {
+		if (database->checkpointer)
+			database->checkpointer->BeforeWrite(database->db);
 		Statement remove(database->db, "DELETE FROM pins WHERE id=?");
 		remove.Bind(1, pin->id);
 		remove.Step();
@@ -962,15 +1180,7 @@ std::string Session::Read(const std::string &path, int64_t offset, int64_t size)
 	RequireFile(node);
 	int64_t available = std::max<int64_t>(0, node.fields[1] - offset);
 	int64_t length = size < 0 ? available : std::min(size, available);
-	std::string result(size_t(length), '\0');
-	size_t consumed = 0;
-	while (consumed < result.size()) {
-		int64_t position = offset + int64_t(consumed);
-		auto bytes = Block(database->db, node.key.inode, position / BLOCK_SIZE, view);
-		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, result.size() - consumed);
-		std::memcpy(&result[consumed], bytes.data() + position % BLOCK_SIZE, amount);
-		consumed += amount;
-	}
+	auto result = ReadBytes(database->db, node.key.inode, offset, length, view);
 	tx.Commit();
 	return result;
 }
@@ -1625,12 +1835,20 @@ void PinInode(sqlite3 *db, int64_t inode, const View &view, int64_t references =
 	RequireOwnMount(db, view);
 	if (references < 1)
 		Fail(ErrorCode::Invalid, "Invalid inode reference count");
-	Statement pin(db, "INSERT INTO open_inodes VALUES(vane_fs_owner(),?,?,?) "
-	                  "ON CONFLICT(owner,branch,inode) DO UPDATE SET refs=refs+excluded.refs");
+	// The durable row protects the inode across connections and crash recovery.
+	// Exact counts are connection-local and roll back with the same transaction;
+	// additional opens/lookups need no WAL writes while this pin remains live.
+	Statement pin(db, "INSERT INTO open_inodes VALUES(vane_fs_owner(),?,?,1) "
+	                  "ON CONFLICT(owner,branch,inode) DO NOTHING");
 	pin.Bind(1, view.branch);
 	pin.Bind(2, inode);
-	pin.Bind(3, references);
 	pin.Step();
+	Statement count(db, "INSERT INTO temp.inode_references VALUES(?,?,?) "
+	                    "ON CONFLICT(branch,inode) DO UPDATE SET refs=refs+excluded.refs");
+	count.Bind(1, view.branch);
+	count.Bind(2, inode);
+	count.Bind(3, references);
+	count.Step();
 }
 
 Record OpenedInode(sqlite3 *db, int64_t inode, const View &view) {
@@ -1654,7 +1872,11 @@ FileStat Describe(const Record &node) {
 void Database::Close() {
 	if (process != OwnerLock::Process()) {
 		// SQLite connections and C++ mutexes must not be reused across fork.
+		statements.idle.clear(); // Abandon inherited statements without calling SQLite.
 		db = nullptr;
+		// The worker and its locks belong to vanished parent threads. As with
+		// inherited SQLite handles, abandon them without joining or destroying.
+		checkpointer.release();
 		owner_lock.Close();
 		return;
 	}
@@ -1662,24 +1884,39 @@ void Database::Close() {
 	if (!db) {
 		return;
 	}
-	Exec(db, "BEGIN IMMEDIATE");
+	if (checkpointer)
+		checkpointer->Stop();
 	try {
-		RetireOwner(db, owner);
-		Exec(db, "COMMIT");
+		if (checkpointer)
+			checkpointer->CheckError();
+		if (durability == Durability::Fsync)
+			Exec(db, "PRAGMA synchronous=FULL");
+		Exec(db, "BEGIN IMMEDIATE");
+		try {
+			RetireOwner(db, owner);
+			Exec(db, "COMMIT");
+		} catch (...) {
+			sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+			throw;
+		}
+		{
+			auto &registry = Pins();
+			std::lock_guard<std::mutex> guard(registry.mutex);
+			registry.pins.erase(std::remove_if(registry.pins.begin(), registry.pins.end(),
+			                                   [&](const auto &pin) { return pin->owner == owner; }),
+			                    registry.pins.end());
+		}
+		statements.Clear();
+		sqlite3_wal_hook(db, nullptr, nullptr);
+		checkpointer.reset();
+		Check(db, sqlite3_close(db));
+		db = nullptr;
+		owner_lock.Remove();
 	} catch (...) {
-		sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+		if (checkpointer)
+			checkpointer->Start();
 		throw;
 	}
-	{
-		auto &registry = Pins();
-		std::lock_guard<std::mutex> guard(registry.mutex);
-		registry.pins.erase(std::remove_if(registry.pins.begin(), registry.pins.end(),
-		                                   [&](const auto &pin) { return pin->owner == owner; }),
-		                    registry.pins.end());
-	}
-	Check(db, sqlite3_close(db));
-	db = nullptr;
-	owner_lock.Remove();
 }
 
 RecoveryResult Workspace::RecoverOwners() {
@@ -1732,6 +1969,9 @@ void Workspace::ReleaseMount(const std::string &branch) {
 	Transaction tx(*database, true);
 	auto view = Branch(database->db, branch, false, true);
 	RequireOwnMount(database->db, view);
+	Statement references(database->db, "DELETE FROM temp.inode_references WHERE branch=?");
+	references.Bind(1, view.branch);
+	references.Step();
 	for (const auto *table : {"open_inodes", "mounts"}) {
 		Statement remove(database->db,
 		                 "DELETE FROM " + std::string(table) + " WHERE owner=vane_fs_owner() AND branch=?");
@@ -1793,26 +2033,32 @@ void Session::CloseFile(int64_t inode, int64_t references) {
 	auto view = SessionView(database->db, id, snapshot, closed);
 	if (!snapshot) {
 		OpenedInode(database->db, inode, view);
-		Statement count(database->db,
-		                "SELECT refs FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
+		Statement count(database->db, "SELECT refs FROM temp.inode_references WHERE branch=? AND inode=?");
 		count.Bind(1, id);
 		count.Bind(2, inode);
-		count.Step();
+		if (!count.Step())
+			Fail(ErrorCode::Closed, "Inode handle is closed");
 		if (count.Integer(0) < references)
 			Fail(ErrorCode::Invalid, "Too many inode references released");
-		Statement remove(database->db,
-		                 "DELETE FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=? AND refs=?");
-		remove.Bind(1, id);
-		remove.Bind(2, inode);
-		remove.Bind(3, references);
-		remove.Step();
-		Statement decrement(database->db,
-		                    "UPDATE open_inodes SET refs=refs-? WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
-		decrement.Bind(1, references);
-		decrement.Bind(2, id);
-		decrement.Bind(3, inode);
-		decrement.Step();
-		CleanupOrphans(database->db);
+		if (count.Integer(0) == references) {
+			Statement remove_refs(database->db, "DELETE FROM temp.inode_references WHERE branch=? AND inode=?");
+			remove_refs.Bind(1, id);
+			remove_refs.Bind(2, inode);
+			remove_refs.Step();
+			Statement remove(database->db,
+			                 "DELETE FROM open_inodes WHERE owner=vane_fs_owner() AND branch=? AND inode=?");
+			remove.Bind(1, id);
+			remove.Bind(2, inode);
+			remove.Step();
+			CleanupOrphans(database->db);
+		} else {
+			Statement decrement(database->db,
+			                    "UPDATE temp.inode_references SET refs=refs-? WHERE branch=? AND inode=?");
+			decrement.Bind(1, references);
+			decrement.Bind(2, id);
+			decrement.Bind(3, inode);
+			decrement.Step();
+		}
 	}
 	tx.Commit();
 }
@@ -1857,20 +2103,13 @@ std::string Session::ReadInode(int64_t inode, int64_t offset, int64_t size) {
 	auto node = OpenedInode(database->db, inode, view);
 	RequireFile(node);
 	int64_t length = std::min(size, std::max<int64_t>(0, node.fields[1] - offset));
-	std::string result(size_t(length), '\0');
-	for (int64_t consumed = 0; consumed < length;) {
-		auto position = offset + consumed;
-		auto bytes = Block(database->db, inode, position / BLOCK_SIZE, view);
-		auto amount = std::min(BLOCK_SIZE - position % BLOCK_SIZE, length - consumed);
-		std::memcpy(&result[size_t(consumed)], bytes.data() + position % BLOCK_SIZE, size_t(amount));
-		consumed += amount;
-	}
+	auto result = ReadBytes(database->db, inode, offset, length, view);
 	tx.Commit();
 	return result;
 }
 
-void Session::WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append) {
-	Transaction tx(*database, true);
+void Session::WriteInode(int64_t inode, const std::string &data, int64_t offset, bool append, bool synchronous) {
+	Transaction tx(*database, true, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, true);
 	auto node = OpenedInode(database->db, inode, view);
 	WriteBytes(database->db, node, data, append ? node.fields[1] : offset, view);
@@ -1941,8 +2180,8 @@ int64_t ParentInode(sqlite3 *db, int64_t inode, const View &view) {
 }
 } // namespace
 
-FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate) {
-	Transaction tx(*database, !snapshot);
+FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate, bool synchronous) {
+	Transaction tx(*database, !snapshot, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, truncate);
 	auto node = OpenedInode(database->db, inode, view);
 	if (bool(node.fields[0]) != directory)
@@ -1978,8 +2217,8 @@ FileStat Session::LookupInode(int64_t parent, const std::string &name) {
 }
 
 FileStat Session::CreateNode(int64_t parent, const std::string &name, bool directory, int64_t mode, bool exclusive,
-                             bool truncate, int64_t references) {
-	Transaction tx(*database, true);
+                             bool truncate, int64_t references, bool synchronous) {
+	Transaction tx(*database, true, synchronous);
 	auto view = SessionView(database->db, id, snapshot, closed, true);
 	auto key = ChildKey(database->db, parent, name, view);
 	Record entry, node;
@@ -2068,8 +2307,23 @@ std::vector<std::pair<std::string, FileStat>> Session::DirectoryEntries(int64_t 
 			throw;
 	}
 	result.emplace_back(".", Describe(node));
-	for (const auto &entry : Visible(database->db, DIRENTS, view.point, inode)) {
-		result.emplace_back(entry.key.name, Describe(Inode(database->db, entry.fields[0], view)));
+	// Resolve every child's inode at the same view point in one query. Keep a
+	// missing inode visible to the caller instead of silently dropping its name.
+	Statement entries(database->db,
+	                  "SELECT d.name,i.inode,i.kind,i.size,i.mode,i.mtime_ns FROM dirent_versions d "
+	                  "LEFT JOIN inode_versions i ON i.inode=d.inode AND i.low<=?1 AND i.high>?1 AND i.deleted=0 "
+	                  "WHERE d.parent=?2 AND d.low<=?1 AND d.high>?1 AND d.deleted=0 ORDER BY d.name");
+	entries.Bind(1, view.point);
+	entries.Bind(2, inode);
+	while (entries.Step()) {
+		if (entries.IsNull(1))
+			Fail(ErrorCode::NotFound, "Inode does not exist");
+		auto name = entries.Text(0);
+		if (result.back().first == name)
+			Fail(ErrorCode::Storage, "Overlapping visible versions");
+		bool directory = entries.Integer(2) != 0;
+		result.emplace_back(std::move(name), FileStat {entries.Integer(1), directory, entries.Integer(3),
+		                                               entries.Integer(4), entries.Integer(5), directory ? 2 : 1});
 	}
 	std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
 	tx.Commit();

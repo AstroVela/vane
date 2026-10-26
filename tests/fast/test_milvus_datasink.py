@@ -811,7 +811,7 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
                    ('row-' || i::VARCHAR)::VARCHAR AS title
             FROM range(8) AS t(i)
         """)
-        assert relation._get_runner_type() == datasink_runner
+        assert relation._get_runner_type() == ("ray" if datasink_runner == "ray" else "local")
         bound_schema = relation._arrow_schema()
         assert bound_schema.field("title").type == pa.string()
         bound_vector_type = pa.list_(pa.float32(), 3) if fixed_vector else pa.list_(pa.float32())
@@ -844,11 +844,11 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
     worker_schemas = [pa.ipc.read_schema(pa.BufferReader(path.read_bytes())) for path in tmp_path.glob("*.schema")]
     assert len(worker_schemas) == len(batches)
     for schema in worker_schemas:
-        string_type = pa.string() if datasink_runner == "local-fast" else pa.large_string()
+        string_type = pa.string() if datasink_runner != "ray" else pa.large_string()
         vector_type = (
             pa.list_(pa.float32(), 3)
             if fixed_vector
-            else (pa.list_(pa.float32()) if datasink_runner == "local-fast" else pa.large_list(pa.float32()))
+            else (pa.list_(pa.float32()) if datasink_runner != "ray" else pa.large_list(pa.float32()))
         )
         assert schema.field("title").type == string_type
         assert schema.field("id").type == (string_type if primary_kind == "string" else pa.int64())

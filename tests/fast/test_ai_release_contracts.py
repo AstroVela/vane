@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import pickle
 import sys
 import threading
@@ -13,6 +14,50 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pyarrow as pa
 import pytest
+
+
+@pytest.mark.parametrize("kind", ["text", "image", "audio", "video", "multimodal"])
+def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
+    from vane.ai.provider import ProviderImportError, _safe_provider_execution_error, load_provider
+
+    imported = []
+    original_import = builtins.__import__
+
+    def missing_sdk(name, *args, **kwargs):
+        if name.split(".")[0] in {"mlx", "mlx_vlm", "transformers", "huggingface_hub", "PIL"}:
+            imported.append(name)
+            raise ModuleNotFoundError("optional SDK is absent", name=name.split(".")[0])
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_sdk)
+    descriptor = load_provider("mlx").get_text_embedder()
+    selected = pickle.loads(pickle.dumps(getattr(load_provider("mlx"), "get_" + kind + "_embedder")()))
+    assert selected.get_dimensions() == 768 and selected.get_udf_options().num_gpus == 0
+    assert ("input_type" in selected.get_options()) == (kind == "text")
+    (output,) = selected.get_output_spec().outputs
+    expected_sources = ("text", "image", "video", "audio") if kind in {"text", "multimodal"} else (kind,)
+    assert output.source_modalities == expected_sources
+    assert output.space == descriptor.get_output_spec().outputs[0].space
+    service = pickle.loads(
+        pickle.dumps(
+            getattr(load_provider("mlx"), "get_" + kind + "_embedder")(
+                options={"runtime": "service", "service_path": "/not-connected/mlx.json", "service_id": "metadata-only"}
+            )
+        )
+    )
+    assert service.get_output_spec() == selected.get_output_spec()
+    assert service.get_udf_options().num_gpus == 0 and service.is_async()
+    assert service.instantiate()._zmq_client is None
+    assert imported == []
+    monkeypatch.setattr("vane.ai.providers.mlx.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("vane.ai.providers.mlx.platform.machine", lambda: "arm64")
+    with pytest.raises(ProviderImportError, match=r"vane-ai\[mlx\]"):
+        selected.instantiate()
+    assert imported == ["mlx.core"]
+    error = pickle.loads(pickle.dumps(ProviderImportError("mlx")))
+    safe = _safe_provider_execution_error("mlx", descriptor.get_model(), "Embed", error)
+    assert isinstance(safe, ProviderImportError)
+    assert "vane-ai[mlx]" in str(safe)
 
 
 def test_jev_optional_sdk_is_loaded_only_when_preparing_questions(monkeypatch):

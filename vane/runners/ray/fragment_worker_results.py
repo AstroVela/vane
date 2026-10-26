@@ -76,6 +76,8 @@ def fte_query_status(
         scoped_contexts = {_task_context_key(context) for context in task_context_filter}
         if None in scoped_contexts:
             raise ValueError("task_context_filter contains an invalid task context")
+    scheduler = _FTE_SCHEDULERS.get(query_id)
+    completion_generation = scheduler.completion_generation() if scheduler is not None else None
     with _FTE_REGISTRY_LOCK:
         registration_pending = _FTE_ACTIVE_OPERATIONS_BY_QUERY.get(query_id, 0) > 0
         canceled = query_id in _FTE_CLOSING_QUERIES
@@ -99,7 +101,6 @@ def fte_query_status(
         for fragment_id, fragment_execution, snapshot in fragment_execution_snapshots
         if scoped_contexts is None or _fragment_task_context_key(fragment_execution) in scoped_contexts
     ]
-    scheduler = _FTE_SCHEDULERS.get(query_id)
     scheduler_stats = scheduler.stats().to_dict() if scheduler is not None else None
     scheduler_failed = bool(scheduler_stats and scheduler_stats.get("state") == "FAILED")
     fragment_executions: dict[str, dict[str, Any]] = {}
@@ -149,7 +150,20 @@ def fte_query_status(
             fragment_executions[fragment_id]["failed_partitions"] = fragment_failed_partitions
             failed_partitions.extend({"fragment_id": fragment_id, **failure} for failure in fragment_failed_partitions)
     failed = scheduler_failed or global_fragment_failed
-    finished = bool(fragment_executions) and all(bool(item["finished"]) for item in fragment_executions.values())
+    # Submitting events can return while another thread owns the scheduler.
+    # Its handlers may register a new fragment after the registry copy above,
+    # then finish the old fragments before their snapshots are read. Accept
+    # completion only if the whole read belongs to one idle event generation.
+    completion_pending = scheduler is not _FTE_SCHEDULERS.get(query_id) or (
+        scheduler is not None
+        and (completion_generation is None or scheduler.completion_generation() != completion_generation)
+    )
+    registration_pending = registration_pending or completion_pending
+    finished = (
+        not completion_pending
+        and bool(fragment_executions)
+        and all(bool(item["finished"]) for item in fragment_executions.values())
+    )
     status = {
         "query_id": query_id,
         "matched": bool(fragment_executions),

@@ -290,11 +290,11 @@ def test_vane_distribution_owns_only_the_vane_import_namespace():
     assert files.isdisjoint(removed_runner_compatibility_modules)
 
 
-def _requirements_for_extra(extra):
+def _requirements_for_extra(extra, environment=None):
     selected = set()
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
-        if requirement.marker is not None and requirement.marker.evaluate({"extra": extra}):
+        if requirement.marker is not None and requirement.marker.evaluate({"extra": extra, **(environment or {})}):
             selected.add(canonicalize_name(requirement.name))
     return selected
 
@@ -328,8 +328,21 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
-    assert "vllm" in _requirements_for_extra("vllm")
-    assert "sglang" in _requirements_for_extra("sglang")
+    # These optional runtimes are published only for Linux x86_64.
+    linux = {"sys_platform": "linux", "platform_system": "Linux", "platform_machine": "x86_64"}
+    assert "vllm" in _requirements_for_extra("vllm", linux)
+    assert "sglang" in _requirements_for_extra("sglang", linux)
+    darwin = {"sys_platform": "darwin", "platform_system": "Darwin", "platform_machine": "arm64"}
+    assert "vllm" not in _requirements_for_extra("vllm", darwin)
+    assert "sglang" not in _requirements_for_extra("sglang", darwin)
+    assert _requirement_for_extra("vllm", "vllm", linux).marker is not None
+    assert _requirement_for_extra("sglang", "sglang", linux).marker is not None
+    # These optional runtimes are published only for Linux x86_64.
+    assert "vllm" in _requirements_for_extra("vllm", linux)
+    assert "sglang" in _requirements_for_extra("sglang", linux)
+    darwin = {"sys_platform": "darwin", "platform_system": "Darwin", "platform_machine": "arm64"}
+    assert "vllm" not in _requirements_for_extra("vllm", darwin)
+    assert "sglang" not in _requirements_for_extra("sglang", darwin)
 
 
 def test_datasink_extras_require_supported_sdk_versions():
@@ -357,9 +370,56 @@ def test_structured_provider_extras_require_supported_sdk_versions():
     )
 
     assert openai.specifier == SpecifierSet(">=1.66.0")
-    assert google.specifier == SpecifierSet(">=1.22.0")
+    assert google.specifier == SpecifierSet(">=1.73.0")
     assert vllm.specifier == SpecifierSet(">=0.31.0,<0.32")
     assert sglang.specifier == SpecifierSet("==0.5.17")
+
+
+def test_mlx_extra_declares_its_sdk_and_pillow_only_on_apple_silicon():
+    apple = {"sys_platform": "darwin", "platform_machine": "arm64"}
+    for package, specifier in (
+        ("mlx", "==0.32.4"),
+        ("mlx-vlm", "==0.7.8"),
+        ("transformers", "==5.18.0"),
+        ("pillow", ">=10.4"),
+    ):
+        requirement = _requirement_for_extra("mlx", package, apple)
+        assert requirement.specifier == SpecifierSet(specifier)
+        assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "linux", "platform_machine": "x86_64"})
+        assert not requirement.marker.evaluate({"extra": "mlx", "sys_platform": "darwin", "platform_machine": "x86_64"})
+
+
+def test_embedding_service_extra_keeps_model_sdks_optional():
+    packages = _requirements_for_extra("embedding_service", {"sys_platform": "darwin", "platform_machine": "arm64"})
+    assert "pyzmq" in packages
+    assert not packages & {"mlx", "mlx-vlm", "transformers", "torch", "sglang", "vllm"}
+    assert _requirement_for_extra("embedding_service", "pyzmq").specifier == SpecifierSet(">=26.2,<28")
+
+
+def test_mlx_release_and_sdist_include_all_modality_contracts_and_reference_helpers():
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    included = set(config["tool"]["scikit-build"]["sdist"]["include"])
+    release = (REPOSITORY_ROOT / "scripts/run_release_tests.sh").read_text()
+    for name in ("provider", "image_provider", "audio_provider", "video_provider", "multimodal_provider"):
+        file = "tests/fast/test_mlx_" + name + ".py"
+        assert "/" + file in included
+        assert '"$project_root/' + file + '"' in release
+    for kind in ("text", "image", "audio", "video", "multimodal"):
+        assert f"/tests/ai/test_mlx_{kind}_embedding.py" in included
+    assert {"/tests/mlx_sdk_fixture.py", "/tests/mlx_metal_reference.py"} <= included
+    for file in ("test_embedding_service_backend.py", "test_mlx_service_provider.py"):
+        assert "/tests/fast/" + file in included
+        assert '"$project_root/tests/fast/' + file + '"' in release
+    assert {
+        "/tests/fast/test_mlx_service_runtime.py",
+        "/tests/mlx_service_fixture.py",
+        "/tests/ai/test_mlx_service_embedding.py",
+    } <= included
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():
@@ -514,12 +574,7 @@ def test_video_extra_installs_video_dependencies():
 
 
 def test_base_distribution_keeps_media_dependencies_optional():
-    base_requirements = set()
-    for raw_requirement in requires("vane-ai") or []:
-        requirement = Requirement(raw_requirement)
-        if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
-            base_requirements.add(canonicalize_name(requirement.name))
-
-    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(
-        base_requirements
-    )
+    base_requirements = _base_requirements()
+    # Local process admission requires memory capacity even without media extras.
+    assert base_requirements["psutil"].specifier == SpecifierSet(">=5.9")
+    assert {"av", "pillow", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(base_requirements)

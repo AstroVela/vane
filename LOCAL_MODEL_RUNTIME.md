@@ -1,0 +1,2391 @@
+# Local model pool lifetime
+
+This document describes the internal execution interfaces for explicitly
+registered, session-owned subprocess models. The roadmap is tracked in
+[#838](https://github.com/AstroVela/vane/issues/838), with model ownership in
+[#840](https://github.com/AstroVela/vane/issues/840). The connection runtime
+exposes explicit CPU and fixed-device GPU model registration for ordinary SQL
+and Relation queries.
+The lower-level plan interfaces remain available; neither entry point creates
+a serving endpoint.
+
+The [CPU serving acceptance scenario](LOCAL_SERVING_ACCEPTANCE.md) exercises
+these interfaces together with synthetic text/RGB UDFs, concurrent requests,
+slow consumers, cancellation, expiry, and worker loss. It produces a JSON
+report with initialization counts, latency distributions, and resource
+checkpoints using an installed wheel.
+Its [sustained lifecycle mode](LOCAL_SERVING_ACCEPTANCE.md#sustained-lifecycle-acceptance)
+repeats load and fault recovery in one runtime under an independent process
+watchdog, retaining bounded failure diagnostics and an acceptance map.
+The [integrated stage acceptance record](LOCAL_SERVING_ACCEPTANCE.md#integrated-stage-acceptance-2026-10-02)
+identifies the merged CPU/CUDA and streaming version, its validation evidence,
+and the unresolved historical startup incident.
+
+## Selecting local execution
+
+`vane.configure(runner="local")`, `vane.set_runner_local()`, and
+`VANE_RUNNER=local` select native local execution for new connections.
+`local-fast` remains a compatibility alias accepted by the environment and
+`vane.configure()`; configuration snapshots and connection runner names
+normalize it to `local`. The default remains `ray`.
+
+The former local FTE runner has been removed. `set_runner_local()` returns
+`None` and takes no worker or execution-mode arguments. Set native thread
+counts with `vane.connect(config={"threads": ...})` and configure shared
+admission with `connection.configure_local_runtime()`. Existing connections
+retain their runner, so choose the mode before opening a connection (before
+importing Vane when using its module-level default connection).
+
+## Shared runtime for ordinary local queries
+
+Enable session-wide request, task and UDF byte admission through the existing
+connection. Configure it once on the owning connection, after connection setup
+and before creating cursors. The configuration is immutable for that session.
+For example, with `VANE_RUNNER=local`:
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8, queue_timeout=10.0),
+        task_limit=TaskAdmissionLimits(2, 16),
+        data_limit=DataAdmissionLimits(
+            64 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024,
+            wait=DataAdmissionWaitLimits(16, 10.0),
+        ),
+        execution_timeout=30.0,
+    )
+    with connection.cursor() as cursor:
+        rows = cursor.sql("SELECT sum(i) FROM range(100) t(i)").fetchall()
+    print(runtime.resource_snapshot())
+```
+
+`execute()`, lazy SQL relations, and Relation operations share this path. A lazy
+relation acquires its request when execution starts. Concurrent clients use
+independent cursors belonging to the same connection. Admission precedes the
+execution's native preparation; lazy relation construction and initial binding
+remain outside the request budget. Preparation collects every subprocess UDF once and supplies
+the session's captured configuration. A different connection has a distinct
+runtime even if it opens the same database. Unconfigured connections retain
+their existing behavior.
+
+The connection integration supports auto-commit, read-only SELECT and Relation
+queries with CPU UDFs and explicitly registered GPU models. Configure catalog objects and connection settings before
+enabling it. Writes, explicit transactions, SQL PREPARE/EXECUTE, SQL EXPLAIN,
+Relation EXPLAIN ANALYZE, PRAGMA and
+reentrant execution on the same cursor are rejected. Parameterized reads and
+read-only `executemany()` remain supported; each parameter set gets a fresh
+request and native preparation. Unregistered local subprocess actors remain
+query-owned in this entry point. Explicitly registered models use resident
+pools through the same preparation and cleanup path.
+
+If `PRAGMA enable_verification` is set before runtime configuration, DuckDB's
+internal verification plans share the outer request's admission, deadline and
+cancellation scope. `QueryEnd` confirms that the previous plan has stopped;
+its resources must finish cleanup before another plan is prepared. Failed
+cleanup retains both the owners and the request allowance. Registered models
+remain resident while each plan releases its own borrow. Verification is not
+disabled or routed through an alternative execution path.
+
+An active runtime query rejects another query or relation binding on the same
+cursor before taking connection locks. Concurrent clients use independent
+cursors. DataSource callbacks include task deserialization, `execute()`, batch
+iteration and stream teardown; pandas/NumPy callbacks include Python object
+conversion. All follow the input callback contract below.
+
+Connection-bound FILE operations include `File.open()`, `File.exists/stat/mime_type()`
+and an open reader's reads, MIME detection, source identity, interrupt checks
+and closure.
+Query-owned DataSource readers use their execution context directly and remain
+available for producing input without calling a Python connection.
+
+Python input and registered filesystem callbacks cannot call connection query,
+binding, fetch or `close()` APIs, including on idle siblings or unrelated
+connections. Connection-bound FILE readers follow the same rule. Reentry raises
+`InvalidInputException` before acquiring connection locks or changing connection
+state, with or without a configured runtime. Move such work outside the callback.
+Independent control threads can still interrupt or close running queries.
+
+The callback scope starts before invoking Python, including filesystem `open()`,
+`glob()`, metadata, read, seek, write and teardown calls. It does not depend on an
+existing file handle, a held I/O lock or the target cursor's activity. Arrow,
+DataSource and pandas/NumPy callbacks use the same scope, including input
+metadata, copying and serialization during binding. This removes the need
+to track inherited file dependencies across nested queries: those queries never
+start. Per-handle I/O locks still protect seek/read/write sequences when Python
+releases the GIL; unrelated handles can operate concurrently.
+
+Input copying is part of this boundary: `read_csv()`/`read_json()` invoke file-like
+`read()` and path conversion under the callback scope before native scanning.
+Their Python option conversion also stays in scope, including column/type objects.
+Filesystem registration also guards protocol and capability properties.
+Parameter conversion follows the same rule: parameter length/iteration,
+mapping copies, names and nested values run inside the callback
+scope, including both outer and inner `executemany()` parameter sets. Plain
+Python work remains allowed in these hooks; connection query, binding and close
+operations are rejected. Filesystem provider destruction also stays in scope,
+covering `__del__` and weakref callbacks during unregistration and database closure.
+DataSource schema snapshots normalize structured entries, strings and tensor
+dimensions inside that scope. Only built-in metadata and parsed Arrow types reach
+the later connection-backed type parser; copying just the outer dictionary is
+insufficient because nested methods can still execute Python.
+
+Binding callbacks also include the first Arrow protocol probe, Relation argument
+conversion (including iteration and error formatting), and UDF resource/payload
+conversion. A scope covers both the call and destruction of its temporary Python
+objects. DataSource task lists therefore remain in scope through normal return,
+iteration errors and pickling errors. Registered input dependencies and cached
+DataSource schemas guard their own final decrefs; a caller need not remember to
+wrap each disposal site. Trusted SQL UDF type normalization runs before taking
+the registration lock, with callback entry checked first.
+The shared `try_cast` helper also guards failed type conversions: constructing
+the conversion error can call a user-defined metaclass's `__str__`, including
+when an invalid object is passed as a SQL statement. Shared container checks and
+value conversion enforce the same boundary.
+Replacement scans keep the scope through frame lookup, initial type probing,
+failure diagnostics and frame-reference cleanup, including registration errors.
+
+Exported live Arrow readers continue native execution and enforce the callback
+entry rule when fetching. They also reject a busy source cursor instead of
+waiting. All connection-owned results carry the source cursor lock, including
+prepared `executemany()` and SQL `EXECUTE` results; their owner reference is weak
+to avoid retaining the connection through its own result. Materialized readers
+no longer drive a query and do not need its
+connection lock. A live reader cannot be used as another query's input, even
+on a sibling cursor; materialize it with `reader.read_all()` before registering
+it, or execute the relation before exporting its reader. The configured runtime's
+Arrow input policy still applies.
+
+New native-to-Python input entry points must establish `PythonInputCallbackScope`
+before invoking Python; connection entry must use `LockForQuery`,
+`LockConnection` or the explicit callback check before any blocking operation.
+`test_python_callback_entry.py` covers opening, metadata, I/O and cleanup against
+connection, Relation and FILE APIs, including two concurrent imports whose input
+callbacks try to enter each other's connections. Filesystem concurrency tests cover
+active and idle siblings, nested scans, native workers and independent control threads.
+`test_python_parameter_callbacks.py` applies the same concurrent checks to
+parameter conversion, including a reused prepared statement and callback errors.
+`test_python_binding_callbacks.py` extends this to Arrow protocol descriptors,
+Relation expressions/options, UDF resources, task-list unwinding and registered
+input disposal. Its two threads meet inside Python hooks while the outer binds
+retain different cursor locks, then try to query or close each other's cursors.
+Successful normal binding and subsequent cursor reuse are checked too.
+
+Conversion scopes end before native Relation binding, including expression
+projection/filter/order, joins and UDF composition. Native binding can invoke
+trusted AI SQL type normalization, so it must not inherit the argument-conversion
+scope. Compatibility tests bind real `AI_EMBED` specifications through these APIs
+without calling a provider. Implicit type conversion keeps its callback guard:
+it uses the existing default catalog when open, or a private native parser context
+when that catalog is closed. It does not recreate a Python connection from inside
+a conversion callback. Tests cover nested types, catalog-defined types and native
+execution with a string UDF schema after default-connection closure.
+
+When reviewing a new boundary, follow the complete ownership path:
+
+1. Check callback entry before any connection lock or native binding.
+2. Treat attribute probes, container conversion, numeric/string conversion and
+   exception formatting as calls into Python, even without an explicit `()`.
+3. Declare the callback scope before temporary Python owners so it outlives their
+   destructors on every exit. Owners retained beyond that block must guard their
+   own disposal or be released after the connection lock.
+4. Leave the scope before trusted runner/connection entry. Pass normalized native
+   values across that boundary, and test ordinary calls as well as rejection.
+
+Arrow schema binding and stream callbacks use the context of the cursor executing
+the query, including Arrow views created by another cursor. Each
+execution retains its own callback identity while sharing the input factory's
+captured format settings. Input validation also uses the executing cursor.
+
+Configured runtimes accept materialized Arrow `Table` and `RecordBatch` inputs,
+built-in `InMemoryDataset` inputs and unions composed entirely of them, and
+materialized Polars `DataFrame` inputs. Opaque Arrow `RecordBatchReader` inputs,
+C stream capsules/providers, prebuilt Scanners, file-backed/custom Datasets and
+Polars `LazyFrame` inputs are rejected. A reader created by `from_batches()` can
+still hide an asynchronous producer, and Polars collection can invoke Python
+on its own worker threads. Wrapping the outer stream does not establish query
+ownership on those threads.
+
+Validation precedes schema export, stream creation and LazyFrame collection,
+including initial relation binding before request admission. Views and relations
+created before configuration are checked again using the executing cursor's
+policy. Use native file scans such as `read_parquet(...)`, or materialize inputs
+before submitting the runtime query: `reader.read_all()`, `dataset.to_table()` or
+`lazy_frame.collect()`. This external materialization is outside runtime budgets
+and deadlines. Unconfigured connections retain their existing input support.
+Input producers must not dispatch connection operations to other threads and
+wait for those operations themselves.
+
+The `json_execute_serialized_sql()` table function is also rejected, including
+inside macros and subqueries: it executes on a separate native connection that
+does not inherit the request's budgets or cancellation. Execute the inner SQL
+directly on the configured connection instead. JSON serialization and
+deserialization remain available, and unconfigured connections retain native
+JSON execution.
+
+Results use the normal fetch/Arrow APIs and are materialized before the request
+returns its execution capacity, including when the caller asks for an Arrow
+reader. This is not incremental native result delivery. The UDF byte budget
+covers the existing shared-memory reservations and retained allocations; it
+does not bound DuckDB's materialized result, Python conversion buffers or
+caller-owned copies. Native memory remains governed by DuckDB's settings.
+
+`cursor.interrupt()` cancels that cursor's queued or running request.
+Its fence covers Python cancellation through completion: overlapping queries
+are rejected, and its native callback stays bound to the original request.
+`cursor.close()` cancels its request before waiting for execution to retire and
+leaves sibling cursors usable. Closing the owning connection drains ingress,
+cancels its own and child queries, and closes the runtime after the last cursor
+finishes. Failed cleanup retains the request allowance and retry owner;
+`runtime.close()` or a repeated connection close retries it. `runtime.drain()`
+rejects new requests while claimed requests finish. No failed execution is
+automatically replayed. An optional `execution_timeout` starts when admission
+is claimed; the request limit's `queue_timeout` independently bounds waiting.
+
+The returned `LocalQueryRuntime` exposes `resource_snapshot()`, `drain()` and
+`close(timeout=..., kill=...)`. It composes the same `LocalModelRuntime` request,
+task, data, cancellation and cleanup policies used by the explicit plan API.
+The native bridge passes preparation metadata and executor handles only;
+Python never owns a borrowed native physical-plan pointer.
+Preparation visits owned execution plans as well as ordinary inputs, so UDFs
+inside correlated subqueries receive the same captured session environment,
+task admission and byte limits as top-level UDFs. Local graph collection exposes
+their individual resource units and the delim join's materialized input
+dependency without changing native scan state.
+
+## Registration and binding
+
+`vane.execution.udf_local_model.LocalModelRuntime` owns local subprocess actor
+pools for one Vane session. Construct it from a physical plan's `session_id()`
+and `session_config()`. Register a model by an explicit name and version, using
+the payload of a collected `subprocess_actor` UDF node:
+
+```python
+from vane.execution.udf_local_model import LocalModelRuntime
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+)
+node = plan.collect_udf_nodes(conn=connection)[0]
+models.register("encoder", version="weights-v1", payload=node["payload"])
+models.prewarm("encoder")
+query_resources = models.prepare(
+    plan, {str(node["node_id"]): "encoder"}, conn=connection
+)
+```
+
+Registration is lazy; prewarm initializes the workers without keeping a query
+borrow. Bindings are explicit per UDF node. A new query can bind the same model
+when its session identity, captured configuration, compatible UDF payload and
+actor count match. The payload fingerprint includes serialized initialization,
+schema, device and execution settings, but excludes the per-query
+`expression_id` assigned during SQL planning. Workers still receive the complete
+registered payload. Generated `vane.cls` and `vane.cls.batch` actor adapters
+serialize through explicit reconstruction recipes containing the user class,
+constructor arguments, input/call layout, literal row-call keywords, and output
+contract. Rebuilding equivalent projections therefore preserves the callable
+payload, without depending on temporary adapter class identities or caching
+adapter classes globally. Model compatibility still compares the full callable
+bytes and all other payload settings. Changing a model or its version requires
+a distinct registration name. Different sessions cannot share a registration,
+even if their configuration dictionaries are equal.
+
+Adapters supplying `local_model_pool` directly must provide the owning plan's
+session identity to preparation: `ensure_local_subprocess_actor_pools_for_plan`
+reads `plan.session_id()`, while the node-level helper requires an explicit
+`session_id`. Matching configuration alone does not authorize model reuse.
+Registration publishes its registry entry and model handle together with
+respect to drain/close; payload serialization runs outside that lifecycle lock.
+
+Preparation validates all explicit bindings, then delegates to the existing
+`ensure_local_subprocess_actor_pools_for_nodes` step to acquire fresh borrows and
+inject pools through `local_actor_pool`. It returns the query resources to the
+caller. Callers must retain these resources until executor cleanup has finished,
+then call their existing `shutdown(kill=...)` cleanup path. A registered
+model's returned resource releases only that query's borrow. Native query
+cleanup and preparation rollback use this same resource contract.
+
+Every collected UDF node receives the plan's captured session configuration,
+including unregistered actor and function/task UDFs. Workers use this explicit
+snapshot instead of inheriting another session's current process environment;
+session variables absent from the snapshot remain absent in those workers.
+Preparation preserves other executor options and publishes all node options
+within the same rollback boundary. Unregistered actors remain query-owned,
+and task pools retain their existing executor/task-runtime ownership.
+
+Applications integrating at the internal physical-plan layer must run this
+preparation/cleanup step for every execution. Preparation does not execute a
+query. A native plan can be prepared again after the previous execution and
+its query cleanup finish; each execution acquires a fresh model borrow. Do not
+run a second generic plan-preparation pass afterward: native node
+collection does not currently expose the previously injected executor options.
+Concurrent queries need independent cursors and plans constructed with those
+cursors, all from the owning session. No callable or payload is automatically
+registered.
+
+## Resident models in ordinary queries
+
+Register an instantiated `vane.cls` or `vane.cls.batch` with the runtime returned
+by `configure_local_runtime()`. Registration binds a prototype using declared
+input types; it does not execute rows or initialize a worker. The returned
+model builds typed positional expressions and can be attached as a SQL function.
+Use `VANE_RUNNER=local` for this example.
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.resources import ResourceVector
+
+@vane.cls(actor_number=1, return_dtype="BIGINT")
+class Encoder:
+    def __init__(self, offset):
+        self.offset = offset  # Load CPU model weights here.
+
+    def __call__(self, value):
+        return value + self.offset
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        resident_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**2),
+    )
+    encoder = runtime.register_model(
+        "encoder", Encoder(10), version="weights-v1", parameters=["BIGINT"],
+        cpus=1, memory_bytes=64 * 1024**2,
+    )
+    encoder.prewarm()  # Optional; the first query otherwise initializes it.
+    vane.attach_function(encoder, "encode_value", connection=connection)
+    with connection.cursor() as cursor:
+        assert cursor.execute("SELECT encode_value(2)").fetchall() == [(12,)]
+        source = cursor.sql("SELECT 3 AS x")
+        assert source.project(encoder(vane.col("x"))).fetchall() == [(13,)]
+```
+
+The registration serializes the class adapter and constructor arguments once;
+later expression builds reuse that snapshot. Input names,
+types, return schema, actor count and batch size come from the declaration and
+cannot be overridden at SQL attachment; choose another registration name and
+version for a different definition. Expression calls cast inputs to the same
+declared types that SQL binding uses. Batch byte settings use the captured
+session configuration. SQL aliases and native passthrough columns
+do not change initialization identity. Each registration is explicit: an
+equivalent unregistered class keeps its existing per-query lifetime.
+
+`cpus` and optional `memory_bytes` are declarations per actor. `resident_limit`
+applies to their pool-wide sum and uses the existing registry admission policy.
+An oversized registration fails before startup; prewarming another model can
+refuse capacity occupied by resident pools. These declarations do not enforce
+OS limits or evict models. Task and UDF byte limits retain their separate roles.
+
+SQL and Relation queries acquire fresh borrows, with the same session snapshot,
+task/byte admission, deadline, cancellation and cleanup contracts as ordinary
+queries. A model cannot be used by another session, an unconfigured connection
+or another runner. Finishing or cancelling one query does not retire the pool.
+Worker loss fails the affected request without replay; a new request may start
+a replacement worker. Initialization failure follows the existing sticky failure
+contract. Drain rejects new registration, expression construction and prewarm;
+already claimed requests retain their preparation capability. Connection close
+drains requests and then releases resident models. An in-progress `prewarm()`
+keeps its owning connection alive through initialization and borrow cleanup,
+including initialization failure. An idle model handle does not retain the
+connection.
+
+Model registration, expression construction, attachment and prewarm obey the
+Python input callback reentry rule. Use them outside input/filesystem callbacks.
+The registration API uses positional call inputs and the SQL-compatible class
+signature; eager Python evaluation and per-call option overrides are not part
+of this returned model handle's contract.
+
+## Ownership and shutdown
+
+`ModelPoolRegistry` and `ModelPoolBorrow` contain the common ownership policy:
+
+- Concurrent acquisitions initialize each registered identity once. Different
+  models can initialize independently.
+- A borrow is a lifetime reference, not an execution slot or memory reservation.
+  Per-executor admission and cancellation continue to use the existing shared
+  UDF contracts. Finishing or cancelling one executor does not close the model
+  pool or cancel another executor's scope.
+- Local worker loss uses the pool's existing replacement path. Replacement may
+  initialize a new worker; it does not authorize replay of a failed request.
+- `drain()` rejects new registrations and acquisitions. Existing borrowers can
+  finish and release their references.
+- `close(timeout=0.0, kill=False)` drains and waits for all borrowers and pending
+  constructors before shutting down pools. The default fails promptly if work
+  remains. The timeout bounds this quiescence wait; backend cleanup has its own
+  timeout. `kill=True` selects backend forced cleanup after quiescence and does
+  not revoke borrowers. Cancel and finish requests before releasing them.
+- A timed-out close leaves the runtime draining. Release the outstanding
+  borrowers and retry close. Close and borrow release are idempotent.
+- Initialization failure is sticky for that registration. The initializing
+  caller receives the original error; subsequent callers receive independent
+  exceptions restored from the same bounded, value-only snapshot used by Ray.
+  Exceptions that cannot be snapshotted or restored produce a fresh
+  `RuntimeError` with a bounded diagnostic containing the original type and,
+  when available, its string argument. The cache retains no live request
+  tracebacks. Partial constructor owners stay with the runtime.
+  Close retains uncertain cleanup owners for another explicit retry and
+  continues attempting cleanup of the other models. It never relies on garbage
+  collection to prove that cleanup completed.
+
+Use explicit close after all query resources have been released. The runtime
+context manager performs the same close on exit.
+
+## Bounded local requests
+
+The first serving increment of [#843](https://github.com/AstroVela/vane/issues/843)
+adds an internal CPU request entry point around native local execution:
+
+```python
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    request_limit=RequestAdmissionLimits(
+        max_active_requests=2,
+        max_queued_requests=8,
+        queue_timeout=30.0,
+    ),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=16),
+    track_data=True,
+)
+models.register("encoder", version="weights-v1", payload=node["payload"])
+request = models.request(queue_timeout=5.0)
+result = request.execute(
+    plan, {str(node["node_id"]): "encoder"}, conn=connection, execution_timeout=5.0
+)
+```
+
+Use an independent cursor and a fresh plan bound to it for each concurrent
+request. `request.execute()` is synchronous on its calling thread: it waits
+for admission, prepares the plan exactly once, calls the existing native
+executor, then shuts down the returned query resources. Each request executes
+once. Request-limited runtimes require this entry point; calling `prepare()`
+directly is rejected. Runtimes without `request_limit` retain the existing
+explicit preparation/cleanup interface.
+
+Ready and executing requests share `max_active_requests`; the FIFO queue has
+at most `max_queued_requests` entries. The queue owns ticket metadata only and
+acquires no model borrows, UDF slots, or task-byte reservations. Plans, request
+bodies, and caller-owned inputs waiting outside execution are not covered by
+this count limit or by `data_limit`. Callers manage their own ingress buffers.
+`RequestQueueFull` refuses overload immediately. A finite, non-negative
+`queue_timeout` starts when the ticket is created and ends when it is admitted;
+expiration raises `RequestQueueTimeout`. Zero requires immediate admission.
+Expired entries are removed by waiting callers or the next admission/state
+operation, so no background timer thread is required. Notifications and timed
+condition waits drive blocked callers, without polling.
+
+`request.execute(..., execution_timeout=seconds)` optionally limits execution
+time. The finite, non-negative duration starts when `execute()` claims its
+admission ticket, before model borrowing and preparation. Time spent queued or
+holding an unclaimed ready ticket is excluded. `None` disables the execution
+deadline; zero expires before preparation. Queue admission continues to use
+`queue_timeout` independently.
+
+The execution deadline uses a monotonic clock and covers model preparation,
+native execution, UDF execution, and task/shared-memory waits. Expiration uses
+the same cancellation path as `request.cancel()` and raises
+`RequestExecutionTimeout` from `vane.execution.request_admission`. Manual
+cancellation raises `RequestCancelled`; queue expiration raises
+`RequestQueueTimeout`. The first accepted cancellation cause wins and is exposed
+as `request.cancellation_reason` (`"cancelled"` or `"execution_timeout"`).
+Preparation and completion also check the deadline, with completion arbitrated
+under the cancellation/finish lock, so a delayed watcher cannot start native work
+after expired preparation or return an overdue result. A callback arriving after
+completion cannot cancel that request or interrupt a reused cursor.
+
+Each timed, claimed request has one interruptible deadline watcher. Request
+admission bounds this population; queued requests and executions without a
+deadline create no watcher. Cancellation callbacks run independently so one
+request's slow cleanup cannot delay another request's expiration. Completion
+stops the watcher and removes its callback. Normal post-execution cleanup and
+caller-side output delivery are outside the execution deadline.
+
+`request.cancel()` returns true for the first accepted cancellation of queued,
+ready, preparing, or running work. `execute()` raises `RequestCancelled` instead
+of returning a result. Running cancellation interrupts the actual native cursor
+after query startup and cancels this request's UDF execution scopes, including
+admission and shared-memory waits. A blocked UDF's active subprocess is terminated;
+shared pools remain open and replace terminated workers through their existing
+recovery path. Other requests and already returned outputs keep their owners.
+Repeated cancellation, or cancellation after execution has finished, returns
+false. The native interrupt binding is fenced before `execute()` returns, so a
+late callback cannot interrupt the next query on that cursor.
+
+An accepted running cancellation reports `cancelling` until execution and cleanup
+release the request slot; it then reports `cancelled` for manual cancellation or
+`execution_timed_out` for execution expiry. Cancellation does not
+return admission capacity early. A waiter can leave shared model initialization
+without cancelling its initializer. A request that started the initialization
+itself waits for that constructor to finish or fail; its pool remains owned by
+the runtime. A deadline triggers cancellation rather than guaranteeing a hard
+return time: shared initialization and pending cleanup can still delay completion.
+Queue timeouts apply only before admission. Abandoned
+unstarted tickets must be cancelled or shut down; the request context manager
+does this on exit. `shutdown()` remains a cleanup operation after running
+`execute()` returns; use `cancel()` to interrupt execution from another thread.
+
+Native cancellation and stream cleanup callbacks retain their original query
+context. Releasing their last context owner, including during Python traceback
+collection, happens outside the GIL so native worker thread cleanup can finish.
+
+Successful execution, UDF failure, and worker exit all run query cleanup.
+The request slot stays charged through uncertain or concurrent cleanup; retry
+`request.shutdown()` after failure. The runtime retains pending cleanup owners
+and also retries them from `close()`, without retaining request exceptions or
+their tracebacks. Cleanup failure does not replace a primary execution error.
+Request and runtime context-manager exit preserve that error as well.
+Transport cleanup ownership does not require `track_data` or `data_limit`: a
+request retains running UDF tasks, failed input leases, and unconverted output
+grants until cleanup succeeds, even after a failed worker leaves its pool.
+Completion callbacks remain owned separately from input cleanup. If executor
+shutdown times out, the request stays `cancelling` and keeps its admission slot
+until callbacks release their outputs and execution slots and cleanup is retried
+through `request.shutdown()` or `runtime.close()`. This also applies without
+`task_limit`, `track_data`, or `data_limit`.
+
+Standalone local UDF executors follow the same completion boundary: a successful
+`close()` waits for their completion callbacks to release task admissions and
+finish scope and activity cleanup. A cleanup timeout retains the executor's
+futures and pool reference for an explicit close retry. The wait covers only
+that executor's invocations; other executors sharing the pool can keep running.
+
+Retries use each lease's shared-input ownership rules and each task's grant
+identities, so cleaning one request cannot release another request's data.
+Shared registered models remain resident. Shared-memory UDF outputs and their
+zero-copy views keep their separate byte ownership after the request slot is
+returned; a slow consumer retaining those views can cause a later request to
+encounter the existing explicit byte capacity refusal. Native final Arrow
+results can contain copies outside this ledger; callers must bound response
+buffering separately. Request management never replays a failed UDF.
+
+For request-limited runtimes, `drain()` first fences new requests and cancels
+queued/unclaimed tickets. Requests that already claimed execution may finish
+preparation and execution. `close(timeout=...)` waits for those request leases
+and their cleanup before draining and closing the inner task/data/model owners.
+Registration, runtime prewarming, and `acquire()`/`prewarm()` on handles returned
+by `register()` are refused after drain. Public acquisitions already initializing
+at the fence may finish initialization, but return no new borrow; the registry
+keeps their pools for cleanup. Claimed preparation uses a separate binding to
+its live request ticket, leaving the returned handle fenced. That binding
+expires when the request releases its slot. Existing borrows remain valid until
+their owners release them. A close timeout leaves the runtime draining for an
+explicit retry.
+
+`resource_snapshot()["request_admission"]` reports ready, running, queued,
+completed, cancelling, explicitly cancelled, drained, timed-out and rejected requests,
+aggregate queue wait seconds, cleanup-pending requests, and drain/close state.
+Running counts include cancelling requests and requests still owning cleanup;
+cancelled counts increase only after their slots are returned.
+`timed_out_requests` counts queue expirations; `execution_timed_out_requests`
+counts execution expirations after their cleanup releases the request slot.
+`executed_requests`, `failed_executions`, and `execution_seconds` record claimed
+executions once at their execution boundary, before query cleanup. Preparation
+and cancellation callbacks are included; accepted cancellation and expiry are
+not execution failures. `cleanup_seconds` updates when the slot is returned,
+including time awaiting cleanup retries. Cleanup-only errors are represented
+by pending owners, not `failed_executions`. `completed_requests` continues to
+count non-cancelled slots returned, including failed executions.
+`request.timing_snapshot()` exposes completed queue, execution, and cleanup
+intervals; unstarted or unfinished intervals are `None`. These counters retain
+no per-request history or exceptions. See the acceptance guide for full timing
+boundaries and the separate driver-side percentile report.
+The policy and
+`AdmissionLease` are common execution components; native execution is the local
+adapter. Managed result delivery is described below. HTTP/RPC endpoints and
+a Ray request/delivery adapter require separately scoped work beyond the
+local serving runtime delivered under #843.
+
+## Worker failure metrics
+
+`runtime.resource_snapshot()["worker_failures"]` exposes cumulative counters
+for subprocess worker outcomes, including prewarming and replacement. The
+snapshot always includes all six fields, initialized to zero:
+
+| Field | Observation |
+| --- | --- |
+| `initialization_failures` | Worker startup fails before readiness, including constructor errors and startup communication failures |
+| `execution_errors` | A ready worker reports an execution error through its protocol, including UDF and worker-side conversion errors |
+| `worker_losses` | Unexpected process exit, control-channel failure or invalid protocol response after readiness |
+| `runtime_errors` | Parent-side execution, serialization, control handling, wakeup or resource-cleanup errors retire a ready worker, without an earlier terminal outcome |
+| `cancelled_workers` | Cancellation intentionally retires a worker or interrupts its startup |
+| `shutdown_workers` | Ordinary closure of a live worker without an earlier failure or cancellation |
+
+One physical worker generation, including its startup attempt, records its
+first observed terminal outcome once. Repeated exception delivery, cleanup
+retries and several requests borrowing the same failed model do not add counts.
+A replacement has its own lifecycle. Cancelling a queued request or a task
+that leaves its worker reusable does not count a retired worker. Normal
+closure and cancellation are separate from the four failure counters.
+Counters describe observed boundaries, not inferred OS causes such as OOM;
+an idle worker's exit is observed on a later acquisition or shutdown, without
+a background monitor. A recorded outcome does not establish that cleanup has
+finished: pending owners and resource charges retain their existing semantics.
+Control messages and final results are classified before fallible parent cleanup:
+malformed worker events, result descriptors and Arrow IPC responses count as
+`worker_losses`, and a reported input-consumption failure counts as
+`execution_errors`. Parent response serialization and `MemoryError` during frame
+assembly, reception or result decoding count as `runtime_errors`. Subsequent
+grant or lease cleanup failures cannot replace an already observed category.
+Descriptor field validation runs before budgets and shared-memory ownership are
+transferred to the result; failed decoding retires the affected worker.
+Lazy shared-memory results retain an observer for their producing worker and
+collector. Malformed Arrow contents discovered during later materialization
+retire that physical worker and count as `worker_losses`; parent decoding
+allocation failures count as `runtime_errors`. The result remains zero-copy
+and is not decoded on arrival. A deferred observation keeps its producer's
+attribution even if a cached task worker has since served another runtime;
+it cannot retire a replacement worker or override an earlier terminal outcome.
+For chained subprocess UDFs, the consumer reports which input block failed
+Arrow decoding. The parent verifies that block belongs to the consumer's input
+lease, then notifies its producer before releasing the lease or recording the
+consumer's execution error. This also preserves attribution when one cached
+worker produces a result and later consumes it for another runtime. A separate
+consumer still records its own execution error; consumer allocation failures
+and errors applying input projections do not blame the producer.
+
+Registered and query-owned actor workers report to their owning runtime.
+Cached task pools can be shared by different runtimes: an active worker
+reports to its current borrower, and detaches that collector before becoming
+idle. A dead idle task worker is attributed to the next borrower that discovers
+it; idle pool teardown has no borrower and does not charge the previous one.
+Unconfigured executions do not charge a previously configured runtime.
+These counters are not per-query failure totals; `request_admission` continues
+to report `failed_executions`, which also covers preparation failures before
+any worker starts.
+
+`WorkerOutcome`, `WorkerLifecycle` and `WorkerMetrics` define the common
+backend-neutral accounting contract. This increment wires the subprocess
+adapter; Ray integration remains separate. Collectors keep only fixed counters,
+and retain no worker IDs, runtime owners, requests, exceptions or tracebacks.
+The finite acceptance/soak driver still records its own injected-fault counts;
+those are scenario evidence, separate from these runtime observations.
+
+## Managed results from SQL and Relation queries
+
+Configure `result_limit` on the owning connection to enable explicit managed
+delivery for ordinary local queries. Both `connection.execute_result()`
+and `relation.execute_result()` return the existing `ManagedResult` handle:
+
+```python
+import vane
+
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.result_delivery import ResultDeliveryLimits
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        result_limit=ResultDeliveryLimits(max_results=4, max_bytes=64 * 1024**2),
+    )
+    with connection.execute_result(
+        "SELECT ?::BIGINT AS value", [7], delivery_timeout=5.0,
+    ) as result:
+        for table in result:
+            assert table.column("value").to_pylist() == [7]
+    relation = connection.sql("SELECT i FROM range(3) t(i)").project("i + 1 AS value")
+    with relation.execute_result(delivery_timeout=5.0) as result:
+        for table in result:
+            assert table.column("value").to_pylist() == [1, 2, 3]
+```
+
+These calls share the configured request, UDF task/data and registered-model
+budgets with other queries in the session. Concurrent clients use independent
+cursors. SQL accepts one read-only SELECT, including positional or named
+parameters; multi-statement scripts are rejected before executing any statement.
+SQL replacement scans keep the caller's lookup frame across admission and honor
+the existing replacement-scan settings. A Relation must have no open result;
+an exhausted or explicitly closed result permits a new execution.
+Each explicit call executes once;
+delivery never replays a query. Existing `execute()`, `fetchall()` and Arrow
+fetch methods retain their ordinary result behavior and do not enter this
+opt-in delivery budget.
+
+The request waits for execution admission before reserving a result slot.
+Slot refusal occurs before user execution and retires the private request
+ticket, so repeated refusals do not exhaust ingress. For materialized delivery, execution and confirmed
+UDF cleanup release request capacity before result encoding or consumption.
+The same coupled reservation, exact Arrow IPC byte accounting, delivery
+deadline and cleanup-retry policy described below governs both this entry
+point and explicit physical-plan requests.
+
+By default this adapter materializes the native result and prepares one Arrow IPC payload
+for a nonempty query. An empty query preserves its schema without a payload.
+`result_schema` contains native column names and type names; `completion_status`
+is `ok` or `empty`. The adapter does not populate per-fragment `stats` or
+`task_stats`; shared runtime diagnostics remain in `resource_snapshot()`.
+Native materialization, Arrow conversion and temporary encoding overlap are
+outside `max_bytes`. This is a retained delivery-buffer bound, not native
+streaming or a whole-process memory limit. Opt-in streaming is described in
+[managed native result streams](#managed-native-result-streams). A byte refusal can follow UDF
+execution and must not be treated as permission to replay it.
+
+`close()`, `cancel()` and delivery expiry retire unconsumed results. Exported
+Arrow tables and their zero-copy views remain charged until the last reference
+is released, even after connection/runtime close. Pending or failed result
+cleanup remains runtime-owned for an explicit retry. Keep the connection alive
+while using pending managed results; closing or collecting its final session
+connection closes those results. Independently exported views remain valid.
+The input/filesystem callback reentry restriction also applies to both new
+entry points and their argument conversion.
+
+## Managed result delivery
+
+Configure an independent result budget and use `execute_result()` to hand a
+materialized local result to a consumer through an explicitly owned iterator:
+
+```python
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.result_delivery import ResultDeliveryLimits
+from vane.execution.udf_local_model import LocalModelRuntime
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    request_limit=RequestAdmissionLimits(4, 16),
+    result_limit=ResultDeliveryLimits(max_results=8, max_bytes=64 * 1024**2),
+)
+try:
+    with models.request() as request:
+        with request.execute_result(
+            plan, bindings, conn=connection,
+            execution_timeout=5.0, delivery_timeout=2.0,
+        ) as result:
+            for table in result:
+                consume(table)
+finally:
+    models.close()
+```
+
+`result_limit` requires `request_limit`. Both capacities are positive integers.
+Each managed request first waits for request admission without reserving any
+result capacity. Once ready, it reserves a result slot and claims execution
+under the request admission lock. Queued requests cannot occupy result capacity
+needed by earlier ready requests. Slot exhaustion raises `ResultDeliveryFull`
+before consuming the ready request or starting query UDFs; the caller can retry the
+same ticket, cancel it, or leave its request context. The original `execute()`
+API continues to return its native result and does not enter this delivery gate.
+
+Execution and its cleanup release the request slot independently of result
+consumption. The local delivery adapter then sizes each Arrow IPC partition,
+reserves its exact bytes, and encodes it into a fixed-size buffer. Byte exhaustion
+raises `ResultDeliveryFull`; partially built delivery buffers are cleaned up.
+This can happen after user code has executed and never authorizes automatic
+query replay. Native result collection, IPC sizing/encoding work, DuckDB memory,
+and the temporary overlap with the original materialized result are outside
+this retained-buffer limit. Encoding makes one IPC copy per native partition.
+This materialized delivery adapter does not stream native execution or impose
+a whole-process memory bound.
+
+### Capacity refusal details and retry boundaries
+
+`ResultDeliveryFull` remains a `RuntimeError` and existing catches and message
+text remain compatible. Runtime refusals expose scalar snapshots taken at the
+capacity check; they do not change when another consumer releases memory:
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | `"slots"` for result-slot exhaustion, `"bytes"` for retained-buffer exhaustion; `None` when unspecified |
+| `requested` | One slot, or the size of the proposed IPC buffer in bytes |
+| `used` | Occupied slots or charged bytes at refusal, excluding the refused amount |
+| `limit` | The corresponding configured capacity |
+| `execution_started` | `False` for a managed request's confirmed slot refusal before its execution claim; `True` after that claim; `None` without request-layer confirmation |
+
+The execution claim includes model preparation, so `True` does not prove a UDF
+ran or completed. It prevents treating an inner request's slot refusal as
+permission to replay an already-running outer query. Binding or argument
+conversion callbacks that ran before admission are outside this boundary.
+Errors constructed as `ResultDeliveryFull(message)` have unknown fields.
+Standalone result-registry checks can report capacity without knowing request
+execution state. Never infer retry permission from a message or from
+`execution_started is None`.
+
+SQL, Relation and explicit physical-plan requests share this contract. A caller
+may consider a new attempt only when `error.reason == "slots"` and
+`error.execution_started is False`, subject to its own cancellation, deadline
+and retry budget. Public calls retire their private request ticket on refusal;
+another call creates a new ticket. The explicit request API retains its ready
+ticket for retry. Neither path automatically replays a query. Byte refusals
+after execution, unknown errors and cleanup failures provide no replay guarantee.
+The [serving example](scripts/validate_local_serving.py) uses these fields for
+bounded slot retries; fixture call markers independently verify that no UDF ran.
+
+Iteration, or `result.take()`, exports one partition as a zero-copy Arrow table.
+The final successful transfer releases the result slot. Its buffers remain
+charged until their last underlying reference is gone: tables, slices, arrays,
+buffers and zero-copy NumPy views can keep bytes charged after handle or runtime
+close. New results may therefore obtain a slot but fail byte admission while
+older consumer views remain live. Native metadata is available as
+`result.result_schema`, `result.completion_status`, `result.stats`, and
+`result.task_stats`. The native column names and completion status are preserved.
+
+`delivery_timeout` is a finite non-negative total deadline starting when the
+managed result is ready, after execution cleanup and IPC preparation. `None`
+disables it; zero expires results with pending partitions before consumption. Queue
+time and execution use their separate deadlines. A watcher expires an abandoned
+result even if no caller polls it, and synchronous checks fence expired or
+already-cancelled output before transfer. Each timed result has one watcher,
+bounded by `max_results`; slow cleanup in one watcher does not delay another.
+
+The deadline ends when all partitions have been transferred to the caller.
+It does not time the caller's subsequent serialization, network sends, or
+retention of exported views. HTTP/RPC adapters must own those operations and
+drop their own references on disconnect. Opt-in incremental native output is
+available through [managed native result streams](#managed-native-result-streams).
+Serving transport integration remains separately scoped work.
+
+`result.close()` discards remaining output. `result.cancel()` accepts the first
+cancellation and subsequent consumption raises `ResultDeliveryCancelled`;
+expiry raises `ResultDeliveryTimeout`. Explicit/runtime close raises
+`ResultDeliveryClosed` on subsequent consumption. These exceptions are in
+`vane.execution.result_delivery`. The first terminal cause wins. Completion,
+close and expiry fence copied callbacks; they do not close shared models or
+another result's output. A handle supports one active consumer at a time.
+
+States are `preparing`, `ready`, `closing`, and terminal `delivered`, `closed`,
+`cancelled`, `delivery_timed_out`, or `failed`. `closing` means an operation,
+cancellation callback, or failed payload cleanup still owns the result slot.
+Concurrent or failed cleanup retains the owner and reports an error; retry
+`result.close()` or `models.close()`. The runtime owns abandoned handles, so
+cleanup does not depend on callers retaining them or on garbage collection.
+Runtime drain fences request ingress; already ready results remain consumable.
+Runtime close fences all results before cleaning any of them and permits
+already-exported views to outlive the runtime.
+
+`resource_snapshot()["result_delivery"]` reports result/byte limits, active,
+preparing, ready and cleanup-pending results, live buffer count, total charged
+bytes, external-consumer bytes, terminal outcome counts, refusals and close
+state. Delivery bytes are a separate budget from UDF shared-memory accounting.
+`delivery_seconds` and `delivery_samples` count ready-to-retirement intervals
+once, including cleanup retries but excluding subsequent exported-view
+lifetime. Results that never become ready have no delivery sample.
+`result.timing_snapshot()` reports the completed interval, or `None` until it
+exists. The interval is observational and does not extend the delivery deadline.
+The common layer reuses `AdmissionLease`, output lease ownership, cancellation
+scopes and monotonic deadlines; Arrow IPC allocation/materialization belongs
+to the local adapter. Ray authorization and transport remain with Ray's adapter.
+
+## Resident resource admission
+
+Pass an optional `resident_limit` to bound the sum of declared process
+resources for this runtime's registered model pools:
+
+```python
+from vane.execution.resources import ResourceVector
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    resident_limit=ResourceVector(cpu=4, heap_bytes=8 * 1024**3),
+)
+```
+
+Declare the per-actor heap on the relation before building its physical plan:
+
+```python
+relation = source.map_batches(
+    Model,
+    schema=output_schema,
+    execution_backend="subprocess_actor",
+    actor_number=2,
+    cpus=0.5,
+    memory_bytes=1024**3,
+)
+```
+
+`flat_map` also accepts this declaration for `subprocess_actor`. The collected
+native payload carries `memory_bytes` through registration, compatibility
+validation, and execution; use that payload directly. Heap declarations also
+apply to `subprocess_task` as a per-task process-memory reservation.
+
+`ResourceVector` and UDF process-resource parsing are shared with Ray's query
+resource graph. CPU may be fractional; heap uses integer bytes from the UDF's
+`memory_bytes` declaration. A pool requests the per-actor resources multiplied
+by its actor count. For example, two actors each declaring `cpus=0.5` and
+`memory_bytes=1024**3` reserve one CPU and two GiB. Missing `memory_bytes`
+reserves zero heap, matching Ray. All vector fields are finite limits, with
+zero meaning zero capacity; omitting the entire limit preserves unbounded
+resident admission while still reporting usage. Configured or fully reserved
+zero capacity rejects every positive request, even below the shared vector's
+floating-point tolerance. Fractional arithmetic retains that tolerance when
+capacity remains; Ray's resource-vector comparisons are unchanged.
+
+Registration validates each pool against the limit but starts no workers and
+reserves nothing. The first acquire or prewarm atomically reserves the whole
+pool before initialization, so concurrent constructors cannot each spend the
+runtime's full budget. Repeated borrows, query completion, cancellation, and
+worker replacement retain the same reservation. Only confirmed pool cleanup
+returns capacity. A clean constructor failure returns its reservation;
+partial initialization or uncertain cleanup retains the full reservation until
+all associated owners have finished cleanup. Close retries return each pool's
+capacity once, without releasing reservations for other unfinished pools.
+
+An individually oversized registration raises `ModelPoolCapacityError` before
+publishing the model. When other pools occupy the available capacity, acquire
+or prewarm raises the same error before calling the constructor. The error
+reports `requested`, `reserved`, `limit`, exceeded `dimensions`, and whether
+the request is `oversized`. Capacity refusal is not cached as an initialization
+failure: it can be retried if another failed constructor returns capacity.
+There is no admission wait queue or automatic eviction for resident models;
+waiting for a persistent pool's reservation to expire could deadlock. End the
+runtime and choose a different set of models or limits to change residency.
+
+`resource_snapshot()` reports the limit, registered resource demand, reserved
+resources, active borrow count, and runtime state. Its `initializing_resources`,
+`resident_resources`, and `retained_failure_resources` partition the reserved
+total. These are logical declarations, not measured RSS or OS enforcement.
+Models without heap declarations and memory used by decoding, DuckDB, Python
+results, and mapped shared-memory blocks are outside this resident limit.
+Shared mappings remain charged by the existing shared-memory budget; they are
+not multiplied by the number of model borrowers. Local resident limits accept
+CPU, declared heap and GPU counts. A positive GPU limit also requires an
+explicit device inventory; object-store bytes are unsupported here.
+
+The limit is shared by registered models and queries using one runtime. Separate
+runtimes and unregistered query-owned UDF pools keep independent ownership.
+This is the first increment of [#841](https://github.com/AstroVela/vane/issues/841).
+Resident admission does not replace executor backpressure or impose a
+whole-process memory cap.
+
+## Registered local GPU models
+
+Pass a provisioned inventory to `configure_local_runtime(gpu_devices=...)`,
+declare `gpus=1` and a fixed `actor_number` on the class UDF, then assign one
+inventory UUID per replica in `register_model(gpu_devices=...)`. The resulting
+handle supports prewarm, SQL attachment, Relation expressions and managed
+results through the existing runtime APIs. For example, on a CUDA host with
+PyTorch installed and `VANE_RUNNER=local`:
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.resources import ResourceVector
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+# Replace this example UUID with a provisioned full physical GPU UUID.
+devices = ["GPU-aaaaaaaa-0000-0000-0000-000000000001"]
+
+@vane.cls(gpus=1, actor_number=1, return_dtype="DOUBLE")
+class Score:
+    def __init__(self):
+        import torch
+        self.weights = torch.arange(8, dtype=torch.float64, device="cuda")
+
+    def __call__(self, value):
+        return float((self.weights * value).sum().cpu().item())
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        resident_limit=ResourceVector(cpu=1, gpu=1),
+        gpu_devices=devices,
+        task_limit=TaskAdmissionLimits(1, 16),
+    )
+    model = runtime.register_model(
+        "score", Score(), version="v1", parameters=["DOUBLE"], gpu_devices=devices,
+    )
+    model.prewarm()
+    vane.attach_function(model, "score", connection=connection)
+    assert connection.execute("SELECT score(2)").fetchone() == (56.0,)
+    print(runtime.resource_snapshot()["gpu"])
+```
+
+`vane.cls.batch` uses the same registration path. UDFs return ordinary host
+values/Arrow arrays after their device work completes; moving a CUDA result
+to host as above supplies that synchronization. A callable that starts device
+work unrelated to its returned host result must synchronize it before returning.
+The runtime does not discover arbitrary CUDA streams or synchronize background
+GPU work that outlives a UDF invocation. It introduces no PyTorch dependency;
+the application supplies its CUDA framework.
+
+Query-owned GPU table UDFs can run without a configured runtime, as described
+below. GPU task UDFs, fractional GPU declarations and multiple GPUs per replica
+remain unsupported. An empty explicit inventory is invalid;
+omit `gpu_devices` for a CPU-only runtime. CPU and GPU registered models share
+one registry, task budget, byte budget and request lifecycle. CPU registrations
+must omit the device assignment. A resident GPU limit of zero rejects GPU
+registration even if the inventory contains devices.
+
+### Query-owned GPU table UDFs
+
+With `VANE_RUNNER=local`, `relation.map_batches(Model, schema=...,
+actor_number=1, gpus=1)` and `flat_map` assign one visible physical CUDA GPU
+per fixed actor replica. Workers, GPU residency, and query admission belong to
+that query and close on completion or failure. They use the same subprocess
+streaming, CPU/heap admission, and shared query budget as CPU actors. An ordinary
+connection can therefore use the original audio benchmark's table UDF and native
+`write_parquet` sink; no expression adapter or Arrow collection is needed.
+
+Device discovery runs in a separate interpreter using the CUDA driver and NVML,
+without loading a model framework or initializing CUDA in the calling process.
+The CUDA driver's [visibility and ordering rules](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html)
+resolve `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`; the assigned full UUID is
+set before each worker imports its UDF. MIG devices are rejected. CUDA and NVML
+driver libraries must be available. Discovery errors are reported directly.
+Discovery participates in the query's startup cancellation scope, including
+ordinary connections without `configure_local_runtime()`. Connection interrupts
+kill and reap the owned probe before `fetchall()` or `write_parquet()` returns.
+Configured runtimes also apply execution deadlines and retain the request slot
+until this cleanup completes. The same cleanup runs when discovery exceeds its
+internal 30-second timeout. A cancelled probe does not reserve GPU devices.
+
+Query-owned and explicitly registered GPU pools share device exclusions within
+the driver process. A pool reserves all its replicas before starting workers;
+insufficient free GPUs fail promptly and can be retried after the occupying pool
+closes. Failed worker cleanup retains the device reservation until a successful
+retry. Forked children cannot release inherited reservations or reuse devices
+owned by inherited parent pools. Separate driver processes and external GPU
+applications are not arbitrated. This does not add VRAM enforcement.
+
+The configured model runtime retains its read-only query contract and explicit
+inventory/registration API for models reused across queries. Unregistered GPU
+column expressions still require Ray; this increment enables table UDFs.
+
+### Device residency
+
+The shared `vane.execution.udf_local_gpu.LocalGpuModelAdapter` implements
+the device contract tracked in [#842](https://github.com/AstroVela/vane/issues/842).
+
+The adapter binds a provisioned inventory to one `ModelPoolRegistry` and
+registers fixed replicas, each requesting exactly one GPU and assigned one
+full GPU UUID. The inventory and assignments reject ordinals, abbreviated
+UUIDs, duplicate identities and MIG devices. UUIDs are canonicalized before
+comparison. Inventory provisioning is explicit; this increment does not
+discover hardware or prove that a listed device is physically available.
+
+Registration starts no workers. The common registry atomically reserves the
+pool's CPU/GPU/declared heap and its exclusive `cuda:<UUID>` keys before calling
+any model constructor. An exclusive-resource conflict raises
+`ModelPoolResourceBusy` with the conflicting keys. It publishes no partial
+reservation and is retryable; it is not cached as an initialization failure.
+All adapters managing the same devices must share this registry. The scope is
+one registry, not machine-wide arbitration across independent runtimes or
+processes. Ray continues to use Ray Core placement and its own authorization.
+
+Each subprocess receives its assigned UUID in `CUDA_VISIBLE_DEVICES` before
+loading the serialized UDF, using CUDA's documented
+[GPU UUID visibility selection](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html).
+The explicit assignment controls the child environment, including after later
+parent-environment changes; the parent's environment is not modified. Session
+configuration and model payloads are frozen at registration. Ordered device
+assignments participate in pool identity, so changing replica placement cannot
+reuse an incompatible registration.
+
+Resident ownership follows the existing pool lifetime: query completion,
+borrow release and cancellation do not free devices. Replacement closes the
+old worker before starting its successor on the same device. Failed cleanup
+prevents replacement. Clean initialization failure returns reservations;
+partial initialization or failed shutdown retains all of that pool's device
+keys and numeric resources until close retries confirm cleanup. Drain fences
+new borrows and prewarms; an initializer already in progress remains owned for
+close even if its caller cancels or the registry drains.
+
+`ModelPoolRegistry.resource_snapshot()["exclusive_resources"]` maps reserved
+keys to their model/version/session owner. `pool.device_snapshot()` reports
+replica index, device, generation, PID and cleanup completion for current,
+provisional replacement and retained cleanup workers. These are passive
+component snapshots; initialization may still be in progress before a pool is
+available for borrowing.
+
+CPU-only tests use fake provisioned UUIDs and real subprocesses to verify
+environment setup, reuse, concurrent prewarm, device conflicts, cancellation,
+replacement and retained cleanup. They establish no CUDA-kernel or physical
+VRAM guarantee. This resident GPU count is separate from per-device execution
+demand and GPU-memory admission.
+
+### GPU execution admission
+
+GPU actor pools use the existing `LocalExecutionSlotPool` arbitration and
+`AdmissionLease` lifecycle. Each slot maps to one fixed replica/device; it is
+not a second semaphore or wait queue. `RuntimeTaskAdmission` can therefore
+acquire a task allowance and device slot together, and the byte-wait adapter
+continues to reserve a complete envelope only when that slot is available.
+The existing arbitration treats limited and ordinary queries fairly within
+the shared pool. Different devices can run concurrently, subject to the
+runtime's task limit.
+
+An `udf_subprocess.UDFExecutor` attached to a GPU pool passes its
+admission lease when submitting work. Direct `pool.submit(...)` also requires
+the `admission=` keyword for GPU pools; missing, foreign, released or already
+submitted leases are rejected. The pool dispatches to the lease's replica,
+independently of idle-worker ordering, and records the actual worker PID and
+generation when execution begins. CPU pool submission is unchanged.
+
+Per-device execution demand is one logical GPU slot, separate from the
+registry's resident GPU reservation. Model borrows and repeated invocations
+do not reserve resident GPUs again. Waiting for an initial byte envelope owns
+no device or runtime task allowance. During an in-flight shared-memory wait,
+the runtime task allowance can be yielded while the invocation retains its
+physical device/worker. Both device and UDF-unit diagnostics observe that
+wait and the subsequent wait to resume execution.
+
+Completion returns execution demand while buffered results retain the
+existing output slot until consumption. Cancellation and execution deadlines
+use the ordinary executor cancellation path. Worker replacement stays on the
+assigned device; unfinished replacement or failed worker cleanup retains its
+execution record as well as resident ownership. The actor pool retries the
+physical cleanup, and only confirmed completion retires the retained record.
+A callback that has not reported execution completion also remains visible
+to pool cleanup.
+
+`pool.gpu_execution_snapshot()` is passive and reports devices, live execution
+leases, states, PID/generation, logical execution resources, retained result
+slots and worker generations. Queued requests appear once at pool scope
+because a pending request has no assigned replica yet. These are independently
+locked diagnostic samples, not an atomic reservation API. They never acquire
+capacity or perform cleanup.
+
+The public `runtime.resource_snapshot()["gpu"]` lists the frozen inventory and
+each registered model's assignment plus these pool snapshots. It includes
+retained owners after initialization or shutdown failure, without acquiring a
+borrow or prewarming a model. During initialization the pool may not yet be
+published; `initializing_resources` still records its resident reservation.
+After successful close the model's configured assignment remains diagnostic
+metadata, while its pool list and all reservations are empty.
+
+CPU-only tests run real subprocess UDFs with fake provisioned UUIDs. They cover
+device binding, parallel replicas, query fairness, shared task budgets,
+cancellation/deadlines, byte waiting and failed-cleanup retry. The separate
+CUDA acceptance module exercises actual device tensor computation through
+registered row/batch models, SQL, rebuilt Relations and managed results, plus
+concurrent cursors, drain, cancellation, deadlines, model failure and byte
+limits. It requires PyTorch with CUDA and downloads no models:
+
+```bash
+# Optional: choose a provisioned UUID instead of the first visible GPU.
+export VANE_TEST_CUDA_DEVICE=GPU-aaaaaaaa-0000-0000-0000-000000000001
+scripts/run_installed_pytest.sh tests/fast/test_local_query_gpu_cuda.py -m gpu
+```
+
+These hardware tests carry the `gpu` marker and run separately from CPU CI.
+For repeated load, slow consumers, cancellation, execution expiry and worker
+recovery in one CUDA runtime, use the
+[sustained serving runner](LOCAL_SERVING_ACCEPTANCE.md#sustained-lifecycle-acceptance).
+It shares the CPU supervisor and workload, checking device/worker generations
+and idle ownership each round, with bounded diagnostic artifacts on failure.
+Logical resident/execution counts do not estimate or enforce physical VRAM,
+reserve a device against other processes/runtimes, or provide spill or GPU
+utilization scheduling. Provision exclusive devices externally when needed.
+
+## Managed native result streams
+
+`execute_result(..., stream=True, rows_per_batch=2048)` on a configured connection
+or Relation returns a pull-driven managed result. `take()` reads the next native
+Arrow batch and encodes one delivery payload; it does not collect the complete
+query into an Arrow table first. Existing calls keep their materialized behavior.
+
+```python
+with connection.execute_result(
+    "SELECT encode(x) FROM inputs", stream=True, rows_per_batch=2048,
+    delivery_timeout=30,
+) as result:
+    while True:
+        try:
+            table = result.take()
+        except StopIteration:
+            break
+        consume(table)
+        del table
+```
+
+The request slot, UDF scopes, model borrows and native interrupt fence remain
+owned until EOF or confirmed cleanup. Use an independent cursor for concurrent
+queries; an open stream fences further queries on its cursor. Execution timeout
+covers the entire stream, including consumer pauses. Delivery timeout starts
+when the stream is ready and covers the total consumption interval.
+
+Each IPC buffer is reserved before allocation and stays charged through exported
+Arrow/NumPy views. When those views fill the delivery budget, the next `take()`
+waits for capacity, cancellation or a deadline instead of reading more batches.
+One decoded batch may wait for its exact IPC reservation. Release previous
+views before taking another batch, or provision capacity for overlapping batches.
+In particular, a Python `for table in result` loop retains its previous loop
+variable while asking for the next item. Set a delivery or execution deadline
+when retained views could otherwise prevent progress.
+
+A single batch larger than the complete delivery budget fails explicitly after
+execution started; it must not be replayed as a new request. Closing a stream
+cancels unread work and preserves exported views. Runtime close cancels live
+streams and fences streams still being prepared before waiting for request
+admission. This fence remains effective if close times out. Failed native or UDF
+cleanup keeps both cleanup ownership and admission until an explicit retry succeeds.
+
+The delivery budget bounds encoded IPC buffers. Native scan/sort/aggregate/join
+state, the current decoded batch and temporary encoding copies remain outside
+that budget and under DuckDB's native memory policy. Blocking operators may
+materialize internally before their result can stream. This interface does not
+provide a whole-process memory bound. HTTP sends and disconnect handling remain
+transport-adapter responsibilities.
+
+`result_delivery` snapshots also expose `streaming_results`,
+`waiting_byte_results` and `waiting_bytes` (requested capacity, not a reservation).
+The [sustained streaming acceptance](LOCAL_SERVING_ACCEPTANCE.md#sustained-streaming-delivery)
+reuses one CPU or CUDA runtime across mixed consumers, byte waits, deadlines,
+worker replacement and shutdown.
+
+## Runtime task admission
+
+Pass a separate, optional task limit to share execution capacity across all
+queries prepared by one runtime:
+
+```python
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=32),
+)
+```
+
+Two registered models with four actors each can keep all eight processes
+resident, while their queries together hold at most four execution allowances.
+Ready grants count against this limit before submission, so dispatchers cannot
+overbook it. Executing tasks do not charge the models' resident CPU or heap a
+second time. These are logical task counts, not CPU scheduling or OS limits.
+
+Preparation attaches one query admission owner to **every** collected local
+UDF node: registered models, unregistered subprocess actors, and subprocess
+tasks. Plans using other backends are rejected before actor preparation.
+With a task limit, `prepare(plan, {}, conn=connection)` also supports plans
+containing only unregistered UDFs. A task-only plan still receives the captured
+session configuration and participates in runtime drain and close.
+
+Pending admission requests share a bounded queue, rotating between queries.
+Each eligible query gets one grant per round. A busy pool can be skipped so
+another UDF in the same query can progress. A grant acquires both the runtime
+allowance and a pool slot without waiting while holding just one of them.
+Capacity changes wake pending dispatchers; they do not poll for capacity.
+
+Subprocess tasks and resident actors share one process-wide CPU/heap admission
+ledger. Its capacity is captured when the local subprocess runtime starts, using
+the process CPU affinity where supported (bounded by the host CPU count) and
+available system memory. `cpus` can be fractional; `memory_bytes` is an optional
+per-process heap reservation. These declarations govern admission, not OS CPU or
+RSS enforcement.
+Shared-memory flow remains governed by its separate transport and data budgets.
+On Linux with cgroup v2, available process memory also respects containing
+cgroup limits.
+
+Subprocess actors use the same default library thread policy as Ray's native
+actors. When unset, `OMP_NUM_THREADS` defaults to the assigned CPU count rounded
+down, with a minimum of one (also one when `cpus` is omitted). Vane does not add
+Rayon, BLAS-specific or PyTorch inter-op limits for actors; libraries interpret
+OMP and their own defaults. Explicit inherited environment settings are preserved.
+Local actors also honor `VANE_TORCH_NUM_THREADS` and
+`VANE_TORCH_INTEROP_THREADS` individually when PyTorch is loaded during actor
+initialization; setting either leaves the other pool unchanged. With neither
+override, constructor-selected PyTorch settings are preserved. Subprocess task
+workers retain their managed library thread limits and inter-op default of one.
+
+Tasks without `memory_bytes` have zero declared heap commitment, matching
+Ray. Worker RSS, including mapped shared memory and past high-water marks,
+does not create a separate local concurrency cap or calibration phase. Declare
+`memory_bytes` when a known per-process heap reservation is required.
+
+Default local admission uses the same query resource manager, query budget
+allocator, downstream reservations, and pending-output accounting as Ray.
+The node's process capacity still governs physical placement; shared-memory
+allocations keep their transport limits. Additional `task_limit` and
+`data_limit` settings remain explicit application constraints.
+
+Execution completion returns task and actor slots independently of result
+consumption. Retained results and zero-copy views keep their output-byte
+charges until storage is released. Query shutdown waits for execution cleanup
+to return these policy leases; failed cleanup keeps its owner for retry.
+Process-resource snapshots report declared commitments, and query policy
+snapshots report task, output, reservation, and shared-budget usage.
+
+Retiring an idle task worker tolerates an exit deadline after a successful
+close acknowledgement only if forced termination, reaping and all resource
+cleanup succeed. Protocol errors and failed cleanup remain errors and retain
+their cleanup owner for retry.
+
+Native scan width controls native pipeline work only. It does not set the number
+of UDF workers: a single Parquet row group and one native thread can submit
+multiple batches. Batches can complete out of input order; add a downstream
+`ORDER BY` when ordered rows are required. A task pool sizes its physical slots
+from the node capacity and its per-task declarations; workers and coordinator
+threads start lazily. All pools reserve CPU and declared heap together with a
+slot before reporting ready.
+Resident actor pools reserve their total CPU and heap before startup and retain
+that reservation through idle periods, replacements and cleanup retries. Actor
+calls do not charge those resources a second time. Registered GPU pools retain
+their existing device inventory and exclusive assignment rules.
+
+Preparation protects one declared heap reservation per task stage for the whole
+query, including task-only plans. Producers can use additional capacity only
+after leaving every idle stage's minimum available. This deliberately uses a
+conservative minimum across all task stages, including stages on separate
+branches or separated by native materialization. A query whose resident actors
+plus this heap minimum and the largest task CPU request exceed node capacity
+is rejected before workers start. Later actor startup must also preserve the
+CPU minimum for prepared tasks. These progress reservations are separate from
+actual resource usage and are returned during query cleanup.
+
+Temporary node-capacity refusal raises `LocalProcessCapacityError` and does not
+cache a model initialization failure. After the other owner closes, the same
+registered model can retry `prewarm()`. Actual constructor failures remain
+cached, and failed physical cleanup retains its original ownership.
+
+`batch_size` controls each Python call; a physical task can combine multiple
+compute batches. For UDFs that expand small inputs into large outputs,
+`task_input_max_bytes` bounds input accumulation per task. Declare `memory_bytes`
+to account for each task's working heap. The shared-memory transport budget does
+not account for arbitrary allocations made by the UDF itself.
+
+Tasks waiting for shared-memory input or output yield CPU, while retaining their
+heap reservation, process and pool slot. They reacquire CPU before user execution
+continues. Separate task pools can start a consumer even when all existing task
+processes are waiting; there is no shared thread count blocking that consumer.
+Ready-to-resume tasks take priority over fresh grants. A new resident actor must
+also leave CPU for suspended tasks to resume. Completion returns CPU and heap
+even while the result still holds its pool slot. Cancellation and failed
+transport skip reacquisition and return retained resources at completion.
+
+Process-resource grants rotate between eligible pools, with one grant per pool
+per round. A continuously busy pool cannot starve another eligible pool, including
+when pools use different runtimes or omit `task_limit`. Pending grants and new
+requests both respect that arbitration.
+
+This matches Ray's separation of batch tasks, process resources and resident
+actors from native pipeline width. Local still uses subprocess IPC and bounded
+shared memory; Ray owns cluster placement, its object store and distributed
+recovery. Their transport budgets and default capacity detection are distinct.
+
+Within each shared pool, its ordinary FIFO queue and each runtime policy also
+rotate, with one grant per source per round. Queries with and without
+`task_limit` therefore share cached pools fairly. A runtime has one source
+regardless of its query count, and preserves its own query-level ordering.
+Policies at their runtime limit are skipped without reserving a pool slot;
+closing one query keeps the source subscribed until its last query closes.
+
+Tasks blocked on shared-memory input allocation or output grants temporarily
+yield their runtime allowance. This lets a downstream consumer run and release
+the bytes they need. They reacquire an allowance before resuming execution;
+submitted tasks ready to resume take priority over fresh admission. The byte
+budget is rechecked after reacquisition, so this does not overcommit memory.
+Suspension and resumption run outside the memory-budget lock.
+
+Task workers retired after completion or idle-cache eviction remain in the
+process inventory until `close()` succeeds. A failed retirement never makes
+that worker reusable or releases its inventory count. Executor cleanup retries
+the pool's retired workers; the task runtime retains them even after the final
+pool reference is released, and a failed runtime close can be retried explicitly.
+A closed runtime with pending worker cleanup cannot be replaced by a fresh one.
+Worker acquisition retries retained retirements before spawning or waiting for
+a free slot. A failed retry returns a task error and its execution resources;
+shared-pool peers do not wait indefinitely behind an unclosed retired worker.
+
+Each subprocess worker starts its own session. Its process group and observed
+engine descendants remain owned after the worker PID exits. Shutdown terminates
+remaining live descendants before confirming cleanup or returning process
+capacity. A failed termination retains that owner for a later close; inherited
+fork finalizers cannot signal the parent's workers. A zombie has already
+released execution resources and is left for its parent to reap.
+
+When a cached task callable fails to close, the executor and its original async
+loop remain owned outside the idle callable LRU. The same cache key must finish
+that cleanup before another task binds a new loop. Clearing the idle cache does
+not discard outstanding cleanup. Runtime close captures bounded exception types
+and numeric diagnostics before transporting the error, including cleanup errno.
+
+`max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
+may be zero to require immediate admission. A full queue raises
+`TaskAdmissionQueueFull`; native execution surfaces this as a query error.
+Clean up the failed execution before retrying it. Refusal reserves no capacity
+and is not a cached model initialization failure. The queue is not a bound on
+all query inputs, bytes, prepared plans, or resident processes.
+
+The returned query resources now also contain a `QueryTaskAdmission` owner.
+Retain and shut down **all** returned resources after executors finish, as in
+the registration workflow. Query shutdown removes its pending requests and
+unused ready grants. Running tasks retain ownership until their backend futures
+finish, including cancellation/failure cleanup. A task waiting for shared-memory
+capacity retains its worker slot, heap reservation and query owner while yielding
+its CPU and runtime execution allowance. Cancellation wakes both memory and
+allowance waits without releasing another query's capacity. Cancelling one query
+does not close its shared model or release another query's allowances. A runtime
+close waits for these query owners, including task-only queries;
+`kill=True` does not revoke running work. Drain prevents new preparation while
+allowing already prepared queries to finish.
+The shared query admission gate closes before model draining starts, so
+task-only preparation cannot enter between the two drain operations.
+
+The runtime allowance and task pool slot are released when execution finishes,
+even if the result has not yet been consumed. Buffered results retain their
+output ownership, and shared-memory references keep their byte accounting until
+downstream releases them. Output flow control bounds buffering independently of
+execution slots. Releasing an older result cannot release a newer invocation
+that has reused its slot.
+
+`resource_snapshot()["task_admission"]` reports the limits, `running_tasks`,
+`ready_tasks`, `queued_tasks`, `waiting_tasks`, `resuming_tasks`, query owners,
+and drain/close state. Waiting tasks include those waiting to resume; their
+counts are not additive. Both remain tracked until backend completion and
+are bounded by their physical pools, separately from the pending admission
+queue. The running and ready counts sum to the currently reserved runtime task
+capacity. Omitting `task_limit` skips the runtime-wide allowance and bounded
+query queue. Pool slots and process-wide CPU/heap resources still constrain
+admission.
+
+This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
+contract. Its fair queue consumes a backend-neutral, nonblocking
+`AdmissionCapacity` adapter, initially implemented for local subprocess pools.
+It does not install a runtime queue in Ray or replace Ray authorization.
+Strict input/output byte envelopes are described below. Dependency-aware byte
+waiting is available through the [bounded byte waiting](#bounded-byte-waiting)
+configuration delivered under [#841](https://github.com/AstroVela/vane/issues/841);
+this task limit alone does not establish a whole-process memory bound. Yielding during
+transport waits lets consumers with available workers use the execution
+allowance. It does not pre-reserve worst-case UDF output expansion or account
+worker heap buffers as shared-memory allocations.
+
+## Retained shared-memory data
+
+Enable an optional runtime data ledger to observe the lifetime of shared-memory
+inputs and outputs across prepared queries:
+
+```python
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    track_data=True,
+)
+query_resources = models.prepare(plan, bindings, conn=connection)
+data = models.resource_snapshot()["data"]
+```
+
+`track_data` is independent of resident and task limits. It also permits empty
+model bindings for task-only or other unregistered local subprocess plans.
+Preparation attaches one `QueryDataScope` to every collected subprocess actor
+and task, preserving their captured session configuration and existing pool
+ownership. Other backends are rejected before preparation. Retain and shut down
+all returned resources after executor cleanup, as with model and task owners.
+The data-query gate closes before task and model drain, preventing new data-only
+preparation while allowing prepared queries to finish.
+
+The ledger uses transport provider and shared-memory name as an allocation
+identity. It charges the descriptor's IPC size, including its header, once per
+live allocation in the runtime. Repeated input slices, concurrent readers, and
+overlapping input/output roles do not multiply that total. Sizes must agree
+while an identity is live. The ledger records identities, sizes, counters, and
+pending input-cleanup owners, without retaining caller or query objects or
+request tracebacks.
+
+- A task borrows its shared-memory inputs before dispatching them to a worker.
+  The borrow lasts through backend completion, including failure or cancellation
+  cleanup. A worker's input ACK can return independent input-transport capacity earlier; it
+  does not end this data borrow. Failed input cleanup keeps the borrow charged
+  and the query active until transport cleanup succeeds. Query `shutdown()`
+  retries those input leases, including partially released inputs and failures
+  before dispatch; runtime close waits for that cleanup. Pending ref releases
+  remain shared with later borrowers: retrying an earlier query transfers
+  cleanup to the remaining borrowers without releasing their inputs. While
+  an owner's release call is running, a new borrow of that input fails before
+  dispatch; retry only after cleanup returns and the input is still valid.
+  This also applies to
+  accounting with `track_data=True` and no byte limit.
+- An output owner follows `generator_pending`, `unit_queue`,
+  `downstream_input`, and `external_consumer` lifetimes. Backend completion
+  returns execution allowances while output owners remain with buffered results.
+  Consuming or dropping a result releases only that owner's reference.
+- Materializing a tracked output forks an owner onto the Arrow foreign buffer.
+  Tables, slices, arrays, buffers, and zero-copy NumPy views keep the allocation
+  accounted for until their last underlying mapping is released. They remain
+  valid after query cleanup and runtime close. A deferred mapping close retains
+  its owner until the existing shared-memory cleanup retry succeeds.
+
+`resource_snapshot()["data"]` reports:
+
+| Field | Meaning |
+| --- | --- |
+| `retained_bytes` | Deduplicated bytes across all live input and output leases |
+| `input_bytes`, `output_bytes` | Deduplicated bytes within each role |
+| `output_state_bytes` | Deduplicated output bytes within each lifecycle state |
+| `allocations`, `leases` | Distinct transport allocations and their live owners/borrows |
+| `queries`, `tasks` | Query scopes and tasks awaiting backend completion or input cleanup |
+| `draining`, `closed` | Preparation and runtime shutdown state |
+
+Role and state counters overlap; do not sum them to obtain total retained bytes.
+For example, a 64-KiB output borrowed by two queries reports 64 KiB of input,
+64 KiB of output, and 64 KiB retained. Closing the runtime waits for query/task
+owners, not consumer output views. A closed runtime can therefore continue to
+report retained bytes until those views are released.
+
+This increment provides accounting without a new byte admission policy. It
+observes allocations once they enter the local subprocess transport; it does
+not measure Python/Arrow heap copies, worker-retained objects, model heap, or
+DuckDB memory. UDF results returned directly as in-process `pa.Table` objects
+instead of shared-memory ref bundles are outside output accounting. Separate
+runtimes have separate ledgers. Omitting `track_data` creates no runtime data
+owners and preserves the existing transport-budget behavior.
+
+The output owner and forward-state/release policy are extracted from Ray into
+`vane.execution.data_lifecycle` and used by both backends. Ray keeps its manager,
+query-generation authorization, object-store reservations, and existing import
+path. Common tests exercise that owner against both local and Ray managers.
+Strict retained-byte admission and output-completion reservations are described
+below. Data accounting alone preserves the observational behavior above.
+
+## Streaming output backpressure
+
+Ray and local subprocess UDFs share the downstream event/byte window policy in
+`vane.execution.udf_stream_backpressure`. An empty native DATA window stops
+reading further blocks. A nonempty soft byte window accepts one complete block
+that exceeds its target, then waits for new downstream capacity. Terminal,
+error, and cancellation messages do not consume DATA capacity.
+
+Each task or actor invocation has a two-block unread producer window. Ray
+enforces this with four generator objects (a data/metadata pair per block).
+The local stream adapter grants a permit before the worker advances its UDF
+output iterator, and returns it when the capacity-aware native reader takes
+that block. A slow consumer therefore pauses fanout inside the invocation.
+The window belongs to the invocation, not the reusable worker. Cancellation
+wakes a blocked producer, and the worker must complete its terminal protocol
+and cleanup before reuse.
+
+The local reader, like the Ray collector, requests exact-byte query output
+admission only after native DATA capacity is available. Receiving a worker's
+descriptor does not request that grant. A pending grant wakes the reader
+asynchronously; it does not block the worker response loop or the native
+scheduler. Other invocations' terminal events can still advance, while each
+invocation's terminal event stays behind its own output blocks.
+
+A multi-block result requests admission once for its complete byte size.
+After that grant, its lease is partitioned into independent physical block
+owners before the group is handed to the consumer.
+
+Worker completion returns physical execution capacity independently of the
+reader. Unread blocks retain their producer's query task lease and pending
+output estimate until they are admitted or discarded. Admitted output leases
+then retain exact bytes until their descriptors and zero-copy views are
+released, even after the producer and query have closed.
+
+Stream permits do not release storage or task resources. Pooled allocations
+remain charged while any descriptor, Arrow/NumPy view, worker read lease, or
+fork pin retains them. The input ACK records the consuming dependency and
+returns the acknowledged output's progress credit. Overlapping slices cannot
+multiply reserved bytes.
+Ordinary output admission allows a consumer holding live input to finish one
+complete block across the soft transport window. Each output source also has
+a bounded allowance to produce the next block, so an actor that releases its
+previous input only after receiving the next batch can advance. This includes
+sources with no live output of their own: in a longer pipeline, the retained
+block may belong to an intermediate operator.
+This additional allowance stops at two pending or unconsumed outputs per source
+across invocations. A downstream input ACK returns that output's progress credit,
+even while a worker view or fork pin retains its storage. The physical allocation
+and byte charge remain until the last lease is released. Each source may allocate
+one next-call input while it has room in this progress window; another input
+must wait for that input's byte charge to be released. This lets the next call
+reach output admission without opening an unbounded input queue. Explicit per-task byte
+envelopes keep their hard boundary. The physical arena always enforces its own
+capacity, including allocation rounding and fragmentation; it does not spill.
+If none of the waiting writers can fit an output even after every unrelated
+allocation is released, the arena reports a capacity error instead of waiting
+indefinitely on their pinned inputs. The pinned working set includes inputs
+reported as retained after a worker finishes its call and clears temporary
+references. These inputs may need another call before the actor can release
+them, so they cannot be assumed reclaimable while waiting for that next output.
+
+These bounds cover transport output, not arbitrary intermediate heap objects
+allocated inside user code before it returns or yields a table. A UDF that
+materializes its entire result before yielding still owns that heap allocation.
+
+## Reusable local transport storage
+
+Materialized inputs and subprocess outputs use one bounded shared-memory arena
+owned by the parent process. Workers share the arena and cache its mapping across
+tasks. Allocations carry a generation so a stale descriptor cannot refer to a
+later output that reuses the same offset. Multiple output blocks can share one
+allocation; its space becomes reusable only after every block is released.
+Large allocations use size classes with at most 6.25% rounding overhead, so
+small IPC metadata changes between batches do not strand a nearly usable slot.
+Physical capacity includes this rounding.
+
+Stream-window permits are independent of storage ownership. Input acknowledgments
+return progress credits without reserving replacement output bytes. Pooled
+input and output bytes remain charged to the transport budget until the allocation's last
+physical lease, including worker views and fork pins, is released. Before sending
+an input, the parent registers a read lease for the receiving worker. Arrow and
+NumPy views retain this lease through the underlying buffer owner, including
+views saved in actor state after a task returns. Last-buffer notifications use a
+separate channel so they can arrive while the task channel waits for an output
+grant. A disconnected channel does not release a worker's buffers: cleanup must
+first confirm that the process exited. Failed process cleanup retains ownership
+for retry.
+
+When a UDF forks, the worker also pins all live remote input leases, including
+views retained by an earlier invocation. Last-buffer notifications wait for the
+inheriting child and its descendants to exit or exec. One lifetime pipe per
+worker, transferred at startup, lets the parent retain outstanding input regions
+even if the worker exits before those descendants. Retiring the storage peer
+after unexpected worker exit transfers these leases to arena pins; they keep
+preventing reuse and page reclamation until the inherited writers close.
+Explicit executor shutdown first terminates the worker's process group and
+observed descendants, including fork readers, before retiring its storage peer.
+Ordinary batches do not allocate additional descriptors. Worker-client cleanup
+and inherited input finalizers check the creator PID before touching locks,
+release queues, or sockets, so a fork child's normal exit cannot shut down its
+parent's release channel.
+
+`VANE_LOCAL_SHM_STORE_BYTES` sets the physical transport arena's capacity. The default
+`auto` uses the minimum of 200 GiB, 30% of available system memory, and 95% of
+available `/dev/shm` space when the store is created. Pages are populated on use;
+the arena's virtual size is not its resident memory. Each worker maps the entire
+arena on first use and retains that mapping across tasks. Processes using
+`RLIMIT_AS` must leave room for this mapping in addition to their heap and IPC
+buffers; set `VANE_LOCAL_SHM_STORE_BYTES` explicitly when testing within a fixed
+address-space allowance. The automatic transport budget uses half of the configured
+or automatically sized arena, including on small `/dev/shm` mounts, leaving space
+for a consuming stage's output. The arena limit is separate from
+`VANE_LOCAL_SHM_REF_BUDGET_BYTES` and runtime data admission. It covers pooled UDF
+inputs and outputs, not model heap, source Arrow tables, or control allocations. Ordinary
+outputs wait for physical releases when live buffers or fragmentation temporarily
+prevent an allocation, releasing their byte grant and worker CPU while waiting.
+Cancellation wakes this wait. If the current input plus output cannot fit, or
+all live regions are inputs of writers waiting for output space, admission reports
+a capacity error instead of waiting cyclically. Explicit byte envelopes retain
+their strict capacity error. Reduce input/output block sizes, release retained
+views, or increase the store capacity when the working set cannot fit.
+
+Materialized inputs and outputs are measured with a counting IPC stream before byte admission, then
+serialized directly into the granted arena region. Publication requires the
+exact measured size; no intermediate payload buffer is copied into the arena.
+The shared writer matches Ray's large-buffer copy policy: individual writes
+larger than 1 MiB use six copy threads and 64-byte blocks. Smaller writes remain
+serial. The copy completes before the result descriptor is published.
+
+On Linux, releasing the last worker and query owner decommits wholly free pages.
+Returned Arrow views remain valid after runtime shutdown; the arena closes after
+the last view is released. Cleanup failures retain the store for retry. Normal interpreter
+exit unlinks arenas owned by that process even when views remain alive, without
+invalidating their mappings for later exit callbacks. Forked children do not
+reclaim inherited parent allocations or arenas. Allocation-lease release and
+arena cleanup check the owning PID before acquiring locks, including releases
+from block-ref finalizers and retained-view destructors. This prevents a child's
+stale free list from decommitting pages subsequently allocated by the parent.
+After `os.fork()`, the child starts with an empty output-store registry and a
+new registry lock. New workers allocate from child-owned arenas. Inherited
+stores and allocation leases reject new allocations, borrows, and buffer access
+before taking any inherited lock; they cannot reuse the parent's copied free
+list. Parent-owned results and already materialized views keep their existing
+ownership and cleanup rules. Worker-peer cleanup also checks its creator PID
+before taking locks or shutting down the release channel, so inherited executor
+finalizers cannot close the parent's live channel when a fork child exits.
+Before a driver forks, its live allocations gain process-lifetime pins. The
+parent cannot reuse these regions or decommit their pages after releasing its
+own Arrow or NumPy views. An inherited pipe writer keeps the pins alive until
+the child and any inheriting descendants exit or replace their address space
+with `exec`; this includes normal exit, `os._exit()`, and signal termination.
+These pins conservatively last for the inheriting processes' lifetimes even if
+they drop the views earlier, and count against the physical arena capacity.
+Allocation and cleanup paths collect completed pins synchronously; a background
+watcher also drains idle stores. Fork preparation uses a separate allocation
+mutation lock without acquiring registry, store, or lease locks. Automatic
+cyclic GC is paused before acquiring that mutation lock and restored after the
+last owner or waiter leaves. This prevents Arrow/NumPy view finalizers from
+taking store or lease locks in reverse order inside the mutation critical
+section. Nested acquisitions preserve the caller's original GC setting; the
+fork child discards parent-thread pause counts before restoring its own GC
+setting after registry reset. If notification setup fails, the affected regions
+remain pinned until owner-process exit, rather than being reused without proof
+that inherited views are gone.
+`vane.execution.udf_shm_store.local_shm_store_snapshot()` reports mapped capacity,
+live allocation bytes, allocation counts, and reuse counts for diagnostics.
+
+## Strict shared-memory byte admission
+
+Pass `data_limit` to reserve a complete input/output envelope before each UDF
+invocation is submitted. It automatically enables data tracking and supports
+registered actors, query-owned actors, and task-only native plans:
+
+```python
+from vane.execution.udf_data_admission import DataAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=256 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=16 * 1024**2,
+    ),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=32),
+)
+```
+
+All three byte limits are positive integers, and the total must fit at least
+one input/output envelope. `task_limit` remains optional. Byte-limited plans
+must use local shared-memory ref-bundle output; preparation validates every
+node before creating actor pools. Native local plans use this transport.
+
+Existing task/pool arbitration runs first. Before its ready state is exposed,
+the byte authority reserves the full per-task input and output bounds from
+both the runtime ledger and the process transport budget. A refusal returns
+any unused worker/thread/task grant immediately. No worker is submitted while
+waiting for bytes. Ordinary and runtime-limited queries keep their existing
+pool arbitration, and ready reservations are released on executor/query
+cleanup if they are never submitted.
+
+**By default, byte admission refuses immediately when capacity is unavailable.**
+`DataAdmissionCapacityError` identifies the runtime or transport owner and
+reports requested, used, and limit bytes. It does not cache an initialization
+failure. A refusal observed by a reentrant pool or transport wakeup is handed
+back to the request/state caller using fresh exception objects, and does not
+become a permanent callback failure. Native execution surfaces the refusal as
+a query error; release that execution's resources and retained consumer views
+before retrying. A query can
+be refused partway through a pipeline when its buffered results and the next
+complete envelope cannot coexist, even when each batch fits individually.
+Set `DataAdmissionLimits.wait` to enable the bounded waiting mode described
+below. Neither mode automatically replays a query or UDF.
+
+The input and output bounds count exact IPC bytes, including headers. All
+blocks in one task's output share its output bound; repeated input slices of
+the same allocation count once. An oversized materialized input is rejected
+before creating its shared-memory allocation. Existing input descriptors are
+validated before scheduling. Workers request the total output bytes before
+allocating output mappings; an oversized output fails there. An output refusal
+can occur after user code has run, so it never authorizes replay of that UDF.
+Choose smaller batches or larger explicit bounds for oversized work.
+
+An admitted task draws input allocations and output grants from its protected
+transport reservation, without a second byte wait. Other transport users see
+that reservation in the same shared-memory budget. Input ACKs do not create
+output reservations. Cancellation, failed submission/startup,
+worker exit, and unused grants return their unused envelopes exactly once.
+The task reservation keeps track of consumed output grants until they become
+result allocations or are released. At backend completion it also retries any
+grants left by failed delivery or worker cleanup. A failed grant or unused-byte
+cleanup keeps its runtime/query owner and conservative byte charge for an
+explicit cleanup retry; runtime close waits for that confirmation. Cleanup
+does not release result allocations or grants belonging to another task.
+
+As descriptors enter the ledger, reserved bytes convert to actual allocation
+ownership. Shared allocations remain charged once across queries and roles.
+Unused input headroom remains reserved until task completion even when an
+input already exists in the ledger; this is a conservative envelope, not a
+second charge for that mapping. Backend completion returns unused reservations;
+input borrows are released after input transport cleanup succeeds. A failed
+input cleanup can return unused headroom while keeping the actual input bytes
+charged. Output references and zero-copy views retain their actual bytes until
+the last owner releases them, including after runtime close.
+
+The data snapshot additionally reports `limit_bytes`, the two per-task bounds,
+`input_reserved_bytes`, `output_reserved_bytes`, `reserved_bytes`,
+`reservations`, and `usage_bytes`. The invariant is:
+
+```text
+usage_bytes = retained_bytes + reserved_bytes <= limit_bytes
+```
+
+This bound covers data admitted to this runtime's transport ledger. Native
+inputs waiting to be submitted, Python/Arrow serialization and decoding copies,
+worker/model heap, DuckDB memory, and other runtimes remain outside it. The
+process transport budget continues to account its own allocations and exposes
+`task_reserved_bytes`; it is a separate constraint, not another runtime limit.
+
+The protected task/output byte arithmetic comes from Ray's resource manager
+and now lives in `vane.execution.byte_budget`. Both managers use it. Ray keeps
+its soft shares, liveness escapes, authorization, and object-store transport;
+the local strict envelope neither changes Ray's limits nor enables its spill
+or dependency-aware waiting on local execution.
+
+The same module also exposes `allocate_resource_reservations` and
+`build_byte_budget_state` for operator budgeting. Ray supplies current-phase
+eligibility, resource demands, concurrency maxima, and its existing arithmetic
+tolerance. The shared calculations preserve baseline reservations, equal
+surplus shares, proportional allocation under pressure, integer byte rounding,
+and separate protected task/output capacity. Ineligible operators' retained
+bytes remain charged before the available budget is divided.
+
+These helpers calculate policy from an accounting snapshot; they acquire no
+resources and supply no spill or scheduling capability. Ray retains its graph registration,
+authorization, learned output estimates, and bounded liveness decisions. Local
+execution can also apply the per-UDF byte policy described below, while
+retaining complete task envelopes and checking hard shared-memory capacity
+independently of soft reservations.
+
+## Shared resource graph and local execution identity
+
+`ResourceGraphMetadataProvider.collect_resource_graph_metadata(conn=...)` is the
+common internal plan-adapter interface. `LocalResourceGraphAdapter` exports
+metadata without changing the plan's UDF payloads; `RayResourceGraphAdapter`
+registers the existing Ray query/operator identities during collection. Both
+return the same schema, including `udf_node_ids`, a mapping from graph nodes to
+physical UDF binding IDs. Consumers must use this mapping because Ray's
+pipeline order can differ from the physical execution traversal.
+
+Local collection reads the physical execution graph directly through
+`collect_local_resource_graph_metadata()`. It does not construct a distributed
+plan, assign temporary scan/UDF identities, or use a distributed operator
+support list. `GetChildren()` exposes ordinary and owned execution subtrees;
+`GetMaterializedInputChildren()` describes the native operator's blocking
+inputs. Streaming sinks have no completion barrier, hash joins build their
+right side, and IE/ASOF joins materialize both sides. A local exchange uses the
+same streaming/buffer configuration for metadata and pipeline construction.
+When only some inputs materialize, their barriers sit on those input edges;
+upstream UDFs on the other inputs can run concurrently under native scheduling.
+Registered model prototypes use the same native collector after binding and
+planning their Relation, without exporting or serializing a distributed plan.
+
+CTE and delim scans reference their producer's materialized input. Local
+metadata expands owned delim-join plans, including their UDFs. Ray still
+serializes those plans into a worker fragment; graph registration rejects an
+internal UDF that has no corresponding resource unit instead of omitting it.
+Recursive CTEs and their working/recurring-table scans retain their native
+structure. Both the seed and recursive branches expose their UDF units;
+iteration feedback and working-table storage remain owned by DuckDB rather than
+forming cycles in the resource graph. Sinks inside a repeated body do not
+retire its resources through one-shot completion barriers. Graph
+tracking and byte waiting therefore do not require distributed recursive-query
+support. Ray's existing recursive-scan rejection is unchanged.
+Repeated recursive steps that invoke a UDF still have a native executor restart
+limitation: task UDFs can stop early, and actor UDFs can time out. This also occurs
+with graph tracking disabled and requires separate execution-layer work.
+
+Both backends use `vane.execution.resource_graph.ResourceGraph` for dependency
+validation, deterministic ordering, materialization barriers, and phase
+eligibility. Backend-specific unit validation remains separate: local units
+identify native fragments, subprocess tasks and subprocess actor pools; Ray
+units retain their existing process demands, output windows and authorization.
+Local graph modules do not import Ray or its cluster resource coordinator.
+Native collection does not read distributed join, worker sizing or shuffle
+settings and does not modify the plan or process environment. UDF
+execution continues to use the session's captured configuration; Ray execution
+keeps its distributed planning settings.
+
+Enable graph and UDF diagnostics explicitly with `LocalModelRuntime(...,
+track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},
+conn=conn)` accepts local subprocess plans without model bindings, data tracking,
+or admission limits. Each preparation gets a fresh execution query ID, even
+when the same physical plan is executed again. Its UDF resource-unit contexts
+travel in executor options, independent of model initialization fingerprints.
+`UDFExecutor.resource_identity()` returns this context without changing numeric
+executor statistics. Models can remain resident across independently rebuilt
+queries and across concurrent executions.
+
+`runtime.resource_snapshot()["prepared_query_graphs"]` reports graphs whose
+preparation diagnostic owners have not been released. Direct `prepare()` callers
+must shut down every returned owner, as for other preparation resources. Requests
+handle this automatically; `request.resource_graph_snapshot()` retains the
+structural snapshot for that request after execution. Runtime close clears the
+diagnostic registry after its existing resource cleanup gates succeed. Snapshots
+contain identities and dependencies, not serialized functions or credentials.
+Releasing a graph diagnostic owner does not assert that other owners' cleanup
+has succeeded.
+
+These snapshots are marked `phase_tracking="structural_only"`. They expose
+`initial_eligible_unit_ids`, not a live phase or a count of running operators.
+The barriers come from the native operators' input contracts; local
+still executes its native plan and does not emit barrier completion events into
+this graph. DuckDB manages native sort, aggregation and join-build memory
+inside local execution, as it does inside each Ray worker. Per-UDF byte budgets
+use UDF admission lifetimes. Bounded waiting additionally protects the UDFs of
+each activated query, without inferring native phase completion.
+Graph tracking does not enable
+local spill or change admission
+limits. Tracking traverses all native execution children and accepts only local
+subprocess UDFs; unsupported UDF backends are
+rejected before model acquisition.
+
+## UDF resource attribution
+
+With `track_graph=True`, `runtime.resource_snapshot()["udf_units"]` and each
+prepared/request graph snapshot's `udf_units` report activity by the same
+`query_id`, `resource_unit_id`, `physical_node_id`, and `backend` used by the
+graph. Tasks are observed at submission, worker execution, and completion:
+
+- `preparing_tasks`: preparing inputs after task admission.
+- `submitted_tasks`: dispatched to the pool, before its worker callback starts.
+- `running_tasks`: executing a worker callback, excluding observed memory waits.
+- `completing_tasks`: worker completion and result/cleanup callbacks. A shutdown
+  timeout does not erase callbacks still in progress.
+- `queued_tasks` and `ready_tasks`: requests queued for task/pool capacity and
+  grants ready for submission. Each executor can have one such request.
+  Custom pool authorities without passive observation report these counts
+  (and the `task_capacity` reason) as `None`.
+- `waiting_tasks`: submitted work waiting for shared memory or reacquiring its
+  execution allowance. `waiting_by_reason` separates `shared_memory_input`,
+  `shared_memory_output`, `execution_capacity`, and queued `task_capacity`.
+  With byte waiting enabled, it also includes queued `byte_capacity` requests
+  that own no execution slot.
+- `byte_refusals`: counts strict admission refusals from the runtime or process
+  transport budget. With byte waiting enabled, it counts transitions into
+  runtime/transport byte pressure; waiting counts are reported separately. If
+  only data views survive after their diagnostic scope is collected, this
+  historical counter is `None`; live byte attribution remains available.
+
+These counters describe UDF callbacks, including transport and worker startup;
+they do not measure native operators or CPU utilization. Reading them never
+requests admission, reserves bytes, or invokes wakeup callbacks. Snapshots copy
+independently locked owners and are diagnostic observations, not one atomic
+scheduler state. They contain scalar identities/counts only and do not retain
+executors, requests, futures, or input buffers.
+
+The `data` member is `None` unless `track_data=True` or `data_limit` is also
+configured. When enabled, it reports unique associated `retained_bytes`,
+`input_bytes`, `output_bytes`, allocation/lease counts, unused input/output
+reservation bytes, and `cleanup_pending_tasks`. Failed cleanup keeps its unit
+identity until the existing cleanup owner succeeds. Consumer output views
+preserve the producing UDF's identity after query or runtime shutdown.
+
+An allocation borrowed by multiple UDF units appears in each unit's retained
+bytes and `shared_retained_bytes`. These unit totals **must not be summed** to
+estimate runtime usage; the runtime data ledger charges each allocation once.
+Input and output roles can overlap for the same reason. Unit reservation bytes
+are unused portions of existing task envelopes, not additional reservations.
+Untracked/native allocations and process-transport output grants that have not
+become ledger allocations are outside these retained-byte counts.
+
+The runtime lists prepared UDF units and units with live activity or data
+owners. It drops finished, empty units even if a caller keeps an old plan.
+A retained request graph can still show that request's final empty units.
+Graph tracking supplies attribution. Per-unit byte admission is enabled
+separately through `data_limit.unit_reservation_ratio`; progress-preserving byte
+waits are enabled through the [bounded byte waiting](#bounded-byte-waiting)
+configuration.
+
+## Per-UDF byte budgets
+
+Set `unit_reservation_ratio` on the existing data limit to share its capacity
+among UDF units through the common byte-budget policy:
+
+```python
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=256 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=24 * 1024**2,
+        unit_reservation_ratio=0.5,
+    ),
+)
+```
+
+The default `None` preserves aggregate byte admission. A finite ratio from zero
+through one enables unit budgets and automatically enables local resource-graph
+collection. The plan must therefore support that metadata interface. Model
+bindings, captured session configuration, local subprocess backend requirements,
+and shared-memory output requirements follow the existing preparation contract.
+
+The runtime ledger calculates shares and checks admission under the same lock
+that records reservations and allocation ownership. Eligibility comes from
+unfinished task/ready reservations and the UDF making the current byte request.
+Prepared units alone receive no share. An open query's unit remains eligible
+while it has unfinished reservations. Query shutdown fences admission and
+removes its units from eligibility. Retained data and pending cleanup charges
+still reduce the available budget.
+This uses UDF lifetimes and does not infer live native phases from the graph.
+
+Each eligible unit has a baseline of one complete input/output envelope and a
+maximum equal to the runtime byte limit. The shared
+`allocate_resource_reservations` calculation preserves fitting baselines and
+divides the configured fraction of surplus equally. Under pressure it allocates
+that fraction proportionally; unallocated and rounded bytes stay shared. A zero
+ratio still preserves fitting baselines. Ray uses the same arithmetic with its
+own demands and eligibility; its object-store baseline remains zero because it
+does not require a local-style complete task envelope.
+
+The unit's protected output portion is its share multiplied by the declared
+output/envelope ratio, rounded upward. The rest protects task/input bytes. This
+supports unequal input and output bounds, including a budget that fits exactly
+one complete task. The common `build_byte_budget_state` accepts this explicit
+split; Ray retains its existing half-output split by default. Admission applies
+the common byte checks to input and then output against one candidate state.
+Both portions and process transport capacity must fit before publishing a grant.
+Previously admitted tasks retain their full output reservation when shares
+change. Runtime and transport hard limits continue to apply to every grant.
+
+Budget accounting assigns each allocation's entire charge and input/output
+classification to its first ledger lease until the last lease is released.
+The charge stays with that unit even after its query finishes or only another
+unit's input borrow remains. No query or executor object is retained for this
+identity. Each unused reservation belongs to its submitting unit. The sum of
+these unique charges equals runtime `usage_bytes`; the overlapping per-unit
+associations described above remain available for diagnostics. Borrowing an
+already charged allocation keeps the borrower's unused input headroom reserved,
+as in aggregate admission.
+
+`resource_snapshot()["data"]["unit_budget"]` reports:
+
+- `reservation_ratio`, total `usage_bytes`, and `inactive_usage_bytes` charged
+  before eligible shares are calculated.
+- `shared_pool_bytes`, `shared_used_bytes`, and `shared_remaining_bytes`.
+- `units`: scalar UDF identities, `eligible`, unique `usage_bytes`,
+  `output_usage_bytes`, `protected_task_bytes`, `protected_output_bytes`, and
+  per-unit `shared_used_bytes`. Output usage includes unused output envelopes as
+  well as allocations first charged as output. These counters are distinct from
+  retained-output association counts.
+
+Reading snapshots is passive. With `wait=None`, a unit-share refusal raises
+`DataAdmissionCapacityError` with `resource_unit_id` and an input/output
+`reason`, and returns the unused task/pool grant. It can occur while aggregate
+capacity remains because another eligible unit's share is protected. Existing
+task/pool arbitration is preserved. Release retained data or finish admitted
+work before retrying. Bounded waiting uses the additional progress contract below.
+
+## Bounded byte waiting
+
+Enable automatic byte waits with a finite queue bound and timeout:
+
+```python
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+runtime = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=512 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=24 * 1024**2,
+        unit_reservation_ratio=0.5,
+        wait=DataAdmissionWaitLimits(max_queued_tasks=32, queue_timeout=10.0),
+    ),
+)
+```
+
+Waiting requires bound local UDF resource units and enables graph collection
+automatically. It protects at least one complete input/output envelope for
+**every UDF in an activated query**, including downstream UDFs that have not
+submitted a task yet. A query activates on its first successful reservation;
+its protected shares last until query shutdown. Merely preparing a query does
+not activate it. This is deliberately conservative: native materialization
+phases do not reclaim these protected shares early.
+
+For example, two UDFs with a 32 MiB envelope need a minimum 64 MiB runtime and
+transport capacity. Preparation raises `DataAdmissionProgressError` if that
+minimum cannot fit the configured hard capacities. Activation waits if other
+active queries or retained results leave too little room for all of its UDFs.
+This includes existing usage above the shares that activation would assign:
+new protected envelopes cannot displace bytes still needed by an active query.
+Completed queries' consumer views remain charged before dividing the available
+budget. Use request admission to bound the number of simultaneous queries.
+
+The common reservation and byte-budget algorithms allocate these shares against
+the smaller of the runtime limit and a finite transport limit. An unlimited
+transport leaves the runtime limit authoritative. When waiting is enabled
+without `unit_reservation_ratio`, its effective ratio is
+zero: fitting per-UDF baselines stay protected and surplus remains shared.
+Previously admitted tasks keep their full envelopes. An upstream UDF can wait
+while the downstream UDF spends its protected envelope and releases the input.
+Native UDF inputs also observe byte pressure before requesting a task. If a UDF
+in the runtime is waiting for bytes, a downstream input may submit a short
+batch below `min_task_batch_size` or `batch_size`, using the existing partial
+batch path. This prevents a consumer from waiting for more rows whose producer
+cannot obtain an envelope. Without byte pressure, normal batch coalescing is
+preserved. Observing pressure acquires no task or byte capacity; short batches
+still pass the same admission and exact IPC-size checks.
+Local graph collection restores the physical plan's original scan identities
+on success and failure, so enabling byte waiting preserves native range,
+table and Parquet scans without requiring distributed split assignments.
+Before fetching another native batch, a drained pipeline drops consumed
+intermediate batches and invokes input cleanup on operator and local sink
+states, including their nested states. Projection, filter, UNNEST, sort/TopN,
+aggregation, window and join scratch inputs release their borrowed references
+after all output from the batch has been consumed. Reference-only aggregate
+chunks also clear their vectors, since they have no owned vector cache to
+restore. Inputs needed by a blocked retry or an operator with more output remain live, and
+externally retained views continue to consume their byte budget until their
+owners release them. Cleanup preserves accumulated aggregate values, join
+tables, sorted runs and window history. DuckDB manages this owned data
+independently of UDF shared-memory accounting.
+Cancellation and execution errors discard buffered native UDF inputs after
+the pipeline tasks stop, even if the caller retains the physical plan. These
+inputs have not acquired task admission and therefore have no worker cleanup
+owner yet.
+Protection concerns the runtime's own ledger; other runtimes and ungoverned
+transport users still compete for the process-wide shared-memory hard capacity.
+That external pressure can cause a bounded wait to time out.
+
+Byte checks run inside the existing physical-slot arbitration, after both a
+pool slot and the declared process resources are available. A successful check
+commits the complete runtime and transport envelope together with those slots,
+before the task policy publishes an allowance. A byte waiter owns none of those
+resources. The native caller can still retain its pending input; this queue is
+not a limit on DuckDB's native buffers. Release and cleanup notifications retry
+pending work without polling or blocking a worker. Repeated rejected guards do
+not keep the fair dispatcher spinning on an unchanged capacity state.
+
+Waiting uses `RuntimeTaskAdmission`'s query ordering and the shared pools'
+existing source/global round robin. With no explicit `task_limit`, it uses a
+capacity-only policy (`TaskAdmissionLimits.max_running_tasks=None`): backend
+slots remain authoritative. With a task limit, its running and queue limits
+also apply. Both paths preserve fairness alongside ordinary cached-pool users.
+
+`max_queued_tasks` is a non-negative count of pending admission requests across
+this runtime; zero requires immediate admission. `queue_timeout` is finite,
+positive, in seconds, and starts at the admission request. It includes time
+waiting for task/pool capacity as well as bytes. Immediate grants create no
+watcher thread. Queued requests reuse the monotonic deadline watcher; expiry
+is checked again before publishing a grant. Full queues raise
+`DataAdmissionQueueFull` (or the separately configured `TaskAdmissionQueueFull`).
+Expired requests report `DataAdmissionTimeout`; native execution surfaces the
+failure as a query error. Exact IPC input/output bounds still fail promptly
+with `DataBatchTooLarge`, even in waiting mode. An output bound covers the sum
+of all output blocks in a task, not each compute batch separately.
+
+Query shutdown and request cancellation remove pending requests, stop their
+watchers and release unused grants. Failed transport cleanup retains its owner
+and charge for retry. Drain fences new preparation and lets already admitted
+queries finish; it does not cancel their waits. Runtime close still waits for
+those query owners. Consumer views remain valid and charged until released.
+
+Snapshots expose `queued_byte_admissions`, `max_queued_byte_admissions`, and
+`byte_queue_timeout` under `data`, plus the effective `unit_budget` shares.
+`data.unit_budget.limit_bytes` reports the capacity used to protect those shares;
+`data.limit_bytes` remains the configured runtime limit.
+`udf_units[*].waiting_by_reason.byte_capacity` identifies UDFs waiting for bytes.
+Snapshot reads are passive. Waiting does not add spill, exceed a hard limit,
+replay user code, or govern native sort/aggregation/join memory.
+
+## Ray boundary and validation
+
+The registry uses the `shutdown` and `cleanup_pending` contracts already exposed
+by both local and Ray actor pools. Adapter tests exercise both implementations.
+Local registration accepts only `subprocess_actor`; it cannot cache a Ray pool
+or its query-generation capability. Ray's driver resource graph, actor identity,
+admission and generation checks remain authoritative and query-scoped. A future
+Ray registry adapter must establish valid query borrowing authorization before
+enabling cross-query model reuse. This change does not resolve the separate
+named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251).
+
+The affected tests include `test_local_resource_graph.py`, `test_udf_resource_usage.py`,
+`test_local_udf_resources_native.py`, `test_udf_model_pool.py`, `test_udf_local_model.py`,
+`test_udf_model_resources.py`, the query resource graph/builder/manager suites,
+`test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
+`test_udf_data_lease.py`, `test_udf_data_transport.py`,
+`test_udf_data_admission.py`, `test_udf_data_admission_native.py`,
+`test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
+`test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
+Request deadlines also have coverage in `test_request_deadline.py`,
+`test_udf_local_request_deadline_native.py`, and the parameterized cancellation
+cases in `test_udf_local_request_cancellation.py`.
+Managed result delivery, retained Arrow views, deadlines, and cleanup retries
+have coverage in `test_result_delivery.py` and
+`test_local_result_delivery_native.py`.
+Adapter serialization also has coverage in `test_pickle.py`, the expression
+class test suites, and `test_ray_udf_plan_replay.py` (run its real-Ray cases in a
+separate pytest process).
+They cover shared contracts, real subprocess reuse, native sequential/concurrent
+queries (including repeated SQL calls and rebuilt class projections),
+captured session isolation in mixed actor/task plans, failed-request collection,
+cancellation, worker replacement, ownership recovery, bounded fair queuing,
+native concurrent mixed plans sharing task capacity across models, shared-data
+deduplication, and output views that outlive query/runtime shutdown. Follow the
+installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+### Backpressure acceptance gate
+
+`scripts/run_release_tests.sh` includes a bounded local-runtime acceptance set
+in its non-Ray process. It runs against the installed native extension with
+real subprocesses and shared-memory allocations; no model download, GPU, or
+external service is required. The complete parameter matrices still run in
+the fast-test shards.
+
+| Contract | Release coverage |
+| --- | --- |
+| Public SQL/Relation serving shares model, request, task, data and result budgets | `test_local_serving_acceptance.py`: synthetic text/image model, concurrent clients, overload, retained Arrow/NumPy views, cancellation/deadlines and worker recovery |
+| Concurrent queries reuse a resident model and return execution/byte capacity | `test_local_runtime_baseline.py`: repeated two-query waves, one task worker, a 420,000-byte budget, projection, and downstream batching |
+| Byte waiting leaves enough space for downstream work | Native chain and progress tests, smaller transport capacity, activation with retained outputs, and partial-batch draining |
+| Native buffers release consumed inputs | Representative UNNEST, sort, TopN, aggregation, join build/probe cases; native range/Parquet scan cases |
+| Slow consumers retain their own bytes without retaining request slots | Native retained-view and managed-result tests, including queued request/result reservation ordering |
+| Cancellation and cleanup failure keep a retry owner | Mixed task/model cancellation and reuse; failed output-grant delivery/cleanup with explicit request or runtime retry |
+| Failed native startup retires its active query before the caller can dispose of the plan | Startup callback failure with both a short query and scheduled range aggregation; the connection can then be reused |
+| Dispatcher notifications cannot be lost while entering a wait | Controlled admission-ready and result-ready notifications between the empty check and the condition-variable wait |
+| Final UDF counters survive native cleanup | `test_execute_native_subprocess_udf_reports_admission_task_stats`, with waiting enabled and disabled, reusing the same plan |
+| Shared Local/Ray contracts remain compatible | Reentrant wakeups, callback removal, late grants after close, exact input handoff, idempotent lease release, retained-output accounting and retry |
+
+Local table-producing `map_batches` and `flat_map` subprocess calls publish
+bounded output blocks as the callable produces them. Each block is serialized
+once into an Arrow IPC buffer; its exact size, including the transport header,
+is admitted before shared memory is allocated. The parent adopts each block
+independently so downstream work can start before the physical task finishes.
+An explicit terminal result retains task completion and slot ownership until
+worker execution and cleanup finish. An error after earlier blocks still fails
+the query, and cancellation releases queued blocks and outstanding grants.
+If reception stops before the terminal response, the worker is retired before
+the pool can serve another invocation. This includes cancellation after a chunk
+arrives or after its buffers are adopted. A cancelled call whose terminal
+response has already been consumed can keep its healthy worker. Intentional
+stream retirement counts as `cancelled_workers`, rather than worker loss.
+Row-preserving calls keep their row-count validation and fused output contract.
+Local IPC transport and Ray's object store remain different implementations;
+this change does not imply equal throughput or equal memory budgets.
+
+Local subprocess and Ray execution now use `QueryResourceManager` and
+`ClusterQueryResourceCoordinator` from `vane.execution` for default admission.
+Both charge declared CPU/GPU/heap, retained task inputs, managed outputs, and
+the same dynamically learned pending-generator window. An undeclared UDF heap
+commitment is zero; worker RSS high-water marks do not become an additional
+local concurrency limit. Native plan preparation installs this policy even
+when `track_data`, `track_graph`, and explicit runtime limits are omitted.
+Ordinary native `CREATE TABLE AS` and `INSERT` queries retain their DuckDB write
+semantics when they include subprocess UDFs. Their resource graph includes the
+UDF inputs and the native write sink as a materialization boundary. This does
+not extend the configured local request runtime's read-only SQL contract or
+enable distributed execution of these native writes.
+
+Both runners use `VANE_QUERY_OBJECT_STORE_FRACTION` (default `0.5`) for query
+soft budgets, split those budgets between live queries, and preserve downstream
+operator reservations with the common bounded liveness policy. Local capacity
+uses the physical shared-memory arena, with the query fraction applied once.
+Query preparation pins that arena before task workers start, so later workers
+use the capacity admitted for the query. The transport reference budget is a
+separate constraint and does not reduce the query capacity a second time; an
+unbounded transport limit still leaves the physical query budget in place.
+Ray capacity comes from its cluster. Their actual object storage and physical
+placement remain backend responsibilities. DuckDB schedules local native
+operators and supplies their materialization ordering; local UDF concurrency does not depend on pipeline
+width or the number of Parquet row groups.
+
+DuckDB can create local dispatchers for the same UDF at different times. When
+the currently registered dispatchers drain, the UDF becomes temporarily idle
+and can accept a later dispatcher. Retained outputs stay charged throughout
+this transition. Materialization phase changes still require native ordering
+evidence; draining the current dispatchers does not seal UDF production.
+
+`VANE_QUERY_RESOURCE_RESERVATION_RATIO` and
+`VANE_QUERY_RESOURCE_REFRESH_INTERVAL_S` configure the same reservation and
+refresh policy for both runners. Concurrent local queries count distinct GPU
+device identities, including when models expose overlapping device subsets.
+
+Actor prefetch defaults to two admitted calls per replica, with one executing
+call. `VANE_UDF_ACTOR_PREFETCH_DEPTH` controls this shared default. Local actor
+queues preserve per-replica submission order and cancellation ownership.
+Admitted materialized inputs are sized and written by the bounded prefetch
+threads before waiting for their actor's execution turn, overlapping the previous
+call's computation. Preparation follows per-replica FIFO order and is speculative:
+it never waits for memory or spends an execution progress allowance. Executing
+calls take priority and can reclaim unclaimed prefetched blocks when they need
+space. The arena tracks reclamation until every snapshotted callback has been
+attempted, including when another output starts reclamation concurrently.
+Capacity waits remain cancellable and recheck queued-input dependencies after
+reclamation finishes, even when callbacks release no bytes or fail. Callbacks
+run outside the arena lock; claimed input views still enforce the physical
+capacity bound. The queued call retains its original Arrow input and prepares
+it again at execution handoff, without replaying user code. Explicit byte reservations
+are consumed only at that handoff. Cancelling a prepared call releases its
+blocks even when it never acquires a worker. Input ACK returns
+the materialized-input progress credit independently of retained physical bytes.
+The input lease owns newly materialized descriptors and releases the parent's
+reference on ACK; worker views and fork descendants retain their physical leases.
+Each replica has its own bounded input progress slot; a queued prefetch for one
+replica cannot prevent an idle replica from accepting its next input. Output
+progress credits remain bounded per producer operator.
+Queued materialized inputs carry a stream identity for physical-capacity waits.
+
+Ordinary synchronous local and Ray `map_batches` actors share the native
+byte-budget transport aggregation policy. A task can carry multiple complete
+compute batches without changing `batch_size`. Ready actors receive a complete
+batch immediately; byte pressure and end-of-input drain partial tails. Explicit
+`min_task_batch_size` retains its existing upstream-block soft-minimum semantics.
+Local automatic aggregation also caps its byte target at half the actual worker
+arena capacity, leaving room for outputs. Query startup installs that capacity
+alongside the actor resource owners before native input planning; pipeline
+threads neither enter Python nor wait for capacity discovery. This remains an
+estimated transport target with the existing
+single-compute-batch and oversized-row rules, not a guarantee that arbitrary UDF
+outputs fit in the arena. Claimed inputs, live views and fork leases remain
+protected from speculative reclamation.
+
+Failed or cancelled workers are cleaned up before their invocation completes;
+their replacements initialize on the next invocation. Cancellation interrupts
+that replacement startup without waiting for the model to finish loading.
+Execution completion returns the task/actor slot immediately; managed output
+bytes remain charged through queued results, zero-copy Arrow/NumPy views,
+remote readers, and inherited views protected by the shared-memory store.
+
+A local result bundle is one publication, even when it contains several IPC
+blocks. Query output admission reserves its complete byte count atomically,
+then assigns each physical block an independent lease. A liveness grant covers
+the complete bundle and returns only after every part is handed off or released.
+Retained parts remain charged individually until their last physical owner
+releases them; releasing one part does not free another part's charge.
+
+Shared-memory progress credits and physical bytes have separate lifetimes.
+The per-producer soft-budget window counts pending and unconsumed outputs.
+A downstream input ACK returns that output's progress credit, even when an
+actor retains a zero-copy view across calls. Its physical allocation and byte
+charge remain live until the last view or fork owner releases them. Consequently,
+multiple actors can receive replacement inputs without requiring their old
+views to disappear first. Explicit task byte envelopes remain strict.
+
+Each output request reports the worker's live input views, including views from
+earlier calls. Physical-capacity waits use this snapshot, idle retained views,
+and queued outputs of the input streams used by waiting consumers. The current
+call's upstream producer identities are recorded independently of live views
+and persist until the call completes or is cancelled. An all-NULL input can
+retain no physical views while its next batch still needs the occupied actor
+slot; releasing input storage must not erase that stream dependency. Physical
+leases held only by fork descendants or pending release notifications can be
+released independently and are excluded from the worker's blocking views.
+Queued-input inference requires a live parent lease: a region with zero parent
+references, held only by fork descendants, can release independently and must
+not be classified as queued work merely because it has no input reader.
+Queued input is not assumed reclaimable merely because it belongs to another
+allocation: its next invocation may require the very actor slot occupied by the
+waiting writer.
+A current read owner in another worker, or an unrelated stream, still permits
+an independent release. This is a conservative admission boundary: an input
+whose consumer has not started is not evidence that a capacity wait can finish.
+When these dependencies leave no contiguous region large enough for any waiting
+output, execution reports a capacity error with pinned, retained, and queued
+input bytes. Reducing input/output blocks or increasing the arena addresses this
+hard capacity boundary; increasing the soft reference budget does not.
+
+Explicit local `DataAdmissionLimits` remain an additional application limit.
+Their byte-accounting tests verify these differences from default soft admission:
+Local preserves a complete task envelope even at a zero reservation ratio;
+Ray's object-store reservation baseline stays zero. Both charge retained output
+after its producing unit retires. Matching full reservation settings share the
+same partition calculation. These tests do not introduce local spill or apply
+local hard limits to Ray's soft-budget and liveness policy.
+
+The concurrent baseline and mixed task/model cancellation/reuse test capture failure
+diagnostics **before** cancellation or resource teardown. Set
+`VANE_TEST_DIAGNOSTICS_DIR` to retain them outside pytest's temporary directory:
+
+```bash
+export VANE_TEST_DIAGNOSTICS_DIR="$PWD/build/local-runtime-diagnostics"
+scripts/run_installed_pytest.sh \
+  tests/fast/test_local_runtime_baseline.py \
+  tests/fast/test_udf_local_request_cancellation.py
+```
+
+Each failure directory contains `threads.txt` and `resources.json`: passive
+runtime/UDF activity, task pool/worker state, execution slots, and shared-memory
+accounting. The mixed-pipeline cancellation/reuse test also records
+`progress.json`, with observed constructor entry/completion, preparation,
+the native-start notification, upstream UDF entry/return, and downstream model
+entry. It resets these test-owned markers before the reuse query so an earlier
+query cannot supply that query's progress. Native workers can execute before
+the startup callback records its notification: `native_started=false` can coexist with
+producer or model entry and does not establish that native execution stalled.
+The ordinary native regression joins the first query before requiring every
+marker, including when the callback is held until model entry. Controlled
+preparation and output-grant stalls verify the failure artifacts while the
+request and its resources are still active, including output-grant snapshots
+taken before the startup callback records its notification.
+
+Thread stacks and milestones are written before acquiring resource locks, so
+a blocked snapshot still leaves the earlier evidence. Failure of the milestone
+callback does not skip the resource snapshot or replace the original error.
+These observations are not an atomic global view; a constructor marker alone
+does not establish worker IPC readiness. Read milestones alongside the stacks
+and resource state. Diagnostics never request admission or dump serialized
+UDFs or session credentials. CI uploads these files on failure.
+The startup deadline is unchanged: a timeout remains a test failure, with no
+automatic retry. A non-reproducing stress run is evidence about that run, not
+proof that every scheduling race has been eliminated.
