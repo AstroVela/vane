@@ -64,6 +64,23 @@ def test_real_native_service_reference_and_public_apis(tmp_path, monkeypatch, ba
         parts(("audio", audio)),
         parts(("video", video)),
         parts(("text", "red shape"), ("image", image), ("audio", audio), ("video", video)),
+        parts(("image", np.asarray(data["tiny_image"], dtype=np.uint8))),
+        parts(
+            (
+                "video",
+                VideoClip(
+                    tuple(np.asarray(frame, dtype=np.uint8) for frame in data["tiny_frames"]),
+                    (0.0, 1.0),
+                    (0, 1),
+                ),
+            )
+        ),
+        parts(
+            *(
+                ("audio", AudioClip(np.asarray(clip, dtype=np.float32).reshape(-1, 1), 16000))
+                for clip in data["unequal_audio"]
+            )
+        ),
     ]
     provider = load_provider("onnx")
     native = provider.get_multimodal_embedder(dimensions=dimensions, options=options).instantiate()

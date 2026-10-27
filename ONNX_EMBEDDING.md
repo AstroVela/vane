@@ -119,6 +119,9 @@ and shutdown join owned calls; failed cleanup remains retryable.
 ## Input limits and validation
 
 Inputs require decoded uint8 HWC RGB images/frames and finite mono PCM arrays.
+Image and video preprocessing explicitly uses `channels_last`. Multiple audio
+parts are padded together with validity masks, independently of unpadded text;
+truncation remains disabled for both modalities.
 Video uses every supplied frame, in order, up to 32 frames with equal shape;
 frame selection belongs to the caller and the model's visual-only video path
 does not add timestamps. Audio is bounded to 180 seconds at 16 kHz. Each row

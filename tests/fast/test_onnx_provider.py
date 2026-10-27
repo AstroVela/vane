@@ -232,7 +232,41 @@ def test_media_and_ordered_composition_route_through_encoders_then_text_graph(op
         assert runs == ["vision_encoder", "vision_encoder", "audio_encoder", "model"]
         processed = next(event[2] for event in sdk.events if event[0] == "process")
         assert processed["text"] == ["title: none | text: look<|image|><|audio|><|video|>"]
-        assert processed["videos_kwargs"] == {"device": "cpu", "do_sample_frames": False, "add_timestamps": False}
+        assert processed["videos_kwargs"] == {
+            "device": "cpu",
+            "input_data_format": "channels_last",
+            "do_sample_frames": False,
+            "add_timestamps": False,
+        }
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("audio_lengths", [(16000, 32000), (32000, 16000)])
+def test_mixed_media_keeps_audio_padding_separate_and_decoded_rgb_channels_last(options, sdk, audio_lengths):
+    image = np.arange(3 * 7 * 3, dtype=np.uint8).reshape(3, 7, 3)
+    clips = [AudioClip(np.zeros((length, 1), dtype=np.float32), 16000) for length in audio_lengths]
+    video = VideoClip((image, image.copy()), (0.0, 1.0), (0, 1))
+    content = EmbeddingContent(
+        tuple(
+            EmbeddingPart(EmbeddingPartSpec(kind), value)
+            for kind, value in (("image", image), ("audio", clips[0]), ("audio", clips[1]), ("video", video))
+        )
+    )
+    runtime = load_provider("onnx").get_multimodal_embedder(options=options).instantiate()
+    try:
+        values = runtime.embed_multimodal([content])
+        assert len(values) == 1 and values[0].shape == (768,)
+        processed = next(event[2] for event in sdk.events if event[0] == "process")
+        assert "padding" not in processed
+        assert processed["text_kwargs"] == {"padding": False}
+        assert processed["truncation"] is False
+        assert processed["audio_kwargs"] == {"padding": True}
+        assert [len(clip) for clip in processed["audio"]] == list(audio_lengths)
+        assert processed["images_kwargs"]["input_data_format"] == "channels_last"
+        assert processed["videos_kwargs"]["input_data_format"] == "channels_last"
+        assert processed["images"][0][0].shape == (3, 7, 3)
+        assert processed["videos"][0].shape == (2, 3, 7, 3)
     finally:
         runtime.close()
 

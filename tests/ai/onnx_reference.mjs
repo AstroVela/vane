@@ -33,6 +33,9 @@ try {
         ...(await embedding('audio')),
         ...(await embedding('video')),
         ...(await embedding('mixed')),
+        ...(await embedding('tiny_image')),
+        ...(await embedding('tiny_video')),
+        ...(await embedding('unequal_audio')),
     ];
     fs.writeFileSync(outputPath, JSON.stringify({ bundle_sha256: bundleSHA256, processor_versions: fixture.processor_versions, documents, queries, media }));
 } finally {

@@ -16,8 +16,10 @@ import pytest
 
 from tests.fast.test_onnx_provider import options as options
 from tests.fast.test_onnx_provider import sdk as sdk
+from vane.ai import AudioClip, EmbeddingContent, EmbeddingPart, EmbeddingPartSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._onnx_options import ONNX_MODEL
+from vane.ai._video_embedding import VideoClip
 from vane.ai.embedding_service import EmbeddingService
 from vane.ai.provider import load_provider
 
@@ -83,6 +85,47 @@ def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, 
             await service.aclose()
         assert service.credits.bytes == service.credits.inflight == 0
         assert sdk.active == 0 and service.backend.executor is None
+
+    asyncio.run(scenario())
+
+
+def test_service_preserves_unequal_audio_and_small_hwc_media(tmp_path, options, sdk):
+    image = np.arange(3 * 7 * 3, dtype=np.uint8).reshape(3, 7, 3)
+    content = EmbeddingContent(
+        tuple(
+            EmbeddingPart(EmbeddingPartSpec(kind), value)
+            for kind, value in (
+                ("image", image),
+                ("audio", AudioClip(np.zeros((16000, 1), dtype=np.float32), 16000)),
+                ("audio", AudioClip(np.zeros((32000, 1), dtype=np.float32), 16000)),
+                ("video", VideoClip((image, image.copy()), (0.0, 1.0), (0, 1))),
+            )
+        )
+    )
+
+    async def scenario():
+        service = instance(tmp_path, options)
+        await service.start()
+        client = (
+            load_provider("onnx")
+            .get_multimodal_embedder(dimensions=128, options=client_options(tmp_path, options))
+            .instantiate()
+        )
+        try:
+            values = await client.embed_multimodal([content])
+            assert len(values) == 1 and values[0].shape == (128,)
+            processed = next(event[2] for event in sdk.events if event[0] == "process")
+            assert [len(clip) for clip in processed["audio"]] == [16000, 32000]
+            assert "padding" not in processed and processed["audio_kwargs"] == {"padding": True}
+            assert processed["text_kwargs"] == {"padding": False} and processed["truncation"] is False
+            assert processed["images_kwargs"]["input_data_format"] == "channels_last"
+            assert processed["videos_kwargs"]["input_data_format"] == "channels_last"
+            np.testing.assert_array_equal(processed["images"][0][0], image)
+            np.testing.assert_array_equal(processed["videos"][0], np.stack([image, image]))
+        finally:
+            await client.aclose()
+            await service.aclose()
+        assert service.credits.bytes == service.credits.inflight == sdk.active == 0
 
     asyncio.run(scenario())
 

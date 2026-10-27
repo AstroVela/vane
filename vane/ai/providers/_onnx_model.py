@@ -243,15 +243,27 @@ class ONNXEmbedder:
             > self.options["max_input_bytes"]
         ):
             raise EmbeddingConfigurationError("ONNX row including retrieval prefixes exceeds max_input_bytes")
-        kwargs: dict[str, Any] = {"text": [prompt], "return_tensors": "np", "padding": False, "truncation": False}
+        kwargs: dict[str, Any] = {
+            "text": [prompt],
+            "return_tensors": "np",
+            "text_kwargs": {"padding": False},
+            "truncation": False,
+        }
         if media["image"]:
-            kwargs.update(images=[media["image"]], images_kwargs={"device": "cpu"})
+            kwargs.update(
+                images=[media["image"]], images_kwargs={"device": "cpu", "input_data_format": "channels_last"}
+            )
         if media["audio"]:
-            kwargs.update(audio=media["audio"], sampling_rate=16000)
+            kwargs.update(audio=media["audio"], sampling_rate=16000, audio_kwargs={"padding": True})
         if media["video"]:
             kwargs.update(
                 videos=media["video"],
-                videos_kwargs={"device": "cpu", "do_sample_frames": False, "add_timestamps": False},
+                videos_kwargs={
+                    "device": "cpu",
+                    "input_data_format": "channels_last",
+                    "do_sample_frames": False,
+                    "add_timestamps": False,
+                },
             )
         processed = dict(self.processor(**kwargs))
         if np.asarray(processed["input_ids"]).shape[1] > self.options["max_length"]:
