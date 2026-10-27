@@ -2530,6 +2530,47 @@ static void DriveStreamingLazySubmits(ExecutionContext &context, StreamingUDFSta
 	}
 }
 
+static idx_t MediaFlowSliceBytes(const DataChunk &chunk, idx_t offset, idx_t rows) {
+	D_ASSERT(offset <= chunk.size() && rows <= chunk.size() - offset);
+	if (rows == 0) {
+		return 0;
+	}
+	if (offset == 0 && rows == chunk.size()) {
+		return EstimateMediaFlowInputBytes(chunk);
+	}
+	// A view measures the selected payload without allocating a receiving copy.
+	// In particular, string/struct payloads are not uniform across their rows.
+	DataChunk slice;
+	slice.InitializeEmpty(chunk.GetTypes());
+	slice.SetCapacity(chunk);
+	SelectionVector selection(rows);
+	for (idx_t row = 0; row < rows; row++) {
+		selection.set_index(row, offset + row);
+	}
+	slice.Slice(chunk, selection, rows);
+	return EstimateMediaFlowInputBytes(slice);
+}
+
+static idx_t MediaFlowRowsWithinByteLimit(const DataChunk &chunk, idx_t offset, idx_t candidate_rows,
+                                          idx_t remaining_bytes) {
+	if (MediaFlowSliceBytes(chunk, offset, candidate_rows) <= remaining_bytes) {
+		return candidate_rows;
+	}
+	// Find the largest fitting prefix using actual payloads. An average size
+	// can select an oversized prefix when the large strings come first.
+	idx_t lower = 0;
+	idx_t upper = candidate_rows;
+	while (lower < upper) {
+		auto middle = lower + (upper - lower + 1) / 2;
+		if (MediaFlowSliceBytes(chunk, offset, middle) <= remaining_bytes) {
+			lower = middle;
+		} else {
+			upper = middle - 1;
+		}
+	}
+	return lower;
+}
+
 static unique_ptr<DataChunk> BuildStreamingBatchFromPending(ExecutionContext &context, StreamingUDFState &state,
                                                             idx_t desired_rows, idx_t max_bytes,
                                                             bool allow_oversized_single_row) {
@@ -2557,18 +2598,33 @@ static unique_ptr<DataChunk> BuildStreamingBatchFromPending(ExecutionContext &co
 			continue;
 		}
 		auto take_rows = MinValue<idx_t>(remaining, available_rows);
+		const auto precise_payload = src.HasMediaFlow();
 		if (max_bytes > 0) {
 			const auto remaining_bytes = accumulated_bytes >= max_bytes ? idx_t(0) : max_bytes - accumulated_bytes;
-			const auto candidate_bytes =
-			    available_rows > 0
-			        ? MaxValue<idx_t>(idx_t(1), SaturatingMultiply(entry.bytes, take_rows) / available_rows)
-			        : entry.bytes;
-			const auto byte_limited_rows = RowsWithinByteLimit(take_rows, candidate_bytes, remaining_bytes,
-			                                                   allow_oversized_single_row && batch->size() == 0);
+			idx_t byte_limited_rows;
+			if (precise_payload) {
+				// Flow ingress has already rejected an impossible single row.
+				byte_limited_rows = MediaFlowRowsWithinByteLimit(src, offset, take_rows, remaining_bytes);
+			} else {
+				const auto candidate_bytes =
+				    MaxValue<idx_t>(idx_t(1), SaturatingMultiply(entry.bytes, take_rows) / available_rows);
+				byte_limited_rows = RowsWithinByteLimit(take_rows, candidate_bytes, remaining_bytes,
+				                                        allow_oversized_single_row && batch->size() == 0);
+			}
 			if (byte_limited_rows == 0) {
 				break;
 			}
 			take_rows = byte_limited_rows;
+		}
+		idx_t consumed_bytes = 0;
+		idx_t tail_bytes = 0;
+		if (precise_payload) {
+			consumed_bytes = MediaFlowSliceBytes(src, offset, take_rows);
+			tail_bytes = MediaFlowSliceBytes(src, offset + take_rows, available_rows - take_rows);
+			if (consumed_bytes > entry.bytes || tail_bytes != entry.bytes - consumed_bytes ||
+			    state.pending_bytes < entry.bytes) {
+				throw InternalException("Native media pending payload does not match its remaining rows");
+			}
 		}
 		if (offset == 0 && take_rows == src_rows) {
 			batch->Append(src, true);
@@ -2580,19 +2636,21 @@ static unique_ptr<DataChunk> BuildStreamingBatchFromPending(ExecutionContext &co
 			batch->Append(src, true, &take_sel, take_rows);
 		}
 		state.pending_rows -= take_rows;
-		idx_t consumed_bytes = 0;
 		if (take_rows == available_rows) {
 			consumed_bytes = entry.bytes;
 			state.pending_bytes = state.pending_bytes >= entry.bytes ? state.pending_bytes - entry.bytes : 0;
 			state.pending_inputs.pop_front();
 		} else {
-			consumed_bytes =
-			    available_rows > 0 ? SaturatingMultiply(entry.bytes, take_rows) / available_rows : entry.bytes;
-			if (consumed_bytes == 0 && entry.bytes > 0) {
-				consumed_bytes = 1;
+			if (precise_payload) {
+				entry.bytes = tail_bytes;
+			} else {
+				consumed_bytes = SaturatingMultiply(entry.bytes, take_rows) / available_rows;
+				if (consumed_bytes == 0 && entry.bytes > 0) {
+					consumed_bytes = 1;
+				}
+				consumed_bytes = MinValue<idx_t>(consumed_bytes, entry.bytes);
+				entry.bytes -= consumed_bytes;
 			}
-			consumed_bytes = MinValue<idx_t>(consumed_bytes, entry.bytes);
-			entry.bytes -= consumed_bytes;
 			entry.row_offset = offset + take_rows;
 			state.pending_bytes = state.pending_bytes >= consumed_bytes ? state.pending_bytes - consumed_bytes : 0;
 		}

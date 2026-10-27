@@ -30,11 +30,21 @@ shared_ptr<MediaFlowTicket> TakeFlow(MediaFlowWindow &window, idx_t bytes) {
 	return window.TakeGrant(*request);
 }
 
-// Deliberately refuse task admission. The real UDF ingress must still accept
+// Default to refusing task admission. The real UDF ingress must still accept
 // only its reserved byte window, and must distinguish accepted BLOCKED from
 // rejected BLOCKED without duplicating the input on retry.
+struct SubmitProbe {
+	idx_t accepts_remaining = 0;
+	idx_t accepted = 0;
+	vector<idx_t> proposed_bytes;
+	vector<idx_t> actual_bytes;
+	vector<vector<idx_t>> chunk_bytes;
+};
+
 class RefusingExecutor : public UDFExecutor {
 public:
+	explicit RefusingExecutor(shared_ptr<SubmitProbe> probe_p) : probe(std::move(probe_p)) {
+	}
 	idx_t Submit(DataChunk &, DataChunk &, ClientContext &) override {
 		throw InternalException("unexpected blocking submit");
 	}
@@ -47,9 +57,24 @@ public:
 	bool TrySubmitEnvelope(vector<unique_ptr<DataChunk>> &, DataChunk &, ClientContext &, idx_t &) override {
 		return false;
 	}
-	bool TrySubmitEnvelopeWithRetainedBytes(vector<unique_ptr<DataChunk>> &, DataChunk &, ClientContext &, idx_t,
-	                                        idx_t &) override {
-		return false;
+	bool TrySubmitEnvelopeWithRetainedBytes(vector<unique_ptr<DataChunk>> &chunks, DataChunk &, ClientContext &,
+	                                        idx_t bytes, idx_t &submit_id) override {
+		idx_t actual_bytes = 0;
+		vector<idx_t> chunk_bytes;
+		for (auto &chunk : chunks) {
+			auto payload_bytes = EstimateMediaFlowInputBytes(*chunk);
+			actual_bytes += payload_bytes;
+			chunk_bytes.push_back(payload_bytes);
+		}
+		probe->proposed_bytes.push_back(bytes);
+		probe->actual_bytes.push_back(actual_bytes);
+		probe->chunk_bytes.push_back(std::move(chunk_bytes));
+		if (!probe->accepts_remaining) {
+			return false;
+		}
+		probe->accepts_remaining--;
+		submit_id = ++probe->accepted;
+		return true;
 	}
 	bool SupportsRefBundleInput() override {
 		return false;
@@ -89,10 +114,14 @@ public:
 	InsertionOrderPreservingMap<string> Stats() override {
 		return {};
 	}
+
+private:
+	shared_ptr<SubmitProbe> probe;
 };
 
-unique_ptr<UDFExecutor> RefuseTasks(ClientContext &, const Value &, UDFConfig &, shared_ptr<void>) {
-	return make_uniq<RefusingExecutor>();
+unique_ptr<UDFExecutor> RefuseTasks(ClientContext &, const Value &, UDFConfig &, shared_ptr<void> handles) {
+	auto probe = handles ? shared_ptr_cast<void, SubmitProbe>(handles) : make_shared_ptr<SubmitProbe>();
+	return make_uniq<RefusingExecutor>(std::move(probe));
 }
 
 struct CopyProbe {
@@ -120,19 +149,20 @@ DBConfig *ConfigureCopyAllocator(DBConfig &config, shared_ptr<CopyProbe> probe) 
 }
 
 struct SinkFixture {
-	SinkFixture(idx_t input_bytes, idx_t batch_rows = 4)
-	    : probe(make_shared_ptr<CopyProbe>()), db(nullptr, ConfigureCopyAllocator(config, probe)), con(db),
-	      thread(*con.context), context(*con.context, thread, nullptr), plan(Allocator::DefaultAllocator()) {
+	SinkFixture(idx_t input_bytes, idx_t batch_rows = 4, bool preserve_work_units = true)
+	    : probe(make_shared_ptr<CopyProbe>()), submits(make_shared_ptr<SubmitProbe>()),
+	      db(nullptr, ConfigureCopyAllocator(config, probe)), con(db), thread(*con.context),
+	      context(*con.context, thread, nullptr), plan(Allocator::DefaultAllocator()) {
 		SetUDFExecutorFactory(*db.instance, RefuseTasks);
 		auto payload = Value::STRUCT({{"execution_backend", Value("subprocess_task")},
 		                              {"call_mode", Value("map")},
 		                              {"batch_size", Value::BIGINT(batch_rows)},
-		                              {"min_task_batch_size", Value::BIGINT(batch_rows)},
+		                              {"min_task_batch_size", Value::BIGINT(preserve_work_units ? batch_rows : 0)},
 		                              {"udf_task_input_max_bytes", Value::BIGINT(input_bytes)},
 		                              {"udf_output_target_max_bytes", Value::BIGINT(4096)}});
 		sink = make_uniq<PhysicalStreamingUDF>(plan, vector<LogicalType> {LogicalType::BIGINT},
 		                                       MakeUDFTableFunction(payload, {LogicalType::BIGINT}, {"result"}),
-		                                       make_uniq<UDFFunctionData>(payload, LogicalType::BIGINT),
+		                                       make_uniq<UDFFunctionData>(payload, LogicalType::BIGINT, submits),
 		                                       vector<ColumnIndex> {ColumnIndex(0)}, 0, vector<column_t> {});
 		global = sink->GetGlobalSinkState(*con.context);
 		global->PipelineMaxThreadsResolved(1);
@@ -153,6 +183,7 @@ struct SinkFixture {
 		return sink->Sink(context, chunk, input);
 	}
 	shared_ptr<CopyProbe> probe;
+	shared_ptr<SubmitProbe> submits;
 	DBConfig config;
 	DuckDB db;
 	Connection con;
@@ -527,6 +558,101 @@ TEST_CASE("Oversized UDF flow input cannot use the legacy one-chunk escape", "[m
 	CHECK(ticket->IsActive());
 	CHECK(receiver.sink->ParamsToString()["udf_accepted_input_rows"] == "0");
 	CHECK(receiver.sink->ParamsToString()["udf_pending_input_bytes"] == "0");
+}
+
+TEST_CASE("Splitting skewed media input preserves pending bytes before another receipt",
+          "[media-resource][media-flow][media-flow-split]") {
+	const auto batch = GENERATE(false, true);
+	const auto accept_prefix = GENERATE(false, true);
+	const auto nested = GENERATE(false, true);
+	const auto large_first = GENERATE(false, true);
+	SinkFixture receiver(1000, 2, false);
+	receiver.submits->accepts_remaining = accept_prefix ? 1 : 0;
+	MediaFlowWindow window(1000);
+	auto type = nested ? LogicalType::STRUCT({{"payload", LogicalType::VARCHAR}}) : LogicalType::VARCHAR;
+	auto value = [&](idx_t bytes) {
+		auto text = Value(string(bytes, 'x'));
+		return nested ? Value::STRUCT({{"payload", text}}) : text;
+	};
+	DataChunk first, next;
+	first.Initialize(Allocator::DefaultAllocator(), {type}, 3);
+	for (idx_t row = 0; row < 3; row++) {
+		first.SetValue(0, row, value(row == (large_first ? 0 : 2) ? 900 : 0));
+	}
+	first.SetCardinality(3);
+	REQUIRE(EstimateMediaFlowInputBytes(first) == 948);
+	first.AddMediaFlow(TakeFlow(window, 948));
+	CHECK(receiver.Accept(first, false, batch) == SinkResultType::NEED_MORE_INPUT);
+	const idx_t prefix_bytes = large_first ? 932 : 32;
+	const idx_t remaining_bytes = 948 - prefix_bytes;
+	const idx_t pending_bytes = accept_prefix ? remaining_bytes : 948;
+	REQUIRE_FALSE(receiver.submits->proposed_bytes.empty());
+	CHECK(receiver.submits->proposed_bytes.front() == prefix_bytes);
+	CHECK(receiver.submits->proposed_bytes == receiver.submits->actual_bytes);
+	CHECK(receiver.sink->ParamsToString()["udf_pending_input_bytes"] == std::to_string(pending_bytes));
+	CHECK(receiver.sink->ParamsToString()["udf_accepted_input_rows"] == "3");
+	CHECK(window.Snapshot().reserved.bytes == 0);
+
+	next.Initialize(Allocator::DefaultAllocator(), {type}, 1);
+	next.SetValue(0, 0, value(584));
+	next.SetCardinality(1);
+	REQUIRE(EstimateMediaFlowInputBytes(next) == 600);
+	auto ticket = TakeFlow(window, 600);
+	next.AddMediaFlow(ticket);
+	const auto would_fit = pending_bytes + 600 <= 1000;
+	// With the long row last and the task domain refusing a 32-byte prefix,
+	// all 948 bytes still belong to ingress. The old proportional deduction
+	// reported 348 and incorrectly acknowledged these additional 600 bytes.
+	for (idx_t retry = 0; retry < (would_fit ? 1 : 3); retry++) {
+		CHECK(receiver.Accept(next, true, batch) ==
+		      (would_fit ? SinkResultType::NEED_MORE_INPUT : SinkResultType::BLOCKED));
+		CHECK(ticket->IsActive() == !would_fit);
+		CHECK(receiver.sink->ParamsToString()["udf_pending_input_bytes"] ==
+		      std::to_string(pending_bytes + (would_fit ? 600 : 0)));
+		CHECK(receiver.sink->ParamsToString()["udf_accepted_input_rows"] == (would_fit ? "4" : "3"));
+		CHECK(receiver.sink->ParamsToString()["udf_accepted_input_bytes"] == (would_fit ? "1548" : "948"));
+		CHECK(receiver.submits->proposed_bytes == receiver.submits->actual_bytes);
+	}
+	window.Close();
+	CHECK_FALSE(ticket->IsActive());
+	CHECK(window.Snapshot().reserved.bytes == 0);
+}
+
+TEST_CASE("Repeated media splits measure payloads at the remaining row offset",
+          "[media-resource][media-flow][media-flow-split]") {
+	const auto batch = GENERATE(false, true);
+	const idx_t rows = 3 * STANDARD_VECTOR_SIZE + 1;
+	const idx_t total_bytes = rows * sizeof(string_t) + 900;
+	SinkFixture receiver(200000, 2, false);
+	MediaFlowWindow window(200000);
+	DataChunk first, next;
+	first.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR}, rows);
+	for (idx_t row = 0; row < rows; row++) {
+		first.SetValue(0, row, Value(string(row == STANDARD_VECTOR_SIZE + 1 ? 900 : 0, 'x')));
+	}
+	first.SetCardinality(rows);
+	REQUIRE(EstimateMediaFlowInputBytes(first) == total_bytes);
+	first.AddMediaFlow(TakeFlow(window, total_bytes));
+	CHECK(receiver.Accept(first, false, batch) == SinkResultType::NEED_MORE_INPUT);
+	REQUIRE(receiver.submits->proposed_bytes.size() == 1);
+	CHECK(receiver.submits->proposed_bytes[0] == total_bytes - sizeof(string_t));
+	CHECK(receiver.submits->proposed_bytes == receiver.submits->actual_bytes);
+	CHECK(receiver.submits->chunk_bytes[0] == vector<idx_t> {STANDARD_VECTOR_SIZE * sizeof(string_t),
+	                                                         STANDARD_VECTOR_SIZE * sizeof(string_t) + 900,
+	                                                         STANDARD_VECTOR_SIZE * sizeof(string_t)});
+	CHECK(receiver.sink->ParamsToString()["udf_pending_input_bytes"] == std::to_string(total_bytes));
+	next.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR}, 1);
+	next.SetValue(0, 0, Value(string(120000 - sizeof(string_t), 'x')));
+	next.SetCardinality(1);
+	auto ticket = TakeFlow(window, 120000);
+	next.AddMediaFlow(ticket);
+	for (idx_t retry = 0; retry < 3; retry++) {
+		CHECK(receiver.Accept(next, true, batch) == SinkResultType::BLOCKED);
+		CHECK(ticket->IsActive());
+		CHECK(receiver.sink->ParamsToString()["udf_pending_input_bytes"] == std::to_string(total_bytes));
+		CHECK(receiver.sink->ParamsToString()["udf_accepted_input_rows"] == std::to_string(rows));
+	}
+	window.Close();
 }
 
 TEST_CASE("Failed UDF ingress copy retains the producer and rolls back its reservation",
