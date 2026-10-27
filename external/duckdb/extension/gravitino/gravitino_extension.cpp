@@ -8,6 +8,7 @@ namespace duckdb {
 void GravitinoExtension::Load(ExtensionLoader &loader) {
 	RegisterGravitinoCatalog(loader);
 	RegisterGravitinoFunctions(loader);
+	RegisterGravitinoDiscovery(loader);
 	RegisterGravitinoFileSystem(loader);
 }
 std::string GravitinoExtension::Name() {

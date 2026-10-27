@@ -26,7 +26,9 @@ public:
 private:
 	std::unique_ptr<duckdb_yyjson::yyjson_doc, GravitinoJsonDeleter> doc;
 };
+enum class GravitinoScope { CATALOG, METALAKE };
 struct GravitinoConfig {
+	GravitinoScope scope = GravitinoScope::CATALOG;
 	string endpoint;
 	string metalake;
 	string catalog;
@@ -48,6 +50,7 @@ public:
 	GravitinoResponse Request(ClientContext &context, const string &method, const string &suffix,
 	                          const string &body = "", long allowed_error_status = 0) const;
 	GravitinoJson Get(ClientContext &context, const string &suffix = "") const;
+	GravitinoJson GetDiscovery(ClientContext &context, const string &suffix = "") const;
 	vector<string> List(ClientContext &context, const string &suffix) const;
 	string Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
 	               string *root = nullptr, string *selected_location = nullptr) const;
