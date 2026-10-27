@@ -4171,3 +4171,128 @@ native `c61f97db6955cd2f3d58a16b70af293a0a562ea6a27791dbb1307bb263a4602d`.
 `audit.json` checks all 42 results, comparison settings, code/input identities,
 channel proof and process/resource cleanup. Estimates and configured operator
 memory do not bound peak RSS. Pipeline parity with Local remains unproven.
+
+## Avoid repeated exchange frame selection allocation: SF100 Q9 (October 28, 2026)
+
+The preceding Q9 attribution found exchange CPU after confirming that Local and
+Pipeline both use Parquet scanning and dynamic filters. Each frame measurement
+copied its top-level selected row indexes into a fresh vector. Frame construction
+also repeated a sizing traversal after TryWrite had already validated that size.
+
+Measurement and copying now use a read-only FrameSelection view of the caller's
+indexes during the synchronous traversal. Nested compaction still owns derived
+child indexes. No borrowed selection survives the traversal or enters a published
+frame. The private frame constructor receives TryWrite's validated size, allocates
+and copies the same owned representation, and checks the copied size matches.
+
+The existing coalescer, sequence publication, routing, cancellation, byte/slot
+credits and frame lifetime remain unchanged. This adds no type-specific coalescer,
+scan, filter, plan, resource allowance or SQL-specific rule. It still performs the
+final owned-frame copy and preserves existing bounds/contiguity checks.
+
+### Controlled Q9 result
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q9 | 9.881 s | 12.967 s | 12.258 s | -5.47% | 1.24× |
+
+Each median has four steady observations. Baseline phases bracket candidate runs
+in opposite Local/Pipeline mode orders. First SQL executions are retained and
+excluded. Baseline phase drift is **+0.73%**.
+Steady ranges: Local 9.821–10.049 s,
+baseline 12.879–13.092 s,
+candidate 12.211–12.390 s.
+The final baseline phase alone has median 13.024 s; candidate change against
+that phase is -5.88%.
+
+Separate diagnostics, two queries per variant, measure summed worker CPU
+**364.565 → 359.615 CPU seconds (-1.36%)**.
+Two samples per variant do not establish a stable small CPU difference. Their
+wall times do not enter primary latency. Complete pre-cleanup counters show
+**229,329,453 inter-fragment row transmissions per Q9** on both binaries, including
+the same 150-million-row orders exchange. All native tasks and producers finished;
+remote input/output row counts agree. All **22 normalized query graphs are
+identical**. These measurements isolate implementation work at the same row volume.
+
+All **52 final result checks pass**: 18 primary Q9 executions, 24 control executions,
+six Local oracle preparations and four CPU diagnostics. Schema and complete result
+values are compared, including floating tolerance. Six quick Q9 checks are separate
+and excluded from the formal medians. Each control below has only one steady
+sample per variant; these screens do not establish small performance changes or
+a new full-22 score:
+
+| Control | Baseline s | Candidate s | Change |
+| --- | ---: | ---: | ---: |
+| Q1 | 4.475 | 4.404 | -1.60% |
+| Q4 | 4.373 | 4.236 | -3.13% |
+| Q10 | 7.140 | 6.924 | -3.02% |
+| Q12 | 3.995 | 3.871 | -3.11% |
+| Q18 | 8.159 | 8.064 | -1.15% |
+| Q21 | 14.675 | 14.370 | -2.08% |
+
+### Exchange throughput screens and confirmation
+
+A bounded native in-process screen sends two million rows per case: one/four
+threads, narrow orders-like columns, six fixed columns, filtered rows and
+alternating nullable blocks. Old/new/new/old phases run three repetitions per cell,
+retaining four steady observations per variant. All **96 executions** have correct
+row counts and bounded/returned credits. The screen includes source expressions
+and Python polling; it measures neither a pure frame kernel nor full value hashes.
+Full value semantics are covered by the test suite and SF100 result comparisons.
+
+| Two-million-row case | Threads | CPU change | Wall change |
+| --- | ---: | ---: | ---: |
+| orders | 1 | -31.16% | -31.17% |
+| orders | 4 | -20.18% | -21.80% |
+| fixed6 | 1 | -17.96% | -18.10% |
+| fixed6 | 4 | -23.48% | -30.86% |
+| selected6 | 1 | -15.26% | -15.27% |
+| selected6 | 4 | -26.20% | -38.12% |
+| nullable6 | 1 | -14.62% | -14.64% |
+| nullable6 | 4 | -32.49% | -36.44% |
+
+A separate old/new/new/old confirmation uses eight million rows and four threads,
+with the same limits. All **24 executions** validate row counts and returned credits.
+Four steady observations per variant give:
+
+| Eight-million-row case | Baseline CPU s | Candidate CPU s | CPU change | Wall change |
+| --- | ---: | ---: | ---: | ---: |
+| orders | 1.280 | 1.103 | -13.87% | -14.89% |
+| nullable6 | 6.753 | 4.811 | -28.76% | -31.98% |
+
+These throughput windows are separate from SF100 latency. Both versions declare
+64 MiB exchange, 1 MiB result, 1 MiB staging and 64 MiB operator reservations;
+frames are 64 KiB/2,048 rows and windows 1 MiB/16 slots. Their reservations and
+measured limits differ from the SF100 configuration below.
+
+### Validation, frozen configuration and retention
+
+- **1,149 distinct related tests pass**: 1,117 direct/analytical/compact-decimal/
+  materialized/hash/performance checks and 32 real-Ray cases. The final noneditable
+  Release binary is byte-identical to the tested binary. No full/GPU suite ran.
+  Four new cases retain an old frame while consuming more frames, covering
+  alternating NULL/valid blocks, selected input, wide/decimal/temporal values,
+  63/65-row boundaries and one/four threads. Existing tests cover one-slot
+  progress, close/cancel, nested data, Flight, materialized exchange and FTE retry.
+- Original SQL and the same 307 files / 37.5033 GiB are verified
+  before/after phases. Local uses 36 threads/32 GiB; Pipeline uses two 18-thread/
+  16-GiB workers, two partitions, one active query, exchange/staging 128/256 MiB,
+  frames 64 KiB/2,048 rows, windows 1 MiB/16 slots and a specialized 1-GiB Ray
+  object store. Test Ray clusters use default sizing. Installed Python is unchanged.
+  Native/Python/driver/source/input identities and resources are frozen.
+- Shared host and retained OS caches apply. Own builds, tests and CPU diagnostics
+  do not overlap primary timing. Owned BE/HDFS stop during timing; FE suspends
+  and resumes. Services are healthy afterward with file/page caches disabled.
+- Formatting, Ruff and copyleft checks pass. After owned processes stop, run spills,
+  temporary data, owned test fixtures, oracle IPCs and the duplicate baseline are
+  removed with a cleanup manifest. Measurements, configuration/code identities,
+  counts/hashes, complete counters, logs and JUnit remain at `/home/kaka/astrovela_vane/.worktrees/pipelined-engine-pool-20261017/build/pipeline-sf100-frame-selection-20261028`. Source datasets
+  and unrelated processes remain intact.
+
+Validated source `82b24c352e6ece9523b985b74c1be145f8af5055`, package
+`0.3.0.dev134`, native SHA-256 `5a02d11b08518970740c546a0a23937ffa07f1a372fcecd0725ae2152e3b7813`.
+Baseline source `4c5e930c7f2bb58419fa83984462f5bf78d24111`, native SHA-256
+`74a6a3d1bdf63263acbe0b62c5637b96dbb43a65a8ff0f4d08e230d6427a7667`. `audit.json` verifies final results, frozen settings,
+code/input identities, complete row counters and run cleanup. This round establishes
+neither fresh SF100 FTE performance nor a full-22 timing total. Operator reservations
+do not bound process RSS.
