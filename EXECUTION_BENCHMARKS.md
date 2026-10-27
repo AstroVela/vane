@@ -4067,3 +4067,107 @@ Validated source `d6b14c09f899a90e304547a935ad53e35f60198d`, noneditable package
 `audit.json` checks all 42 results, frozen comparison settings, code/input
 identities, channel proof and process/resource cleanup. Row/width cost estimates
 and configured operator memory do not bound peak RSS.
+
+
+## Place proven donor filters before earlier joins: SF100 Q9 (October 28, 2026)
+
+The previous Q9 change reuses a selective `part` donor before the final wide
+hash exchange. Its filter still follows the supplier join, leaving the first
+`partsupp` exchange at 80 million rows. This round moves that same, already
+approved filter through exact typed column references, row filters and the probe
+input of INNER/SEMI hash joins. It now precedes that first exchange.
+
+`PushBuildFilter` translates projection and left-output column positions while
+preserving the original key type. It stops at computed/cast keys, build-side
+outputs, preserved-row joins, limits/aggregates and scoped/shared ownership.
+The existing donor budget, replication traffic margin, selectivity, complete
+producer dependency and independent-input proofs still determine eligibility.
+Original joins retain exact NULL, duplicate, residual and multiplicity semantics.
+This adds no runtime operator, protocol, scan or resource allowance. In Q9 the
+part donor remains a single source feeding the original join and the early SEMI
+filter. The complete key filter runs above the Parquet scan: source decoding of
+80 million partsupp rows remains, and scan-level payload pruning is unproven.
+
+### Controlled Q9 result
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q9 | 9.904 s | 14.284 s | 13.136 s | -8.03% | 1.33× |
+
+Each median uses **four steady samples**. Two baseline phases bracket candidate
+phases in opposite Local/Pipeline mode orders. First SQL executions are retained
+separately and excluded. Baseline phase drift is **+0.40%**.
+Steady ranges: Local 9.868–10.026 s,
+baseline 14.249–14.322 s,
+candidate 13.043–13.355 s.
+The final baseline phase alone has median 14.313 s, giving
+-8.22% change against that phase.
+
+Separate diagnostics, two executions per variant, measure summed worker CPU
+**410.670 → 366.555 CPU seconds (-10.74%)**.
+Diagnostic wall times are excluded from primary latency. In both diagnostic
+queries per variant, all four output channels of the first partsupp hash
+exchange have their producers observed finished. Their retained counters prove
+**80,000,000 → 4,351,928 rows/query
+(-94.56%)**. This is the first source-fragment output,
+before its supplier join; the earlier round's proof covered the final wide
+exchange. One part-source fragment remains, with no additional part scan.
+
+All **42 final follow-up executions** match Local: 18 primary Q9 timing queries,
+16 Q4/Q10/Q18/Q21 control screens, four Local oracle preparations and four CPU
+diagnostics. Six earlier prototype checks remain separate. All 22 normalized
+serialized graphs were compared: only Q9 changes, with **11 fragments and 11
+exchanges retained**, rewiring the donor to the earlier consumer. Other 21 graphs
+are identical. Controls have one steady sample per variant and establish no
+small performance gain:
+
+| Control | Baseline s | Candidate s | Change |
+| --- | ---: | ---: | ---: |
+| Q4 | 4.366 | 4.505 | +3.19% |
+| Q10 | 6.977 | 6.986 | +0.14% |
+| Q18 | 8.550 | 8.343 | -2.42% |
+| Q21 | 14.744 | 14.757 | +0.09% |
+
+This baseline already includes the preceding budgeted-donor optimization
+(source `0eacc15fad`, native `c61f97db...`). The preceding Q9 window's
+17.383 → 14.543 s result, Q10/Q18 windows, and October 26 full-22 table remain
+separate measurements. No fresh full-22 or SF100 FTE timing score is inferred.
+
+### Validation and frozen configuration
+
+- **1,043 distinct related tests pass**: 1,022 donor/compiler/cost/aggregate/graph
+  checks and 21 real-Ray cases. The final reinstalled Release native binary is
+  byte-identical to the tested binary. No full/GPU suite ran.
+- New placement checks cover INNER/SEMI paths, permuted references, row filters,
+  equality/NULL-safe comparisons, NULL/duplicate keys, two/three partitions and
+  one/four native threads. Boundary checks cover LEFT/RIGHT/FULL joins, LIMIT,
+  computed/cast keys and build-side references. Four-KiB windows, one-slot
+  channels, exact Local result comparison and returned credits verify progress.
+  Real Ray covers Pipeline, FTE and killed-consumer retry for both nested and
+  original donor consumers. The frozen old binary reproduces the misplaced
+  first-exchange regression; the candidate passes.
+- Same original SQL and 307 Parquet files / 37.5033 GiB, with bytes and mtimes
+  checked before/after every phase. Local: 36 threads/32 GiB. Pipeline: two
+  workers × 18 threads/16 GiB, two partitions, one active query, 128/256 MiB
+  exchange/staging, 64 KiB/2,048-row frames, 1 MiB/16-slot windows, specialized
+  1 GiB benchmark Ray object store. Test clusters use default Ray sizing.
+- Native/source/installed Python, SQL, driver, packages, resources and inputs have
+  frozen identities. Installed Python is unchanged across variants. Shared host
+  and retained OS caches apply; no own build/test/profiling overlaps primary
+  timing. CPU/channel diagnostics run separately using the same driver.
+- Owned BE/HDFS services stop during timing; FE suspends/resumes to retain inotify
+  registration. Services are healthy afterward, with file/Parquet page caches
+  disabled. Source data and unrelated processes remain intact. Formatting, Ruff
+  and copyleft checks pass.
+- Temporary outputs, spills, fixtures, oracle IPCs and the duplicate baseline are
+  removed after owned processes stop and their hashes are recorded. Raw samples,
+  diagnostic graphs/counters, logs, JUnit, frozen identities/configurations,
+  output row counts/hashes and cleanup manifests remain at `/home/kaka/astrovela_vane/.worktrees/pipelined-engine-pool-20261017/build/pipeline-sf100-q9-early-filter-20261028`.
+
+Validated source `574b2ba00e713b7d9fee171a2be6fce063b9ef2e`, noneditable package
+`0.3.0.dev132`, native SHA-256
+`74a6a3d1bdf63263acbe0b62c5637b96dbb43a65a8ff0f4d08e230d6427a7667`. Baseline source `0eacc15fad054719672b1d32a0baf92ce8b162cb`,
+native `c61f97db6955cd2f3d58a16b70af293a0a562ea6a27791dbb1307bb263a4602d`.
+`audit.json` checks all 42 results, comparison settings, code/input identities,
+channel proof and process/resource cleanup. Estimates and configured operator
+memory do not bound peak RSS. Pipeline parity with Local remains unproven.
