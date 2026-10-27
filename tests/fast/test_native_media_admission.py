@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -14,6 +15,37 @@ from tests.fast import test_native_media_extensions as media
 video_path = media.video_path
 
 
+def _assert_retained_video_pixels(read_frames):
+    import numpy as np
+
+    retained = read_frames().project("frame_index, data").fetchall()
+    assert [row[0] for row in retained] == list(range(12))
+    assert all(
+        pixels.shape == (6, 8, 3) and pixels.dtype == np.uint8 and pixels.nbytes == 144 for _, pixels in retained
+    )
+    snapshots = [pixels.copy() for _, pixels in retained]
+    repeated = read_frames().project("frame_index, data").fetchall()
+    assert [row[0] for row in repeated] == list(range(12))
+    for (_, retained_pixels), (_, repeated_pixels), snapshot in zip(retained, repeated, snapshots):
+        np.testing.assert_array_equal(retained_pixels, snapshot)
+        np.testing.assert_array_equal(repeated_pixels, snapshot)
+    return retained
+
+
+def test_video_admission_retained_image_contract():
+    pytest.importorskip("numpy")
+    import vane
+
+    with vane.connect() as con:
+        _assert_retained_video_pixels(
+            lambda: con.sql(
+                "SELECT i AS frame_index, "
+                "image(repeat(chr(65 + i::INTEGER), 144)::BLOB, 8, 6, 3, 'RGB')::IMAGE('RGB', 6, 8) AS data "
+                "FROM range(12) t(i) ORDER BY i"
+            )
+        )
+
+
 @pytest.mark.parametrize("capacity", [None, "", "1", "4"])
 @pytest.mark.parametrize("variable", ["VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"])
 def test_native_decoder_admission_configuration(capacity, variable):
@@ -22,7 +54,7 @@ def test_native_decoder_admission_configuration(capacity, variable):
         env.pop(variable, None)
     else:
         env[variable] = capacity
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             "-I",
@@ -34,11 +66,11 @@ def test_native_decoder_admission_configuration(capacity, variable):
             "a.close(); b.close()",
         ],
         env=env,
-        check=True,
         capture_output=True,
         text=True,
         timeout=30,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("capacity", ["0", "-1", "1.5", " 2", "2x", str(2**64)])
@@ -63,7 +95,9 @@ def test_native_video_admission_parallel_files_and_cleanup(video_path, tmp_path,
     broken.write_bytes(b"not a video")
     # The pool is fixed when the first database is created, including a module's
     # default connection. Configure the subprocess before importing Vane.
-    script = r"""
+    script = (
+        inspect.getsource(_assert_retained_video_pixels)
+        + r"""
 import concurrent.futures
 import sys
 import vane
@@ -97,10 +131,8 @@ def run(index):
         # LIMIT and a downstream expression error end the source before EOF.
         assert len(frames(con, path).limit(1).fetchall()) == 1
         assert len(frames(con, [path] * 3).order("frame_index DESC").fetchall()) == 36
-        retained = frames(con, path).project("frame_index, frame.data").fetchall()
-        assert [row[0] for row in retained] == list(range(12))
-        assert all(len(row[1]) == 144 for row in retained)
-        assert retained == frames(con, path).project("frame_index, frame.data").fetchall()
+        # Keep detached results alive through the later error/cleanup checks.
+        retained = _assert_retained_video_pixels(lambda: frames(con, path))
         try:
             frames(con, path).project("CAST('invalid' || frame_index::VARCHAR AS BIGINT)").fetchall()
         except vane.ConversionException:
@@ -121,19 +153,20 @@ def run(index):
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     list(executor.map(run, range(3)))
 """
+    )
     env = {**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1"}
     if output_bytes is None:
         env.pop("VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES", None)
     else:
         env["VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"] = output_bytes
-    subprocess.run(
+    result = subprocess.run(
         [sys.executable, "-I", "-c", script, artifact, str(video_path), str(broken)],
         env=env,
-        check=True,
         capture_output=True,
         text=True,
         timeout=90,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_native_video_output_budget_rejects_an_oversized_frame(video_path):
@@ -159,11 +192,11 @@ for policy in ('raise', 'skip'):
 assert vane.read_video_frames(path, 6, 8, connection=con, frame_limit=0).fetchall() == []
 con.close()
 """
-    subprocess.run(
+    result = subprocess.run(
         [sys.executable, "-I", "-c", script, artifact, str(video_path)],
         env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "143"},
-        check=True,
         capture_output=True,
         text=True,
         timeout=30,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
