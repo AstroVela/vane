@@ -789,6 +789,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
             raise ValueError(f"{artifact.path}: Vane sdist contains an unexpected archive root: {name!r}")
 
     required_paths = (
+        "native-media-release.toml",
         "vane_fs/include/vane_fs/reader_abi.h",
         "DUCKDB_FORK_REVISION",
         "DUCKDB_SOURCE_ID",

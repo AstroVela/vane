@@ -363,6 +363,22 @@ def test_sdist_public_stubs_must_use_their_exact_project_paths(required_path):
         check_release_artifacts._require_sdist_path([decoy], required_path, Path("test.tar.gz"))
 
 
+@pytest.mark.parametrize(
+    "paths",
+    [
+        [],
+        ["decoy/native-media-release.toml"],
+        ["native-media-release.toml", "native-media-release.toml"],
+    ],
+    ids=["missing", "misplaced", "duplicate"],
+)
+def test_sdist_requires_one_native_media_release_configuration(paths):
+    artifact = _NamesOnlyArtifact([f"{TEST_LAYOUT.archive_root}/{path}" for path in paths])
+
+    with pytest.raises(ValueError, match="expected one project file 'native-media-release.toml'"):
+        check_release_artifacts._check_sdist(artifact, TEST_LAYOUT)
+
+
 @pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
 @pytest.mark.parametrize(
     "selector",
