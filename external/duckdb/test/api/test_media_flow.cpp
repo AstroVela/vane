@@ -164,6 +164,8 @@ struct SinkFixture {
 
 struct FlowProbe {
 	shared_ptr<MediaFlowWindow> window;
+	shared_ptr<MediaFlowTicket> initial_view;
+	bool hold_initial_view = false;
 	idx_t produced = 0;
 };
 struct FlowInfo : public TableFunctionInfo {
@@ -183,14 +185,20 @@ struct FlowBind : public TableFunctionData {
 	}
 };
 struct FlowGlobal : public GlobalTableFunctionState {
-	explicit FlowGlobal(shared_ptr<FlowProbe> probe_p) : probe(std::move(probe_p)) {
-		probe->window = make_shared_ptr<MediaFlowWindow>(8);
+	explicit FlowGlobal(shared_ptr<FlowProbe> probe_p)
+	    : probe(std::move(probe_p)), window(make_shared_ptr<MediaFlowWindow>(8)) {
+		probe->window = window;
 		probe->produced = 0;
+		if (probe->hold_initial_view) {
+			auto request = window->Request(8);
+			probe->initial_view = window->TakeGrant(*request);
+		}
 	}
 	~FlowGlobal() override {
-		probe->window->Close();
+		window->Close();
 	}
 	shared_ptr<FlowProbe> probe;
+	shared_ptr<MediaFlowWindow> window;
 	unique_ptr<MediaAdmissionRequest> request;
 };
 unique_ptr<FunctionData> BindFlow(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
@@ -209,12 +217,12 @@ SourceResultType PollFlow(ClientContext &, TableFunctionInput &input, DataChunk 
 		return SourceResultType::FINISHED;
 	}
 	if (!state.request) {
-		state.request = state.probe->window->Request(8);
+		state.request = state.window->Request(8);
 	}
 	if (state.request->PollOrArm(interrupt) == MediaAdmissionStatus::WAITING) {
 		return SourceResultType::BLOCKED;
 	}
-	output.AddMediaFlow(state.probe->window->TakeGrant(*state.request));
+	output.AddMediaFlow(state.window->TakeGrant(*state.request));
 	state.request.reset();
 	output.SetValue(0, 0, Value::BIGINT(state.probe->produced++));
 	output.SetCardinality(1);
@@ -387,6 +395,56 @@ TEST_CASE("Enabled native flow rejects unsupported materialization before produc
 		CHECK(probe->produced == 0);
 		CHECK(probe->window->Snapshot().reserved.bytes == 0);
 	}
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Blocked flow source wakes on a receipt and cancels without releasing external views",
+          "[media-resource][media-flow]") {
+	const auto cancel_while_waiting = GENERATE(false, true);
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	auto probe = RegisterFlow(db);
+	probe->hold_initial_view = true;
+	SetUDFExecutorFactory(*db.instance, RefuseTasks);
+	auto pending = con.PendingQuery(R"(
+        SELECT udf(i, {'payload_version': 1, 'udf_name': 'flow-wakeup', 'call_mode': 'map',
+                       'execution_backend': 'subprocess_task', 'method_return_type': 'BIGINT',
+                       'function_pickle': 'fixture'::BLOB, 'function_pickle_size_bytes': 7,
+                       'batch_size': 4, 'min_task_batch_size': 4,
+                       'udf_task_input_max_bytes': 32, 'udf_output_target_max_bytes': 4096})
+        FROM test_media_flow()
+    )");
+	REQUIRE_FALSE(pending->HasError());
+	for (idx_t step = 0; step < 1000; step++) {
+		pending->ExecuteTask();
+		if (probe->window && probe->window->Snapshot().waiting_requests) {
+			break;
+		}
+	}
+	REQUIRE(probe->window);
+	REQUIRE(probe->window->Snapshot().waiting_requests == 1);
+	CHECK(probe->produced == 0);
+	if (!cancel_while_waiting) {
+		probe->initial_view->Acknowledge();
+		for (idx_t step = 0; step < 1000 && probe->produced < 2; step++) {
+			pending->ExecuteTask();
+		}
+		CHECK(probe->produced == 2);
+	}
+	con.Interrupt();
+	bool cancelled = false;
+	for (idx_t step = 0; step < 1000; step++) {
+		if (pending->ExecuteTask() == PendingExecutionResult::EXECUTION_ERROR) {
+			cancelled = true;
+			break;
+		}
+	}
+	CHECK(cancelled);
+	pending.reset();
+	CHECK_FALSE(probe->initial_view->IsActive());
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
 	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
 }
 
