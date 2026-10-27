@@ -101,9 +101,12 @@ def _expected_project_requires_dist() -> tuple[str, ...]:
         for value in values:
             requirement = Requirement(str(value))
             extra_marker = f'extra == "{extra}"'
-            requirement.marker = Marker(
-                extra_marker if requirement.marker is None else f"{requirement.marker} and {extra_marker}"
-            )
+            marker = requirement.marker
+            expression = str(marker) if marker is not None else ""
+            # Only a top-level disjunction needs grouping before the extra gate.
+            if marker is not None and "or" in marker._markers:
+                expression = f"({expression})"
+            requirement.marker = Marker(extra_marker if marker is None else f"{expression} and {extra_marker}")
             requirements.append(requirement)
     return tuple(str(requirement) for requirement in requirements)
 

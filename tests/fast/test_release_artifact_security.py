@@ -19,6 +19,7 @@ from email.message import Message
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 from packaging.version import Version
 
 from scripts import check_release_artifacts, verify_duckdb_coexistence
@@ -465,6 +466,52 @@ def test_release_metadata_rejects_invalid_requirements():
 
     with pytest.raises(ValueError, match="invalid Requires-Dist metadata"):
         check_release_artifacts._check_no_official_duckdb_dependency(artifact, metadata)
+
+
+@pytest.mark.parametrize(
+    "condition, expected",
+    [
+        (None, 'extra == "test-extra"'),
+        (
+            'platform_system == "Linux" or platform_system == "Windows"',
+            '(platform_system == "Linux" or platform_system == "Windows") and extra == "test-extra"',
+        ),
+        (
+            'sys_platform == "darwin" and platform_machine == "arm64"',
+            'sys_platform == "darwin" and platform_machine == "arm64" and extra == "test-extra"',
+        ),
+        (
+            '(platform_system == "Linux" or platform_system == "Windows") and python_version >= "3.12"',
+            '(platform_system == "Linux" or platform_system == "Windows") and python_version >= "3.12" and extra == "test-extra"',
+        ),
+        (
+            'platform_release == "build or release" and python_version >= "3.12"',
+            'platform_release == "build or release" and python_version >= "3.12" and extra == "test-extra"',
+        ),
+    ],
+)
+def test_optional_dependency_markers_preserve_grouping_and_extra_gate(monkeypatch, condition, expected):
+    dependency = "accelerator>=1" + (f"; {condition}" if condition else "")
+    monkeypatch.setattr(
+        check_release_artifacts,
+        "PROJECT_METADATA",
+        {"optional-dependencies": {"test_extra": [dependency]}},
+    )
+    assert check_release_artifacts._expected_project_requires_dist() == (f"accelerator>=1; {expected}",)
+
+
+@pytest.mark.parametrize("platform", ["Linux", "Windows", "Darwin"])
+@pytest.mark.parametrize("extra", ["", "onnx", "onnx-cuda"])
+def test_onnx_cuda_metadata_requires_the_extra_on_every_supported_platform(platform, extra):
+    requirement = next(
+        item
+        for raw in check_release_artifacts.EXPECTED_REQUIRES_DIST
+        if (item := Requirement(raw)).name == "onnxruntime-gpu"
+    )
+    assert requirement.marker is not None
+    assert requirement.marker.evaluate({"platform_system": platform, "extra": extra}) == (
+        extra == "onnx-cuda" and platform in {"Linux", "Windows"}
+    )
 
 
 @pytest.mark.parametrize(

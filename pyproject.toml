@@ -98,6 +98,22 @@ mlx = [ # EmbeddingGemma 2 BF16 text/image/audio/video inference on Apple Silico
     "huggingface-hub>=1.31,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pillow>=10.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+onnx = [ # ONNX Runtime inference; official image/video preprocessing uses CPU Torch
+    "onnxruntime==1.26.0",
+    "onnx>=1.20,<2",
+    "transformers==5.21.0",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
+    "Pillow==12.3.0",
+]
+onnx_cuda = [ # Install this alternative instead of the CPU onnx extra
+    "onnxruntime-gpu[cuda,cudnn]==1.26.0; platform_system == 'Linux' or platform_system == 'Windows'",
+    "onnx>=1.20,<2",
+    "transformers==5.21.0",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
+    "Pillow==12.3.0",
+]
 litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inference
     "litert-lm-api==0.18.0",
     "pillow>=10.4",
@@ -250,6 +266,7 @@ include = [
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
     "/LITERT_EMBEDDING.md",
+    "/ONNX_EMBEDDING.md",
     "/GRAVITINO.md",
     "/LOCAL_MODEL_RUNTIME.md",
     "/LOCAL_SERVING_ACCEPTANCE.md",
@@ -338,6 +355,13 @@ include = [
     "/tests/mlx_metal_reference.py",
     "/tests/ai/test_mlx_text_embedding.py",
     "/tests/fast/test_litert_provider.py",
+    "/tests/fast/test_onnx_provider.py",
+    "/tests/fast/test_onnx_service.py",
+    "/tests/onnx_fixture.py",
+    "/tests/ai/test_onnx_embedding.py",
+    "/tests/ai/onnx_service_process.py",
+    "/tests/ai/onnx_reference.mjs",
+    "/tests/ai/onnx_reference_inputs.py",
     "/tests/fast/test_litert_service.py",
     "/tests/fast/test_litert_http.py",
     "/tests/ai/test_litert_embedding.py",
@@ -412,6 +436,7 @@ include = [
     "/examples/litert_embedding_search.py",
     "/examples/litert_http_model_metadata.py",
     "/examples/litert_service.json",
+    "/examples/onnx_service.json",
     "src/**",
     "vane/**",
 

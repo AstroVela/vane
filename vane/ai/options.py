@@ -12,6 +12,7 @@ from typing import Any, Literal, TypeAlias, TypedDict
 from urllib.parse import parse_qsl, urlsplit
 
 from vane.ai._litert_options import LITERT_TEXT_OPTIONS, litert_option_names, validate_litert_options
+from vane.ai._onnx_options import onnx_option_names, validate_onnx_options
 from vane.ai._redaction import is_sensitive_option_key
 
 VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
@@ -33,7 +34,7 @@ class JevOptions(TypedDict, total=False):
 class MultimodalEmbedOptions(TypedDict, total=False):
     model_path: str
     model_sha256: str
-    backend: Literal["cpu", "gpu"]
+    backend: Literal["cpu", "gpu", "cuda", "coreml"]
     cache_dir: str | None
     num_threads: int
     vision_tokens_per_image: int
@@ -492,6 +493,10 @@ def validate_embed_options(
     _reject_sensitive_embed_options(copied)
     family = (provider_family or "").casefold()
     allowed = _EMBED_COMMON_OPTIONS | _EMBED_PROVIDER_OPTIONS.get(family, frozenset())
+    if family == "onnx":
+        allowed = _EMBED_COMMON_OPTIONS | onnx_option_names(
+            text=_input_kind == "text", service=copied.get("runtime") == "service"
+        )
     if family in {"sglang", "vllm"}:
         allowed = _EMBED_COMMON_OPTIONS | _inference_embed_options(copied)
     if family == "mlx":
@@ -506,6 +511,24 @@ def validate_embed_options(
     if unknown:
         raise TypeError(
             f"Unsupported Embed option(s) for provider {provider_family or 'custom'!r}: " + ", ".join(unknown)
+        )
+
+    if family == "onnx":
+        from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+        if copied.keys() & {"max_chunk_chars", "chunk_overlap_chars"}:
+            raise EmbeddingConfigurationError("ONNX does not support character chunk averaging")
+        if copied.get("max_retries", 0) != 0:
+            raise EmbeddingConfigurationError("ONNX requires max_retries=0; requests are never replayed")
+        copied.setdefault("max_retries", 0)
+        service = copied.get("runtime") == "service"
+        names = onnx_option_names(text=_input_kind == "text", service=service)
+        copied.update(
+            validate_onnx_options(
+                {key: value for key, value in copied.items() if key in names},
+                text=_input_kind == "text",
+                service=service,
+            )
         )
 
     if family == "litert":
@@ -708,6 +731,8 @@ def validate_embed_image_options(
     provider_family: str | None, options: Mapping[str, Any], *, relation: bool
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
+    if provider_family == "onnx":
+        return validate_embed_options(provider_family, options, relation=relation, _input_kind="image")
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
         allowed |= litert_option_names(
@@ -748,6 +773,8 @@ def validate_embed_audio_options(
     provider_family: str | None, options: Mapping[str, Any], *, relation: bool
 ) -> dict[str, Any]:
     """Share execution/loading validation without accepting text-only options."""
+    if provider_family == "onnx":
+        return validate_embed_options(provider_family, options, relation=relation, _input_kind="audio")
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
         return validate_embed_options(provider_family, options, relation=relation, _input_kind="audio")
@@ -774,6 +801,8 @@ def validate_embed_video_options(
     provider_family: str | None, options: Mapping[str, Any], *, relation: bool
 ) -> dict[str, Any]:
     """Video providers cannot inherit text chunking or image loading policies."""
+    if provider_family == "onnx":
+        return validate_embed_options(provider_family, options, relation=relation, _input_kind="video")
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "litert":
         allowed |= litert_option_names(
@@ -818,7 +847,7 @@ def validate_embed_video_options(
 def validate_embed_multimodal_options(
     provider_family: str | None, options: Mapping[str, Any], *, relation: bool
 ) -> dict[str, Any]:
-    if provider_family == "mlx":
+    if provider_family in {"mlx", "onnx"}:
         return validate_embed_options(provider_family, options, relation=relation, _input_kind="multimodal")
     return validate_embed_image_options(provider_family, options, relation=relation)
 

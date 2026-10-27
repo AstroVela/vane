@@ -591,6 +591,7 @@ def _embedding_provider_family(provider: Any) -> str | None:
         "vane.ai.providers.sglang",
         "vane.ai.providers.mlx",
         "vane.ai.providers.litert",
+        "vane.ai.providers.onnx",
     }:
         return module.rsplit(".", 1)[1]
     name = getattr(provider, "name", None)
@@ -602,6 +603,7 @@ def _embedding_provider_family(provider: Any) -> str | None:
         "sglang",
         "mlx",
         "litert",
+        "onnx",
     }:
         return name.casefold()
     return None
@@ -649,7 +651,7 @@ def _prepare_embed_call(
     normalize = prepared.pop("normalize", False)
     execution_backend = prepared.pop("execution_backend", None)
     if (
-        family == "mlx" or family == "litert" and prepared.get("runtime") not in {"service", "http"}
+        family == "mlx" or family in {"litert", "onnx"} and prepared.get("runtime") not in {"service", "http"}
     ) and execution_backend is None:
         execution_backend = "subprocess_actor"
     max_chunk_chars = prepared.pop("max_chunk_chars", None)

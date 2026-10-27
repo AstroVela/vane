@@ -323,6 +323,10 @@ class ServiceEmbedder(ManagedEmbedder):
             "request_id": request_id,
             "parts": parts,
             "nbytes": size,
-            "encoding": context.litert.to_wire() if context.litert is not None else context.encoding,
+            "encoding": context.onnx.to_wire()
+            if context.onnx is not None
+            else context.litert.to_wire()
+            if context.litert is not None
+            else context.encoding,
             "model_contract": context.model_contract.to_wire() if context.model_contract is not None else None,
         }
