@@ -496,7 +496,18 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 			SourceResultType source_result = SourceResultType::BLOCKED;
 			if (!next_batch_blocked) {
 				// "Regular" path: fetch a chunk from the source and push it through the pipeline
-				source_chunk.Reset();
+				// Consumed projections/filters can still reference the last source
+				// allocation. Drop those views before its next byte admission.
+				for (auto &chunk : intermediate_chunks) {
+					chunk->Reset();
+				}
+				final_chunk.Reset();
+				for (auto &state : intermediate_states) {
+					state->ResetBatchInput();
+				}
+				if (local_sink_state) {
+					local_sink_state->ResetBatchInput();
+				}
 				source_result = FetchFromSource(source_chunk);
 				if (source_result == SourceResultType::BLOCKED) {
 					return PipelineExecuteResult::INTERRUPTED;

@@ -1033,7 +1033,9 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
             query_thread.join(timeout=5)
             assert not query_thread.is_alive(), "completed query did not reach unregister"
             assert query_errors == [], query_errors
-            assert cancel_started.is_set(), "slot cleanup never transferred to the collector"
+            # Unregister may reach its 50 ms deadline before the dispatcher
+            # transfers cleanup; that handoff remains asynchronous after return.
+            assert cancel_started.wait(timeout=5), "slot cleanup never transferred to the collector"
             assert executor_closed.wait(timeout=5), "pending remote cleanup retained the local executor"
             assert executor_released.wait(timeout=5), "pending remote cleanup retained the executor object"
             assert len(executor_close_calls) == 1

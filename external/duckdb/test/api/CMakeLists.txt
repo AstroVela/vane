@@ -33,6 +33,7 @@ set(TEST_API_OBJECTS
     test_uuid.cpp
     test_udf_output_lease.cpp
     test_media_resource.cpp
+    test_media_buffer.cpp
     test_insertion_order_preserving_map.cpp
     test_bignum.cpp
     test_threads.cpp
