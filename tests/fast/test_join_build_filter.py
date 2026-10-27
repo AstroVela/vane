@@ -10,7 +10,7 @@ import pytest
 import vane
 from tests.fast.test_direct_exchange import collect, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
-from vane.execution.compiler import FragmentCompileOptions
+from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
 from vane.execution.plan import Distribution
 from vane.execution.query_options import QueryExecutionOptions, RayExecution
@@ -282,3 +282,80 @@ def test_declared_budget_allows_large_estimated_key_filters(tmp_path, partitions
             )
             assert edges and fact_rows < 4096
             assert all(channel.snapshot()["peak_bytes"] <= limits.window_bytes for channel in service.channels.values())
+
+
+def budgeted_shared_join_build_query(connection, directory, comparison="=", *, fixed_plan=True):
+    sql, target, keys = shared_join_build_query(connection, directory, comparison, fixed_plan=fixed_plan)
+    for name, cardinality in [("fact", 100000000), ("keys", 1200000), ("target", 80000000)]:
+        path = directory / f"{name}.parquet"
+        sql = sql.replace(f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality={cardinality})")
+    return sql, target, keys
+
+
+@pytest.mark.parametrize(
+    "budget,partitions,shared",
+    [
+        (0, 2, False),
+        (64 << 20, 2, False),
+        (256 << 20, 2, True),
+        (2 << 30, 3, True),
+        (2 << 30, 1, False),
+        (2 << 30, 128, False),
+    ],
+)
+def test_shared_join_build_uses_declared_replication_budget(tmp_path, budget, partitions, shared):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        sql, target, keys = budgeted_shared_join_build_query(connection, tmp_path)
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="budgeted-shared-build",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        donors = {
+            f.fragment_id
+            for f in graph.fragments
+            if any(str(keys).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        targets = {
+            f.fragment_id
+            for f in graph.fragments
+            if any(str(target).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        assert (
+            any(e.producer_fragment_id in donors and e.consumer_fragment_id in targets for e in graph.exchanges)
+            is shared
+        )
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_budgeted_shared_join_build_filters_before_exchange(tmp_path, threads, partitions, comparison):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql, target, keys = budgeted_shared_join_build_query(connection, tmp_path, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = budgeted_submission(connection, sql, partitions)
+        targets = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(target).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in targets}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            rows = sum(
+                c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+            )
+            assert edges and rows < 4096
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert (
+            sum(
+                any(str(keys).encode() in split.payload for split in source.splits)
+                for f in spec.graph.fragments
+                for source in f.sources
+            )
+            == 1
+        )
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())

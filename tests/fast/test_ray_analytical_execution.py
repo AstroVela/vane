@@ -43,7 +43,7 @@ from tests.fast.test_execution_performance import (
 )
 from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source, large_join_key_query
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
-from tests.fast.test_join_build_filter import shared_join_build_query
+from tests.fast.test_join_build_filter import budgeted_shared_join_build_query, shared_join_build_query
 from tests.fast.test_parquet_aggregate_partitioning import (
     broadcast_aggregate_query,
     disjoint_aggregate_query,
@@ -1263,6 +1263,68 @@ def test_hash_partitioned_groups_preserve_consumer_retry(tmp_path, monkeypatch, 
             assert result.collect().to_pylist() == expected
             assert sum(e.distribution is Distribution.HASH for e in scheduler.spec.graph.exchanges) == 2
             assert all(b"aggregate_state_export" not in f.native_plan for f in scheduler.spec.graph.fragments)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_budgeted_shared_join_build_preserves_consumer_retry(tmp_path, monkeypatch, mode, partitions):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        shared = {
+            e.producer_fragment_id
+            for e in scheduler.spec.graph.exchanges
+            if sum(x.producer_fragment_id == e.producer_fragment_id for x in scheduler.spec.graph.exchanges) > 1
+        }
+        if admitted and not lost and shared.intersection(upstream):
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    limits = resources(
+        tmp_path, max_active_queries=1, partitions=partitions, task_contexts_per_worker=64, io_concurrency=256
+    )
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        sql, _, _ = budgeted_shared_join_build_query(local, tmp_path, "is not distinct from", fixed_plan=False)
+        # Keep the selective donor in a probe-side join with default optimizers.
+        # Its post-filter estimate exceeds the former 8 MiB replication cap.
+        sql = sql.replace("explicit_cardinality=100000000)", "explicit_cardinality=1000000000)")
+        sql = sql.replace("explicit_cardinality=1200000)", "explicit_cardinality=6000000)")
+        sql = sql.replace("max(b.payload)", "max(length(b.payload))")
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            graph = scheduler.spec.graph
+            producers = [e.producer_fragment_id for e in graph.exchanges]
+            shared = {producer for producer in producers if producers.count(producer) > 1}
+            assert len(shared) == 1
+            donor = next(f for f in graph.fragments if f.fragment_id in shared)
+            assert len(donor.sources) == 1
+            consumers = {e.consumer_fragment_id for e in graph.exchanges if e.producer_fragment_id in shared}
+            assert len(consumers) == 2
+            assert all(len(f.sources) == 1 for f in graph.fragments if f.fragment_id in consumers)
+            assert sum(len(f.sources) for f in graph.fragments) == 3
             if mode == "fte_retry":
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]

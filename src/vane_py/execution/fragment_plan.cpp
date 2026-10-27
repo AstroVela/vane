@@ -1082,12 +1082,15 @@ private:
 			}
 			auto try_build = [&](PhysicalHashJoin &probe, idx_t column) {
 				auto &build = probe.children[1].get();
+				auto build_bytes = EstimatedExchangeBytes(build);
+				// Larger donors already qualify for a budgeted broadcast below.
+				// Charge their extra replicas with the same fourfold traffic margin.
+				const auto margin = build_bytes > 8 * 1024 * 1024 ? 4 : 1;
 				if (column >= build.types.size() || build.types[column] != condition.left->return_type ||
 				    !HasFilteredBuildRoot(build) || HasScopedState(build) || !build.estimated_cardinality ||
-				    EstimatedExchangeBytes(build) > 8 * 1024 * 1024 ||
-				    !BroadcastJoin(probe, partitions, 8 * 1024 * 1024) ||
+				    build_bytes > broadcast_limit || !BroadcastJoin(probe, partitions, broadcast_limit) ||
 				    double(build.estimated_cardinality) * 8 >= double(target.estimated_cardinality) ||
-				    EstimatedExchangeBytes(build) * partitions >= target_bytes) {
+				    build_bytes * partitions * margin >= target_bytes) {
 					return false;
 				}
 				result.input = &target;
