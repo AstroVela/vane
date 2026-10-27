@@ -46,6 +46,15 @@ required transitive notices are rejected as well.
 
 ## Incremental package build
 
+For the optional ONNX Runtime EmbeddingGemma 2 adapter, follow the
+[artifact, execution-provider and shared-service contract](ONNX_EMBEDDING.md).
+After review, install a noneditable wheel and run
+`tests/fast/test_onnx_provider.py`, `tests/fast/test_onnx_service.py` and the
+affected embedding options, transport and service-backend tests. Keep real Ray
+task/actor tests in their own process. Explicit real-model qualification lives
+in `tests/ai/test_onnx_embedding.py`; record the exact bundle and selected
+execution provider. Python-only provider changes require no native rebuild.
+
 The [unified embedding design](EMBEDDING_DESIGN.md) tracks the typed input
 contract, provider/protocol boundaries, Context integration and delivery gates.
 Native output changes use `tests/fast/test_embedding_outputs.py` together with

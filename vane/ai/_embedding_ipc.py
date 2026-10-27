@@ -72,13 +72,36 @@ class LiteRTEncoding:
 
 
 @dataclass(frozen=True)
+class ONNXEncoding:
+    model_sha256: str
+    max_length: int
+    input_type: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.model_sha256) is None
+            or type(self.max_length) is not int
+            or not 1 <= self.max_length <= 8192
+            or self.input_type not in ("query", "document")
+        ):
+            raise EmbeddingConfigurationError("Invalid ONNX service encoding")
+
+    def to_wire(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RequestContext:
     encoding: str = "default"
     model_contract: ModelContract | None = None
     request_id: str | None = None
     litert: LiteRTEncoding | None = None
+    onnx: ONNXEncoding | None = None
 
     def __post_init__(self) -> None:
+        if sum(value is not None for value in (self.model_contract, self.litert, self.onnx)) > 1:
+            raise EmbeddingConfigurationError("Embedding request must select exactly one model contract")
         if not isinstance(self.encoding, str) or self.encoding not in {
             "default",
             "text_document",
@@ -104,6 +127,8 @@ class RequestContext:
             value = ModelContract(**value)
         encoding = message["encoding"]
         if isinstance(encoding, dict):
+            if set(encoding) == {"model_sha256", "max_length", "input_type"} and value is None:
+                return cls("default", None, message.get("request_id"), onnx=ONNXEncoding(**encoding))
             fields = {"model_sha256", "max_length", "vision_tokens_per_image", "input_type"}
             if set(encoding) != fields or value is not None:
                 raise EmbeddingConfigurationError("Invalid LiteRT service encoding fields")

@@ -74,6 +74,18 @@ environment. The adapter requires separately provisioned EmbeddingGemma 2
 LiteRT-LM weights (Apache-2.0); Vane distributes no model assets, SDK source or
 third-party datasets. Test images and audio are authored in the tests.
 
+The optional `onnx` and alternative `onnx_cuda` extras install ONNX Runtime
+(MIT), ONNX and Transformers (Apache-2.0), PyTorch/torchvision (BSD-style), and
+Pillow (MIT-CMU for the qualified 12.3.0 wheel). Model inference uses ONNX
+Runtime; the official EmbeddingGemma 2 image/video processor uses CPU PyTorch.
+SDKs, their native
+libraries and notices remain in separately installed dependency wheels. The
+community EmbeddingGemma 2 ONNX export and its tokenizer/processor assets are
+provisioned separately under Apache-2.0. No upstream implementation, model
+weights or tokenizer data are vendored. Test media and small inference fixtures
+are authored locally. Preserve the exact wheels' complete notices when
+redistributing an environment, including NVIDIA notices for the CUDA variant.
+
 The optional `video_asr` extra installs faster-whisper (MIT) and its dependencies;
 `video_ocr` installs RapidOCR (Apache-2.0) and ONNX Runtime (MIT). These packages
 and model weights are not bundled. Local adapters require explicitly provisioned

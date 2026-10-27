@@ -65,7 +65,12 @@ class NativeServiceBackend:
         return self.descriptor.get_input_spec()
 
     def validate_request(self, context: ipc.RequestContext, parts: list[dict[str, Any]]) -> None:
-        if context.encoding != "default" or context.model_contract is not None or context.litert is not None:
+        if (
+            context.encoding != "default"
+            or context.model_contract is not None
+            or context.litert is not None
+            or context.onnx is not None
+        ):
             raise EmbeddingConfigurationError(
                 "Native embedding service requires default encoding and no model contract"
             )
@@ -143,4 +148,8 @@ def create_service_backend(family: str, model: str, dimensions: int, options: di
         return MLXServiceBackend(model, dimensions, options)
     if family == "litert":
         return LiteRTServiceBackend(model, dimensions, options)
-    raise EmbeddingConfigurationError("Embedding service family must be sglang, vllm, mlx or litert")
+    if family == "onnx":
+        from vane.ai.providers._onnx_service import ONNXServiceBackend
+
+        return ONNXServiceBackend(model, dimensions, options)
+    raise EmbeddingConfigurationError("Embedding service family must be sglang, vllm, mlx, litert or onnx")
