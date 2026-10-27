@@ -228,6 +228,7 @@ def test_native_video_flow_window_to_slow_udf(video_path, tmp_path, window_bytes
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
+import threading
 import time
 import pyarrow as pa
 import vane
@@ -259,6 +260,9 @@ with (vane.connect() if not artifact else
         vane.load_installed_extension('native_media', connection=con)
     con.execute("SET video_backend='native'")
     con.execute('SET threads=4')
+    watchdog = threading.Timer(75, con.interrupt)
+    watchdog.daemon = True
+    watchdog.start()
 
     def frames():
         return vane.read_video_frames(path, 6, 8, connection=con,
@@ -317,6 +321,7 @@ with (vane.connect() if not artifact else
         assert sorted(result['frame_index'].to_pylist()) == list(range(0, 12, 2))
     finally:
         proceed.touch()
+        watchdog.cancel()
         vane.teardown_runner()
 """
     result = subprocess.run(
