@@ -14,12 +14,13 @@ namespace duckdb {
 namespace vane_execution {
 struct DirectFrame {
 	DirectFrame(shared_ptr<DirectLedger> ledger_p, DataChunk &input, const vector<idx_t> &rows, idx_t offset,
-	            idx_t count_p)
-	    : ledger(std::move(ledger_p)), types(input.GetTypes()), count(count_p) {
-		bytes = Measure(input, rows, offset, count, NumericLimits<idx_t>::Maximum() - 1);
+	            idx_t count_p, idx_t size)
+	    : ledger(std::move(ledger_p)), types(input.GetTypes()), count(count_p), bytes(size) {
 		buffer = Allocator::DefaultAllocator().Allocate(bytes);
 		memset(buffer.get(), 0, bytes);
-		Measure(input, rows, offset, count, bytes, &columns, buffer.get());
+		if (Measure(input, rows, offset, count, bytes, &columns, buffer.get()) != bytes) {
+			throw InternalException("direct frame size changed while copying");
+		}
 		auto current = ledger->bytes.fetch_add(bytes) + bytes;
 		auto peak = ledger->peak_bytes.load();
 		while (current > peak && !ledger->peak_bytes.compare_exchange_weak(peak, current)) {
@@ -269,7 +270,7 @@ DirectWrite DirectChannel::TryWrite(const string &id, idx_t sequence, DataChunk 
 		}
 		// Broadcast shares one physical allocation; each consumer has an
 		// independent lease/window. Publish only after every enqueue succeeds.
-		auto frame = make_shared_ptr<DirectFrame>(ledger, input, rows, offset, count);
+		auto frame = make_shared_ptr<DirectFrame>(ledger, input, rows, offset, count, size);
 		vector<Consumer *> enqueued;
 		enqueued.reserve(live);
 		try {

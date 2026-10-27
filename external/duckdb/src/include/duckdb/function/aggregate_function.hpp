@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -205,6 +211,10 @@ public:
 	aggregate_update_t GetStateUpdateCallback() const { return update; }
 	void SetStateUpdateCallback(aggregate_update_t callback) { update = callback; }
 
+	bool HasStateImportCallback() const { return state_import != nullptr; }
+	aggregate_update_t GetStateImportCallback() const { return state_import; }
+	void SetStateImportCallback(aggregate_update_t callback) { state_import = callback; }
+
 	bool HasStateSimpleUpdateCallback() const { return simple_update != nullptr; }
 	aggregate_simple_update_t GetStateSimpleUpdateCallback() const { return simple_update; }
 	void SetStateSimpleUpdateCallback(aggregate_simple_update_t callback) { simple_update = callback; }
@@ -243,6 +253,10 @@ public:
 	aggregate_initialize_t initialize;
 	//! The hashed aggregate update state function (may be null, if window is set)
 	aggregate_update_t update;
+	//! Import one complete input state into each distinct, uninitialized target.
+	//! The callback must copy into target-owned storage and initialize NULL inputs.
+	//! Used only for destructor-free states; duplicate groups are combined later.
+	aggregate_update_t state_import = nullptr;
 	//! The hashed aggregate combine states function (may be null, if window is set)
 	aggregate_combine_t combine;
 	//! The hashed aggregate finalization function (may be null, if window is set)
@@ -289,7 +303,8 @@ public:
 public:
 	bool operator==(const AggregateFunction &rhs) const {
 		return state_size == rhs.state_size && initialize == rhs.initialize && update == rhs.update &&
-		       combine == rhs.combine && finalize == rhs.finalize && window == rhs.window;
+		       state_import == rhs.state_import && combine == rhs.combine && finalize == rhs.finalize &&
+		       window == rhs.window;
 	}
 	bool operator!=(const AggregateFunction &rhs) const {
 		return !(*this == rhs);

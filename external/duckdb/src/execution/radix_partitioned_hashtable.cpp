@@ -43,6 +43,12 @@ RadixPartitionedHashTable::RadixPartitionedHashTable(GroupingSet &grouping_set_p
 
 	auto layout = make_shared_ptr<TupleDataLayout>();
 	auto aggregate_objects = AggregateObject::CreateAggregateObjects(op.bindings);
+	can_import_states = !aggregate_objects.empty();
+	for (const auto &aggregate : aggregate_objects) {
+		can_import_states = can_import_states && aggregate.function.HasStateImportCallback() &&
+		                    !aggregate.function.HasStateDestructorCallback() && aggregate.child_count > 0 &&
+		                    !aggregate.IsDistinct() && !aggregate.filter;
+	}
 	layout->Initialize(std::move(group_types_copy), std::move(aggregate_objects), group_validity);
 	layout_ptr = std::move(layout);
 }
@@ -212,6 +218,10 @@ public:
 	idx_t count_before_combining;
 	//! Maximum partition size if all unique
 	idx_t max_partition_size;
+	//! Existing per-thread sketches estimate whether local finalization will
+	//! substantially reduce partial-state exchange, including cross-thread overlap.
+	HyperLogLog partial_group_estimate;
+	idx_t sampled_partial_states = 0;
 };
 
 RadixHTGlobalSinkState::RadixHTGlobalSinkState(ClientContext &context_p, const RadixPartitionedHashTable &radix_ht_p)
@@ -401,6 +411,8 @@ public:
 	static constexpr idx_t ADAPTIVITY_THRESHOLD = 1048576;
 	//! Whether we have decided to adapt our strategy
 	bool adapted;
+	//! Materialized states at the end of the existing HLL sampling window.
+	idx_t sampled_partial_states = 0;
 	//! Sink capacity for this thread
 	idx_t local_sink_capacity;
 
@@ -441,7 +453,18 @@ void RadixPartitionedHashTable::PopulateGroupChunk(DataChunk &group_chunk, DataC
 	group_chunk.Verify();
 }
 
+void SamplePartialStates(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate) {
+	if (!gstate.radix_ht.op.emit_partial_states || !lstate.ht->HLLEnabled()) {
+		return;
+	}
+	lstate.sampled_partial_states = lstate.ht->GetMaterializedCount();
+	if (lstate.abandoned_data) {
+		lstate.sampled_partial_states += lstate.abandoned_data->Count();
+	}
+}
+
 void DecideAdaptation(RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate) {
+	SamplePartialStates(gstate, lstate);
 	//! If the number of unique values is greater than this percentage, we skip lookups altogether
 	static constexpr double SKIP_LOOKUP_UNIQUE_PERCENTAGE_THRESHOLD = 0.95;
 	//! If the deduplication rate could be increased by this number, we increase our sink capacity
@@ -572,7 +595,12 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 	if (!lstate.ht) {
 		lstate.local_sink_capacity = gstate.config.sink_capacity;
 		lstate.ht = CreateHT(context.client, lstate.local_sink_capacity, gstate.config.GetRadixBits());
-		if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD) {
+		if (can_import_states) {
+			// Partial states already contain aggregated input. Import private
+			// tuples directly and combine duplicate keys in the source phase.
+			lstate.ht->SkipLookups();
+			lstate.adapted = true;
+		} else if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD) {
 			// Not using grow strategy, so we enable the HLL to potentially adapt later
 			lstate.ht->EnableHLL(true);
 		} else {
@@ -586,7 +614,12 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 	PopulateGroupChunk(group_chunk, chunk);
 
 	auto &ht = *lstate.ht;
-	ht.AddChunk(group_chunk, payload_input, filter);
+	if (can_import_states) {
+		D_ASSERT(filter.size() == layout_ptr->GetAggregates().size());
+		ht.AppendAggregateStates(group_chunk, payload_input);
+	} else {
+		ht.AddChunk(group_chunk, payload_input, filter);
+	}
 
 	// Decide whether we should adapt our strategy to the data
 	if (!lstate.adapted && lstate.ht->GetSinkCount() >= RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD) {
@@ -599,10 +632,10 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 		return; // We can fit another chunk
 	}
 
-	if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD || gstate.external) {
-		// 'Reset' the HT without taking its data, we can just keep appending to the same collection
-		// This only works because we never resize the HT
-		// We don't do this when running with 1 or 2 threads, it only makes sense when there's many threads
+	if (can_import_states || gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD ||
+	    gstate.external) {
+		// Keep appending to the same collection without growing the pointer
+		// table. Imported states do not populate that table at any thread count.
 		ht.Abandon();
 	}
 
@@ -635,6 +668,13 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
 	MaybeRepartition(context.client, gstate, lstate, true);
 
 	auto &ht = *lstate.ht;
+	HyperLogLog partial_group_estimate;
+	if (op.emit_partial_states && gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD) {
+		if (!lstate.adapted) {
+			SamplePartialStates(gstate, lstate);
+		}
+		ht.MergeHLL(partial_group_estimate);
+	}
 	auto lstate_data = ht.AcquirePartitionedData();
 	if (lstate.abandoned_data) {
 		D_ASSERT(gstate.external);
@@ -655,6 +695,8 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
 
 	auto guard = gstate.Lock();
 	D_ASSERT(!gstate.finalized);
+	gstate.partial_group_estimate.Merge(partial_group_estimate);
+	gstate.sampled_partial_states += lstate.sampled_partial_states;
 	if (gstate.uncombined_data) {
 		gstate.uncombined_data->Combine(*lstate.abandoned_data);
 	} else {
@@ -674,7 +716,17 @@ void RadixPartitionedHashTable::Finalize(ClientContext &context, GlobalSinkState
 		gstate.count_before_combining = uncombined_data.Count();
 
 		// If true there is no need to combine, it was all done by a single thread in a single HT
-		const auto single_ht = !gstate.external && gstate.active_threads == 1 && gstate.number_of_threads == 1;
+		const auto single_ht =
+		    !can_import_states && !gstate.external && gstate.active_threads == 1 && gstate.number_of_threads == 1;
+		// Keep local consolidation when the existing sample predicts more than a
+		// twofold reduction in exchange rows. Merge sketches across native threads:
+		// individually deduplicated tables can still share all their group keys.
+		// This is a cost decision only; the consumer always merges duplicate states.
+		const auto estimated_partial_groups =
+		    (1 + HyperLogLog::GetErrorRate()) * static_cast<double>(gstate.partial_group_estimate.Count());
+		const auto emit_partial_states =
+		    op.emit_partial_states && gstate.sampled_partial_states > 0 &&
+		    static_cast<double>(gstate.sampled_partial_states) <= 2 * estimated_partial_groups;
 
 		auto &uncombined_partition_data = uncombined_data.GetPartitions();
 		const auto n_partitions = uncombined_partition_data.size();
@@ -687,7 +739,10 @@ void RadixPartitionedHashTable::Finalize(ClientContext &context, GlobalSinkState
 			gstate.max_partition_size = MaxValue(gstate.max_partition_size, partition_size);
 
 			gstate.partitions.emplace_back(make_uniq<AggregatePartition>(std::move(partition)));
-			if (single_ht) {
+			// A distributed partial aggregate exports every locally reduced state.
+			// Its downstream merge owns deduplication, including duplicate groups
+			// from abandoned hash tables, native threads and spilled partitions.
+			if (single_ht || emit_partial_states) {
 				gstate.finalize_done++;
 				gstate.partitions.back()->progress = 1;
 				gstate.partitions.back()->state = AggregatePartitionState::READY_TO_SCAN;

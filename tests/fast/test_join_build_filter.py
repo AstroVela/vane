@@ -10,7 +10,12 @@ import pytest
 import vane
 from tests.fast.test_direct_exchange import collect, submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
+from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
 from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
+from vane.execution.plan import Distribution
+from vane.execution.query_options import QueryExecutionOptions, RayExecution
+from vane.execution.resource_demand import MemoryDemand, ResourceDemand
+from vane.execution.submission import prepare_ray_query
 
 
 def shared_join_build_query(connection, directory, comparison="=", shape="keys", *, fact_rows=131072, fixed_plan=True):
@@ -170,3 +175,310 @@ def test_shared_join_build_does_not_fuse_consumers_after_probe_gather(tmp_path, 
         with InProcessTaskService(connection, spec, DirectExchangeLimits(4096, 1024, 32, 1)) as service:
             service.start()
             assert collect(service) == expected
+
+
+@pytest.mark.parametrize("metadata_cache", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_multifile_parquet_cardinality_costs_broadcast_from_footers(tmp_path, metadata_cache, explicit):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files = []
+    for index in range(24):
+        path = tmp_path / f"keys-{index:02}.parquet"
+        keys = [] if index % 3 == 0 else [None if index == 1 else index % 7]
+        pq.write_table(pa.table({"k": pa.array(keys, type=pa.int64())}), path)
+        files.append(str(path))
+    # Repeated and empty references retain their SQL multiplicity.
+    files.extend(files[:3])
+    hint = ", explicit_cardinality=1000000" if explicit else ""
+    sql = f"select sum(f.range), count(*) from range(1024) f join read_parquet({files!r}{hint}) b on f.range % 7=b.k"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side,compressed_materialization'")
+        connection.execute("set parquet_metadata_cache=?", [metadata_cache])
+        graph = compile_sql(connection, sql, 3)
+        kinds = {edge.distribution for edge in graph.exchanges}
+        assert (Distribution.BROADCAST in kinds) is not explicit
+        assert (Distribution.HASH in kinds) is explicit
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_parquet_footer_statistics_follow_hive_file_pruning(tmp_path, partitions):
+    for bucket in range(2):
+        (tmp_path / f"bucket={bucket}").mkdir()
+    selected = tmp_path / "bucket=0" / "data.parquet"
+    pruned = tmp_path / "bucket=1" / "data.parquet"
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        connection.execute(f"copy (select range k from range(8192)) to '{selected}' (row_group_size 2048)")
+        pruned.write_bytes(b"unreadable footer in a pruned partition")
+        sql = f"select sum(k) from read_parquet('{tmp_path}/bucket=*/*.parquet') where bucket=0"
+        expected = connection.execute(sql).fetchall()
+        graph = compile_sql(connection, sql, partitions)
+        assert execute_graph(connection, graph) == expected
+        assert any(
+            str(pruned).encode() in split.payload
+            for fragment in graph.fragments
+            for source in fragment.source_dependencies
+            for split in source.splits
+        )
+
+
+def budgeted_submission(connection, sql, partitions):
+    operator_bytes = 2 << 30
+    return prepare_ray_query(
+        connection,
+        sql,
+        query_id="budgeted-filter",
+        options=QueryExecutionOptions(RayExecution(), 5, 30, 30),
+        resources=ResourceDemand(1, 64, MemoryDemand(operator_bytes, 1 << 20, 1 << 20, 1 << 20), 1),
+        compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=operator_bytes),
+    )
+
+
+@pytest.mark.parametrize("partitions", [2, 3])
+@pytest.mark.parametrize("correlated", [False, True])
+def test_declared_budget_allows_large_estimated_key_filters(tmp_path, partitions, correlated):
+    fact, build, orders = [tmp_path / f"{name}.parquet" for name in ("fact", "build", "orders")]
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        connection.execute(
+            f"copy (select range i, range%4096 k, range%13 v from range(65536)) to '{fact}' (row_group_size 2048)"
+        )
+        connection.execute(f"copy (select range k, range%64=0 keep from range(512)) to '{build}'")
+        connection.execute(f"copy (select range i, range%17 v from range(65536)) to '{orders}'")
+        connection.execute("set disabled_optimizers='join_order,build_side_probe_side,compressed_materialization'")
+        fact_scan = f"read_parquet('{fact}', explicit_cardinality=100000000)"
+        # Keep a 34 MiB estimated key domain while executing only a small
+        # fixture. Join-order estimation is disabled to preserve this shape.
+        build_scan = f"read_parquet('{build}', explicit_cardinality=4000000)"
+        if correlated:
+            sql = (
+                f"select sum(f.v),count(*) from {fact_scan} f join {build_scan} b on f.k=b.k and b.keep "
+                f"where f.v < (select avg(i.v) from {fact_scan} i where i.k=b.k)"
+            )
+        else:
+            sql = (
+                "select sum(p.v),count(*) from ("
+                f"select f.k,f.v from {fact_scan} f join "
+                f"read_parquet('{orders}', explicit_cardinality=200000000) o on f.i=o.i) p "
+                f"join {build_scan} b on p.k=b.k and b.keep"
+            )
+        expected = connection.execute(sql).fetchall()
+        spec = budgeted_submission(connection, sql, partitions)
+        fact_fragments = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(fact).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        edges = {edge.exchange_id for edge in spec.graph.exchanges if edge.producer_fragment_id in fact_fragments}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            fact_rows = sum(
+                channel.snapshot()["accepted_rows"]
+                for name, channel in service.channels.items()
+                if name.split("/")[0] in edges
+            )
+            assert edges and fact_rows < 4096
+            assert all(channel.snapshot()["peak_bytes"] <= limits.window_bytes for channel in service.channels.values())
+
+
+def budgeted_shared_join_build_query(connection, directory, comparison="=", *, fixed_plan=True):
+    sql, target, keys = shared_join_build_query(connection, directory, comparison, fixed_plan=fixed_plan)
+    for name, cardinality in [("fact", 100000000), ("keys", 1200000), ("target", 80000000)]:
+        path = directory / f"{name}.parquet"
+        sql = sql.replace(f"read_parquet('{path}')", f"read_parquet('{path}', explicit_cardinality={cardinality})")
+    return sql, target, keys
+
+
+@pytest.mark.parametrize(
+    "budget,partitions,shared",
+    [
+        (0, 2, False),
+        (64 << 20, 2, False),
+        (256 << 20, 2, True),
+        (2 << 30, 3, True),
+        (2 << 30, 1, False),
+        (2 << 30, 128, False),
+    ],
+)
+def test_shared_join_build_uses_declared_replication_budget(tmp_path, budget, partitions, shared):
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        sql, target, keys = budgeted_shared_join_build_query(connection, tmp_path)
+        graph = compile_fragment_graph(
+            connection,
+            sql,
+            query_id="budgeted-shared-build",
+            options=FragmentCompileOptions(partitions, worker_operator_bytes=budget),
+        )
+        donors = {
+            f.fragment_id
+            for f in graph.fragments
+            if any(str(keys).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        targets = {
+            f.fragment_id
+            for f in graph.fragments
+            if any(str(target).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        assert (
+            any(e.producer_fragment_id in donors and e.consumer_fragment_id in targets for e in graph.exchanges)
+            is shared
+        )
+
+
+@pytest.mark.parametrize("threads,partitions", [(1, 2), (4, 3)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_budgeted_shared_join_build_filters_before_exchange(tmp_path, threads, partitions, comparison):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql, target, keys = budgeted_shared_join_build_query(connection, tmp_path, comparison)
+        expected = connection.execute(sql).fetchall()
+        spec = budgeted_submission(connection, sql, partitions)
+        targets = {
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(target).encode() in split.payload for source in f.sources for split in source.splits)
+        }
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id in targets}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            rows = sum(
+                c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+            )
+            assert edges and rows < 4096
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert (
+            sum(
+                any(str(keys).encode() in split.payload for split in source.splits)
+                for f in spec.graph.fragments
+                for source in f.sources
+            )
+            == 1
+        )
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+def early_shared_join_build_query(connection, directory, comparison="=", shape="inner", *, fixed_plan=True):
+    sql, target, keys = budgeted_shared_join_build_query(connection, directory, comparison, fixed_plan=fixed_plan)
+    if shape in {"right", "full"}:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        # NULL-safe consumer keys retain unmatched right rows, so optimizer
+        # simplification cannot remove the preserved-row boundary under test.
+        for name in ("fact", "target"):
+            original = directory / f"{name}.parquet"
+            replacement = directory / f"{name}-nullable.parquet"
+            table = pq.read_table(original)
+            groups = pc.if_else(pc.is_null(table.column("k")), pa.scalar(None, pa.int64()), table.column("g"))
+            table = table.set_column(table.schema.get_field_index("g"), "g", groups)
+            pq.write_table(table, replacement, row_group_size=2048)
+            sql = sql.replace(str(original), str(replacement))
+        target = directory / "target-nullable.parquet"
+        sql = sql.replace("and p.g=b.g", "and p.g is not distinct from b.g")
+    dimension = directory / "dimension.parquet"
+    connection.execute(f"copy (select range id from range(12)) to '{dimension}'")
+    scan = f"read_parquet('{target}', explicit_cardinality=80000000)"
+    if shape == "limit":
+        scan = f"(select * from {scan} order by k limit 8192)"
+    kind = shape if shape in {"left", "right", "full", "semi"} else "inner"
+    key = {"computed": "b.k%2", "right_key": "d.id", "cast": "b.k::double"}.get(shape, "b.k")
+    columns = f"{key} k,b.g,b.v,b.payload" if shape != "permuted" else "b.payload,b.v,b.k k,b.g"
+    predicate = "b.v>b.g" if shape == "row_filter" else "b.v>=0"
+    if shape in {"left", "right", "full"}:
+        predicate = "true"
+    nested = (
+        f"(select {columns} from {scan} b {kind} join "
+        f"read_parquet('{dimension}', explicit_cardinality=8000000) d on b.v=d.id "
+        f"where {predicate})"
+    )
+    sql = sql.replace(f"read_parquet('{target}', explicit_cardinality=80000000)", nested)
+    return sql, target, keys
+
+
+@pytest.mark.parametrize("partitions,threads", [(2, 1), (3, 4)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+@pytest.mark.parametrize("shape", ["inner", "semi", "permuted", "row_filter"])
+def test_shared_build_filter_moves_before_nested_join_exchange(tmp_path, partitions, threads, comparison, shape):
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        sql, target, keys = early_shared_join_build_query(connection, tmp_path, comparison, shape)
+        expected = connection.execute(sql).fetchall()
+        spec = budgeted_submission(connection, sql, partitions)
+        source = next(
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(target).encode() in split.payload for s in f.sources for split in s.splits)
+        )
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id == source}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            rows = sum(
+                c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+            )
+            assert edges and rows < 4096
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert (
+            sum(
+                any(str(keys).encode() in split.payload for s in f.sources for split in s.splits)
+                for f in spec.graph.fragments
+            )
+            == 1
+        )
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+@pytest.mark.parametrize(
+    "shape,comparison",
+    [
+        (shape, comparison)
+        for shape in ["left", "right", "full", "limit", "computed", "cast", "right_key"]
+        for comparison in ["=", "is not distinct from"]
+        if shape not in {"right", "full"} or comparison == "is not distinct from"
+    ],
+)
+def test_shared_build_filter_respects_nested_target_boundaries(tmp_path, shape, comparison):
+    with vane.connect(backend="local", config={"threads": 4}) as connection:
+        sql, target, _ = early_shared_join_build_query(connection, tmp_path, comparison, shape)
+        expected = connection.execute(sql).fetchall()
+        spec = budgeted_submission(connection, sql, 2)
+        source = next(
+            f.fragment_id
+            for f in spec.graph.fragments
+            if any(str(target).encode() in split.payload for s in f.sources for split in s.splits)
+        )
+        edges = {e.exchange_id for e in spec.graph.exchanges if e.producer_fragment_id == source}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            rows = sum(
+                c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in edges
+            )
+            assert edges and rows > 4096
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
+
+
+def early_shared_join_runtime_query(connection, directory, comparison="is not distinct from"):
+    import pyarrow.parquet as pq
+
+    sql, _, _ = early_shared_join_build_query(connection, directory, comparison, fixed_plan=False)
+    # Keep default optimizer decisions focused on the supplied cardinalities,
+    # without tiny fixture min/max values adding unrelated join filters.
+    for name in ("fact", "keys", "target", "dimension"):
+        original = directory / f"{name}.parquet"
+        replacement = directory / f"{name}-runtime.parquet"
+        pq.write_table(pq.read_table(original), replacement, row_group_size=2048, write_statistics=False)
+        sql = sql.replace(str(original), str(replacement))
+    return (
+        sql.replace("explicit_cardinality=100000000)", "explicit_cardinality=1000000000000)")
+        .replace("explicit_cardinality=1200000)", "explicit_cardinality=6000000)")
+        .replace("explicit_cardinality=80000000)", "explicit_cardinality=800000000)")
+        .replace("where b.v>=0", "where true")
+        .replace("max(b.payload)", "max(length(b.payload))")
+    )

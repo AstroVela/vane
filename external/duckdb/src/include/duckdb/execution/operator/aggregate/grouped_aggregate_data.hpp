@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -35,6 +41,9 @@ public:
 	//! Pointers to the aggregates
 	vector<BoundAggregateExpression *> bindings;
 	idx_t filter_count;
+	//! Distributed partial output may contain several states for the same group.
+	//! The consumer must merge all states before exposing SQL aggregate results.
+	bool emit_partial_states = false;
 
 public:
 	idx_t GroupCount() const;

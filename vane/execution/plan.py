@@ -92,6 +92,7 @@ class SourceSpec:
     codec: str
     requires_snapshot: bool
     splits: tuple[ScanSplitSpec, ...]
+    split_partitions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("source_id", "function_name", "capability", "codec"):
@@ -105,9 +106,31 @@ class SourceSpec:
             raise ValueError("duplicate split_id")
         # Enumeration order is native source state; preserve it for assignment.
         object.__setattr__(self, "splits", splits)
+        owners = _items(self.split_partitions, "split_partitions")
+        if owners and len(owners) != len(splits):
+            raise ValueError("split_partitions must cover every source split")
+        if any(type(owner) is not int or not 0 <= owner <= 2**31 - 1 for owner in owners):
+            raise ValueError("split_partitions must contain non-negative integer partitions")
+        object.__setattr__(self, "split_partitions", owners)
+
+    def assigned_split_ids(self, partition: int, partition_count: int) -> list[str]:
+        if (
+            type(partition_count) is not int
+            or not 1 <= partition_count <= 2**31 - 1
+            or type(partition) is not int
+            or not 0 <= partition < partition_count
+        ):
+            raise ValueError("source partition is out of range")
+        if self.split_partitions:
+            return [
+                split.split_id
+                for split, owner in zip(self.splits, self.split_partitions, strict=True)
+                if owner == partition
+            ]
+        return [split.split_id for split in self.splits[partition::partition_count]]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "source_id": self.source_id,
             "function_name": self.function_name,
             "capability": self.capability,
@@ -115,12 +138,16 @@ class SourceSpec:
             "requires_snapshot": self.requires_snapshot,
             "splits": [split.to_dict() for split in self.splits],
         }
+        if self.split_partitions:
+            result["split_partitions"] = list(self.split_partitions)
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SourceSpec:
-        _fields(
-            value, {"source_id", "function_name", "capability", "codec", "requires_snapshot", "splits"}, cls.__name__
-        )
+        fields = {"source_id", "function_name", "capability", "codec", "requires_snapshot", "splits"}
+        if isinstance(value, Mapping) and "split_partitions" in value:
+            fields.add("split_partitions")
+        _fields(value, fields, cls.__name__)
         return cls(
             source_id=value["source_id"],
             function_name=value["function_name"],
@@ -128,6 +155,7 @@ class SourceSpec:
             codec=value["codec"],
             requires_snapshot=value["requires_snapshot"],
             splits=tuple(ScanSplitSpec.from_dict(split) for split in _items(value["splits"], "splits")),
+            split_partitions=tuple(_items(value.get("split_partitions", ()), "split_partitions")),
         )
 
 
@@ -180,6 +208,11 @@ class FragmentSpec:
                 raise ValueError(f"{label} must contain SourceSpec objects")
             if len({source.source_id for source in sources}) != len(sources):
                 raise ValueError(f"duplicate source_id in {label}")
+            for source in sources:
+                if any(owner >= self.partition_count for owner in source.split_partitions):
+                    raise ValueError("source split partition is out of range")
+                if label == "source_dependencies" and source.split_partitions:
+                    raise ValueError("source dependency cannot declare partition assignments")
             object.__setattr__(self, label, tuple(sorted(sources, key=lambda source: source.source_id)))
 
     @property

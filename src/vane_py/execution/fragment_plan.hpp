@@ -21,6 +21,8 @@ struct SourceSpec {
 	string capability;
 	string codec;
 	vector<DistributedScanSplit> splits;
+	// Nonempty only when complete groups require co-locating split ranges.
+	vector<idx_t> split_partitions;
 	bool requires_snapshot = false;
 	void Serialize(Serializer &serializer) const;
 	static SourceSpec Deserialize(Deserializer &deserializer);
@@ -35,6 +37,9 @@ struct PlanNode {
 	// A native subtree with shared CTE/delimiter state. Its children declare
 	// external input ports, all bound within this one serialization scope.
 	bool scoped = false;
+	// A complete bounded word/mask input gates an unchanged Parquet probe key.
+	idx_t parquet_mask_words = 0;
+	idx_t parquet_mask_key = 0;
 	void Serialize(Serializer &serializer) const;
 	static PlanNode Deserialize(Deserializer &deserializer);
 };

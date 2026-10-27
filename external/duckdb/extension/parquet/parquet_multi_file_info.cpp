@@ -196,8 +196,44 @@ static void ParseRowGroupIdsFromOpenFile(const OpenFileInfo &file, vector<idx_t>
 	}
 }
 
+idx_t ParquetScanCardinality(ClientContext &context, const MultiFileBindData &bind) {
+	auto &data = bind.bind_data->Cast<ParquetReadBindData>();
+	if (data.explicit_cardinality) {
+		return data.explicit_cardinality;
+	}
+	idx_t count = 0;
+	for (auto &file : bind.file_list->GetAllFiles()) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		ParquetReader reader(context, file, data.GetParquetOptions());
+		vector<idx_t> groups;
+		ParseRowGroupIdsFromOpenFile(file, groups);
+		if (groups.empty()) {
+			for (idx_t group = 0; group < reader.NumRowGroups(); group++) {
+				groups.push_back(group);
+			}
+		}
+		for (auto group : groups) {
+			if (group >= reader.NumRowGroups()) {
+				throw InvalidInputException("Parquet row group index out of range");
+			}
+			auto rows = NumericCast<idx_t>(reader.GetFileMetadata()->row_groups[group].num_rows);
+			if (rows > NumericLimits<idx_t>::Maximum() - count) {
+				throw OutOfRangeException("Parquet row count exceeds the supported range");
+			}
+			count += rows;
+		}
+	}
+	return count;
+}
+
 vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindData &bind, idx_t partitions) {
+	if (partitions <= 1) {
+		return bind.file_list->GetAllFiles();
+	}
 	vector<OpenFileInfo> result;
+	unordered_map<idx_t, idx_t> assigned_rows;
 	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
 	for (auto &file : bind.file_list->GetAllFiles()) {
 		if (context.IsInterrupted()) {
@@ -211,11 +247,19 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 				groups.push_back(i);
 			}
 		}
-		if (groups.size() <= 1 || partitions <= 1) {
+		for (auto group : groups) {
+			if (group >= reader.NumRowGroups()) {
+				throw InvalidInputException("Parquet row group index out of range");
+			}
+		}
+		if (groups.size() <= 1) {
+			assigned_rows[result.size() % partitions] +=
+			    groups.empty() ? 0 : NumericCast<idx_t>(reader.GetFileMetadata()->row_groups[groups[0]].num_rows);
 			result.push_back(file);
 			continue;
 		}
 		auto count = MinValue<idx_t>(groups.size(), partitions);
+		vector<pair<idx_t, OpenFileInfo>> splits;
 		for (idx_t part = 0; part < count; part++) {
 			OpenFileInfo split(file.path);
 			split.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
@@ -225,18 +269,43 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 			auto &split_options = split.extended_info->options;
 			split_options.erase("row_group_id");
 			vector<Value> selected;
+			idx_t rows = 0;
 			for (idx_t i = part * groups.size() / count; i < (part + 1) * groups.size() / count; i++) {
 				selected.push_back(Value::UBIGINT(groups[i]));
+				rows += NumericCast<idx_t>(reader.GetFileMetadata()->row_groups[groups[i]].num_rows);
 			}
 			split_options["row_group_ids"] = Value::LIST(LogicalType::UBIGINT, std::move(selected));
+			splits.emplace_back(rows, std::move(split));
+		}
+		// Strided assignments map these slots to fixed query partitions. Give
+		// larger chunks to their least-loaded slots so odd row-group counts do
+		// not send the larger half of every file to the same worker.
+		vector<pair<idx_t, idx_t>> slots;
+		for (idx_t slot = 0; slot < count; slot++) {
+			slots.emplace_back(assigned_rows[(result.size() + slot) % partitions], slot);
+		}
+		std::sort(slots.begin(), slots.end());
+		std::stable_sort(splits.begin(), splits.end(),
+		                 [](const pair<idx_t, OpenFileInfo> &left, const pair<idx_t, OpenFileInfo> &right) {
+			                 return left.first > right.first;
+		                 });
+		vector<OpenFileInfo> ordered(count);
+		for (idx_t i = 0; i < count; i++) {
+			auto slot = slots[i].second;
+			assigned_rows[(result.size() + slot) % partitions] += splits[i].first;
+			ordered[slot] = std::move(splits[i].second);
+		}
+		for (auto &split : ordered) {
 			result.push_back(std::move(split));
 		}
 	}
 	return result;
 }
 
-bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
-                                idx_t column, optional_ptr<pair<Value, Value>> bounds) {
+bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
+                                idx_t column, idx_t partitions, vector<idx_t> &assignment,
+                                optional_ptr<pair<Value, Value>> bounds) {
+	assignment.clear();
 	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
 	// Schema mappings, virtual columns and casts require a separate proof. In
 	// particular, comparing file statistics before a lossy cast is not sufficient.
@@ -245,8 +314,15 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 	    !bind.reader_bind.schema.empty()) {
 		return false;
 	}
-	vector<pair<Value, Value>> ranges;
-	for (auto &split : splits) {
+	struct KeyRange {
+		Value lower;
+		Value upper;
+		idx_t split;
+		double rows;
+	};
+	vector<KeyRange> ranges;
+	for (idx_t split_index = 0; split_index < splits.size(); split_index++) {
+		auto &split = splits[split_index];
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
@@ -270,6 +346,7 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			}
 		}
 		Value lower, upper;
+		double rows = 0;
 		auto &metadata = *reader.GetFileMetadata();
 		for (auto group : groups) {
 			if (group >= metadata.row_groups.size()) {
@@ -279,6 +356,7 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			if (row_group.num_rows == 0) {
 				continue;
 			}
+			rows += double(row_group.num_rows);
 			auto stats = schema->Stats(metadata, options, group, row_group.columns);
 			// NULL is one SQL group too, even when non-null ranges are disjoint.
 			if (!stats || stats->CanHaveNull() || !NumericStats::HasMinMax(*stats)) {
@@ -297,20 +375,66 @@ bool ParquetSplitRangesDisjoint(ClientContext &context, MultiFileBindData &bind,
 			}
 		}
 		if (!lower.IsNull()) {
-			ranges.emplace_back(std::move(lower), std::move(upper));
+			ranges.push_back({std::move(lower), std::move(upper), split_index, rows});
 		}
 	}
-	std::sort(ranges.begin(), ranges.end(),
-	          [](const pair<Value, Value> &a, const pair<Value, Value> &b) { return a.first < b.first; });
+	std::sort(ranges.begin(), ranges.end(), [](const KeyRange &a, const KeyRange &b) { return a.lower < b.lower; });
+	bool disjoint = true;
 	for (idx_t i = 1; i < ranges.size(); i++) {
 		// Equality at a boundary means a group may span both splits.
-		if (ranges[i - 1].second >= ranges[i].first) {
-			return false;
+		if (ranges[i - 1].upper >= ranges[i].lower) {
+			disjoint = false;
+			break;
 		}
 	}
-	if (bounds && !ranges.empty()) {
-		*bounds = {ranges.front().first, ranges.back().second};
+	if (ranges.empty()) {
+		return true;
 	}
+	struct Component {
+		Value upper;
+		double rows;
+		vector<idx_t> splits;
+	};
+	vector<Component> components;
+	for (auto &range : ranges) {
+		if (components.empty() || components.back().upper < range.lower) {
+			components.push_back({range.upper, 0, {}});
+		}
+		auto &component = components.back();
+		if (component.upper < range.upper) {
+			component.upper = range.upper;
+		}
+		component.rows += range.rows;
+		component.splits.push_back(range.split);
+	}
+	if (bounds) {
+		*bounds = {ranges.front().lower, components.back().upper};
+	}
+	if (disjoint) {
+		return true;
+	}
+	if (partitions <= 1 || components.size() < partitions) {
+		return false;
+	}
+	std::stable_sort(components.begin(), components.end(),
+	                 [](const Component &a, const Component &b) { return a.rows > b.rows; });
+	vector<double> loads(partitions, 0);
+	vector<idx_t> planned(splits.size(), 0);
+	double total_rows = 0;
+	for (auto &component : components) {
+		auto owner = idx_t(std::min_element(loads.begin(), loads.end()) - loads.begin());
+		loads[owner] += component.rows;
+		total_rows += component.rows;
+		for (auto split : component.splits) {
+			planned[split] = owner;
+		}
+	}
+	// Saving a merge must not concentrate the source on a few workers. Rows
+	// estimate the balance only; the interval proof establishes completeness.
+	if (*std::max_element(loads.begin(), loads.end()) * double(partitions) > total_rows * 1.25) {
+		return false;
+	}
+	assignment = std::move(planned);
 	return true;
 }
 

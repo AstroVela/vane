@@ -144,6 +144,8 @@ public:
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	void SerializeOperatorData(Serializer &serializer) const override;
+	//! Allow duplicate groups only for explicitly planned exported aggregate states.
+	void SetPartialStateOutput();
 	//! Toggle multi-scan capability on a hash table, which prevents the scan of the aggregate from being destructive
 	//! If this is not toggled the GetData method will destroy the hash table as it is scanning it
 	static void SetMultiScan(GlobalSinkState &state);

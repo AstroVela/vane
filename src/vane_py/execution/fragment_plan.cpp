@@ -3,6 +3,7 @@
 
 #include "fragment_plan.hpp"
 #include "correlated_partition.hpp"
+#include "parquet_mask.hpp"
 #include "file_snapshot.hpp"
 #include "exchange_types.hpp"
 #include "parquet_split.hpp"
@@ -22,6 +23,7 @@
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/lambda_functions.hpp"
@@ -32,6 +34,8 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -164,6 +168,9 @@ void SourceSpec::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(4, "codec", codec);
 	serializer.WriteProperty(5, "splits", splits);
 	serializer.WriteProperty(6, "requires_snapshot", requires_snapshot);
+	if (!split_partitions.empty()) {
+		serializer.WriteProperty(7, "split_partitions", split_partitions);
+	}
 }
 
 SourceSpec SourceSpec::Deserialize(Deserializer &deserializer) {
@@ -174,8 +181,14 @@ SourceSpec SourceSpec::Deserialize(Deserializer &deserializer) {
 	result.codec = deserializer.ReadProperty<string>(4, "codec");
 	result.splits = deserializer.ReadProperty<vector<DistributedScanSplit>>(5, "splits");
 	result.requires_snapshot = deserializer.ReadProperty<bool>(6, "requires_snapshot");
+	result.split_partitions = deserializer.ReadPropertyWithDefault<vector<idx_t>>(7, "split_partitions");
 	if (result.source_id.empty() || result.capability.empty() || result.codec.empty()) {
 		throw SerializationException("empty fragment source identity");
+	}
+	if (!result.split_partitions.empty() &&
+	    (result.split_partitions.size() != result.splits.size() ||
+	     (result.function_name != "read_parquet" && result.function_name != "parquet_scan"))) {
+		throw SerializationException("split partition assignment must cover every source split");
 	}
 	std::set<string> ids;
 	for (auto &split : result.splits) {
@@ -194,6 +207,10 @@ void PlanNode::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(4, "source_id", source_id);
 	serializer.WriteProperty(5, "children", children);
 	serializer.WriteProperty(6, "scoped", scoped);
+	if (parquet_mask_words) {
+		serializer.WriteProperty(7, "parquet_mask_words", parquet_mask_words);
+		serializer.WriteProperty(8, "parquet_mask_key", parquet_mask_key);
+	}
 }
 
 PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
@@ -204,7 +221,22 @@ PlanNode PlanNode::Deserialize(Deserializer &deserializer) {
 	result.source_id = deserializer.ReadProperty<string>(4, "source_id");
 	result.children = deserializer.ReadProperty<vector<PlanNode>>(5, "children");
 	result.scoped = deserializer.ReadProperty<bool>(6, "scoped");
+	result.parquet_mask_words = deserializer.ReadPropertyWithDefault<idx_t>(7, "parquet_mask_words");
+	result.parquet_mask_key = deserializer.ReadPropertyWithDefault<idx_t>(8, "parquet_mask_key");
 	CheckTypes(result.types);
+	if (result.parquet_mask_words) {
+		if (!ValidParquetMaskSize(result.parquet_mask_words) || !result.input_port.empty() ||
+		    !result.native_operator.empty() || !result.source_id.empty() || result.scoped ||
+		    result.children.size() != 2 || result.children[0].types != result.types ||
+		    result.children[1].types != vector<LogicalType> {LogicalType::UBIGINT, LogicalType::UBIGINT} ||
+		    result.parquet_mask_key >= result.types.size() || !result.types[result.parquet_mask_key].IsIntegral()) {
+			throw SerializationException("invalid Parquet mask fragment node");
+		}
+		return result;
+	}
+	if (result.parquet_mask_key) {
+		throw SerializationException("Parquet mask key has no bounded mask");
+	}
 	if (!result.input_port.empty()) {
 		if (!result.native_operator.empty() || !result.source_id.empty() || !result.children.empty() || result.scoped) {
 			throw SerializationException("fragment input port contains operator state");
@@ -252,6 +284,18 @@ FragmentSpec FragmentSpec::Deserialize(const string &payload) {
 	CheckPartitions(result.partition_count);
 	if (result.fragment_id.empty() || result.names.size() != result.root.types.size()) {
 		throw SerializationException("invalid fragment identity or result names");
+	}
+	for (auto &source : result.sources) {
+		for (auto partition : source.split_partitions) {
+			if (partition >= result.partition_count) {
+				throw SerializationException("source split partition is out of range");
+			}
+		}
+	}
+	for (auto &source : result.source_dependencies) {
+		if (!source.split_partitions.empty()) {
+			throw SerializationException("source dependency cannot declare partition assignments");
+		}
 	}
 	return result;
 }
@@ -393,6 +437,10 @@ SourceSpec ParquetSource(const string &id, const string &name, FunctionData *bin
 
 class LogicalValidator : public LogicalOperatorVisitor {
 public:
+	explicit LogicalValidator(idx_t partitions) : partitions(partitions) {
+	}
+
+	idx_t partitions;
 	vector<SourceSpec> source_dependencies;
 	bool frozen_files = false;
 
@@ -423,6 +471,14 @@ public:
 				// Change only this bound scan's capability, not the shared catalog or
 				// session optimizer settings; native TopN can still be distributed.
 				get.function.late_materialization = false;
+				if (partitions > 1) {
+					// Cost the remaining files when the optimizer requests statistics,
+					// after file pruning, rather than opening every bound footer here.
+					get.function.cardinality = [](ClientContext &context, const FunctionData *data) {
+						return make_uniq<NodeStatistics>(
+						    ParquetScanCardinality(context, data->Cast<MultiFileBindData>()));
+					};
+				}
 				// Statistics and file pruning depend on the bound file set even if
 				// optimization later removes every executable scan.
 				source_dependencies.push_back(ParquetSource("dependency" + std::to_string(source_dependencies.size()),
@@ -758,6 +814,13 @@ public:
 	    : context(context), plan(plan), graph(graph), partitions(partitions),
 	      broadcast_limit(
 	          MaxValue<idx_t>(8 * 1024 * 1024, MinValue<idx_t>(64 * 1024 * 1024, worker_operator_bytes / 16))) {
+		// Cost 128 bytes per word for grouping, probe tables and encoded masks.
+		// This bounds domain rows, not total allocation: native operator memory
+		// and spill budgets still apply, including thread-local aggregate states.
+		const auto word_capacity = broadcast_limit / 128;
+		while (max_bitmap_words <= word_capacity / 2) {
+			max_bitmap_words *= 2;
+		}
 	}
 
 	string Finish(DistributedSubtree subtree, const vector<string> &names = {}) {
@@ -823,7 +886,7 @@ public:
 				auto domain = ExchangeFrom(filter.domain_producer, filter.domain->types,
 				                           count == 1 ? "gather" : "broadcast", count);
 				result = SemiFilter(op, std::move(result), filter.column, *filter.domain, std::move(domain),
-				                    filter.keys_only ? 0 : filter.build_column, filter.hashed);
+				                    filter.keys_only ? 0 : filter.build_column, filter.bitmap_words);
 			}
 		}
 		return result;
@@ -937,6 +1000,7 @@ private:
 	FragmentGraph &graph;
 	idx_t partitions;
 	idx_t broadcast_limit;
+	idx_t max_bitmap_words = 65536;
 	idx_t next_exchange = 0;
 	unordered_map<string, std::pair<idx_t, vector<idx_t>>> output_partitioning;
 	// Nodes have independent payloads, but join and scan references must share
@@ -951,7 +1015,7 @@ private:
 		PhysicalOperator *domain = nullptr;
 		string domain_producer;
 		bool keys_only = false;
-		bool hashed = false;
+		idx_t bitmap_words = 0;
 	};
 	unordered_map<const PhysicalOperator *, vector<EarlyProbeFilter>> probe_filters;
 	unordered_map<const PhysicalOperator *, string> shared_join_builds;
@@ -1018,12 +1082,15 @@ private:
 			}
 			auto try_build = [&](PhysicalHashJoin &probe, idx_t column) {
 				auto &build = probe.children[1].get();
+				auto build_bytes = EstimatedExchangeBytes(build);
+				// Larger donors already qualify for a budgeted broadcast below.
+				// Charge their extra replicas with the same fourfold traffic margin.
+				const auto margin = build_bytes > 8 * 1024 * 1024 ? 4 : 1;
 				if (column >= build.types.size() || build.types[column] != condition.left->return_type ||
 				    !HasFilteredBuildRoot(build) || HasScopedState(build) || !build.estimated_cardinality ||
-				    EstimatedExchangeBytes(build) > 8 * 1024 * 1024 ||
-				    !BroadcastJoin(probe, partitions, 8 * 1024 * 1024) ||
+				    build_bytes > broadcast_limit || !BroadcastJoin(probe, partitions, broadcast_limit) ||
 				    double(build.estimated_cardinality) * 8 >= double(target.estimated_cardinality) ||
-				    EstimatedExchangeBytes(build) * partitions >= target_bytes) {
+				    build_bytes * partitions * margin >= target_bytes) {
 					return false;
 				}
 				result.input = &target;
@@ -1094,17 +1161,52 @@ private:
 		return result;
 	}
 
+	void PushBuildFilter(EarlyProbeFilter &filter) {
+		auto op = filter.input;
+		auto column = filter.column;
+		auto type = op->types[column];
+		while (!op->children.empty()) {
+			if (op->type == PhysicalOperatorType::PROJECTION) {
+				auto &expression = *op->Cast<PhysicalProjection>().select_list[column];
+				if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+					break;
+				}
+				column = expression.Cast<BoundReferenceExpression>().index;
+			} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+				auto &join = op->Cast<PhysicalHashJoin>();
+				if ((join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
+				    !join.delim_types.empty() || column >= join.lhs_output_columns.col_idxs.size()) {
+					break;
+				}
+				column = join.lhs_output_columns.col_idxs[column];
+			} else if (op->type != PhysicalOperatorType::FILTER) {
+				break;
+			}
+			auto &child = op->children[0].get();
+			if (column >= child.types.size() || child.types[column] != type || HasScopedState(child) ||
+			    shared_join_builds.count(&child)) {
+				break;
+			}
+			// A necessary key restriction can precede an INNER/SEMI probe without
+			// changing the join's matches or multiplicity. Stop at scoped/shared
+			// ownership, computed keys and cardinality/preserved-row boundaries.
+			filter.input = &child;
+			filter.column = column;
+			op = &child;
+		}
+	}
+
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
 		EarlyProbeFilter result;
 		auto &build = join.children[1].get();
 		if (partitions == 1 || (join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
-		    !join.filter_pushdown || !build.estimated_cardinality) {
+		    !build.estimated_cardinality) {
 			return result;
 		}
 		// Native scan pushdown cannot cross an integer compression projection.
 		// A filter at the exchange boundary still sees the exact join-key type;
 		// recognize a filtered build even when no native scan target was found.
-		if (!join.filter_pushdown->build_side_has_filter && !HasFilteredBuildRoot(build)) {
+		if ((!join.filter_pushdown || !join.filter_pushdown->build_side_has_filter) && !HasFilteredBuildRoot(build)) {
 			return result;
 		}
 		// Find existing early filters before considering larger broadcasts. Their
@@ -1181,17 +1283,32 @@ private:
 			    double(build.estimated_cardinality) * (1 + GetTypeIdSize(condition.right->return_type.InternalType()));
 			auto probe_bytes = EstimatedExchangeBytes(*target.input);
 			target.keys_only = !broadcast;
-			target.hashed = !broadcast && key_bytes > 8 * 1024 * 1024 && HasFilteredAggregate(build);
-			if (target.hashed) {
-				// HAVING estimates can hide a tiny build. A distinct hash domain
-				// has at most 65536 entries even when that estimate is wrong.
-				// Collisions only retain extra probes; the original join is exact.
-				if (target.input->estimated_cardinality <= 8 * 65536) {
+			if (!broadcast && key_bytes > 8 * 1024 * 1024 &&
+			    (HasFilteredAggregate(build) || key_bytes > MaxValue<idx_t>(16 * 1024 * 1024, broadcast_limit))) {
+				// An ancestor's early filter already reduces this exchange. Its
+				// original cardinality cannot fund another blocking domain.
+				if (probe_filters.count(target.input)) {
 					continue;
 				}
-				key_bytes = 65536 * 9;
+				// A filtered build can be overestimated. Bound the domain by its
+				// word count instead of broadcasting every key. Each word retains
+				// 64 hash positions; collisions only retain extra probes.
+				target.bitmap_words = 65536;
+				if (target.input->estimated_cardinality <= 8 * target.bitmap_words) {
+					continue;
+				}
+				// Size each filter to its own probe and traffic savings. A larger
+				// worker budget must not disable a useful smaller key domain.
+				while (target.bitmap_words < max_bitmap_words &&
+				       16 * target.bitmap_words < target.input->estimated_cardinality &&
+				       EstimatedExchangeBytes(build) + double(target.bitmap_words) * 18 * partitions < probe_bytes) {
+					target.bitmap_words *= 2;
+				}
+				key_bytes = target.bitmap_words * 18;
 			} else {
-				if (!broadcast && key_bytes > 16 * 1024 * 1024) {
+				// Key replicas can use the same bounded per-query allowance as a
+				// full-build broadcast. Charge all extra edges below as before.
+				if (!broadcast && key_bytes > MaxValue<idx_t>(16 * 1024 * 1024, broadcast_limit)) {
 					continue;
 				}
 				if (double(build.estimated_cardinality) * (broadcast ? 8 : 4) >=
@@ -1214,7 +1331,11 @@ private:
 			// edge below. Complete-build broadcasts keep their smaller limits.
 			auto traffic = broadcast ? EstimatedExchangeBytes(build) * partitions
 			                         : EstimatedExchangeBytes(build) + key_bytes * partitions;
-			if (traffic < probe_bytes) {
+			// A streaming build adds a new complete-build barrier and bitmap
+			// hashing work. Require the same fourfold margin as full broadcasts.
+			// A filtered aggregate already blocks before producing its keys.
+			const auto margin = target.bitmap_words && !HasFilteredAggregate(build) ? 4 : 1;
+			if (traffic * margin < probe_bytes) {
 				target.build = &build;
 				target.build_column = condition.right->Cast<BoundReferenceExpression>().index;
 				return target;
@@ -1223,48 +1344,100 @@ private:
 		return result;
 	}
 
-	unique_ptr<Expression> HashBucket(const LogicalType &type, idx_t column) {
+	unique_ptr<Expression> FilterFunction(const string &name, vector<unique_ptr<Expression>> arguments) {
+		FunctionBinder binder(context);
+		ErrorData error;
+		auto result = binder.BindScalarFunction(DEFAULT_SCHEMA, name, std::move(arguments), error);
+		if (error.HasError()) {
+			throw InternalException("cannot bind join filter %s: %s", name, error.Message());
+		}
+		return result;
+	}
+	unique_ptr<Expression> FilterHash(const LogicalType &type, idx_t column) {
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundReferenceExpression>(type, column));
+		return FilterFunction("hash", std::move(arguments));
+	}
+	unique_ptr<Expression> FilterWord(idx_t column, idx_t words) {
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, column));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(words - 1)));
+		return FilterFunction("&", std::move(arguments));
+	}
+	unique_ptr<Expression> FilterBit(idx_t column) {
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, column));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(32)));
+		auto upper = FilterFunction(">>", std::move(arguments));
+		arguments.clear();
+		arguments.push_back(std::move(upper));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(63)));
+		auto bit = FilterFunction("&", std::move(arguments));
+		arguments.clear();
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(1)));
+		arguments.push_back(std::move(bit));
+		return FilterFunction("<<", std::move(arguments));
+	}
+	vector<unique_ptr<Expression>> FilterMaskAggregate() {
+		auto &entry =
+		    Catalog::GetEntry<AggregateFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "bit_or");
 		FunctionBinder binder(context);
 		ErrorData error;
 		vector<unique_ptr<Expression>> arguments;
-		arguments.push_back(make_uniq<BoundReferenceExpression>(type, column));
-		auto hash = binder.BindScalarFunction(DEFAULT_SCHEMA, "hash", std::move(arguments), error);
+		arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, 1));
+		auto function = binder.BindFunction("bit_or", entry.functions, arguments, error);
 		if (error.HasError()) {
-			throw InternalException("cannot bind join filter hash: %s", error.Message());
+			throw InternalException("cannot bind join filter mask aggregate: %s", error.Message());
 		}
-		arguments.clear();
-		arguments.push_back(std::move(hash));
-		arguments.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(65535)));
-		auto bucket = binder.BindScalarFunction(DEFAULT_SCHEMA, "&", std::move(arguments), error);
-		if (error.HasError()) {
-			throw InternalException("cannot bind join filter bucket: %s", error.Message());
-		}
-		return bucket;
+		vector<unique_ptr<Expression>> aggregates;
+		aggregates.push_back(binder.BindAggregateFunction(entry.functions.GetFunctionByOffset(function.GetIndex()),
+		                                                  std::move(arguments)));
+		return aggregates;
+	}
+	std::pair<DistributedSubtree, PhysicalOperator *> BitmapDomain(DistributedSubtree domain, PhysicalOperator &build,
+	                                                               idx_t key, idx_t words) {
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(FilterHash(build.types[key], key));
+		auto &hash = plan.Make<PhysicalProjection>(vector<LogicalType> {LogicalType::UBIGINT}, std::move(expressions),
+		                                           build.estimated_cardinality);
+		Wrap(hash, domain);
+		expressions.clear();
+		expressions.push_back(FilterWord(0, words));
+		expressions.push_back(FilterBit(0));
+		auto &projection =
+		    plan.Make<PhysicalProjection>(vector<LogicalType> {LogicalType::UBIGINT, LogicalType::UBIGINT},
+		                                  std::move(expressions), build.estimated_cardinality);
+		Wrap(projection, domain);
+		vector<unique_ptr<Expression>> groups;
+		groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, 0));
+		auto &partial = MakeAggregate(Copy(groups), FilterMaskAggregate());
+		Wrap(partial, domain);
+		domain = Exchange(std::move(domain), "gather", 1);
+		// One globally merged row per word prevents the filtering join below
+		// from multiplying probe rows or missing bits from another partition.
+		auto &complete = MakeAggregate(std::move(groups), FilterMaskAggregate());
+		Wrap(complete, domain);
+		return std::make_pair(std::move(domain), &complete);
 	}
 
 	void BuildKeyDomain(EarlyProbeFilter &filter) {
 		auto &build = *filter.build;
 		auto domain = ExchangeFrom(filter.producer, build.types, "hash", partitions, {filter.build_column});
+		if (filter.bitmap_words) {
+			auto bitmap = BitmapDomain(std::move(domain), build, filter.build_column, filter.bitmap_words);
+			filter.domain = bitmap.second;
+			filter.domain_producer = Finish(std::move(bitmap.first));
+			return;
+		}
 		vector<unique_ptr<Expression>> expressions;
 		expressions.push_back(
-		    filter.hashed ? HashBucket(build.types[filter.build_column], filter.build_column)
-		                  : make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
+		    make_uniq<BoundReferenceExpression>(build.types[filter.build_column], filter.build_column));
 		auto type = expressions[0]->return_type;
 		auto &projection = plan.Make<PhysicalProjection>(vector<LogicalType> {type}, std::move(expressions),
 		                                                 build.estimated_cardinality);
 		projection.children.push_back(build);
 		Wrap(projection, domain);
 		filter.domain = &projection;
-		if (filter.hashed) {
-			vector<unique_ptr<Expression>> groups;
-			groups.push_back(make_uniq<BoundReferenceExpression>(type, 0));
-			auto &partial = MakeAggregate(Copy(groups), {});
-			Wrap(partial, domain);
-			domain = Exchange(std::move(domain), "gather", 1);
-			auto &complete = MakeAggregate(std::move(groups), {});
-			Wrap(complete, domain);
-			filter.domain = &complete;
-		}
 		filter.domain_producer = Finish(std::move(domain));
 	}
 
@@ -1281,11 +1454,43 @@ private:
 		return false;
 	}
 
+	PhysicalTableScan &KeyScan(PhysicalTableScan &scan, idx_t column) {
+		const auto key = scan.projection_ids.empty() ? column : scan.projection_ids[column];
+		vector<ColumnIndex> columns {scan.column_ids[key]};
+		unique_ptr<TableFilterSet> filters;
+		if (scan.table_filters) {
+			filters = make_uniq<TableFilterSet>();
+			for (auto &entry : scan.table_filters->filters) {
+				idx_t position = 0;
+				if (entry.first != key) {
+					position = columns.size();
+					columns.push_back(scan.column_ids[entry.first]);
+				}
+				filters->filters.emplace(position, entry.second->Copy());
+			}
+		}
+		ExtraOperatorInfo info;
+		info.file_filters = scan.extra_info.file_filters;
+		info.total_files = scan.extra_info.total_files;
+		info.filtered_files = scan.extra_info.filtered_files;
+		info.scan_node_id = scan.extra_info.scan_node_id;
+		info.scan_group_id = scan.extra_info.scan_group_id;
+		// Keep static predicates and their input columns, but do not share an
+		// original join's runtime filters with this independently bound scan.
+		return plan
+		    .Make<PhysicalTableScan>(vector<LogicalType> {scan.types[column]}, scan.function, scan.bind_data->Copy(),
+		                             scan.returned_types, std::move(columns), vector<idx_t> {0}, scan.names,
+		                             std::move(filters), scan.estimated_cardinality, std::move(info), scan.parameters,
+		                             scan.virtual_columns)
+		    .Cast<PhysicalTableScan>();
+	}
+
 	DistributedSubtree FilterCorrelatedInput(PhysicalOperator &op, DistributedSubtree input, idx_t key,
 	                                         const CorrelatedKeyFilter &filter, const string &owner_producer) {
 		auto count = input.fragment.partition_count;
 		auto keys = filter.scan;
-		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= 8 * 1024 * 1024 &&
+
+		bool rescan = keys.source && EstimatedExchangeBytes(*keys.source) <= broadcast_limit &&
 		              double(keys.source->estimated_cardinality) * 8 < double(op.estimated_cardinality) &&
 		              double(keys.source->estimated_cardinality) * count < double(op.estimated_cardinality);
 		if (!rescan && keys.source && keys.source == filter.owner.source && broadcast_limit > 8 * 1024 * 1024) {
@@ -1299,6 +1504,33 @@ private:
 			rescan = key_bytes <= broadcast_limit && matches > 0 && matches * 4 < double(op.estimated_cardinality) &&
 			         probe_bytes != NumericLimits<double>::Maximum() &&
 			         key_bytes * count < probe_bytes * (1 - matches / double(op.estimated_cardinality));
+			if (!rescan && key_bytes > broadcast_limit && matches > 0 &&
+			    matches * 4 < double(op.estimated_cardinality) && op.types[key].IsIntegral() &&
+			    input.incoming.empty() && input.fragment.sources.size() == 1 && input.local_scan &&
+			    !probe_filters.count(&op) && CanFilterParquetKey(op, key) &&
+			    probe_bytes != NumericLimits<double>::Maximum()) {
+				auto &source = keys.source->Cast<PhysicalTableScan>();
+				if (!source.extra_info.sample_options) {
+					// The proof above uses this scan's complete owner and a single
+					// correlation key. Bound its domain instead of trusting the key
+					// cardinality estimate, and read no unrelated owner payload.
+					auto saved = probe_bytes * (1 - matches / double(op.estimated_cardinality));
+					idx_t words = 65536;
+					while (words < max_bitmap_words && 16 * words < op.estimated_cardinality &&
+					       key_bytes + double(words * 2) * 18 * (partitions + count) < saved) {
+						words *= 2;
+					}
+					// Charge the extra key scan, partial-domain gather and complete
+					// domain replicas against traffic estimated to disappear.
+					if (op.estimated_cardinality > 8 * words &&
+					    key_bytes + double(words) * 18 * (partitions + count) < saved) {
+						auto &scan = KeyScan(source, keys.column);
+						auto bitmap = BitmapDomain(Build(scan), scan, 0, words);
+						auto domain = Exchange(std::move(bitmap.first), count == 1 ? "gather" : "broadcast", count);
+						return ParquetBitmapFilter(op, std::move(input), key, std::move(domain), words);
+					}
+				}
+			}
 		}
 		DistributedSubtree domain;
 		if (rescan) {
@@ -1310,7 +1542,7 @@ private:
 			auto &owner = *keys.source;
 			auto key_bytes =
 			    double(owner.estimated_cardinality) * (1 + GetTypeIdSize(owner.types[keys.column].InternalType()));
-			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > 8 * 1024 * 1024 ||
+			if (owner_producer.empty() || !owner.estimated_cardinality || key_bytes > broadcast_limit ||
 			    double(owner.estimated_cardinality) * 8 >= double(op.estimated_cardinality) ||
 			    EstimatedExchangeBytes(owner) + key_bytes * count >= EstimatedExchangeBytes(op)) {
 				return input;
@@ -1331,14 +1563,91 @@ private:
 		return SemiFilter(op, std::move(input), key, projection, std::move(domain), 0);
 	}
 
+	DistributedSubtree ParquetBitmapFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key,
+	                                       DistributedSubtree domain, idx_t words) {
+		PlanNode node;
+		node.types = op.types;
+		node.parquet_mask_words = words;
+		node.parquet_mask_key = key;
+		node.children.push_back(std::move(input.fragment.root));
+		node.children.push_back(std::move(domain.fragment.root));
+		input.fragment.root = std::move(node);
+		for (auto &edge : domain.incoming) {
+			input.incoming.push_back(std::move(edge));
+		}
+		return input;
+	}
+
+	DistributedSubtree BitmapFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
+	                                DistributedSubtree domain, idx_t words) {
+		if (input.incoming.empty() && input.fragment.sources.size() == 1 && CanFilterParquetKey(op, key)) {
+			// This source-only unary probe can consume the complete domain
+			// before scan initialization, using the same build dependency as
+			// the word join below. Do not move it across incoming exchanges or
+			// another already-installed filter's native fragment root.
+			return ParquetBitmapFilter(op, std::move(input), key, std::move(domain), words);
+		}
+		const auto columns = op.types.size();
+		vector<LogicalType> types = op.types;
+		vector<unique_ptr<Expression>> expressions;
+		for (idx_t i = 0; i < columns; i++) {
+			expressions.push_back(make_uniq<BoundReferenceExpression>(op.types[i], i));
+		}
+		expressions.push_back(FilterHash(op.types[key], key));
+		types.push_back(LogicalType::UBIGINT);
+		auto &hash = plan.Make<PhysicalProjection>(types, std::move(expressions), op.estimated_cardinality);
+		Wrap(hash, input);
+
+		vector<JoinCondition> conditions;
+		JoinCondition condition;
+		condition.left = FilterWord(columns, words);
+		condition.right = make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, 0);
+		condition.comparison = ExpressionType::COMPARE_EQUAL;
+		conditions.push_back(std::move(condition));
+		types.push_back(LogicalType::UBIGINT);
+		LogicalComparisonJoin logical(JoinType::INNER);
+		logical.types = types;
+		auto &join =
+		    plan.Make<PhysicalHashJoin>(logical, hash, build, std::move(conditions), JoinType::INNER, vector<idx_t> {},
+		                                vector<idx_t> {1}, vector<LogicalType> {}, op.estimated_cardinality, nullptr);
+		auto node = Node(join);
+		node.children.push_back(std::move(input.fragment.root));
+		node.children.push_back(std::move(domain.fragment.root));
+		input.fragment.root = std::move(node);
+		for (auto &edge : domain.incoming) {
+			input.incoming.push_back(std::move(edge));
+		}
+
+		// Compute the bit only after matching a populated word. Sparse domains
+		// can discard most probes without evaluating or carrying another column.
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(FilterBit(columns));
+		arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::UBIGINT, columns + 1));
+		expressions.clear();
+		expressions.push_back(make_uniq<BoundComparisonExpression>(
+		    ExpressionType::COMPARE_NOTEQUAL, FilterFunction("&", std::move(arguments)),
+		    make_uniq<BoundConstantExpression>(Value::UBIGINT(0))));
+		auto &filter = plan.Make<PhysicalFilter>(types, std::move(expressions), op.estimated_cardinality);
+		Wrap(filter, input);
+		expressions.clear();
+		for (idx_t i = 0; i < columns; i++) {
+			expressions.push_back(make_uniq<BoundReferenceExpression>(op.types[i], i));
+		}
+		auto &output = plan.Make<PhysicalProjection>(op.types, std::move(expressions), op.estimated_cardinality);
+		Wrap(output, input);
+		return input;
+	}
+
 	DistributedSubtree SemiFilter(PhysicalOperator &op, DistributedSubtree input, idx_t key, PhysicalOperator &build,
-	                              DistributedSubtree domain, idx_t build_key, bool hashed = false) {
+	                              DistributedSubtree domain, idx_t build_key, idx_t bitmap_words = 0) {
+		if (bitmap_words) {
+			return BitmapFilter(op, std::move(input), key, build, std::move(domain), bitmap_words);
+		}
 		// NULL-safe equality is only a necessary condition; the original
 		// join still decides matches. SEMI preserves probe duplicates.
 		vector<JoinCondition> conditions;
 		JoinCondition condition;
-		condition.left =
-		    hashed ? HashBucket(op.types[key], key) : make_uniq<BoundReferenceExpression>(op.types[key], key);
+		condition.left = make_uniq<BoundReferenceExpression>(op.types[key], key);
 		condition.right = make_uniq<BoundReferenceExpression>(build.types[build_key], build_key);
 		condition.comparison = ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 		conditions.push_back(std::move(condition));
@@ -1712,7 +2021,22 @@ private:
 		}
 		return true;
 	}
-	bool CompleteParquetGroups(PhysicalOperator &input, const DistributedSubtree &child,
+	vector<idx_t> CompleteHashGroups(const DistributedSubtree &child, const vector<unique_ptr<Expression>> &groups) {
+		vector<idx_t> output_keys;
+		for (auto key : child.hash_keys) {
+			for (idx_t i = 0; i < groups.size(); i++) {
+				auto &group = *groups[i];
+				if (group.GetExpressionClass() == ExpressionClass::BOUND_REF &&
+				    group.Cast<BoundReferenceExpression>().index == key &&
+				    group.return_type == child.fragment.root.types[key]) {
+					output_keys.push_back(i);
+					break;
+				}
+			}
+		}
+		return output_keys.size() == child.hash_keys.size() ? output_keys : vector<idx_t>();
+	}
+	bool CompleteParquetGroups(PhysicalOperator &input, DistributedSubtree &child,
 	                           const vector<unique_ptr<Expression>> &groups) {
 		if (!child.local_scan || child.fragment.sources.size() != 1) {
 			return false;
@@ -1766,9 +2090,12 @@ private:
 				splits.push_back(DecodeFile(split.payload));
 			}
 			pair<Value, Value> bounds;
-			if (ParquetSplitRangesDisjoint(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
-			                               &bounds) &&
+			vector<idx_t> assignment;
+			if (PlanParquetGroupPartitions(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
+			                               child.fragment.partition_count, assignment, &bounds) &&
+			    (assignment.empty() || !scan.extra_info.sample_options) &&
 			    InjectiveGroupKey(std::move(bounds), transforms)) {
+				child.fragment.sources[0].split_partitions = std::move(assignment);
 				return true;
 			}
 		}
@@ -1806,13 +2133,18 @@ private:
 			// order. Finalization, rather than a partial subtotal, checks range.
 			wide_aggregate = WidenAggregate(aggregate) || wide_aggregate;
 		}
-		if (child.fragment.partition_count == 1 || CompleteParquetGroups(op.children[0], child, groups)) {
+		// Grouping on every existing hash key makes each group complete in one
+		// partition, even when GROUP BY includes additional payload columns.
+		auto hash_groups = CompleteHashGroups(child, groups);
+		if (child.fragment.partition_count == 1 || !hash_groups.empty() ||
+		    CompleteParquetGroups(op.children[0], child, groups)) {
 			if (wide_aggregate) {
 				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
 				Wrap(aggregate, child);
 			} else {
 				Wrap(op, child);
 			}
+			child.hash_keys = std::move(hash_groups);
 			return child;
 		}
 		if (!split) {
@@ -1843,6 +2175,9 @@ private:
 			output.push_back(make_uniq<BoundReferenceExpression>(aggregate.return_type, column));
 		}
 		auto &partial = MakeAggregate(Copy(groups), std::move(partials));
+		if (partial.type == PhysicalOperatorType::HASH_GROUP_BY) {
+			partial.Cast<PhysicalHashAggregate>().SetPartialStateOutput();
+		}
 		Wrap(partial, child);
 		child = Exchange(std::move(child), groups.empty() ? "gather" : "hash", groups.empty() ? 1 : partitions, keys);
 		auto &final = MakeAggregate(std::move(final_groups), std::move(finals));
@@ -1857,6 +2192,7 @@ private:
 		// depend on a new filter supplied by the opposite input.
 		auto build_filter = filter.input ? EarlyProbeFilter() : PlanBuildFilter(join);
 		if (build_filter.input) {
+			PushBuildFilter(build_filter);
 			auto found = shared_join_builds.find(build_filter.build);
 			if (found == shared_join_builds.end()) {
 				auto producer = Finish(Build(*build_filter.build));
@@ -2158,7 +2494,7 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		if (!planner.plan || !planner.properties.IsReadOnly() || planner.properties.parameter_count) {
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");
 		}
-		LogicalValidator validator;
+		LogicalValidator validator(partitions);
 		validator.frozen_files = !snapshot_directory.empty();
 		validator.VisitOperator(*planner.plan);
 		CheckTypes(planner.types);
@@ -2208,6 +2544,13 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		auto &result = *input;
 		plan.TakeOwnership(std::move(input));
 		return result;
+	}
+	if (node.parquet_mask_words) {
+		auto &probe =
+		    LoadNode(context, plan, node.children[0], inputs, sources, assignments, used_sources, used_inputs, filters);
+		auto &domain =
+		    LoadNode(context, plan, node.children[1], inputs, sources, assignments, used_sources, used_inputs, filters);
+		return MakeParquetMask(plan, probe, domain, node.parquet_mask_key, node.parquet_mask_words);
 	}
 	unique_ptr<PhysicalOperator> op;
 	bound_parameter_map_t parameters;
@@ -2302,12 +2645,24 @@ PhysicalOperator &LoadNode(ClientContext &context, PhysicalPlan &plan, const Pla
 		}
 		vector<DistributedScanSplit> selected;
 		std::set<string> selected_ids;
+		optional_idx owner;
 		for (auto &id : assignment->second) {
 			auto found = known.find(id);
 			if (found == known.end() || !selected_ids.insert(id).second) {
 				throw InvalidInputException("unknown or duplicate assigned split %s", id);
 			}
+			if (!spec.split_partitions.empty()) {
+				auto partition = spec.split_partitions[idx_t(found->second - spec.splits.data())];
+				if (!parquet || (owner.IsValid() && owner.GetIndex() != partition)) {
+					throw InvalidInputException("owned Parquet splits must belong to one complete partition");
+				}
+				owner = partition;
+			}
 			selected.push_back(*found->second);
+		}
+		if (owner.IsValid() && idx_t(std::count(spec.split_partitions.begin(), spec.split_partitions.end(),
+		                                        owner.GetIndex())) != selected.size()) {
+			throw InvalidInputException("owned Parquet splits must cover the complete partition");
 		}
 		if (parquet) {
 			vector<OpenFileInfo> files;
