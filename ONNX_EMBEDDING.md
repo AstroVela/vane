@@ -83,8 +83,11 @@ a Vane worker GPU; CPU and CoreML reserve none.
 The explicit `backend` selects `cpu`, `cuda` or `coreml`.
 CUDA selects logical device 0 in the worker's assigned visible devices;
 use `CUDA_VISIBLE_DEVICES` to select a physical GPU for an external service.
-An unavailable backend or unsupported graph fails. Session initialization and execution fallback are
-disabled; non-CPU sessions also disable CPU execution-provider fallback.
+An unavailable backend or unsupported graph fails. Session initialization and
+execution failures propagate without retrying another backend. ORT still uses
+its normal graph partitioning: CUDA executes supported model kernels while
+shape/control nodes may execute on CPU. This does not promise every node runs
+on the selected accelerator.
 ONNX Runtime supports multiple operating systems, but availability and graph/
 quantization support depend on the selected execution provider. A platform
 claim requires a real run there. The generic Vane subprocess launcher currently

@@ -159,7 +159,31 @@ def test_backend_initialization_failure_never_retries_on_cpu(options, sdk):
         load_provider("onnx").get_text_embedder(options=options | {"backend": "cuda"}).instantiate()
     loads = [event for event in sdk.events if event[0] == "load"]
     assert len(loads) == 1 and loads[0][3:5] == ("CUDAExecutionProvider", False)
-    assert loads[0][5] == {"session.disable_cpu_ep_fallback": "1"}
+    assert loads[0][5] == {}
+
+
+def test_cuda_execution_failure_propagates_without_recreating_sessions(options, sdk, monkeypatch):
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "cuda"}).instantiate()
+    attempts = []
+    error = RuntimeError("CUDA execution failed")
+
+    def fail(*args, **kwargs):
+        attempts.append(1)
+        raise error
+
+    monkeypatch.setattr(type(runtime.sessions["model"]), "run", fail)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            runtime.embed_text(["query"])
+        assert caught.value is error and attempts == [1]
+        loads = [event for event in sdk.events if event[0] == "load"]
+        assert len(loads) == 3 and all(event[3:5] == ("CUDAExecutionProvider", False) for event in loads)
+    finally:
+        # Drop captured frames before checking release of Python-owned sessions.
+        error.__traceback__ = None
+        del caught
+        runtime.close()
+    assert sdk.active == 0
 
 
 def test_partial_initialization_releases_the_preceding_session(options, sdk):

@@ -174,8 +174,8 @@ class ONNXEmbedder:
             settings = ort.SessionOptions()
             settings.intra_op_num_threads = self.options["num_threads"]
             settings.inter_op_num_threads = 1
-            if self.options["backend"] != "cpu":
-                settings.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+            # ORT assigns shape/control nodes to CPU even with CUDA. Keep that
+            # graph partitioning; enable_fallback=False forbids backend retries.
             self.sessions[tower] = ort.InferenceSession(
                 str(path), sess_options=settings, providers=[(selected, provider_options)], enable_fallback=False
             )

@@ -99,6 +99,7 @@ def test_real_native_service_reference_and_public_apis(tmp_path, monkeypatch, ba
         "service_id": config["service_id"],
         "model_sha256": options["model_sha256"],
         "max_length": 2048,
+        "timeout": 300,
     }
     log = (root / "log.txt").open("w")
     helper = Path(__file__).with_name("onnx_service_process.py")
