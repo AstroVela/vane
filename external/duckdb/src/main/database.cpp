@@ -85,6 +85,7 @@ DatabaseInstance::DatabaseInstance() : db_validity(*this) {
 	execution_runtime = make_uniq<ExecutionRuntime>();
 	media_decoder_pool = GetNativeMediaDecoderPool();
 	media_output_pool = GetNativeMediaOutputPool();
+	media_flow_capacity = GetNativeMediaFlowCapacity();
 }
 
 DatabaseInstance::~DatabaseInstance() {

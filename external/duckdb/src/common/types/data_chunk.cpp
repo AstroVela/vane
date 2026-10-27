@@ -12,6 +12,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/execution/media_resource.hpp"
 
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -83,6 +84,7 @@ idx_t DataChunk::GetAllocationSize() const {
 }
 
 void DataChunk::Reset() {
+	media_flow.clear();
 	SetCardinality(0);
 	if (data.empty() || vector_caches.empty()) {
 		return;
@@ -97,6 +99,7 @@ void DataChunk::Reset() {
 }
 
 void DataChunk::Destroy() {
+	media_flow.clear();
 	data.clear();
 	vector_caches.clear();
 	capacity = 0;
@@ -122,6 +125,7 @@ bool DataChunk::AllConstant() const {
 }
 
 void DataChunk::Reference(DataChunk &chunk) {
+	media_flow = chunk.media_flow;
 	D_ASSERT(chunk.ColumnCount() <= ColumnCount());
 	SetCapacity(chunk);
 	SetCardinality(chunk);
@@ -135,6 +139,7 @@ void DataChunk::Move(DataChunk &chunk) {
 	SetCardinality(chunk);
 	data = std::move(chunk.data);
 	vector_caches = std::move(chunk.vector_caches);
+	media_flow = std::move(chunk.media_flow);
 
 	chunk.Destroy();
 }
@@ -148,6 +153,7 @@ void DataChunk::Copy(DataChunk &other, idx_t offset) const {
 		VectorOperations::Copy(data[i], other.data[i], size(), offset, 0);
 	}
 	other.SetCardinality(size() - offset);
+	other.InheritMediaFlow(*this);
 }
 
 void DataChunk::Copy(DataChunk &other, const SelectionVector &sel, const idx_t source_count, const idx_t offset) const {
@@ -160,6 +166,7 @@ void DataChunk::Copy(DataChunk &other, const SelectionVector &sel, const idx_t s
 		VectorOperations::Copy(data[i], other.data[i], sel, source_count, offset, 0);
 	}
 	other.SetCardinality(source_count - offset);
+	other.InheritMediaFlow(*this);
 }
 
 void DataChunk::Split(DataChunk &other, idx_t split_idx) {
@@ -177,9 +184,11 @@ void DataChunk::Split(DataChunk &other, idx_t split_idx) {
 	}
 	other.SetCapacity(*this);
 	other.SetCardinality(*this);
+	other.InheritMediaFlow(*this);
 }
 
 void DataChunk::Fuse(DataChunk &other) {
+	InheritMediaFlow(other);
 	D_ASSERT(other.size() == size());
 	const idx_t num_cols = other.data.size();
 	for (idx_t col_idx = 0; col_idx < num_cols; ++col_idx) {
@@ -199,6 +208,7 @@ void DataChunk::ReferenceColumns(DataChunk &other, const vector<column_t> &colum
 		this_col.Reference(other_col);
 	}
 	SetCardinality(other.size());
+	InheritMediaFlow(other);
 }
 
 void DataChunk::Append(const DataChunk &other, bool resize, SelectionVector *sel, idx_t sel_count) {
@@ -229,6 +239,7 @@ void DataChunk::Append(const DataChunk &other, bool resize, SelectionVector *sel
 		}
 	}
 	SetCardinality(new_size);
+	InheritMediaFlow(other);
 }
 
 void DataChunk::Flatten() {
@@ -308,6 +319,7 @@ void DataChunk::Slice(const SelectionVector &sel_vector, idx_t count_p) {
 }
 
 void DataChunk::Slice(const DataChunk &other, const SelectionVector &sel, idx_t count_p, idx_t col_offset) {
+	InheritMediaFlow(other);
 	D_ASSERT(other.ColumnCount() <= col_offset + ColumnCount());
 	this->count = count_p;
 	SelCache merge_cache;
@@ -319,6 +331,37 @@ void DataChunk::Slice(const DataChunk &other, const SelectionVector &sel, idx_t 
 		} else {
 			data[col_offset + c].Slice(other.data[c], sel, count_p);
 		}
+	}
+}
+
+void DataChunk::AddMediaFlow(shared_ptr<MediaFlowTicket> ticket) {
+	if (!ticket) {
+		return;
+	}
+	for (auto &existing : media_flow) {
+		if (existing == ticket) {
+			return;
+		}
+	}
+	media_flow.push_back(std::move(ticket));
+}
+
+void DataChunk::InheritMediaFlow(const DataChunk &other) {
+	if (this == &other) {
+		return;
+	}
+	for (auto &ticket : other.media_flow) {
+		AddMediaFlow(ticket);
+	}
+}
+
+bool DataChunk::HasMediaFlow() const {
+	return !media_flow.empty();
+}
+
+void DataChunk::AcknowledgeMediaFlow() const {
+	for (auto &ticket : media_flow) {
+		ticket->Acknowledge();
 	}
 }
 

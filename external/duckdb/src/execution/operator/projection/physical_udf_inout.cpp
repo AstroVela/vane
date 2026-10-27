@@ -22,6 +22,7 @@
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/external_block.hpp"
+#include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/function_serialization.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
@@ -468,6 +469,9 @@ static idx_t EstimateStreamingVarlenBytes(const Vector &vec, const idx_t count) 
 }
 
 static idx_t EstimateStreamingChunkBytes(const DataChunk &chunk) {
+	if (chunk.HasMediaFlow()) {
+		return EstimateMediaFlowInputBytes(chunk);
+	}
 	auto count = chunk.size();
 	idx_t total = chunk.GetAllocationSize();
 	for (auto &vec : chunk.data) {
@@ -3091,6 +3095,10 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	state.sink_calls.fetch_add(1);
 	auto incoming_rows = chunk.size();
 	auto incoming_bytes = EstimateStreamingChunkBytes(chunk);
+	if (chunk.HasMediaFlow() && incoming_bytes > state.config.task_input_max_bytes) {
+		throw OutOfMemoryException("Native media batch exceeds the UDF task_input_max_bytes receiving capacity; "
+		                           "reduce the scan batch/window or increase the UDF input capacity");
+	}
 
 	auto guard = state.Lock();
 	if (state.source_finished) {
@@ -3119,10 +3127,16 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	state.reserved_bytes += incoming_bytes;
 	guard.unlock();
 
-	auto buffered = make_uniq<DataChunk>();
+	unique_ptr<DataChunk> buffered;
+	idx_t buffered_bytes = 0;
 	try {
+		buffered = make_uniq<DataChunk>();
 		buffered->Initialize(context.client, chunk.GetTypes(), incoming_rows);
 		chunk.Copy(*buffered, 0);
+		buffered_bytes = EstimateStreamingChunkBytes(*buffered);
+		if (chunk.HasMediaFlow() && buffered_bytes > incoming_bytes) {
+			throw InternalException("Native media UDF copy exceeded its reserved input payload");
+		}
 	} catch (...) {
 		auto cleanup_guard = state.Lock();
 		state.reserved_rows = state.reserved_rows >= incoming_rows ? state.reserved_rows - incoming_rows : 0;
@@ -3131,7 +3145,6 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 		throw;
 	}
 	auto buffered_rows = buffered->size();
-	auto buffered_bytes = EstimateStreamingChunkBytes(*buffered);
 
 	guard = state.Lock();
 	DrainStreamingOutputEventsLocked(state, guard);
@@ -3150,6 +3163,14 @@ SinkResultType PhysicalStreamingUDF::Sink(ExecutionContext &context, DataChunk &
 	state.max_pending_rows = MaxValue<idx_t>(state.max_pending_rows, state.pending_rows + state.reserved_rows);
 	AtomicAddStreamingCounter(state.accepted_input_rows, buffered_rows);
 	AtomicAddStreamingCounter(state.accepted_input_bytes, buffered_bytes);
+	if (chunk.HasMediaFlow()) {
+		// The independent copy is now owned and charged by the bounded ingress
+		// queue. A blocked-before-accept retry, copy failure or closed receiver
+		// never reaches this receipt. Callbacks must run outside state.lock.
+		guard.unlock();
+		chunk.AcknowledgeMediaFlow();
+		guard.lock();
+	}
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, false);
 	DrainStreamingOutputEventsLocked(state, guard);

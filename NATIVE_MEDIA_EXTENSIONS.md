@@ -242,6 +242,38 @@ progress reservations for interdependent media operators are still pending.
 The complete target, implementation status and remaining validation are in
 [Native media backpressure design](NATIVE_MEDIA_BACKPRESSURE_DESIGN.md).
 
+`VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES` enables an additional experimental
+**per-scan production window**, shared by that scan's parallel workers. Configure
+it before importing Vane with the same positive-integer and fixed-at-first-use
+rules. It is independent of the process-wide original-pixel capacity above.
+The scan reserves production credit before reading and allocating each batch;
+both limits can reduce the batch size, and an impossible single frame fails
+without waiting.
+
+This window currently supports a linear native video scan through projections,
+filters and streaming LIMIT into a streaming UDF. Its C++ ingress queue reserves
+`task_input_max_bytes` payload capacity before copying, commits the independent
+copy, then acknowledges the producer outside its lock. A rejected or failed
+copy retains the producer credit. An accepted but blocked sink acknowledges
+once. The original pixel lease stays charged until the last physical view dies.
+Ingress byte pressure can flush a batch below its preferred compute size.
+
+The UDF ingress payload contract covers primitive slots, fixed primitive
+ARRAY/IMAGE/TENSOR values, structs and out-of-line strings. Cast dynamic IMAGE
+values to `IMAGE(mode, height, width)` before the UDF. Variable-sized nested
+collections and non-primitive arrays require a later copy-capacity contract.
+A source batch larger than the UDF ingress capacity raises a resource error;
+reduce the producer window/batch or increase `task_input_max_bytes`.
+
+With this window enabled, direct result collection and materialization before
+the UDF (including sorting and aggregation) raise a clear unsupported-path error.
+Their materialization/spill budget handoff is a separate increment. Scan cleanup
+cancels flow waiters and returns production credits even if detached views
+remain alive; physical pixel reservations on those views remain valid. The
+receipt covers C++ ingress, while subsequent Python task/SHM/Ray admission keeps
+its existing ownership. Neither window accounts for codec workspace, allocator
+overhead or all live copies, and neither is a process RSS limit.
+
 ## Build and package
 
 For the complete protected publication workflow, including source-rebuild and

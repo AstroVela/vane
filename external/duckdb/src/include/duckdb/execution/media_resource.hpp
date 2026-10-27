@@ -111,4 +111,42 @@ DUCKDB_API shared_ptr<MediaResourcePool> GetNativeMediaDecoderPool();
 //! active decoder from obtaining output bytes and reaching EOF. Host use only.
 DUCKDB_API shared_ptr<MediaResourcePool> GetNativeMediaOutputPool();
 
+struct MediaFlowWindowState;
+
+//! A production credit, independent of the allocation lease. A bounded receiver
+//! acknowledges it only after accepting the copied input. Aliases share one
+//! idempotent receipt; dropping the last owner also returns the credit.
+class MediaFlowTicket {
+public:
+	DUCKDB_API ~MediaFlowTicket();
+	DUCKDB_API void Acknowledge() noexcept;
+	DUCKDB_API bool IsActive() const;
+
+private:
+	friend class MediaFlowWindow;
+	MediaFlowTicket(MediaResourceLease lease, weak_ptr<MediaFlowWindowState> window, idx_t id);
+	struct State;
+	unique_ptr<State> state;
+};
+
+//! One window per native scan edge, shared by its parallel workers. Close
+//! cancels waiters AND revokes production credits, including detached views;
+//! it never revokes the physical allocation leases on those views.
+class MediaFlowWindow {
+public:
+	DUCKDB_API explicit MediaFlowWindow(idx_t bytes);
+	DUCKDB_API ~MediaFlowWindow();
+	DUCKDB_API unique_ptr<MediaAdmissionRequest> Request(idx_t bytes);
+	DUCKDB_API shared_ptr<MediaFlowTicket> TakeGrant(MediaAdmissionRequest &request);
+	DUCKDB_API MediaResourceSnapshot Snapshot() const;
+	DUCKDB_API void Close() noexcept;
+
+private:
+	shared_ptr<MediaFlowWindowState> state;
+};
+
+//! Host constructor only. Extensions read DatabaseInstance's installed value.
+//! Zero means disabled. Like the allocation pools, fixed on first database use.
+DUCKDB_API idx_t GetNativeMediaFlowCapacity();
+
 } // namespace duckdb

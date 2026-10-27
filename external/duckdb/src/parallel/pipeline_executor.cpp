@@ -7,6 +7,8 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 
 #include "duckdb/execution/external_block.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -114,6 +116,22 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p),
       execution_mode(pipeline_p.GetExecutionMode()) {
 	D_ASSERT(pipeline.source_state);
+	if (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() &&
+	    pipeline.source->type == PhysicalOperatorType::TABLE_SCAN &&
+	    pipeline.source->Cast<PhysicalTableScan>().function.media_flow_source) {
+		if (!pipeline.sink || pipeline.sink->type != PhysicalOperatorType::STREAMING_UDF) {
+			throw NotImplementedException("Native media flow window currently requires a streaming UDF receiver; "
+			                              "materialization budget handoff is not implemented");
+		}
+		for (auto &op : pipeline.operators) {
+			const auto type = op.get().type;
+			if (type != PhysicalOperatorType::PROJECTION && type != PhysicalOperatorType::FILTER &&
+			    type != PhysicalOperatorType::STREAMING_LIMIT) {
+				throw NotImplementedException("Native media flow window does not support intermediate operator %s",
+				                              op.get().GetName());
+			}
+		}
+	}
 	if (pipeline.sink) {
 		local_sink_state = pipeline.sink->GetLocalSinkState(context);
 		required_partition_info = pipeline.sink->RequiredPartitionInfo();
@@ -932,6 +950,9 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 			StartOperator(current_operator);
 			auto result = current_operator.Execute(context, prev_chunk, current_chunk, *current_operator.op_state,
 			                                       *intermediate_states[current_intermediate - 1]);
+			if (current_chunk.size()) {
+				current_chunk.InheritMediaFlow(prev_chunk);
+			}
 			EndOperator(current_operator, &current_chunk, current_operator.op_state.get(),
 			            intermediate_states[current_intermediate - 1].get());
 			if (result == OperatorResultType::BLOCKED) {
@@ -1010,6 +1031,9 @@ OperatorResultType PipelineExecutor::ExecuteBatch(ExecutionBatch &input, Executi
 			StartOperator(current_operator);
 			auto result = current_operator.ExecuteBatch(context, prev_batch, current_batch, *current_operator.op_state,
 			                                            *intermediate_states[current_intermediate - 1]);
+			if (current_batch.materialized && current_batch.materialized->size() && prev_batch.materialized) {
+				current_batch.materialized->InheritMediaFlow(*prev_batch.materialized);
+			}
 			EndOperator(current_operator, ExecutionBatchMaterializedChunk(current_batch),
 			            current_operator.op_state.get(), intermediate_states[current_intermediate - 1].get());
 			if (result == OperatorResultType::BLOCKED) {

@@ -474,6 +474,9 @@ public:
 	table_function_t function;
 	//! Mutually exclusive with function/in_out_function: scheduler-aware source polling.
 	table_function_poll_t poll_function;
+	//! Native source that attaches production credits when the host enables its
+	//! media flow window. Currently requires a linear pipeline into a UDF sink.
+	bool media_flow_source = false;
 	//! The table in-out function (if this is an in-out function)
 	table_in_out_function_t in_out_function;
 	//! The table in-out final function (if this is an in-out function)
