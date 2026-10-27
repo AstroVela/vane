@@ -16,8 +16,12 @@
 
 #include <thread>
 #include <cstdlib>
+#include <type_traits>
 
 using namespace duckdb;
+
+static_assert(!std::is_copy_constructible<MediaFlowWindow>::value,
+              "Copying a scoped flow window could close credits still owned by its producer");
 
 namespace {
 shared_ptr<MediaFlowTicket> TakeFlow(MediaFlowWindow &window, idx_t bytes) {
@@ -553,7 +557,7 @@ TEST_CASE("Flow ingress copy cost follows selected values and fixed image payloa
 	DataChunk source, selected, copied;
 	source.Initialize(Allocator::DefaultAllocator(), {image, metadata}, 2);
 	for (idx_t row = 0; row < 2; row++) {
-		source.SetValue(0, row, Value::ARRAY(LogicalType::UTINYINT, vector<Value>(12, Value::UTINYINT(42))));
+		source.SetValue(0, row, ImageVector::FromPixels(vector<Value>(12, Value::UTINYINT(42)), 2, 2, "RGB", image));
 		source.SetValue(1, row, Value::STRUCT({{"path", Value(string(30 + row, 'x'))}}));
 	}
 	source.SetCardinality(2);

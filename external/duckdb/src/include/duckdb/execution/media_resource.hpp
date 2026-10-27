@@ -136,6 +136,8 @@ class MediaFlowWindow {
 public:
 	DUCKDB_API explicit MediaFlowWindow(idx_t bytes);
 	DUCKDB_API ~MediaFlowWindow();
+	MediaFlowWindow(const MediaFlowWindow &) = delete;
+	MediaFlowWindow &operator=(const MediaFlowWindow &) = delete;
 	DUCKDB_API unique_ptr<MediaAdmissionRequest> Request(idx_t bytes);
 	DUCKDB_API shared_ptr<MediaFlowTicket> TakeGrant(MediaAdmissionRequest &request);
 	DUCKDB_API MediaResourceSnapshot Snapshot() const;
