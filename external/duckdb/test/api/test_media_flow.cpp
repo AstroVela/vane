@@ -552,13 +552,16 @@ TEST_CASE("Failed UDF ingress copy retains the producer and rolls back its reser
 }
 
 TEST_CASE("Flow ingress copy cost follows selected values and fixed image payloads", "[media-resource][media-flow]") {
+	const auto nested = GENERATE(false, true);
 	auto image = ImageLogicalType::Create("RGB", 2, 2);
-	auto metadata = LogicalType::STRUCT({{"path", LogicalType::VARCHAR}});
+	auto path_type = LogicalType::STRUCT({{"path", LogicalType::VARCHAR}});
+	auto metadata = nested ? LogicalType::STRUCT({{"details", path_type}}) : path_type;
 	DataChunk source, selected, copied;
 	source.Initialize(Allocator::DefaultAllocator(), {image, metadata}, 2);
 	for (idx_t row = 0; row < 2; row++) {
 		source.SetValue(0, row, ImageVector::FromPixels(vector<Value>(12, Value::UTINYINT(42)), 2, 2, "RGB", image));
-		source.SetValue(1, row, Value::STRUCT({{"path", Value(string(30 + row, 'x'))}}));
+		auto path = Value::STRUCT({{"path", Value(string(30 + row, 'x'))}});
+		source.SetValue(1, row, nested ? Value::STRUCT({{"details", path}}) : path);
 	}
 	source.SetCardinality(2);
 	SelectionVector sel(1);
@@ -570,6 +573,16 @@ TEST_CASE("Flow ingress copy cost follows selected values and fixed image payloa
 	selected.Copy(copied);
 	CHECK(EstimateMediaFlowInputBytes(copied) == EstimateMediaFlowInputBytes(selected));
 	CHECK(copied.GetValue(0, 0) == selected.GetValue(0, 0));
+	DataChunk repeated, repeated_copy;
+	SelectionVector repeat(2);
+	repeat.set_index(0, 1);
+	repeat.set_index(1, 1);
+	repeated.InitializeEmpty(source.GetTypes());
+	repeated.Slice(source, repeat, 2);
+	repeated_copy.Initialize(Allocator::DefaultAllocator(), source.GetTypes(), 2);
+	repeated.Copy(repeated_copy);
+	CHECK(EstimateMediaFlowInputBytes(repeated) == 2 * (12 + sizeof(string_t) + 31));
+	CHECK(EstimateMediaFlowInputBytes(repeated_copy) == EstimateMediaFlowInputBytes(repeated));
 	DataChunk dynamic;
 	dynamic.Initialize(Allocator::DefaultAllocator(), {LogicalType::LIST(LogicalType::UTINYINT)}, 1);
 	dynamic.SetCardinality(1);

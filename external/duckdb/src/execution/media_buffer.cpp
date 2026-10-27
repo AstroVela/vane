@@ -62,14 +62,13 @@ idx_t MediaFlowVectorInputBytes(const Vector &vector, idx_t rows) {
 		                              "cast images to IMAGE(mode, height, width) before the UDF");
 	}
 	if (physical == PhysicalType::STRUCT) {
-		Vector view(type, nullptr);
-		view.Reference(vector);
-		UnifiedVectorFormat format;
-		view.ToUnifiedFormat(rows, format);
 		idx_t bytes = 0;
-		for (auto &entry : StructVector::GetEntries(view)) {
-			Vector selected(*entry, *format.sel, rows);
-			bytes = AddInputBytes(bytes, MediaFlowVectorInputBytes(selected, rows));
+		// Struct slicing has already applied its selection to the children.
+		// Applying the parent's dictionary again can read a different row and
+		// under-reserve nonuniform strings. Follow RecursiveToUnifiedFormat's
+		// child traversal, letting each leaf resolve its own selection.
+		for (auto &entry : StructVector::GetEntries(vector)) {
+			bytes = AddInputBytes(bytes, MediaFlowVectorInputBytes(*entry, rows));
 		}
 		return bytes;
 	}
