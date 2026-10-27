@@ -4097,7 +4097,9 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
-    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", str(required + 1))
+    # Retained Arrow results from other tests must not consume this test's budget.
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: required + 1)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
 
     wait_started = threading.Event()
     original_log = ref_bundle._shm_debug_log
@@ -4110,6 +4112,7 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
     monkeypatch.setattr(ref_bundle, "_shm_debug_log", record_budget_wait)
 
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(table)
+    assert manager.snapshot()["allocated_bytes"] == required
     done = threading.Event()
     holder = {}
 
@@ -4133,9 +4136,7 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
             holder["result"][1][0].release()
         thread.join(timeout=5.0)
 
-    with ref_bundle._local_shm_budget_cond:
-        assert ref_bundle._local_shm_budget_reserved_bytes == 0
-        assert ref_bundle._local_shm_budget_pending_output_bytes == 0
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
 def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monkeypatch):
@@ -4143,10 +4144,12 @@ def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monke
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
-    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", str(required + 1))
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: required + 1)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
 
     descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(table)
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(table)
+    assert manager.snapshot()["allocated_bytes"] == required
 
     wait_events = []
     original_log = ref_bundle._shm_debug_log
@@ -4173,15 +4176,14 @@ def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monke
         thread.start()
         assert done.wait(5.0)
         assert not wait_events
+        assert manager.snapshot()["allocated_bytes"] == 2 * required
     finally:
         refs[0].release()
         if "result" in holder:
             holder["result"][1][0].release()
         thread.join(timeout=5.0)
 
-    with ref_bundle._local_shm_budget_cond:
-        assert ref_bundle._local_shm_budget_reserved_bytes == 0
-        assert ref_bundle._local_shm_budget_pending_output_bytes == 0
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
 def test_subprocess_ref_bundle_output_materializes():
