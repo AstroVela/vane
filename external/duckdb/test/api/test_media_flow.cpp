@@ -346,7 +346,7 @@ TEST_CASE("One-frame flow progresses through projection and cached filters into 
                               'execution_backend': 'subprocess_task', 'method_return_type': 'BIGINT',
                               'function_pickle': 'fixture'::BLOB, 'function_pickle_size_bytes': 7,
                               'batch_size': 4, 'min_task_batch_size': 4,
-                              'udf_task_input_max_bytes': 16, 'udf_output_target_max_bytes': 4096})
+                              'udf_task_input_max_bytes': 32, 'udf_output_target_max_bytes': 4096})
         FROM test_media_flow() WHERE i % 2 = 0
     )");
 	REQUIRE_FALSE(pending->HasError());
@@ -355,7 +355,8 @@ TEST_CASE("One-frame flow progresses through projection and cached filters into 
 	}
 	INFO((pending->HasError() ? pending->GetError() : ""));
 	REQUIRE_FALSE(pending->HasError());
-	// 0 and 2 entered the bounded receiver; 1 was filtered without waiting
+	// Each accepted scalar-map row contains its argument and passthrough i
+	// (16 bytes). 0 and 2 fill the receiver; 1 is filtered without waiting
 	// for the caching operator's preferred vector size.
 	CHECK(probe->produced == 3);
 	con.Interrupt();
