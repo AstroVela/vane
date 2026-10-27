@@ -612,6 +612,42 @@ def test_fixed_width_frames_preserve_offsets_validity_and_owned_values(threads, 
         assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("frame_rows", [63, 65])
+def test_fixed_frame_copy_does_not_mutate_retained_frames(threads, frame_rows):
+    sql = (
+        "select k, v%2=0, v::smallint, v::decimal(15,2), v::decimal(38,5), "
+        "v::hugeint*1000000000000000000000000000000::hugeint, v::double/2, "
+        "date '2026-01-01'+v::integer, interval '1 month 2 days 3 microseconds'*v "
+        "from (select range k, case when (range//257)%2=0 then null else range end v "
+        "from range(8197) where range%3!=0)"
+    )
+    with vane.connect(backend="local", config={"threads": threads}) as connection:
+        expected = connection.execute(sql).fetchall()
+        limits = DirectExchangeLimits(32768, 16384, frame_rows, 2)
+        with InProcessTaskService(connection, submission(connection, sql, partitions=1), limits) as service:
+            service.start()
+            status, batch = next_batch(service)
+            assert status == "data"
+            rows = batch.to_rows()
+            retained = batch.slice(0, 1)
+            first = retained.to_rows()
+            batch.close()
+            try:
+                while len(rows) < frame_rows * 8:
+                    status, batch = next_batch(service)
+                    assert status == "data"
+                    rows.extend(batch.to_rows())
+                    batch.close()
+                assert retained.to_rows() == first
+                assert service.result.snapshot()["leased_bytes"] > 0
+            finally:
+                retained.close()
+            rows.extend(collect(service))
+            assert sorted(rows) == sorted(expected)
+            assert service.result.snapshot()["peak_bytes"] <= limits.window_bytes
+
+
 def test_consumer_starts_before_producers_and_wakes_on_first_frame(connection):
     spec = submission(connection)
     with InProcessTaskService(connection, spec, TINY) as service:
