@@ -91,10 +91,19 @@ def test_native_callback_gc_releases_context_without_holding_gil(monkeypatch, ca
         builtins._vane_callback_gc_batch = pa.record_batch({'x': pa.array(range(rows), type=pa.int64())})
         builtins._vane_callback_gc_threads = set()
         owner = threading.get_ident()
+        builtins._vane_callback_gc_owner = owner
+        builtins._vane_callback_gc_worker = threading.Event()
         class Task(DataSourceTask):
             def execute(self):
                 import builtins, threading
-                builtins._vane_callback_gc_threads.add(threading.get_ident())
+                current = threading.get_ident()
+                builtins._vane_callback_gc_threads.add(current)
+                # A fast caller can drain every task before a native worker runs.
+                # Establish the worker's Python thread state before testing GC.
+                if current == builtins._vane_callback_gc_owner:
+                    assert builtins._vane_callback_gc_worker.wait(5), 'native worker did not enter the source'
+                else:
+                    builtins._vane_callback_gc_worker.set()
                 yield builtins._vane_callback_gc_batch
         class Source(DataSource):
             @property
