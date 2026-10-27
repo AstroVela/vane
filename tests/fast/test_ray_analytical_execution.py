@@ -1206,3 +1206,67 @@ def test_analytical_parquet_join_preserves_source_contract(tmp_path, mode):
         with connection.query(sql, options=options(execution=60) if mode == "fte" else None) as result:
             assert result.collect().to_pylist() == expected
         assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
+@pytest.mark.parametrize("partitions", [2, 3])
+def test_hash_partitioned_groups_preserve_consumer_retry(tmp_path, monkeypatch, mode, partitions):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    lost = []
+    dispatch = RecoveryScheduler._dispatch
+
+    def lose_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and not lost and upstream:
+            attempt = scheduler.active[index]
+            lost.append(attempt.reservation.token)
+            ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_once)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Nested payloads rule out a full-build broadcast, and unknown column
+    # statistics keep the raw key representation without changing DB settings.
+    # Every key occurs in several splits; only the join HASH proves ownership.
+    for name in ("a", "b"):
+        pq.write_table(
+            pa.table(
+                {
+                    "k": [None if i % 64 == 0 else (i % 512) * 10**10 - 2**62 for i in range(4096)],
+                    "v": [[i, i % 7] for i in range(4096)],
+                }
+            ),
+            tmp_path / f"{name}.parquet",
+            row_group_size=2048,
+            write_statistics=False,
+        )
+    sql = (
+        f"select a.k,min(a.v),max(b.v),count(*) from read_parquet('{tmp_path / 'a.parquet'}') a "
+        f"join read_parquet('{tmp_path / 'b.parquet'}') b on a.k is not distinct from b.k "
+        "group by a.k order by a.k nulls first limit 20"
+    )
+    limits = replace(resources(tmp_path, partitions=partitions), exchange=DirectExchangeLimits(4096, 1024, 32, 1))
+    with (
+        vane.connect(backend="local", config={"threads": 1}) as local,
+        vane.Runtime(limits) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table().to_pylist()
+        with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
+            scheduler = result.context._reader
+            assert result.collect().to_pylist() == expected
+            assert sum(e.distribution is Distribution.HASH for e in scheduler.spec.graph.exchanges) == 2
+            assert all(b"aggregate_state_export" not in f.native_plan for f in scheduler.spec.graph.fragments)
+            if mode == "fte_retry":
+                assert len(lost) == 1
+                attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
+                assert len(attempts) == 2
+                assert attempts[0].input_id == attempts[1].input_id
+                assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)

@@ -1983,6 +1983,21 @@ private:
 		}
 		return true;
 	}
+	vector<idx_t> CompleteHashGroups(const DistributedSubtree &child, const vector<unique_ptr<Expression>> &groups) {
+		vector<idx_t> output_keys;
+		for (auto key : child.hash_keys) {
+			for (idx_t i = 0; i < groups.size(); i++) {
+				auto &group = *groups[i];
+				if (group.GetExpressionClass() == ExpressionClass::BOUND_REF &&
+				    group.Cast<BoundReferenceExpression>().index == key &&
+				    group.return_type == child.fragment.root.types[key]) {
+					output_keys.push_back(i);
+					break;
+				}
+			}
+		}
+		return output_keys.size() == child.hash_keys.size() ? output_keys : vector<idx_t>();
+	}
 	bool CompleteParquetGroups(PhysicalOperator &input, DistributedSubtree &child,
 	                           const vector<unique_ptr<Expression>> &groups) {
 		if (!child.local_scan || child.fragment.sources.size() != 1) {
@@ -2080,13 +2095,18 @@ private:
 			// order. Finalization, rather than a partial subtotal, checks range.
 			wide_aggregate = WidenAggregate(aggregate) || wide_aggregate;
 		}
-		if (child.fragment.partition_count == 1 || CompleteParquetGroups(op.children[0], child, groups)) {
+		// Grouping on every existing hash key makes each group complete in one
+		// partition, even when GROUP BY includes additional payload columns.
+		auto hash_groups = CompleteHashGroups(child, groups);
+		if (child.fragment.partition_count == 1 || !hash_groups.empty() ||
+		    CompleteParquetGroups(op.children[0], child, groups)) {
 			if (wide_aggregate) {
 				auto &aggregate = MakeAggregate(Copy(groups), Copy(aggregates));
 				Wrap(aggregate, child);
 			} else {
 				Wrap(op, child);
 			}
+			child.hash_keys = std::move(hash_groups);
 			return child;
 		}
 		if (!split) {
