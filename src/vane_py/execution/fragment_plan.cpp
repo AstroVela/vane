@@ -1161,6 +1161,41 @@ private:
 		return result;
 	}
 
+	void PushBuildFilter(EarlyProbeFilter &filter) {
+		auto op = filter.input;
+		auto column = filter.column;
+		auto type = op->types[column];
+		while (!op->children.empty()) {
+			if (op->type == PhysicalOperatorType::PROJECTION) {
+				auto &expression = *op->Cast<PhysicalProjection>().select_list[column];
+				if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF) {
+					break;
+				}
+				column = expression.Cast<BoundReferenceExpression>().index;
+			} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+				auto &join = op->Cast<PhysicalHashJoin>();
+				if ((join.join_type != JoinType::INNER && join.join_type != JoinType::SEMI) ||
+				    !join.delim_types.empty() || column >= join.lhs_output_columns.col_idxs.size()) {
+					break;
+				}
+				column = join.lhs_output_columns.col_idxs[column];
+			} else if (op->type != PhysicalOperatorType::FILTER) {
+				break;
+			}
+			auto &child = op->children[0].get();
+			if (column >= child.types.size() || child.types[column] != type || HasScopedState(child) ||
+			    shared_join_builds.count(&child)) {
+				break;
+			}
+			// A necessary key restriction can precede an INNER/SEMI probe without
+			// changing the join's matches or multiplicity. Stop at scoped/shared
+			// ownership, computed keys and cardinality/preserved-row boundaries.
+			filter.input = &child;
+			filter.column = column;
+			op = &child;
+		}
+	}
+
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
 		EarlyProbeFilter result;
 		auto &build = join.children[1].get();
@@ -2157,6 +2192,7 @@ private:
 		// depend on a new filter supplied by the opposite input.
 		auto build_filter = filter.input ? EarlyProbeFilter() : PlanBuildFilter(join);
 		if (build_filter.input) {
+			PushBuildFilter(build_filter);
 			auto found = shared_join_builds.find(build_filter.build);
 			if (found == shared_join_builds.end()) {
 				auto producer = Finish(Build(*build_filter.build));

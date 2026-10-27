@@ -43,7 +43,11 @@ from tests.fast.test_execution_performance import (
 )
 from tests.fast.test_fragment_sql_coverage import correlated_partition_cases, correlation_source, large_join_key_query
 from tests.fast.test_hash_key_projection import hash_input_schemas, hash_key_query
-from tests.fast.test_join_build_filter import budgeted_shared_join_build_query, shared_join_build_query
+from tests.fast.test_join_build_filter import (
+    budgeted_shared_join_build_query,
+    early_shared_join_runtime_query,
+    shared_join_build_query,
+)
 from tests.fast.test_parquet_aggregate_partitioning import (
     broadcast_aggregate_query,
     disjoint_aggregate_query,
@@ -1274,7 +1278,8 @@ def test_hash_partitioned_groups_preserve_consumer_retry(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("mode", ["pipelined", "fte", "fte_retry"])
 @pytest.mark.parametrize("partitions", [2, 3])
-def test_budgeted_shared_join_build_preserves_consumer_retry(tmp_path, monkeypatch, mode, partitions):
+@pytest.mark.parametrize("nested_target", [False, True])
+def test_budgeted_shared_join_build_preserves_consumer_retry(tmp_path, monkeypatch, mode, partitions, nested_target):
     import ray
 
     from vane.execution.recovery_runtime import RecoveryScheduler
@@ -1305,12 +1310,15 @@ def test_budgeted_shared_join_build_preserves_consumer_retry(tmp_path, monkeypat
         vane.Runtime(limits) as application,
         application.connect() as connection,
     ):
-        sql, _, _ = budgeted_shared_join_build_query(local, tmp_path, "is not distinct from", fixed_plan=False)
-        # Keep the selective donor in a probe-side join with default optimizers.
-        # Its post-filter estimate exceeds the former 8 MiB replication cap.
-        sql = sql.replace("explicit_cardinality=100000000)", "explicit_cardinality=1000000000)")
-        sql = sql.replace("explicit_cardinality=1200000)", "explicit_cardinality=6000000)")
-        sql = sql.replace("max(b.payload)", "max(length(b.payload))")
+        if nested_target:
+            sql = early_shared_join_runtime_query(local, tmp_path)
+        else:
+            sql, _, _ = budgeted_shared_join_build_query(local, tmp_path, "is not distinct from", fixed_plan=False)
+            # Keep the selective donor in a probe-side join with default optimizers.
+            # Its post-filter estimate exceeds the former 8 MiB replication cap.
+            sql = sql.replace("explicit_cardinality=100000000)", "explicit_cardinality=1000000000)")
+            sql = sql.replace("explicit_cardinality=1200000)", "explicit_cardinality=6000000)")
+            sql = sql.replace("max(b.payload)", "max(length(b.payload))")
         expected = local.execute(sql).to_arrow_table().to_pylist()
         with connection.query(sql, options=options(execution=60) if mode != "pipelined" else None) as result:
             scheduler = result.context._reader
@@ -1324,7 +1332,7 @@ def test_budgeted_shared_join_build_preserves_consumer_retry(tmp_path, monkeypat
             consumers = {e.consumer_fragment_id for e in graph.exchanges if e.producer_fragment_id in shared}
             assert len(consumers) == 2
             assert all(len(f.sources) == 1 for f in graph.fragments if f.fragment_id in consumers)
-            assert sum(len(f.sources) for f in graph.fragments) == 3
+            assert sum(len(f.sources) for f in graph.fragments) == (4 if nested_target else 3)
             if mode == "fte_retry":
                 assert len(lost) == 1
                 attempts = [a for a in scheduler.history if a.task_id == lost[0].task_id]
