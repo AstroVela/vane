@@ -3837,3 +3837,130 @@ and cleanup manifests. Owned test data, spill, oracle IPCs and duplicate
 baseline are removed after validation and process shutdown. Source inputs are
 preserved. Configured native memory and footer row estimates are not peak-RSS
 guarantees.
+
+
+## SF100 refresh and complete hash-partition groups (October 26–27, 2026)
+
+The refreshed 22-query comparison on October 26 uses source `4682b224e5`, native
+`97772ed832be74ac882648b0a38e2c852a18e3adfc7c488c10fb930571618228`.
+All **132 executions** match the Local reference. Each query/mode executes three
+times; the first SQL execution is retained separately, and the median of the
+two remaining samples is shown below. The sum of those per-query medians is
+Local **91.795 s**, Pipeline **127.063 s**
+(**1.384×**). This is a
+single shared-host comparison, Local then Pipeline, with OS caches retained.
+Caches are retained; this is an internal comparison. Original first-run samples and ranges
+remain in `full22/samples.jsonl`, `full22-summary.json` and `full22-summary.csv`.
+
+| Query | Local s | Pipeline s | Extra s | Pipeline / Local |
+| --- | ---: | ---: | ---: | ---: |
+| Q1 | 4.217 | 4.483 | +0.266 | 1.06× |
+| Q2 | 0.946 | 1.179 | +0.234 | 1.25× |
+| Q3 | 3.799 | 5.536 | +1.737 | 1.46× |
+| Q4 | 2.794 | 4.518 | +1.724 | 1.62× |
+| Q5 | 4.072 | 6.026 | +1.954 | 1.48× |
+| Q6 | 2.069 | 2.248 | +0.179 | 1.09× |
+| Q7 | 4.531 | 5.696 | +1.165 | 1.26× |
+| Q8 | 4.834 | 6.545 | +1.711 | 1.35× |
+| Q9 | 10.169 | 16.819 | +6.650 | 1.65× |
+| Q10 | 4.367 | 8.585 | +4.218 | 1.97× |
+| Q11 | 0.960 | 1.169 | +0.209 | 1.22× |
+| Q12 | 2.950 | 4.077 | +1.127 | 1.38× |
+| Q13 | 6.740 | 8.764 | +2.024 | 1.30× |
+| Q14 | 3.185 | 4.555 | +1.370 | 1.43× |
+| Q15 | 3.338 | 3.762 | +0.423 | 1.13× |
+| Q16 | 1.255 | 2.405 | +1.149 | 1.92× |
+| Q17 | 3.644 | 4.108 | +0.464 | 1.13× |
+| Q18 | 7.137 | 8.287 | +1.150 | 1.16× |
+| Q19 | 4.062 | 5.910 | +1.848 | 1.45× |
+| Q20 | 3.721 | 5.110 | +1.389 | 1.37× |
+| Q21 | 11.838 | 14.756 | +2.919 | 1.25× |
+| Q22 | 1.167 | 2.524 | +1.357 | 2.16× |
+
+Q9, Q10 and Q21 have the largest absolute gaps. Separate Q9/Q10 operator
+profiles identify a redundant complete-group merge in Q10. About **3,884,218**
+wide partial-state rows cross its last hash exchange despite the preceding join
+already assigning each customer key to one partition. Operator timers include
+waits; they are not reported as OS CPU measurements.
+
+The generic compiler proof now requires **every existing hash key** to occur as
+an unchanged, exactly typed GROUP BY reference. Additional grouping columns do
+not split a group across partitions. The native aggregate can therefore finalize
+in its join partition, and local TopN precedes the final gather. Output hash-key
+positions are remapped to group-output positions for later consumers. Computed
+keys, casts, collation sort keys and missing composite keys do not establish the
+proof. Existing hash lineage already stops at representation/distribution changes.
+There is no query/table-specific rule, new operator, extra scan, resource increase
+or Local fallback. The Q18 Parquet range ownership optimization remains separate.
+
+### Controlled Q10 follow-up, October 27
+
+Validated source **`a2ef184141eabf711e5ee3bab74435483db250b9`**; noneditable Release
+`0.3.0.dev127`; native SHA-256 **`2a7b480edc7f7e20a542e5c5de44c5ee6261633b97f5395f3afbbb71f9b60b3f`**.
+The frozen baseline has native `97772ed8…`, with matching installed Python hashes.
+Only Q10 changes among all 22 normalized serialized graphs, **12 → 11 fragments**;
+the remaining 21 are identical. Bounded in-process execution verifies that the
+final gather carries at most **partitions × 20** rows and every channel returns
+its credits. New Ray tests use the default optimizer profile and nested Parquet
+payloads to exercise this hash partition proof, including FTE consumer retry.
+
+| Query | Local | Pipeline before | Pipeline now | Change | Now / Local |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q10 | 4.325 s | 8.457 s | 7.212 s | -14.72% | 1.67× |
+
+Each cell has **four steady samples**. Two baseline phases bracket two candidate
+phases with opposite mode orders, three executions per cell/phase, retaining and
+excluding each first SQL execution. Baseline phase drift is
+**+2.50%**. Steady ranges are Local
+4.274–4.380 s,
+baseline 8.278–8.567 s,
+and candidate 7.172–7.250 s.
+
+Separate diagnostics (two executions per variant) measure mean summed worker CPU
+**219.685 → 196.510 CPU seconds (-10.55%)**.
+Their instrumented wall times are excluded from the latency medians. All
+**34 follow-up executions** match Local: 18 primary Q10 timing queries, 12
+Q9/Q18/Q21 control screens and four CPU diagnostics. These controls each have one
+steady sample per variant; their small changes do not establish a speedup.
+
+| Control | Baseline s | Candidate s | Change |
+| --- | ---: | ---: | ---: |
+| Q9 | 17.249 | 16.838 | -2.39% |
+| Q18 | 8.863 | 8.267 | -6.72% |
+| Q21 | 14.897 | 14.795 | -0.68% |
+
+The first Q9 baseline control takes 47.328 s after a day between benchmark
+sessions; it is retained and excluded under the same first-run policy. Its steady
+control returns to approximately 17 s. Do not combine these control windows with
+the October 26 full-22 table or infer a new all-query score from graph identity.
+Q9 remains the largest next target; profiles show exchanges of 150 million order
+rows and 80 million partsupplier rows after a selective part filter, and costly
+joins. Any future shared-domain placement needs its own selectivity, dependency,
+CPU and traffic validation before changing the plan.
+
+### Validation and reproducibility
+
+- 1681 distinct related tests passed after deduplication:
+  1,659 broad compiler/execution regressions before the whitespace-only C++ format
+  rebuild; the final binary passes 23 focused checks, 18 Ray checks and two
+  bounded-channel checks. The final checks overlap the broad set.
+- CI's Python 3.12 failure was DuckDB 2.0 removing relation `fetchone()` in the
+  uninstall-only coexistence check. Commit `6b9a6caa14` uses `fetchall()`; the full
+  isolated install/import/uninstall matrix passes locally against DuckDB 2.0.0.
+  Format, Ruff and copyleft checks pass; no full/GPU suite was run locally.
+- Original SQL and the same 307 `/data/tpch100` Parquet files (37.5033 GiB) are
+  preserved. File bytes/mtimes are checked before/after every phase. Local uses
+  36 threads/32 GiB; Pipeline uses two workers × 18 threads/16 GiB, two partitions;
+  exchange/staging budgets 128/256 MiB, frames 64 KiB/2,048 rows, windows
+  1 MiB/16 slots, specialized benchmark Ray object store 1 GiB. Test Ray clusters
+  use Ray's default memory sizing. No own build/test/profiling overlaps timing.
+- Only the owned Doris FE is suspended, with BE/HDFS stopped during each measured
+  comparison. FE is resumed and BE/HDFS restarted afterward; health and disabled
+  file/Parquet page caches are checked. No host-wide cache drops or settings change.
+- Source, native/installed Python, SQL and driver hashes, frozen configurations,
+  row counts/content hashes, raw first/steady samples, JUnit logs and cleanup
+  manifests remain under `/home/kaka/astrovela_vane/.worktrees/pipelined-engine-pool-20261017/build/pipeline-sf100-full22-q10-20261026`. Temporary native profiling probes are absent
+  from the final binary. Retained output hashes can differ with chunk layout;
+  schema, row count and values are compared, with float rel=1e-9/abs=1e-6.
+
+SF100 FTE performance and Pipeline parity with Local remain unproven.
