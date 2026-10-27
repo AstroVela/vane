@@ -3,8 +3,8 @@
 
 """Authored cross-language inputs for real ONNX model qualification."""
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -28,4 +28,55 @@ def fixture():
 
 
 if __name__ == "__main__":
-    Path(sys.argv[1]).write_text(json.dumps(fixture()))
+    from importlib.metadata import version
+
+    from transformers import AutoProcessor
+
+    parser = argparse.ArgumentParser(
+        description="Prepare official Python processor tensors for independent Node inference"
+    )
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    data = fixture()
+    processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True, trust_remote_code=False)
+    image = np.asarray(data["image"], dtype=np.uint8)
+    audio = np.asarray(data["audio"], dtype=np.float32)
+    video = np.asarray(data["frames"], dtype=np.uint8)
+    cases = {
+        "documents": dict(text=["title: none | text: " + value for value in DOCUMENTS]),
+        "queries": dict(text=["task: search result | query: " + value for value in QUERIES]),
+        "image": dict(text=["<|image|>"], images=[[image]], images_kwargs={"device": "cpu"}),
+        "audio": dict(text=["<|audio|>"], audio=[audio], sampling_rate=16000),
+        "video": dict(
+            text=["<|video|>"],
+            videos=[video],
+            videos_kwargs={"device": "cpu", "do_sample_frames": False, "add_timestamps": False},
+        ),
+        "mixed": dict(
+            text=["title: none | text: red shape<|image|><|audio|><|video|>"],
+            images=[[image]],
+            audio=[audio],
+            videos=[video],
+            sampling_rate=16000,
+            images_kwargs={"device": "cpu"},
+            videos_kwargs={"device": "cpu", "do_sample_frames": False, "add_timestamps": False},
+        ),
+    }
+    result = {
+        "processor_versions": {name: version(name) for name in ("transformers", "torch", "torchvision", "Pillow")},
+        "cases": {},
+    }
+    dtypes = {np.dtype("float32"): "float32", np.dtype("int64"): "int64", np.dtype("bool"): "bool"}
+    for name, options in cases.items():
+        values = processor(**options, return_tensors="np", padding=True, truncation=False)
+        result["cases"][name] = {}
+        for key, value in values.items():
+            array = np.ascontiguousarray(value)
+            if array.dtype not in dtypes:
+                continue
+            filename = f"{name}-{key}.bin"
+            array.tofile(args.output / filename)
+            result["cases"][name][key] = {"type": dtypes[array.dtype], "dims": list(array.shape), "file": filename}
+    (args.output / "inputs.json").write_text(json.dumps(result, indent=2))

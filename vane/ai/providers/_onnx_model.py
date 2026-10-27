@@ -9,6 +9,7 @@ import json
 import math
 import threading
 from importlib import import_module
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,19 @@ EXECUTION_PROVIDERS = {
     "cuda": "CUDAExecutionProvider",
     "coreml": "CoreMLExecutionProvider",
 }
+
+PROCESSOR_VERSIONS = {"transformers": "5.21.0", "torch": "2.14.1", "torchvision": "0.29.1", "Pillow": "12.3.0"}
+
+
+def processor_versions() -> dict[str, str]:
+    return {name: version(name) for name in PROCESSOR_VERSIONS}
+
+
+def validate_software_contract(ort: Any) -> None:
+    if ort.__version__ != "1.26.0" or any(
+        value.split("+", 1)[0] != PROCESSOR_VERSIONS[name] for name, value in processor_versions().items()
+    ):
+        raise EmbeddingConfigurationError("ONNX requires runtime 1.26.0 and the declared onnx-py1 processor versions")
 
 
 def validate_parts(rows: list[list[tuple[str, Any]]], max_input_bytes: int) -> None:
@@ -138,10 +152,13 @@ class ONNXEmbedder:
                 modules[dependency] = import_module(dependency)
         onnx, ort = modules["onnx"], modules["onnxruntime"]
         AutoProcessor = modules["transformers"].AutoProcessor
+        validate_software_contract(ort)
 
         selected = EXECUTION_PROVIDERS[self.options["backend"]]
         if selected not in ort.get_available_providers():
             raise EmbeddingConfigurationError(f"ONNX execution provider {selected} is unavailable")
+        if self.options["backend"] == "cuda":
+            ort.preload_dlls(directory="")
         provider_options = (
             {"device_id": 0, "use_tf32": 0}
             if self.options["backend"] == "cuda"

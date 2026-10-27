@@ -80,8 +80,7 @@ def test_real_native_service_reference_and_public_apis(tmp_path, monkeypatch, ba
     finally:
         native_query.close()
     native_values = np.asarray([*native_docs, *native_queries, *native_media])
-    np.testing.assert_allclose(native_values[:6], expected[:6], atol=1e-5, rtol=1e-4)
-    assert np.min(np.sum(native_values[6:] * expected[6:], axis=1)) >= 0.9999
+    np.testing.assert_allclose(native_values, expected, atol=1e-5, rtol=1e-4)
     assert (np.asarray(native_queries) @ np.asarray(native_docs).T).argmax(axis=1).tolist() == [0, 1, 2]
     root = tmp_path / "service"
     root.mkdir(mode=0o700)

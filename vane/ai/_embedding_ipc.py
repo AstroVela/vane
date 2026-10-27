@@ -16,6 +16,7 @@ import numpy as np
 from vane.ai._audio_embedding import AudioClip, AudioInputSpec
 from vane.ai._embedding_content import EmbeddingContent, EmbeddingPart, EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._onnx_options import ONNX_ENCODING_VERSION
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 
 VERSION = 2
@@ -76,10 +77,13 @@ class ONNXEncoding:
     model_sha256: str
     max_length: int
     input_type: str
+    encoding_version: int = ONNX_ENCODING_VERSION
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.model_sha256, str)
+            type(self.encoding_version) is not int
+            or self.encoding_version != ONNX_ENCODING_VERSION
+            or not isinstance(self.model_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", self.model_sha256) is None
             or type(self.max_length) is not int
             or not 1 <= self.max_length <= 8192
@@ -127,7 +131,7 @@ class RequestContext:
             value = ModelContract(**value)
         encoding = message["encoding"]
         if isinstance(encoding, dict):
-            if set(encoding) == {"model_sha256", "max_length", "input_type"} and value is None:
+            if set(encoding) == {"model_sha256", "max_length", "input_type", "encoding_version"} and value is None:
                 return cls("default", None, message.get("request_id"), onnx=ONNXEncoding(**encoding))
             fields = {"model_sha256", "max_length", "vision_tokens_per_image", "input_type"}
             if set(encoding) != fields or value is not None:

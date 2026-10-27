@@ -99,20 +99,20 @@ mlx = [ # EmbeddingGemma 2 BF16 text/image/audio/video inference on Apple Silico
     "pillow>=10.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 onnx = [ # ONNX Runtime inference; official image/video preprocessing uses CPU Torch
-    "onnxruntime==1.31.1",
+    "onnxruntime==1.26.0",
     "onnx>=1.20,<2",
     "transformers==5.21.0",
-    "torch>=2.10,<3",
-    "torchvision>=0.25,<1",
-    "Pillow>=11,<13",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
+    "Pillow==12.3.0",
 ]
 onnx_cuda = [ # Install this alternative instead of the CPU onnx extra
-    "onnxruntime-gpu==1.31.1; platform_system == 'Linux' or platform_system == 'Windows'",
+    "onnxruntime-gpu[cuda,cudnn]==1.26.0; platform_system == 'Linux' or platform_system == 'Windows'",
     "onnx>=1.20,<2",
     "transformers==5.21.0",
-    "torch>=2.10,<3",
-    "torchvision>=0.25,<1",
-    "Pillow>=11,<13",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
+    "Pillow==12.3.0",
 ]
 litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inference
     "litert-lm-api==0.18.0",

@@ -47,7 +47,9 @@ def install_sdk(monkeypatch):
         returned_provider=None,
     )
     ort = ModuleType("onnxruntime")
+    ort.__version__ = "1.26.0"
     ort.get_available_providers = lambda: list(sdk.available)
+    ort.preload_dlls = lambda **kwargs: sdk.events.append(("preload_cuda", kwargs))
 
     class Settings:
         def __init__(self):
@@ -192,4 +194,7 @@ def install_sdk(monkeypatch):
     processor_module.AutoProcessor = Processor
     for name, module in (("onnxruntime", ort), ("onnx", graph), ("transformers", processor_module)):
         monkeypatch.setitem(__import__("sys").modules, name, module)
+    from vane.ai.providers import _onnx_model
+
+    monkeypatch.setitem(_onnx_model.__dict__, "processor_versions", lambda: dict(_onnx_model.PROCESSOR_VERSIONS))
     return sdk

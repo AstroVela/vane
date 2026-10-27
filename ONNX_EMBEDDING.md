@@ -17,6 +17,14 @@ Transformers processor uses CPU Torch/torchvision for image/video preprocessing;
 it does not load a PyTorch model or checkpoint. Model/tokenizer files must
 already exist locally; remote code and model downloads are disabled at runtime.
 
+The runtime target is ONNX Runtime 1.26.0, with the official CUDA 12.8 GPU
+package for CUDA execution. The processor contract pins Transformers 5.21.0,
+Torch 2.14.1, torchvision 0.29.1 and Pillow 12.3.0. Output spaces and service
+requests also carry encoding version `onnx-py1`; a different processor
+implementation must not claim this identity merely because it uses the same
+weights. In particular, the JavaScript and Python image resamplers can produce
+different pixels from the same source image.
+
 Provision the six JSON sidecars (`config.json`,
 `config_sentence_transformers.json`, `preprocessor_config.json`,
 `processor_config.json`, `tokenizer.json`, `tokenizer_config.json`) plus these
@@ -120,3 +128,11 @@ The [development workflow](DEVELOPMENT.md) runs the affected provider/service
 contracts first. Real model checks are in `tests/ai/test_onnx_embedding.py`;
 record the bundle digest, export revision, processor/runtime versions and
 execution provider. CPU fixtures do not qualify a real model, GPU or platform.
+
+For an independent model reference, run `tests/ai/onnx_reference_inputs.py`
+with `--model-path` and `--output` to prepare tensors through the pinned official
+Python processor. Run `tests/ai/onnx_reference.mjs` in a temporary project with
+official Transformers.js 4.3.1, passing model directory, prepared `inputs.json`,
+output JSON and bundle digest. It uses the official JavaScript model composition
+without importing Vane. The real-model gate compares every modality against
+these results with the same preprocessing and strict numerical tolerances.

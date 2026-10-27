@@ -13,6 +13,7 @@ from typing import Any
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 
 ONNX_MODEL = "onnx-community/embeddinggemma-2-ONNX"
+ONNX_ENCODING_VERSION = 1
 ONNX_DIMENSIONS = (128, 256, 512, 768)
 ONNX_DTYPES = {"fp32": "", "fp16": "_fp16", "q8": "_quantized", "q4": "_q4", "q4f16": "_q4f16"}
 ONNX_OPTIONS = frozenset(

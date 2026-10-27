@@ -41,7 +41,7 @@ def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeyp
     assert restored.get_model() == ONNX_MODEL
     assert restored.get_provider() == "onnx"
     assert restored.get_output_spec() == descriptor.get_output_spec()
-    assert restored.get_output_spec().outputs[0].space == ONNX_MODEL + ":" + "a" * 64
+    assert restored.get_output_spec().outputs[0].space == ONNX_MODEL + ":onnx-py1:" + "a" * 64
     assert restored.get_dimensions() == dimensions
     assert restored.get_udf_options().num_gpus == 0
 
@@ -124,6 +124,25 @@ def test_missing_sdk_has_the_safe_optional_dependency_hint(options, monkeypatch)
     with pytest.raises(ProviderImportError) as error:
         load_provider("onnx").get_text_embedder(options=options).instantiate()
     assert error.value.extra == "onnx"
+
+
+def test_processor_drift_is_rejected_before_session_creation(options, sdk, monkeypatch):
+    from vane.ai.providers import _onnx_model
+
+    monkeypatch.setattr(
+        _onnx_model, "processor_versions", lambda: _onnx_model.PROCESSOR_VERSIONS | {"torchvision": "0.30.0"}
+    )
+    with pytest.raises(EmbeddingConfigurationError, match="onnx-py1 processor"):
+        load_provider("onnx").get_text_embedder(options=options).instantiate()
+    assert not any(event[0] == "load" for event in sdk.events)
+
+
+@pytest.mark.parametrize("encoding_version", [True, 0, 2])
+def test_service_encoding_version_is_closed(encoding_version):
+    from vane.ai import _embedding_ipc as ipc
+
+    with pytest.raises(EmbeddingConfigurationError):
+        ipc.ONNXEncoding("a" * 64, 128, "document", encoding_version)
 
 
 @pytest.mark.parametrize("backend", ["cuda", "coreml"])

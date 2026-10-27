@@ -12,7 +12,7 @@ from vane.ai._audio_embedding import AudioInputSpec
 from vane.ai._embedding_content import EmbeddingPartSpec, MultimodalInputSpec
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_outputs import EmbeddingOutput, EmbeddingOutputSpec
-from vane.ai._onnx_options import validate_onnx_model, validate_onnx_options
+from vane.ai._onnx_options import ONNX_ENCODING_VERSION, validate_onnx_model, validate_onnx_options
 from vane.ai._video_embedding import VideoInputSpec
 from vane.ai.embedding import Modality
 from vane.ai.protocols import (
@@ -41,7 +41,9 @@ def output_spec(model: str, dimensions: int, digest: str, kind: str) -> Embeddin
     kinds: tuple[Modality, ...] = (
         ("text", "image", "video", "audio") if kind == "multimodal" else (cast(Modality, kind),)
     )
-    return EmbeddingOutputSpec((EmbeddingOutput("embedding", dimensions, model + ":" + digest, kinds),))
+    return EmbeddingOutputSpec(
+        (EmbeddingOutput("embedding", dimensions, f"{model}:onnx-py{ONNX_ENCODING_VERSION}:{digest}", kinds),)
+    )
 
 
 class _ONNXDescriptor:
