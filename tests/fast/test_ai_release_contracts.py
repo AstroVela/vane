@@ -17,7 +17,7 @@ import pytest
 
 
 @pytest.mark.parametrize("kind", ["text", "image", "audio", "video", "multimodal"])
-def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
+def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, tmp_path, kind):
     from vane.ai.provider import ProviderImportError, _safe_provider_execution_error, load_provider
 
     imported = []
@@ -41,7 +41,11 @@ def test_mlx_optional_registration_and_safe_dependency_hint(monkeypatch, kind):
     service = pickle.loads(
         pickle.dumps(
             getattr(load_provider("mlx"), "get_" + kind + "_embedder")(
-                options={"runtime": "service", "service_path": "/not-connected/mlx.json", "service_id": "metadata-only"}
+                options={
+                    "runtime": "service",
+                    "service_path": str(tmp_path / "mlx.json"),
+                    "service_id": "metadata-only",
+                }
             )
         )
     )

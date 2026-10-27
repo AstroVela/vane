@@ -28,6 +28,10 @@ add_library(
   query_parameters.cpp
   dynamic_extension.cpp
   vane_python.cpp
+  module_connection.cpp
+  module_types.cpp
+  module_results.cpp
+  module_relations.cpp
   importer.cpp
   merge_relation.cpp
   ai_sql_functions.cpp

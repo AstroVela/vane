@@ -82,6 +82,40 @@ python -m pip install . --no-build-isolation -v
 
 Do not use `pip install -e`. An editable install can cause Ray workers to invoke the build backend during import and delay actor startup.
 
+For Windows x64, activate the Python environment in PowerShell and use the
+Visual Studio generator after bootstrapping the native dependencies:
+
+```powershell
+$env:SKBUILD_BUILD_DIR = "$PWD/build/python-release"
+$env:SKBUILD_CMAKE_BUILD_TYPE = "Release"
+$env:CMAKE_GENERATOR = "Visual Studio 17 2022"
+$env:CMAKE_GENERATOR_PLATFORM = "x64"
+$env:MSBUILDDISABLENODEREUSE = "1"
+python -m pip install . --no-build-isolation `
+  "-Ccmake.define.CMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  "-Ccmake.define.VCPKG_INSTALLED_DIR=$PWD/vcpkg_installed" `
+  '-Ccmake.define.VCPKG_MANIFEST_MODE=OFF' `
+  '-Ccmake.define.VCPKG_TARGET_TRIPLET=x64-windows-static-release' `
+  '-Ccmake.define.DISABLE_UNITY=1' `
+  '-Cbuild.tool-args=/m'
+```
+
+Set `VCPKG_ROOT` to the bootstrapped vcpkg checkout. `/m` lets MSBuild choose
+its default parallel worker count; disabling node reuse keeps those workers
+within the current build process tree for memory monitoring. The Ray binding
+files and module-level connection wrappers compile separately and do not
+require MSVC `/bigobj`. Keep the module wrappers' registration order and
+`pyconnection_default.hpp` type caster when moving them between files.
+The connection class implementations compile independently under
+`src/vane_py/pyconnection/`: bindings, execution, filesystem access, CSV/JSON
+readers, relations, results and UDF registration. Keep their private helpers
+with their callers; `pyconnection.cpp` owns connection/session lifetime and
+the shared default connection, database instance cache and Python import cache.
+Keep binding helper classes at namespace scope: a large local
+class inside a pybind11 lambda caused excessive MSVC frontend memory use.
+The Bash test launchers also support Git Bash with native Windows Python;
+building a wheel does not establish compatibility of every runtime backend.
+
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.

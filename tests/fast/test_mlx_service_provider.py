@@ -9,6 +9,7 @@ import pickle
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,7 +23,11 @@ from vane.ai.functions import _prepare_embed_call
 from vane.ai.provider import ProviderImportError, load_provider
 from vane.ai.providers._mlx_service import preflight, validate_request
 
-OPTIONS = {"runtime": "service", "service_path": "/not-connected/mlx.json", "service_id": "fixed-model-v1"}
+OPTIONS = {
+    "runtime": "service",
+    "service_path": str(Path("/not-connected/mlx.json").absolute()),
+    "service_id": "fixed-model-v1",
+}
 KINDS = ("text", "image", "audio", "video", "multimodal")
 
 
@@ -62,6 +67,7 @@ def test_service_metadata_matches_native_and_pickle_requires_no_model_io(kind, m
 def test_fresh_process_can_plan_all_five_without_sdk_or_zmq():
     code = """
 import builtins, pickle
+from pathlib import Path
 original = builtins.__import__
 def guarded(name, *args, **kwargs):
     assert name.split('.')[0] not in {'mlx','mlx_vlm','transformers','torch','PIL','zmq'}, name
@@ -69,7 +75,7 @@ def guarded(name, *args, **kwargs):
 builtins.__import__ = guarded
 from vane.ai.provider import load_provider
 from vane.ai.functions import _prepare_embed_call
-options = dict(runtime='service', service_path='/not-connected/mlx.json', service_id='fixed-model-v1')
+options = dict(runtime='service', service_path=str(Path('/not-connected/mlx.json').absolute()), service_id='fixed-model-v1')
 for kind in ('text','image','audio','video','multimodal'):
     d = getattr(load_provider('mlx'), 'get_'+kind+'_embedder')(options=options)
     assert pickle.loads(pickle.dumps(d)).get_output_spec() == d.get_output_spec()
@@ -286,7 +292,11 @@ def test_native_reservation_requires_v2_default_semantics(change):
     from vane.ai.providers._embedding_service import service_descriptor
 
     owner = EmbeddingService(
-        path="/not-connected/native.json", service_id="fixture", family="sglang", model="fixture", dimensions=2
+        path=str(Path("/not-connected/native.json").absolute()),
+        service_id="fixture",
+        family="sglang",
+        model="fixture",
+        dimensions=2,
     )
     client = service_descriptor(
         "text", "fixture", 2, OPTIONS | {"service_id": "fixture"}, "sglang", "sglang"

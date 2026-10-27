@@ -10,12 +10,20 @@ if (($# == 0)); then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Use native Python paths before appending pytest node IDs containing ::.
+project_root="$(python -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).as_posix())' "$project_root")"
 # Anchor diagnostics to the caller before entering a disposable test directory.
 if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
   VANE_TEST_DIAGNOSTICS_DIR="$(python -c 'import os; print(os.path.abspath(os.environ["VANE_TEST_DIAGNOSTICS_DIR"]))')"
   export VANE_TEST_DIAGNOSTICS_DIR
 fi
-site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+test_pythonpath="$(python -c '
+import os, sys, sysconfig
+paths = [sysconfig.get_path("purelib"), sys.argv[1]]
+if os.environ.get("PYTHONPATH"):
+    paths.append(os.environ["PYTHONPATH"])
+print(os.pathsep.join(paths))
+' "$project_root")"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-pytest.XXXXXX")"
 cleanup_test_workdir() {
   rm -rf -- "$test_workdir"
@@ -39,12 +47,12 @@ done
 
 cd "$test_workdir"
 export PYTHONSAFEPATH=1
-export PYTHONPATH="${site_packages}:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="$test_pythonpath"
 export VANE_FAST_TEST_ARTIFACT_MODE=1
 
 python -m pytest \
   -c "$project_root/pyproject.toml" \
   --rootdir="$project_root" \
   --import-mode=importlib \
-  -o "pythonpath=$project_root/tests" \
+  -o "pythonpath=tests" \
   "${pytest_args[@]}"
