@@ -3583,6 +3583,23 @@ def test_subprocess_resizes_shared_memory_for_large_output(backend):
         executor.close()
 
 
+def test_subprocess_owns_actual_worker_pid_and_preserves_python_environment():
+    from vane.execution.udf_subprocess import _SingleSubprocessExecutor
+
+    def identity(_table):
+        return pa.table({"pid": [os.getpid()], "prefix": [sys.prefix], "executable": [sys.executable]})
+
+    worker = _SingleSubprocessExecutor(_subprocess_map_payload(identity))
+    try:
+        worker.submit(pa.table({"x": [1]}))
+        output = _wait_for_results(worker, 1, timeout_s=10)[0].to_pylist()[0]
+        assert output["pid"] == worker._proc.pid
+        assert output["prefix"] == sys.prefix
+        assert output["executable"] == sys.executable
+    finally:
+        worker.close(kill=True)
+
+
 def test_darwin_ipc_growth_recreates_the_parent_owned_name(monkeypatch):
     import vane.execution.udf_subprocess_worker as worker
 

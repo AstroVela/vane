@@ -138,8 +138,14 @@ The Python module also stops the process-local Flight service at interpreter
 exit, before Windows terminates the gRPC threads during DLL teardown.
 
 Windows local UDF workers use duplicated sockets and a job object to retain
-ownership of their descendants through shutdown. Shared memory follows Windows
-handle lifetime: keep a raw descriptor alive until its receiver has adopted it,
+ownership of their descendants through shutdown. In a Windows virtual
+environment, launch its base interpreter
+with `__PYVENV_LAUNCHER__` pointing at the virtual-environment executable, as
+CPython's multiprocessing launcher does. This preserves the environment while
+making `Popen.pid` the actual worker PID for socket duplication, process
+ownership, worker-loss detection and GPU placement diagnostics.
+Shared memory follows Windows handle lifetime: keep a raw descriptor alive until
+its receiver has adopted it,
 or release it explicitly. Production subprocess output uses parent-owned arena
 grants. Direct Arrow IPC output grows by replacing the named mapping and sending
 the new name to the parent. Exercise these paths with

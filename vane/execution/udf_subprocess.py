@@ -508,6 +508,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             env.update(self._worker_env)
             env["PYTHONUNBUFFERED"] = "1"
             if sys.platform == "win32":
+                base_executable = getattr(sys, "_base_executable", None)
+                if base_executable and os.path.normcase(base_executable) != os.path.normcase(sys.executable):
+                    # Match multiprocessing's Windows venv launch: bypass the
+                    # redirector so Popen, socket duplication and the job object
+                    # own the actual worker PID, while retaining its venv.
+                    cmd[0] = base_executable
+                    env["__PYVENV_LAUNCHER__"] = sys.executable
                 creationflags = subprocess.CREATE_NO_WINDOW
             else:
                 creationflags = 0

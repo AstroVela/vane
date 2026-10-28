@@ -108,6 +108,7 @@ release_tests=(
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_subprocess_owns_actual_worker_pid_and_preserves_python_environment"
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_darwin_ipc_growth_recreates_the_parent_owned_name"
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_cancelled_darwin_ipc_growth_remaps_before_worker_reuse"
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker"
