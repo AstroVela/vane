@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -113,3 +114,55 @@ def test_memory_guard_rejects_reused_ancestor_pid():
     unrelated_descendant = Process(13, 12, 91)
     children = [child, reused_pid_descendant, unrelated_descendant]
     assert module.owned_process_tree(root) == [root, child]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows jobs retain orphaned descendants")
+@pytest.mark.parametrize("failure", ["memory", "timeout"])
+def test_memory_guard_retains_children_after_their_parent_exits(tmp_path, failure):
+    pid_file = tmp_path / "orphan.pid"
+    worker = (
+        "import os, time; from pathlib import Path; "
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        "time.sleep(0.75); " + ("data = bytearray(128 * 1024**2); " if failure == "memory" else "") + "time.sleep(60)"
+    )
+    middle = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {worker!r}])"
+    script = (
+        f"import subprocess, sys, time; subprocess.run([sys.executable, '-c', {middle!r}], check=True); time.sleep(60)"
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        options = ["--max-process-mib=96"] if failure == "memory" else ["--timeout=3"]
+        result, report = _run_guard(tmp_path, script, *options)
+        assert result.returncode == report["exit_code"] == (137 if failure == "memory" else 124)
+        assert pid_file.is_file()
+        assert not _active_process(int(pid_file.read_text()))
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows command bootstrap")
+def test_memory_guard_preserves_stdin_and_virtual_environment(tmp_path):
+    report = tmp_path / "memory.json"
+    script = "import os, sys; print(sys.prefix); print(sys.stdin.read()); print(os.environ['VANE_GUARD_TEST'])"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_GUARD),
+            "--report",
+            str(report),
+            "--min-available-mib=0",
+            "--",
+            sys.executable,
+            "-c",
+            script,
+        ],
+        input="stdin remains available",
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={**os.environ, "VANE_GUARD_TEST": "inherited"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [sys.prefix, "stdin remains available", "inherited"]

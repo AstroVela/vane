@@ -7,16 +7,52 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import psutil
+
+
+def windows_job(pid: int):
+    # Load the standalone helper without importing the native Vane package:
+    # the guard also wraps its first build in a clean CI environment.
+    path = Path(__file__).resolve().parents[1] / "vane/execution/_windows_job.py"
+    spec = importlib.util.spec_from_file_location("vane_guard_windows_job", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.WindowsWorkerJob(pid)
+
+
+def job_processes(job) -> list[psutil.Process]:
+    processes = []
+    for pid in job.process_ids():
+        try:
+            process = psutil.Process(pid)
+            # Validate membership after capturing the creation time, so a PID
+            # reused since the query cannot introduce an unrelated process.
+            if job.contains(pid) and process.is_running():
+                processes.append(process)
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            continue
+    return processes
+
+
+def windows_command_child() -> int:
+    ready = Path(sys.argv[2])
+    deadline = time.monotonic() + 30
+    while not ready.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("memory guard did not assign the command's Windows job")
+        time.sleep(0.01)
+    return subprocess.call(sys.argv[3:])
 
 
 def owned_process_tree(root: psutil.Process) -> list[psutil.Process]:
@@ -89,16 +125,37 @@ def main() -> int:
     reason = None
     code = 1
     child = None
+    job = None
+    ready_directory = None
     known: set[psutil.Process] = set()
     try:
-        child = subprocess.Popen(command)
+        if os.name == "nt":
+            ready_directory = tempfile.TemporaryDirectory(prefix="vane-memory-guard-")
+            ready = Path(ready_directory.name) / "ready"
+            # Start the base executable directly so a venv redirector cannot
+            # create an unassigned child before job ownership is established.
+            child = subprocess.Popen(
+                [
+                    sys._base_executable,
+                    "-I",
+                    str(Path(__file__).resolve()),
+                    "--windows-command-child",
+                    str(ready),
+                    *command,
+                ],
+                env={**os.environ, "__PYVENV_LAUNCHER__": sys.executable},
+            )
+            job = windows_job(child.pid)
+            ready.touch()
+        else:
+            child = subprocess.Popen(command)
         try:
             root = psutil.Process(child.pid)
         except psutil.NoSuchProcess:
             code = child.wait()
             return code
         while child.poll() is None:
-            processes = owned_process_tree(root)
+            processes = job_processes(job) if job is not None else owned_process_tree(root)
             known.update(processes)
             known = {process for process in known if process.is_running()}
             for process in known:
@@ -126,16 +183,24 @@ def main() -> int:
                 reason, code = "guard interrupted", 130
             if reason is not None:
                 print(f"Memory guard stopped command: {reason}", file=sys.stderr, flush=True)
-                stop_processes(root, known)
+                if job is not None:
+                    job.close(timeout=5)
+                else:
+                    stop_processes(root, known)
                 break
             interrupted.wait(0.25)
         child_code = child.wait()
         if reason is None:
             code = child_code
     finally:
-        if child is not None and child.poll() is None:
+        if job is not None:
+            job.close(timeout=5)
+        elif child is not None and child.poll() is None:
             stop_processes(psutil.Process(child.pid), known)
+        if child is not None:
             child.wait()
+        if ready_directory is not None:
+            ready_directory.cleanup()
         args.report.write_text(
             json.dumps(
                 {
@@ -159,4 +224,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(windows_command_child() if sys.argv[1:2] == ["--windows-command-child"] else main())

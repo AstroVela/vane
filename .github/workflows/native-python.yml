@@ -109,6 +109,20 @@ jobs:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.vcpkg-triplet }}-${{ hashFiles('vcpkg.json') }}
 
+      - name: Create a short Windows Python environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Provider wheels contain namespaced codec DLLs. Keep their installed
+          # paths below MAX_PATH without depending on the host registry setting.
+          $testEnvironment = Join-Path $env:GITHUB_WORKSPACE 'build/py'
+          python -m venv $testEnvironment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $testEnvironment 'Scripts' | Add-Content -LiteralPath $env:GITHUB_PATH
+          $pythonExecutable = Join-Path $testEnvironment 'Scripts/python.exe'
+          "VANE_NATIVE_PYTHON=$pythonExecutable" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "VANE_BOOTSTRAP_PYTHON=$pythonExecutable" | Add-Content -LiteralPath $env:GITHUB_ENV
+
       - name: Install Python build and test dependencies
         shell: bash
         run: |
@@ -197,6 +211,10 @@ jobs:
 
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Verify memory protection and Windows cache permissions
+        if: inputs.python-version == '3.12'
+        run: scripts/run_installed_pytest.sh tests/fast/test_memory_guard.py tests/fast/test_windows_extension_cache.py
 
       - name: Exercise private extension runtime callbacks
         if: inputs.python-version == '3.12'

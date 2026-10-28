@@ -173,6 +173,15 @@ usage in a JSON report. The per-process limit is 4 GiB (Windows private bytes,
 POSIX resident bytes). Windows reserves 4 GiB of available physical memory;
 the Linux and macOS runners reserve 1.5 GiB. The local Windows build retains
 default MSBuild `/m` concurrency and its 4 GiB physical-memory reserve.
+The Windows guard assigns the command to a Job Object before it starts work,
+retaining ownership when an intermediate Git Bash process exits. Its process
+list includes nested worker jobs; the guard never changes CPU or process-count
+limits.
+
+Windows CI installs into a short virtual-environment path, `build/py`, so the
+namespaced codec DLLs in media provider wheels also install with the default
+`MAX_PATH` limit. Use a similarly short path for local media qualification when
+Windows long paths are disabled.
 
 Windows local shuffle storage uses bounded, case-safe node names and Win32
 extended paths for filesystem and Arrow I/O beyond `MAX_PATH`; it does not

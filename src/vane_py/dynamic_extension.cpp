@@ -239,7 +239,14 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 	GENERIC_MAPPING file_mapping {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
 	// DuckDB undefines the Windows DELETE macro to protect its SQL enum names.
 	constexpr ACCESS_MASK delete_access = 0x00010000L;
-	constexpr ACCESS_MASK replacement_rights = delete_access | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
+	const idx_t drive_offset = windows_path.compare(0, 4, L"\\\\?\\") == 0 ? 4 : 0;
+	const auto path_length = std::wstring(windows_path.c_str()).size();
+	const bool drive_root = path_length == drive_offset + 3 && windows_path[drive_offset + 1] == L':' &&
+	                        (windows_path[drive_offset + 2] == L'\\' || windows_path[drive_offset + 2] == L'/');
+	// DELETE cannot remove a drive root. Keep checking rights that can replace
+	// its children or change its ACL, including on a root with a trusted owner.
+	const ACCESS_MASK replacement_rights =
+	    FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | (drive_root ? 0 : delete_access);
 	for (ULONG index = 0; !replaceable && index < entry_count; index++) {
 		auto &entry = entries[index];
 		if ((entry.grfAccessMode != GRANT_ACCESS && entry.grfAccessMode != SET_ACCESS) ||
