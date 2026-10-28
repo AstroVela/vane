@@ -96,7 +96,7 @@ bool LocalFileSystem::IsPipe(const string &filename, optional_ptr<FileOpener> op
 
 #else
 static std::wstring ConvertPathToUnicode(const string &path) {
-	return WindowsUtil::UTF8ToUnicode(path.c_str());
+	return WindowsUtil::UTF8ToUnicodePath(path.c_str());
 }
 
 static std::wstring NormalizePathAndConvertToUnicode(FileSystem &fs, const string &path,

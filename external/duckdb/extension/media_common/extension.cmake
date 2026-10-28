@@ -28,8 +28,10 @@ function(vane_build_native_media_extension)
     set(dependencies ${FFMPEG_LIBRARIES} TIFF::TIFF JPEG::JPEG ZLIB::ZLIB
                      WebP::webp WebP::webpdemux SndFile::sndfile ${VANE_SOXR_LIBRARY})
   else()
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-      message(FATAL_ERROR "The native media runtime currently supports Linux x86-64 only")
+    if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+       AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+       AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+      message(FATAL_ERROR "The native media runtime requires Linux x86-64, macOS arm64 or Windows x86-64")
     endif()
     if(NOT EXTENSION_STATIC_BUILD)
       message(FATAL_ERROR "Dynamic media libraries still require EXTENSION_STATIC_BUILD=ON")
@@ -54,9 +56,17 @@ function(vane_build_native_media_extension)
                  PATHS "${boost_multiprecision_DIR}")
     include_directories("${VANE_MEDIA_RUNTIME_SDK}/include")
     foreach(library avformat avcodec avutil swscale swresample sndfile soxr tiff jpeg z webp webpdemux)
-      set(shared_library "${VANE_MEDIA_RUNTIME_SDK}/lib/lib${library}.so")
-      if(NOT EXISTS "${shared_library}")
-        message(FATAL_ERROR "Missing native media shared library: ${shared_library}")
+      set(names "${library}")
+      if(WIN32 AND library STREQUAL "z")
+        set(names zlib)
+      endif()
+      unset(shared_library)
+      unset(shared_library CACHE)
+      # Windows links the SDK's DLL import libraries. Never fall back to a
+      # cached static dependency from the base wheel's separate vcpkg tree.
+      find_library(shared_library NAMES ${names} PATHS "${VANE_MEDIA_RUNTIME_SDK}/lib" NO_DEFAULT_PATH)
+      if(NOT shared_library)
+        message(FATAL_ERROR "Missing native media SDK library: ${library}")
       endif()
       list(APPEND dependencies "${shared_library}")
     endforeach()
@@ -68,6 +78,9 @@ function(vane_build_native_media_extension)
     # Media readers and exact video time arithmetic require C++17.
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_link_libraries(${target} file_extension Boost::multiprecision ${dependencies})
+    if(APPLE)
+      target_link_options(${target} PRIVATE "LINKER:-headerpad_max_install_names")
+    endif()
   endforeach()
   if(NOT VANE_MEDIA_STATIC_DEVELOPMENT_BUILD)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -79,6 +92,7 @@ function(vane_build_native_media_extension)
                  "${vane_root}/scripts/prepare_dynamic_media_extension.py"
                  "${vane_root}/vane/_native_runtime_format.py"
                  "${vane_root}/vane_packaging/media_runtime.py"
+                 "${vane_root}/vane_packaging/media_binary.py"
                  "${vane_root}/vane_packaging/extension_wheel.py"
                  "${vane_root}/vane_packaging/archive_safety.py"
                  "${vane_root}/vane_packaging/artifact_limits.py"

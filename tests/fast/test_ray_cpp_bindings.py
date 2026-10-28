@@ -1485,6 +1485,22 @@ def test_shuffle_cache_windows_node_names_do_not_alias(tmp_path):
     assert len({str(Path(path)).casefold() for path in paths}) == len(nodes)
 
 
+@pytest.mark.parametrize("storage", ["duckdb", "local"])
+def test_shuffle_cache_roundtrip_with_a_long_base_directory(tmp_path, storage):
+    directory = tmp_path
+    while len(str(directory)) < 180:
+        directory /= "nested-component-0123456789"
+    directory.mkdir(parents=True)
+    if storage == "duckdb":
+        result = vane.ray_cxx.shuffle_cache_duckdb_filesystem_storage_roundtrip_for_test(str(directory), "ray:node:0")
+        assert result["values"] == [71, 72, 73, 74]
+        assert result["committed_manifest"] is True
+    else:
+        result = vane.ray_cxx.shuffle_cache_manifest_recovery_for_test(str(directory))
+        assert result["values"] == [11, 12, 13]
+        assert result["manifest_file_count"] == 1
+
+
 def _minio_test_config():
     endpoint = os.getenv("TEST_MINIO_ENDPOINT") or os.getenv("AWS_ENDPOINT_URL") or "http://127.0.0.1:9000"
     access_key = os.getenv("TEST_MINIO_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID") or ""

@@ -1,4 +1,5 @@
 #include "duckdb/common/windows_util.hpp"
+#include <algorithm>
 
 namespace duckdb {
 
@@ -17,6 +18,36 @@ std::wstring WindowsUtil::UTF8ToUnicode(const char *input) {
 		throw IOException("Failure in MultiByteToWideChar");
 	}
 	return std::wstring(buffer.get(), result_size);
+}
+
+std::wstring WindowsUtil::UTF8ToUnicodePath(const char *input) {
+	auto path = UTF8ToUnicode(input);
+	// CreateDirectory reserves twelve characters below MAX_PATH. Explicit
+	// extended paths work without a machine-wide LongPathsEnabled setting.
+	if (path.size() < MAX_PATH - 12 || path.compare(0, 4, L"\\\\?\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0) {
+		return path;
+	}
+	auto required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+	if (!required) {
+		throw IOException("Could not normalize long Windows path");
+	}
+	vector<wchar_t> buffer(required);
+	while (true) {
+		auto length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+		if (!length) {
+			throw IOException("Could not normalize long Windows path");
+		}
+		if (length >= buffer.size()) {
+			buffer.resize(length + 1);
+			continue;
+		}
+		std::wstring absolute(buffer.data(), length);
+		std::replace(absolute.begin(), absolute.end(), L'/', L'\\');
+		if (absolute.compare(0, 2, L"\\\\") == 0) {
+			return L"\\\\?\\UNC\\" + absolute.substr(2);
+		}
+		return L"\\\\?\\" + absolute;
+	}
 }
 
 static string WideCharToMultiByteWrapper(LPCWSTR input, uint32_t code_page) {
