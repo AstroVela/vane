@@ -131,10 +131,17 @@ providers. Each wheel contains exactly one self-contained artifact, its
 canonical descriptor, required license files, and one provider entry point,
 while declaring an exact dependency on the matching `vane-ai` version and on
 separately packaged dependency-extension wheels. Each extension-wheel package
-version contains the Vane release stage and the complete SHA-256 fingerprint of
-its immutable descriptor split across bounded numeric components. Those
-dependency-extension requirements therefore select the exact artifact identity
-instead of merely another build for the same Vane release. The provider module
+version appends an independent positive release number to the matching Vane
+release tuple: Vane `0.2.0` uses providers `0.2.0.1`, `0.2.0.2`, and so on.
+Vane prerelease/development suffixes are preserved after the fourth component.
+The counter continues across dev, rc, final and post stages of the same numeric
+Vane `X.Y.Z`: `0.2.0.2rc1` advances to `0.2.0.3`. Reset to one only for a new
+numeric base, such as the first `0.3.0.1` provider for Vane `0.3.0`.
+Dependencies pin the actual supplied wheel versions, while descriptors retain
+the exact artifact SHA-256 and dependency identities. Historical versions
+encoded from descriptor digests remain readable. Published files for a given
+version and wheel tag are immutable; changing their bytes requires a new release
+number. The provider module
 path is content-addressed too, so distinct artifacts do not overwrite each
 other's installed files. Each extension wheel is tagged for the active
 supported CPython minor, matching the native base wheel selected for that

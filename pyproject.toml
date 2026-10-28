@@ -282,6 +282,7 @@ include = [
     "/DUCKDB_UPSTREAM_VERSION",
 
     # Build configuration
+    "/native-media-release.toml",
     "/vane_fs/include/vane_fs/reader_abi.h",
     "/build_backend.py",
     "/vane_packaging/**",

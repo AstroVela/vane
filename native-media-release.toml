@@ -1,0 +1,3 @@
+# Increment across dev/rc/final/post stages of the same Vane X.Y.Z; reset only for a new X.Y.Z.
+[providers.native_media]
+release_number = 1
