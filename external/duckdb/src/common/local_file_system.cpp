@@ -1274,14 +1274,22 @@ bool LocalFileSystem::DirectoryExists(const string &directory, optional_ptr<File
 }
 
 void LocalFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
-	if (DirectoryExists(directory)) {
+	if (DirectoryExists(directory, opener)) {
 		return;
 	}
 	auto unicode_path = NormalizePathAndConvertToUnicode(*this, directory, opener);
-	if (directory.empty() || !CreateDirectoryW(unicode_path.c_str(), NULL) || !DirectoryExists(directory)) {
-		auto error = LocalFileSystem::GetLastErrorAsString();
-		throw IOException("Failed to create directory \"%s\": %s", directory.c_str(), error);
+	if (!directory.empty() && CreateDirectoryW(unicode_path.c_str(), NULL)) {
+		return;
 	}
+	auto error_code = directory.empty() ? ERROR_PATH_NOT_FOUND : GetLastError();
+	// Another worker can create the same shuffle/session directory between our
+	// existence check and CreateDirectoryW. A regular file must still fail.
+	if (!directory.empty() && error_code == ERROR_ALREADY_EXISTS && DirectoryExists(directory, opener)) {
+		return;
+	}
+	SetLastError(error_code);
+	auto error = LocalFileSystem::GetLastErrorAsString();
+	throw IOException("Failed to create directory \"%s\": %s", directory.c_str(), error);
 }
 
 static void DeleteDirectoryRecursive(FileSystem &fs, string directory, optional_ptr<FileOpener> opener) {

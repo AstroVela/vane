@@ -165,8 +165,14 @@ inline vector<string> ResolveFlightExchangeLocalDirsFromEnv() {
 	if (dirs.find("://") != std::string::npos) {
 		return {dirs};
 	}
+#if defined(_WIN32)
+	// Windows lists use ';' (or the explicit ',' form above). A drive's ':'
+	// belongs to the path and must not split a single local directory.
+	return {dirs};
+#else
 	auto result = split_dirs(':');
 	return result.empty() ? DefaultFlightExchangeLocalDirs() : result;
+#endif
 }
 
 inline std::string ResolveFlightExchangeNodeIdFromEnv() {

@@ -28,6 +28,26 @@ from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
 
+def test_native_directory_creation_accepts_a_concurrent_creator(tmp_path):
+    path = tmp_path / "created-by-another-worker"
+    vane.ray_cxx.create_local_directory_for_test(str(path), True)
+    assert path.is_dir()
+    vane.ray_cxx.create_local_directory_for_test(str(path), False)
+    assert path.is_dir()
+
+
+@pytest.mark.parametrize("collision", ["file", "missing-parent"])
+def test_native_directory_creation_preserves_real_errors(tmp_path, collision):
+    path = tmp_path / collision
+    if collision == "file":
+        path.write_text("existing file")
+    else:
+        path = path / "child"
+    with pytest.raises(vane.IOException, match="Failed to create directory"):
+        vane.ray_cxx.create_local_directory_for_test(str(path), False)
+    assert not path.is_dir()
+
+
 @pytest.mark.parametrize("explicit_shutdown", [False, True])
 def test_local_flight_service_stops_before_process_exit(tmp_path, explicit_shutdown):
     script = """
@@ -1202,42 +1222,55 @@ def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers(long_t
     _assert_successful_poller_outcome(recovery[0], "worker-recovery")
 
 
-def test_ray_task_result_poller_falls_back_after_batch_helper_failure(monkeypatch, capfd):
-    from vane.runners.ray import driver
+def _run_ray_task_result_poller_diagnostic_script(body):
+    # Redirect stderr before loading the extension: Windows static CRT streams
+    # retain their own descriptor table and cannot follow pytest's capfd swaps.
+    script = """
+import sys
+from unittest.mock import patch
+from tests.fast.test_ray_cpp_bindings import (
+    _PollerTestHandle,
+    _poll_with_shared_ray_task_result_poller,
+    _assert_successful_poller_outcome,
+)
+""" + textwrap.dedent(body)
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return completed.stderr
 
-    def fail_batch_wait(_handles):
-        raise RuntimeError("injected batch helper failure")
 
-    with monkeypatch.context() as patch:
-        patch.setattr(driver, "batch_wait_ready", fail_batch_wait)
-        outcomes = _poll_with_shared_ray_task_result_poller(
-            _PollerTestHandle("first", ready_after=3),
-            _PollerTestHandle("second", ready_after=4),
-        )
+def test_ray_task_result_poller_falls_back_after_batch_helper_failure():
+    stderr = _run_ray_task_result_poller_diagnostic_script("""
+        from vane.runners.ray import driver
 
-    _assert_successful_poller_outcome(outcomes[0], "worker-first")
-    _assert_successful_poller_outcome(outcomes[1], "worker-second")
-    stderr = capfd.readouterr().err
+        def fail_batch_wait(_handles):
+            raise RuntimeError("injected batch helper failure")
+
+        with patch.object(driver, "batch_wait_ready", fail_batch_wait):
+            outcomes = _poll_with_shared_ray_task_result_poller(
+                _PollerTestHandle("first", ready_after=3),
+                _PollerTestHandle("second", ready_after=4),
+            )
+        _assert_successful_poller_outcome(outcomes[0], "worker-first")
+        _assert_successful_poller_outcome(outcomes[1], "worker-second")
+        recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
+        _assert_successful_poller_outcome(recovery[0], "worker-recovery")
+    """)
     assert "operation=batch_wait_ready" in stderr
     assert "injected batch helper failure" in stderr
     assert stderr.count("[vane-ray-result-poller]") == 1
 
-    recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
-    _assert_successful_poller_outcome(recovery[0], "worker-recovery")
 
-
-def test_ray_task_result_poller_falls_back_after_driver_import_failure(monkeypatch, capfd):
-    with monkeypatch.context() as patch:
-        patch.setitem(sys.modules, "vane.runners.ray.driver", None)
-        outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
-
-    _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
-    stderr = capfd.readouterr().err
+def test_ray_task_result_poller_falls_back_after_driver_import_failure():
+    stderr = _run_ray_task_result_poller_diagnostic_script("""
+        with patch.dict(sys.modules, {"vane.runners.ray.driver": None}):
+            outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
+        _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
+        recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
+        _assert_successful_poller_outcome(recovery[0], "worker-recovery")
+    """)
     assert "operation=import vane.runners.ray.driver" in stderr
     assert "vane.runners.ray.driver" in stderr
-
-    recovery = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("recovery"))
-    _assert_successful_poller_outcome(recovery[0], "worker-recovery")
 
 
 @pytest.mark.parametrize(
@@ -1249,20 +1282,14 @@ def test_ray_task_result_poller_falls_back_after_driver_import_failure(monkeypat
         pytest.param([0, 0], "duplicate", id="duplicate"),
     ],
 )
-def test_ray_task_result_poller_falls_back_after_invalid_ready_indices(
-    monkeypatch,
-    capfd,
-    ready_indices,
-    error_fragment,
-):
-    from vane.runners.ray import driver
+def test_ray_task_result_poller_falls_back_after_invalid_ready_indices(ready_indices, error_fragment):
+    stderr = _run_ray_task_result_poller_diagnostic_script(f"""
+        from vane.runners.ray import driver
 
-    with monkeypatch.context() as patch:
-        patch.setattr(driver, "batch_wait_ready", lambda _handles: ready_indices)
-        outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
-
-    _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
-    stderr = capfd.readouterr().err
+        with patch.object(driver, "batch_wait_ready", lambda _handles: {ready_indices!r}):
+            outcomes = _poll_with_shared_ray_task_result_poller(_PollerTestHandle("healthy"))
+        _assert_successful_poller_outcome(outcomes[0], "worker-healthy")
+    """)
     assert "operation=decode batch_wait_ready result" in stderr
     assert error_fragment in stderr
 
@@ -1361,6 +1388,19 @@ def test_flight_exchange_local_dirs_env_supports_multiple_paths(monkeypatch):
     assert result == ["file:///tmp/a", "file:///tmp/b"]
 
 
+@pytest.mark.parametrize("separator", [",", ";"])
+def test_flight_exchange_local_dirs_preserves_native_path_lists(monkeypatch, tmp_path, separator):
+    directories = [str(tmp_path / "first"), str(tmp_path / "second")]
+    monkeypatch.setenv("DUCKDB_SHUFFLE_DIRS", separator.join(directories))
+    assert vane.ray_cxx.flight_exchange_local_dirs_from_env_for_test() == directories
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory lists use colons")
+def test_flight_exchange_local_dirs_preserves_posix_colon_lists(monkeypatch):
+    monkeypatch.setenv("DUCKDB_SHUFFLE_DIRS", "/tmp/first:/tmp/second")
+    assert vane.ray_cxx.flight_exchange_local_dirs_from_env_for_test() == ["/tmp/first", "/tmp/second"]
+
+
 def test_flight_exchange_local_dirs_env_supports_vane_alias(monkeypatch, tmp_path):
     shuffle_dir = tmp_path / "shuffle"
     monkeypatch.delenv("DUCKDB_SHUFFLE_DIRS", raising=False)
@@ -1379,7 +1419,7 @@ def test_flight_exchange_local_dirs_default_uses_vane_session(monkeypatch, tmp_p
 
     result = vane.ray_cxx.flight_exchange_local_dirs_from_env_for_test()
 
-    assert result == [str(session_dir / "flight_shuffle")]
+    assert [Path(directory) for directory in result] == [session_dir / "flight_shuffle"]
 
 
 def test_flight_exchange_node_id_prefers_vane_worker_id(monkeypatch):
@@ -2255,8 +2295,16 @@ def test_distributed_copy_direct_write_commit_manifest(tmp_path):
     assert result["first_output_run_id"] == "run-direct"
     assert result["first_output_direct_write"] is True
     assert result["first_output_committed"] is True
-    assert result["first_output_manifest_path"].endswith("copy_direct_final.duckdb_commit/run-direct/manifest.txt")
-    assert result["first_output_committed_marker_path"].endswith("copy_direct_final.duckdb_commit/run-direct/committed")
+    assert Path(result["first_output_manifest_path"]).parts[-3:] == (
+        "copy_direct_final.duckdb_commit",
+        "run-direct",
+        "manifest.txt",
+    )
+    assert Path(result["first_output_committed_marker_path"]).parts[-3:] == (
+        "copy_direct_final.duckdb_commit",
+        "run-direct",
+        "committed",
+    )
     assert result["manifest_exists"] is True
     assert result["committed_exists"] is True
     assert result["direct_prefix_exists"] is True
@@ -2375,7 +2423,11 @@ def test_distributed_copy_direct_write_committed_reader_requires_marker(tmp_path
     assert result["committed_error"] is False, result["committed_error_message"]
     assert result["committed_rows"] == 7
     assert result["committed_file_count"] == 1
-    assert result["committed_file_path"].endswith("_vane_direct_write_run-reader/w_selected/part.parquet")
+    assert Path(result["committed_file_path"]).parts[-3:] == (
+        "_vane_direct_write_run-reader",
+        "w_selected",
+        "part.parquet",
+    )
     assert result["committed_contains_loser"] is False
 
     conn = vane.connect()
@@ -2389,7 +2441,11 @@ def test_distributed_copy_direct_write_committed_reader_requires_marker(tmp_path
     assert committed["copy_output_direct_write"] is True
     assert committed["copy_output_committed"] is True
     assert len(committed["files"]) == 1
-    assert committed["files"][0]["final_path"].endswith("_vane_direct_write_run-reader/w_selected/part.parquet")
+    assert Path(committed["files"][0]["final_path"]).parts[-3:] == (
+        "_vane_direct_write_run-reader",
+        "w_selected",
+        "part.parquet",
+    )
 
 
 def test_distributed_copy_direct_write_uncommitted_stale_cleanup(tmp_path):

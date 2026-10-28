@@ -1567,8 +1567,8 @@ def _untrack_shm(shm: shared_memory.SharedMemory) -> shared_memory.SharedMemory:
     return shm
 
 
-def _create_shm(size: int, *, track: bool) -> shared_memory.SharedMemory:
-    shm = shared_memory.SharedMemory(create=True, size=size)
+def _create_shm(size: int, *, track: bool, name: str | None = None) -> shared_memory.SharedMemory:
+    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
     return shm if track else _untrack_shm(shm)
 
 

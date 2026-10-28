@@ -1123,13 +1123,24 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         except Exception as exc:
             self._raise_result_decoding_error(exc)
 
-    def _decode_ipc_result(self, result_size: int) -> pa.Table:
+    def _remap_ipc_result_if_needed(self, result_size: int) -> None:
         try:
             data_shm = self._require_data_shm()
             if result_size > len(cast(Any, data_shm.buf)):
-                name = data_shm.name
-                data_shm.close()
-                self._data_shm = data_shm = _open_existing_shm(name, track=False)
+                replacement = _open_existing_shm(data_shm.name, track=False)
+                try:
+                    data_shm.close()
+                except BaseException:
+                    replacement.close()
+                    raise
+                self._data_shm = replacement
+        except Exception as exc:
+            self._raise_result_decoding_error(exc)
+
+    def _decode_ipc_result(self, result_size: int) -> pa.Table:
+        self._remap_ipc_result_if_needed(result_size)
+        try:
+            data_shm = self._require_data_shm()
             ipc_result = _read_ipc_from_shm(data_shm, result_size)
             return _arrow_table_from_ipc_bytes(ipc_result)
         except Exception as exc:
@@ -1464,6 +1475,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 # A terminal response leaves the worker reusable. Synchronize
                 # mapping ownership even when cancellation discards its data.
                 self._adopt_ipc_result_mapping(shm_name)
+            elif sys.platform == "darwin":
+                # Growth recreates the same POSIX name on Darwin. Adopt it
+                # before discarding a cancelled result, so a later small result
+                # cannot be read from the original, now unlinked object.
+                self._remap_ipc_result_if_needed(result_size)
             scope = self._current_execution_scope()
             scope.raise_if_cancelled("UDF subprocess task")
             if result_size == 0:

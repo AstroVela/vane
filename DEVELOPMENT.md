@@ -147,6 +147,22 @@ the new name to the parent. Exercise these paths with
 `tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output`
 and `tests/fast/test_ai_image_embedding.py` through the installed test launcher.
 
+Darwin allows only one size allocation per POSIX shared-memory object. Direct
+IPC growth recreates the original parent-owned name, so cleanup still knows
+which name to unlink if the worker fails before announcing its result. The
+parent remaps a grown result before handling cancellation; a reused worker's
+next small result must not be read from the old, unlinked mapping. Linux keeps
+its in-place growth and Windows keeps its named-mapping handoff.
+
+The macOS and Windows CI jobs also build and install the Vane Python wheel,
+then run the non-Ray, shared-Ray and owner-Ray release phases in separate
+processes. `scripts/run_with_memory_guard.py` preserves build concurrency,
+stops only its owned process tree on a memory limit or deadline, and records
+usage in a JSON report. The per-process limit is 4 GiB (Windows private bytes,
+POSIX resident bytes). Windows reserves 4 GiB of available physical memory;
+the smaller macOS runner reserves 1.5 GiB. The local Windows build retains
+default MSBuild `/m` concurrency and its 4 GiB physical-memory reserve.
+
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.

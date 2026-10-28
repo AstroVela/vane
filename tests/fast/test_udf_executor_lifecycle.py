@@ -3583,6 +3583,87 @@ def test_subprocess_resizes_shared_memory_for_large_output(backend):
         executor.close()
 
 
+def test_darwin_ipc_growth_recreates_the_parent_owned_name(monkeypatch):
+    import vane.execution.udf_subprocess_worker as worker
+
+    class Mapping:
+        name = "psm_parent_owned"
+
+        def __init__(self, size):
+            self.buf = bytearray(size)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    original = Mapping(16)
+    replacement = Mapping(128)
+    events = []
+
+    def unlink(mapping, *, track):
+        assert mapping is original and track is False
+        events.append("unlink")
+
+    def create(size, *, name, track):
+        assert size == 128 and name == original.name and track is False
+        assert not original.closed
+        events.append("create")
+        return replacement
+
+    monkeypatch.setattr(worker, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(worker, "_DEFAULT_SHM_SIZE", 32)
+    monkeypatch.setattr(worker, "_unlink_shm", unlink, raising=False)
+    monkeypatch.setattr(worker, "_create_shm", create)
+    assert worker._resize_shm(original, 128) is replacement
+    assert events == ["unlink", "create"]
+    assert original.closed and not replacement.closed
+    assert worker._resize_shm(replacement, 64) is replacement
+    assert events == ["unlink", "create"]
+
+
+def test_cancelled_darwin_ipc_growth_remaps_before_worker_reuse(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class Mapping:
+        name = "psm_parent_owned"
+
+        def __init__(self, size):
+            self.buf = bytearray(size)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    original, replacement = Mapping(64), Mapping(256)
+    replacement.buf[:4] = b"next"
+    scope = subprocess_exec.ExecutionCancellationScope("darwin-ipc", 1)
+    scope.cancel("discard grown result")
+    worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._data_shm = original
+    worker._shm_peer = None
+    worker._broken_error = None
+    worker._ref_bundle_output = False
+    worker._current_execution_scope = lambda: scope
+    worker._recv_expected = lambda _: (subprocess_exec._MSG_OK, struct.pack("<Q", 128))
+    worker._decode_ipc_result = lambda _: pytest.fail("cancelled IPC must not be decoded")
+
+    def open_mapping(name, *, track):
+        assert name == original.name and track is False
+        return replacement
+
+    monkeypatch.setattr(subprocess_exec, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(subprocess_exec, "_open_existing_shm", open_mapping)
+    with pytest.raises(subprocess_exec.ExecutionCancelledError, match="discard grown result"):
+        worker._recv_submit_result()
+    assert worker._data_shm is replacement
+    assert original.closed and not replacement.closed
+    scope = subprocess_exec.ExecutionCancellationScope("darwin-ipc", 2)
+    worker._recv_expected = lambda _: (subprocess_exec._MSG_OK, struct.pack("<Q", 32))
+    worker._decode_ipc_result = lambda _: bytes(worker._data_shm.buf[:4])
+    worker._wrap_output = lambda result: result
+    assert worker._recv_submit_result() == b"next"
+
+
 @pytest.mark.parametrize("mapping_failure", [None, "open", "close"])
 def test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker(monkeypatch, mapping_failure):
     import vane.execution.udf_subprocess as subprocess_exec

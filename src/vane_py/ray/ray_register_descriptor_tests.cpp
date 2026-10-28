@@ -162,14 +162,16 @@ void RegisterRayDescriptorTestsBindings(py::module_ &m) {
 		    auto &context = *conn.context;
 		    auto &fs = FileSystem::GetFileSystem(context);
 
-		    auto staging_root = local_dir + "/copy_staging/run-replay";
-		    auto first_staged = staging_root + "/w_0/part.parquet";
-		    auto second_staged = staging_root + "/w_1/part.parquet";
-		    auto final_root = local_dir + "/copy_final_replay";
-		    auto first_final = final_root + "/part-0.parquet";
-		    auto second_final = final_root + "/part-1.parquet";
-		    fs.CreateDirectoriesRecursive(staging_root + "/w_0");
-		    fs.CreateDirectoriesRecursive(staging_root + "/w_1");
+		    auto staging_root = fs.JoinPath(fs.JoinPath(local_dir, "copy_staging"), "run-replay");
+		    auto first_worker = fs.JoinPath(staging_root, "w_0");
+		    auto second_worker = fs.JoinPath(staging_root, "w_1");
+		    auto first_staged = fs.JoinPath(first_worker, "part.parquet");
+		    auto second_staged = fs.JoinPath(second_worker, "part.parquet");
+		    auto final_root = fs.JoinPath(local_dir, "copy_final_replay");
+		    auto first_final = fs.JoinPath(final_root, "part-0.parquet");
+		    auto second_final = fs.JoinPath(final_root, "part-1.parquet");
+		    fs.CreateDirectoriesRecursive(first_worker);
+		    fs.CreateDirectoriesRecursive(second_worker);
 		    fs.CreateDirectoriesRecursive(final_root);
 
 		    const std::string first_body = "first";
