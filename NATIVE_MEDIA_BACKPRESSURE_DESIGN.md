@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：分阶段实现中，decoder 准入已合入集成分支，第二批接入扫描原始像素 buffer 的字节准入。更新日期：2026-10-27。
+状态：前三批 decoder、原始像素 buffer 和 UDF ingress flow 已合入集成分支；第四批实现有界流式结果接收。更新日期：2026-10-28。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -70,6 +70,19 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 [核心测试](external/duckdb/test/api/test_media_flow.cpp) 不依赖 provider，覆盖接收提交/拒绝、两条 sink 路径、重试、复制分配失败和回滚、回调重入、取消/确认竞态、slice/Arrow 引用及一帧扫描经过过滤进入阻塞 UDF。真实视频的 1/2 帧窗口、慢 task/actor、短批、LIMIT、接收超额、错误后复用和不支持的物化路径接入现有 [provider CI 文件](tests/fast/test_native_media_admission.py)。实际执行结果在本批 PR 中记录。
 
 本批仍不是完整 M1/M2：`ORDER BY → fetchall` 的物化/溢写预算交接、重型 scalar 可恢复执行、相互依赖路径的最低推进资源、Python/native 权威统一及 Ray/FTE 全链路验证留在后续批次。
+
+### 第四批：有界流式结果接收
+
+实现分支为 `feature/media-result-handoff`，基于集成分支合入 #1101 后的 `3eecc418f`，目标仍为 `native-media-backpressure-dev`。本批只接通 native scan 经投影、过滤、streaming LIMIT 到流式结果队列的线性路径；普通物化结果、排序和聚合继续明确拒绝。
+
+- 开启 flow 后，显式流式结果使用具备接收确认协议的 `PhysicalBufferedCollector`。保序路径使用单个 pipeline worker，避免后续 partition 占满容量而阻止最小 partition 推进；无序路径可并行。过滤后的 LIMIT 使用 streaming limit，不引入需要等待物化的 batch limit。普通查询的 collector 和 LIMIT 选择不受影响。
+- 接收容量使用 query 的 `streaming_buffer_size`，计量沿用 UDF ingress 的受支持 payload 类型和口径。所有选中列都计费，不只计算原始像素。任何接收复制之前，原子预留 `queued_bytes + reserved_bytes + copy_bytes <= streaming_buffer_size`；复制在队列锁外进行，提交成功后把预留转为已入队字节。复制失败或关闭期间未提交的复制回滚，不能确认上游。
+- 批次按实际选中行和剩余行计量拆分。队列放不下整批但能放下部分行时，保存输入偏移并返回 BLOCKED；队列有短批即可交付，不能为了填满容量等到 EOF。重试只接收尚未提交的行，每个输入状态只保留一份等待登记，整批全部提交后才在锁外确认原 flow。单行超过接收容量立即报资源错误；零 payload 的非空复制至少占用一个额度字节，避免零字节队列条目无限增长。
+- dequeue 将目标副本移交给调用者，再归还队列容量并在锁外唤醒 producer。关闭清除排队副本，撤销后续接收；进行中的复制保留 reservation 到其实际回滚。显式关闭或销毁媒体结果流会退役其仍活跃的 native 查询，清理阻塞的扫描和 flow scope；旧结果关闭不能取消同一连接后来的查询。
+- Arrow 导出当前以一行作为接收原子单位，即使 `rows_per_batch` 请求更大也不合并整段输入。该保守策略避免在 Python result delivery 获得容量前按行数预取大量媒体。按可用字节合并多个 Arrow 行属于后续优化。Python 关闭结果及 Arrow stream release 在等待 native worker 清理时释放 GIL。
+- 原始像素 lease 仍跟随原 allocation 的最后引用；队列拥有的是已经预留容量的新副本。调用者取走并长期保留的结果不再占用这个 C++ 队列额度，其数据由结果 owner 和已有 managed result delivery 契约持有。本批不约束任意客户端收集全部结果的内存，不把多个域额度解释为统一 RSS 上限。
+
+核心 `[media-result-flow]` 测试不依赖 provider，覆盖偏斜字符串、嵌套字段、短批重试、复制前预留、重叠复制、复制失败与关闭竞态、单行超限、普通/ExecutionBatch pipeline、过滤与 LIMIT、保留 Arrow buffer 和结果提前关闭。真实 codec 的一帧/两帧窗口、慢消费、结果保留、错误后复用和超限接入现有 provider CI 文件 `test_native_media_admission.py`。最终构建身份、实测结果及跳过项随本批 PR 记录。
 
 ## 1 设计结论
 

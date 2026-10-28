@@ -17,8 +17,29 @@
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/execution/operator/helper/physical_verify_vector.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
+
+bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const PhysicalOperator &plan) {
+	if (!DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity()) {
+		return false;
+	}
+	auto current = &plan;
+	while (current->type != PhysicalOperatorType::TABLE_SCAN) {
+		if (current->type != PhysicalOperatorType::PROJECTION && current->type != PhysicalOperatorType::FILTER &&
+		    current->type != PhysicalOperatorType::STREAMING_LIMIT) {
+			return false;
+		}
+		auto children = current->GetInputChildren();
+		if (children.size() != 1) {
+			return false;
+		}
+		current = &children[0].get();
+	}
+	return current->Cast<PhysicalTableScan>().function.media_flow_source;
+}
 
 PhysicalPlanGenerator::PhysicalPlanGenerator(ClientContext &context) : context(context) {
 }

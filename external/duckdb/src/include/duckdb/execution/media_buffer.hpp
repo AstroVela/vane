@@ -24,9 +24,13 @@ AllocateMediaVector(const LogicalType &type, idx_t count, MediaResourceLease lea
 DUCKDB_API void AllocateMediaList(Vector &list, idx_t rows, idx_t count, MediaResourceLease lease,
                                   shared_ptr<MediaFlowTicket> flow = nullptr);
 
-//! Payload reservation for a fresh UDF ingress copy: primitive slots, fixed
+//! Payload reservation for a fresh bounded receiver copy: primitive slots, fixed
 //! primitive arrays, structs and out-of-line strings. Variable-sized nested
 //! collections require a separate capacity contract and are rejected.
 //! Excludes validity masks, allocator slack, bookkeeping and later task copies.
 DUCKDB_API idx_t EstimateMediaFlowInputBytes(const DataChunk &chunk);
+//! Measure an actual row slice without allocating the receiving payload.
+DUCKDB_API idx_t EstimateMediaFlowInputBytes(const DataChunk &chunk, idx_t offset, idx_t rows);
+//! Largest prefix that fits, measured using actual selected values.
+DUCKDB_API idx_t MediaFlowRowsWithinByteLimit(const DataChunk &chunk, idx_t offset, idx_t rows, idx_t bytes);
 } // namespace duckdb

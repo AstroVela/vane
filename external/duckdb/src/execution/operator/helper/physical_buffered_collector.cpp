@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -5,8 +11,8 @@
 namespace duckdb {
 
 PhysicalBufferedCollector::PhysicalBufferedCollector(PhysicalPlan &physical_plan, PreparedStatementData &data,
-                                                     bool parallel)
-    : PhysicalResultCollector(physical_plan, data), parallel(parallel) {
+                                                     bool parallel, bool media_flow_receiver_p)
+    : PhysicalResultCollector(physical_plan, data), parallel(parallel), media_flow_receiver(media_flow_receiver_p) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -20,16 +26,21 @@ public:
 	shared_ptr<BufferedData> buffered_data;
 };
 
-class BufferedCollectorLocalState : public LocalSinkState {};
+class BufferedCollectorLocalState : public LocalSinkState {
+public:
+	idx_t row_offset = 0;
+};
 
 SinkResultType PhysicalBufferedCollector::Sink(ExecutionContext &context, DataChunk &chunk,
                                                OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<BufferedCollectorGlobalState>();
 	auto &lstate = input.local_state.Cast<BufferedCollectorLocalState>();
-	(void)lstate;
+	auto &buffered_data = gstate.buffered_data->Cast<SimpleBufferedData>();
+	if (media_flow_receiver) {
+		return buffered_data.AppendMediaFlow(chunk, lstate.row_offset, input.interrupt_state);
+	}
 
 	lock_guard<mutex> l(gstate.glock);
-	auto &buffered_data = gstate.buffered_data->Cast<SimpleBufferedData>();
 
 	if (buffered_data.BufferIsFull()) {
 		auto callback_state = input.interrupt_state;
@@ -48,7 +59,7 @@ SinkCombineResultType PhysicalBufferedCollector::Combine(ExecutionContext &conte
 unique_ptr<GlobalSinkState> PhysicalBufferedCollector::GetGlobalSinkState(ClientContext &context) const {
 	auto state = make_uniq<BufferedCollectorGlobalState>();
 	state->context = context.shared_from_this();
-	state->buffered_data = make_shared_ptr<SimpleBufferedData>(context);
+	state->buffered_data = make_shared_ptr<SimpleBufferedData>(context, media_flow_receiver);
 	return std::move(state);
 }
 

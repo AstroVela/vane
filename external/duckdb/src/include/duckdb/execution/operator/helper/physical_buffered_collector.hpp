@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -15,9 +21,11 @@ namespace duckdb {
 
 class PhysicalBufferedCollector : public PhysicalResultCollector {
 public:
-	PhysicalBufferedCollector(PhysicalPlan &physical_plan, PreparedStatementData &data, bool parallel);
+	PhysicalBufferedCollector(PhysicalPlan &physical_plan, PreparedStatementData &data, bool parallel,
+	                          bool media_flow_receiver = false);
 
 	bool parallel;
+	const bool media_flow_receiver;
 
 public:
 	unique_ptr<QueryResult> GetResult(GlobalSinkState &state) const override;
@@ -34,6 +42,9 @@ public:
 	bool SinkOrderDependent() const override;
 	bool IsStreaming() const override {
 		return true;
+	}
+	bool SupportsMediaFlowInput() const override {
+		return media_flow_receiver;
 	}
 };
 

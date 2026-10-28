@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/stream_query_result.hpp"
 
 #include "duckdb/main/client_context.hpp"
@@ -20,6 +26,14 @@ StreamQueryResult::StreamQueryResult(ErrorData error) : QueryResult(QueryResultT
 }
 
 StreamQueryResult::~StreamQueryResult() {
+	if (IsMediaFlowResult()) {
+		try {
+			Close();
+		} catch (...) {
+			// Explicit Close reports errors. Destruction must still release the
+			// retained result buffers without throwing during stack unwinding.
+		}
+	}
 }
 
 string StreamQueryResult::ToString() {
@@ -195,8 +209,21 @@ bool StreamQueryResult::IsOpen() {
 }
 
 void StreamQueryResult::Close() {
-	buffered_data->Close();
+	if (IsMediaFlowResult() && context) {
+		auto cc = context;
+		auto lock = cc->LockContext();
+		buffered_data->Close();
+		if (cc->IsActiveResult(*lock, *this)) {
+			cc->CleanupInternal(*lock, this);
+		}
+	} else if (buffered_data) {
+		buffered_data->Close();
+	}
 	context.reset();
+}
+
+bool StreamQueryResult::IsMediaFlowResult() const {
+	return buffered_data && buffered_data->IsMediaFlowReceiver();
 }
 
 bool StreamQueryResult::IsChunkReady(StreamExecutionResult result) {

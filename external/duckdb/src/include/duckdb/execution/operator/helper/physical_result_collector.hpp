@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -56,6 +62,10 @@ public:
 public:
 	//! Whether this is a streaming result collector
 	virtual bool IsStreaming() const {
+		return false;
+	}
+	//! Pre-copy capacity and committed receipts for native media input.
+	virtual bool SupportsMediaFlowInput() const {
 		return false;
 	}
 

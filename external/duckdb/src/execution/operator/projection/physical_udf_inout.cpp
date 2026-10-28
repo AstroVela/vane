@@ -2530,47 +2530,6 @@ static void DriveStreamingLazySubmits(ExecutionContext &context, StreamingUDFSta
 	}
 }
 
-static idx_t MediaFlowSliceBytes(const DataChunk &chunk, idx_t offset, idx_t rows) {
-	D_ASSERT(offset <= chunk.size() && rows <= chunk.size() - offset);
-	if (rows == 0) {
-		return 0;
-	}
-	if (offset == 0 && rows == chunk.size()) {
-		return EstimateMediaFlowInputBytes(chunk);
-	}
-	// A view measures the selected payload without allocating a receiving copy.
-	// In particular, string/struct payloads are not uniform across their rows.
-	DataChunk slice;
-	slice.InitializeEmpty(chunk.GetTypes());
-	slice.SetCapacity(chunk);
-	SelectionVector selection(rows);
-	for (idx_t row = 0; row < rows; row++) {
-		selection.set_index(row, offset + row);
-	}
-	slice.Slice(chunk, selection, rows);
-	return EstimateMediaFlowInputBytes(slice);
-}
-
-static idx_t MediaFlowRowsWithinByteLimit(const DataChunk &chunk, idx_t offset, idx_t candidate_rows,
-                                          idx_t remaining_bytes) {
-	if (MediaFlowSliceBytes(chunk, offset, candidate_rows) <= remaining_bytes) {
-		return candidate_rows;
-	}
-	// Find the largest fitting prefix using actual payloads. An average size
-	// can select an oversized prefix when the large strings come first.
-	idx_t lower = 0;
-	idx_t upper = candidate_rows;
-	while (lower < upper) {
-		auto middle = lower + (upper - lower + 1) / 2;
-		if (MediaFlowSliceBytes(chunk, offset, middle) <= remaining_bytes) {
-			lower = middle;
-		} else {
-			upper = middle - 1;
-		}
-	}
-	return lower;
-}
-
 static unique_ptr<DataChunk> BuildStreamingBatchFromPending(ExecutionContext &context, StreamingUDFState &state,
                                                             idx_t desired_rows, idx_t max_bytes,
                                                             bool allow_oversized_single_row) {
@@ -2619,8 +2578,8 @@ static unique_ptr<DataChunk> BuildStreamingBatchFromPending(ExecutionContext &co
 		idx_t consumed_bytes = 0;
 		idx_t tail_bytes = 0;
 		if (precise_payload) {
-			consumed_bytes = MediaFlowSliceBytes(src, offset, take_rows);
-			tail_bytes = MediaFlowSliceBytes(src, offset + take_rows, available_rows - take_rows);
+			consumed_bytes = EstimateMediaFlowInputBytes(src, offset, take_rows);
+			tail_bytes = EstimateMediaFlowInputBytes(src, offset + take_rows, available_rows - take_rows);
 			if (consumed_bytes > entry.bytes || tail_bytes != entry.bytes - consumed_bytes ||
 			    state.pending_bytes < entry.bytes) {
 				throw InternalException("Native media pending payload does not match its remaining rows");
