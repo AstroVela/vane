@@ -187,6 +187,35 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 #endif
 }
 
+#ifdef DUCKDB_WINDOWS
+static bool DynamicExtensionCacheIsVolumeRoot(const std::wstring &path) {
+	const idx_t offset = path.compare(0, 4, L"\\\\?\\") == 0 ? 4 : 0;
+	const auto length = std::wstring(path.c_str()).size();
+	if (length != offset + 3 || path[offset + 1] != L':' || (path[offset + 2] != L'\\' && path[offset + 2] != L'/')) {
+		return false;
+	}
+	// SUBST drive roots can name ordinary, replaceable directories. Resolve
+	// the opened directory to its volume GUID before exempting root DELETE.
+	auto handle =
+	    CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+	                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	wchar_t final_path[MAX_PATH];
+	auto final_length =
+	    GetFinalPathNameByHandleW(handle, final_path, MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+	CloseHandle(handle);
+	if (!final_length || final_length >= MAX_PATH) {
+		return false;
+	}
+	const std::wstring resolved(final_path, final_length);
+	const auto volume_end = resolved.find(L'}');
+	return resolved.compare(0, 11, L"\\\\?\\Volume{") == 0 && volume_end != std::wstring::npos &&
+	       volume_end + 2 == resolved.size() && resolved.back() == L'\\';
+}
+#endif
+
 static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 #ifdef DUCKDB_WINDOWS
 	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
@@ -239,10 +268,7 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 	GENERIC_MAPPING file_mapping {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
 	// DuckDB undefines the Windows DELETE macro to protect its SQL enum names.
 	constexpr ACCESS_MASK delete_access = 0x00010000L;
-	const idx_t drive_offset = windows_path.compare(0, 4, L"\\\\?\\") == 0 ? 4 : 0;
-	const auto path_length = std::wstring(windows_path.c_str()).size();
-	const bool drive_root = path_length == drive_offset + 3 && windows_path[drive_offset + 1] == L':' &&
-	                        (windows_path[drive_offset + 2] == L'\\' || windows_path[drive_offset + 2] == L'/');
+	const bool drive_root = DynamicExtensionCacheIsVolumeRoot(windows_path);
 	// DELETE cannot remove a drive root. Keep checking rights that can replace
 	// its children or change its ACL, including on a root with a trusted owner.
 	const ACCESS_MASK replacement_rights =

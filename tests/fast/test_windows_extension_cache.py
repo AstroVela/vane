@@ -43,9 +43,9 @@ def mapped_root(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "right,root_replaceable", [(None, False), ("D", False), ("DC", True), ("WDAC", True), ("WO", True)]
+    "right,root_replaceable", [(None, False), ("D", True), ("DC", True), ("WDAC", True), ("WO", True)]
 )
-def test_volume_root_delete_permission_does_not_replace_the_root(mapped_root, right, root_replaceable):
+def test_drive_alias_does_not_hide_a_replaceable_directory(mapped_root, right, root_replaceable):
     import vane
 
     directory, root = mapped_root

@@ -182,6 +182,9 @@ Windows CI installs into a short virtual-environment path, `build/py`, so the
 namespaced codec DLLs in media provider wheels also install with the default
 `MAX_PATH` limit. Use a similarly short path for local media qualification when
 Windows long paths are disabled.
+Gravitino accepts native Windows storage-location paths and returns local
+filenames with native separators. Fileset-relative paths and S3 locations use
+forward slashes.
 
 Windows local shuffle storage uses bounded, case-safe node names and Win32
 extended paths for filesystem and Arrow I/O beyond `MAX_PATH`; it does not
