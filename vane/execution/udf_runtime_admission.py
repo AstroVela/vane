@@ -61,6 +61,9 @@ class RuntimeTaskAdmission:
         self._leases: dict[str, RuntimeAdmissionAuthority] = {}
         self._running: set[str] = set()
         self._suspended: set[str] = set()
+        # Completed user work no longer consumes a running-task allowance,
+        # but its backend still owns cleanup until finalization returns.
+        self._completing: set[str] = set()
         self._resuming: deque[str] = deque()
         self._draining = False
         self._closed = False
@@ -81,7 +84,7 @@ class RuntimeTaskAdmission:
                 "max_running_tasks": self._limits.max_running_tasks,
                 "max_queued_tasks": self._limits.max_queued_tasks,
                 "running_tasks": len(self._running),
-                "ready_tasks": len(self._leases) - len(self._running) - len(self._suspended),
+                "ready_tasks": len(self._leases) - len(self._running) - len(self._suspended) - len(self._completing),
                 "waiting_tasks": len(self._suspended),
                 "resuming_tasks": len(self._resuming),
                 "queued_tasks": sum(len(q._pending) for q in self._waiting),
@@ -190,6 +193,16 @@ class RuntimeTaskAdmission:
         return wakeups
 
     def _complete_execution(self, token: str, base: AdmissionLease) -> None:
+        with self._condition:
+            if token in self._leases:
+                self._running.discard(token)
+                self._suspended.discard(token)
+                if token in self._resuming:
+                    self._resuming.remove(token)
+                self._completing.add(token)
+        # Returning physical capacity can immediately wake another task, which
+        # can finish before this callback unwinds. Let that wakeup observe the
+        # returned policy allowance while retaining the old cleanup owner.
         try:
             base.complete_execution()
         finally:
@@ -197,7 +210,7 @@ class RuntimeTaskAdmission:
 
     def _has_capacity_locked(self) -> bool:
         limit = self._limits.max_running_tasks
-        return limit is None or len(self._leases) - len(self._suspended) < limit
+        return limit is None or len(self._leases) - len(self._suspended) - len(self._completing) < limit
 
     def _wake_resume_waiters(self) -> None:
         with self._condition:
@@ -268,6 +281,7 @@ class RuntimeTaskAdmission:
                 return
             self._running.discard(token)
             self._suspended.discard(token)
+            self._completing.discard(token)
             if token in self._resuming:
                 self._resuming.remove(token)
             self._condition.notify_all()
