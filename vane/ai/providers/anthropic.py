@@ -9,6 +9,7 @@ import base64
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._client_config import copy_client_options
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import OutputValidationError, serialize_raw_response
@@ -25,6 +26,7 @@ from vane.ai.provider import (
     _ProviderResultError,
     _translate_missing_provider_dependency,
 )
+from vane.ai.providers._anthropic_client_config import capture_anthropic_client, create_anthropic_client
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -84,9 +86,13 @@ class AnthropicProvider(Provider):
         name: str | None = None,
         *,
         prompt_model: str | None = None,
+        api_key: str | None = None,
+        auth_token: str | None = None,
+        base_url: str | None = None,
     ) -> None:
         self._name = name or "anthropic"
         self._prompt_model = prompt_model
+        self._client_options = capture_anthropic_client(api_key=api_key, auth_token=auth_token, base_url=base_url)
 
     @property
     def name(self) -> str:
@@ -117,6 +123,7 @@ class AnthropicProvider(Provider):
             return_format=return_format,
             return_raw_response=return_raw_response,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
 
@@ -149,8 +156,10 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_anthropic_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Anthropic prompt model must be a non-empty string")
         validated_options = _validate_anthropic_prompt_options(self.options)
@@ -180,6 +189,7 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     def instantiate(self) -> Prompter:
         return AnthropicPrompter(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
@@ -199,6 +209,7 @@ class AnthropicPrompter:
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "anthropic",
+        client_options: dict[str, Any] | None = None,
     ) -> None:
         with _translate_missing_provider_dependency("anthropic", "anthropic"):
             from anthropic import AsyncAnthropic  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -210,9 +221,8 @@ class AnthropicPrompter:
         self._return_format = return_format
         self._return_raw_response = return_raw_response
         self._options = {key: value for key, value in options.items() if key in _REQUEST_OPTIONS and value is not None}
-        client_options = {key: options[key] for key in ("base_url", "timeout") if options.get(key) is not None}
-        client_options["max_retries"] = 0
-        self._client = AsyncAnthropic(**client_options)
+        client_options = capture_anthropic_client() if client_options is None else client_options
+        self._client = create_anthropic_client(AsyncAnthropic, client_options, options)
 
     async def aclose(self) -> None:
         await self._client.close()

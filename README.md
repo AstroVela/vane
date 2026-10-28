@@ -7,6 +7,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/vane-ai/">
     <img src="https://img.shields.io/pypi/v/vane-ai?logo=pypi" alt="PyPI">
   </a>
@@ -26,19 +30,6 @@
     <img src="https://img.shields.io/badge/X-Follow_%40AstroVelaAI-black?logo=x&amp;style=for-the-badge" alt="Follow AstroVelaAI on X">
   </a>
 </p>
-
-Vane unifies multimodal data, intelligence, and continuous learning with Python and SQL interfaces, seamlessly scaling from local environments to Ray clusters.
-
-![Vane platform overview](assets/vane-platform.png)
-
-> [!NOTE]
-> **Project status**
->
-> - **Vane Data** — Supports most of the capabilities described below and is under active development. Its interfaces and internals may continue to evolve as the codebase is reviewed and hardened.
-> - **Vane RL** and **Vane Agent** — In the early stages of design and implementation. Their source code will be released in future updates.
-  - **Vibe Coding and Agentic Engineering** — Some parts of our system were initially built through Vibe Coding. We are now continuously analyzing, understanding, and improving the codebase, applying an Agentic Engineering approach to drive iterative optimization and enhance the quality, maintainability, and efficiency of the system.
-
----
 
 ## Vane Data
 
@@ -73,6 +64,19 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
+
+For encoded video intervals with synchronized audio and source timestamps, see
+the [video clipping example](examples/video_clip.py). It covers `VideoFile.clip`,
+the `video_clip` Python/SQL expression, output codecs, and resource limits.
+Clips preserve constant sample aspect ratios in MP4 metadata, including ratios
+that require more precision than the output video codec can represent.
+
+The [multimodal provider example](examples/multimodal_providers.py) covers native
+vLLM/SGLang Python engines with configurable models and multimodal embeddings.
+
+The [Qwen3-VL SQR example](examples/qwen3_vl_sqr.py) documents the opt-in
+`qwen3_vl` provider, its fixed text/image/video encoding contract, and selection
+through Vane Context's models configuration.
 
 ### More Resources
 

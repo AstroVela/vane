@@ -1,0 +1,294 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build and validate borrowed write buffers in an isolated non-editable component."""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+from prepare import WRAPS, clean, digest, execute, save, validate
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    args = parser.parse_args()
+    out, here = args.artifacts.resolve(), Path(__file__).resolve().parent
+    repo = here.parents[3]
+    parent = json.loads((out / "build.json").read_text())
+    assert parent["status"] == "PASS"
+    original = Path(parent["component"]["path"])
+    sdk = Path(parent["component"]["sdk"])
+    target = out / "borrowed"
+    if not target.exists():
+        shutil.copytree(
+            original,
+            target,
+            ignore=shutil.ignore_patterns(
+                "build",
+                "venv",
+                "sanitize",
+                "__pycache__",
+                "*.orig",
+                "probe",
+                "test_progress",
+                "restart-test",
+                "orphan-test",
+                "policy-test",
+            ),
+        )
+    expected = {str(Path(p).relative_to(original)): sha for p, sha in parent["component"]["sources"].items()}
+    changed = {p for p, sha in expected.items() if digest(target / p) != sha}
+    if not changed:
+        subprocess.run(
+            ["patch", "--batch", "--fuzz=0", "-p1", "-i", str(here / "borrow.patch")], cwd=target, check=True
+        )
+    changed = {p for p, sha in expected.items() if digest(target / p) != sha}
+    assert changed == {"src/workspace.cpp", "src/payload_file.hpp"}
+    proof = out / "borrow-reverse"
+    (proof / "src").mkdir(parents=True)
+    for name in changed:
+        shutil.copy2(target / name, proof / name)
+    subprocess.run(
+        ["patch", "--batch", "--reverse", "--fuzz=0", "-p1", "-i", str(here / "borrow.patch")],
+        cwd=proof,
+        check=True,
+        capture_output=True,
+    )
+    assert all(digest(proof / name) == expected[name] for name in changed)
+    report = dict(
+        status="RUNNING",
+        started_epoch=time.time(),
+        commands=[],
+        cleanup=[],
+        tests=[],
+        allocation_controls=[],
+        reverse_patch_exact=True,
+        sources={str(target / p): digest(target / p) for p in expected},
+        inputs={
+            str(p): digest(p)
+            for p in [
+                Path(__file__),
+                here / "borrow.patch",
+                here / "test_borrow.cpp",
+                here / "probe.cpp",
+                here / "costs.cpp",
+                here / "costs.hpp",
+                out / "build.json",
+            ]
+        },
+        binaries={},
+    )
+
+    def run(label, argv, cwd=None, env=None):
+        start = time.time()
+        with (out / (label + ".log")).open("w") as log:
+            result = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=log, timeout=600)
+        report["commands"].append(
+            dict(
+                label=label,
+                argv=argv,
+                cwd=str(cwd),
+                started_epoch=start,
+                ended_epoch=time.time(),
+                returncode=result.returncode,
+            )
+        )
+        save(out / "borrow-build.json", report)
+        assert result.returncode == 0, label
+        print(label, "PASS", flush=True)
+
+    try:
+        python = target / "venv/bin/python"
+        run("borrow-venv", ["uv", "venv", "--python", str(repo / ".venv/bin/python"), str(target / "venv")])
+        (target / "venv/lib/python3.12/site-packages/support.pth").write_text(
+            str(repo / ".venv/lib/python3.12/site-packages")
+            + "\n"
+            + str(repo.parent / "astrovela_vane-batch-udf-20260930/.venv-gpu/lib/python3.12/site-packages")
+            + "\n"
+        )
+        fuse = repo / ".cache/fuse-sdk/root/usr"
+        env = dict(
+            os.environ,
+            SKBUILD_BUILD_DIR=str(target / "build/python-release"),
+            SKBUILD_CMAKE_BUILD_TYPE="Release",
+            CMAKE_BUILD_PARALLEL_LEVEL="2",
+            PKG_CONFIG_PATH=str(fuse / "lib/x86_64-linux-gnu/pkgconfig"),
+            PKG_CONFIG_SYSROOT_DIR=str(fuse.parent),
+        )
+        run(
+            "borrow-install",
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                ".",
+                "--no-build-isolation",
+                "-Ccmake.define.unofficial-sqlite3_DIR=" + str(sdk / "share/unofficial-sqlite3"),
+                "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+                "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+                "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+                "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=fsync",
+            ],
+            target,
+            env,
+        )
+        release = target / "build/python-release"
+        run("borrow-cpp", ["ctest", "--test-dir", str(release), "--output-on-failure"])
+        owned = Path(tempfile.mkdtemp(prefix="owned-borrow-python-", dir="/dev/shm"))
+        try:
+            run(
+                "borrow-python",
+                [
+                    str(python),
+                    "-I",
+                    "-m",
+                    "pytest",
+                    "--rootdir",
+                    str(target),
+                    "--confcutdir",
+                    str(target),
+                    "--basetemp",
+                    str(owned),
+                    "-q",
+                    str(target / "tests"),
+                ],
+                "/tmp",
+                dict(
+                    os.environ,
+                    VANE_FS_MOUNT_BINARY=str(release / "vane-fs-mount"),
+                    VANE_FS_PRODUCTION_PYTHON=str(repo / ".venv/bin/python"),
+                ),
+            )
+        finally:
+            clean(owned, report)
+        sanitized = target / "sanitize"
+        run(
+            "borrow-asan-configure",
+            [
+                "cmake",
+                "-S",
+                str(target),
+                "-B",
+                str(sanitized),
+                "-G",
+                "Ninja",
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DCMAKE_PREFIX_PATH=" + str(sdk),
+                "-DVANE_FS_BUILD_PYTHON=OFF",
+                "-DVANE_FS_BUILD_TOOLS=OFF",
+                "-DVANE_FS_BUILD_FUSE=OFF",
+                "-DVANE_FS_BUILD_TESTS=ON",
+                "-DVANE_FS_TEST_SQLITE_SYNC=fsync",
+                "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer",
+                "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
+            ],
+        )
+        run("borrow-asan-core", ["cmake", "--build", str(sanitized), "-j", "2"])
+        asan_env = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1")
+        run("borrow-asan-cpp", ["ctest", "--test-dir", str(sanitized), "--output-on-failure"], env=asan_env)
+        for mode, core in [("release", release / "libvane_fs.a"), ("asan", sanitized / "libvane_fs.a")]:
+            binary = out / ("borrow-test-" + mode)
+            argv = [
+                "c++",
+                "-std=c++17",
+                "-O2",
+                "-I" + str(target / "include"),
+                str(here / "test_borrow.cpp"),
+                str(core),
+                str(sdk / "lib/libsqlite3.a"),
+                "-ldl",
+                "-pthread",
+                "-o",
+                str(binary),
+            ]
+            if mode == "asan":
+                argv += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+            run("borrow-test-build-" + mode, argv)
+            owned = Path(tempfile.mkdtemp(prefix="owned-borrow-boundaries-", dir="/dev/shm"))
+            try:
+                run("borrow-boundaries-" + mode, [str(binary), str(owned / "db.sqlite")], env=asan_env)
+                assert (out / ("borrow-boundaries-" + mode + ".log")).read_text().count("PASS ") == 12
+                report["tests"].append(dict(mode=mode, cases=12))
+            finally:
+                clean(owned, report)
+            report["binaries"][str(binary)] = digest(binary)
+        for label, inc, core, profiled in [
+            ("borrowed", target, release / "libvane_fs.a", False),
+            ("count-baseline", original, original / "build/python-release/libvane_fs.a", True),
+            ("count-borrowed", target, release / "libvane_fs.a", True),
+        ]:
+            binary = out / ("probe-" + label)
+            argv = [
+                "c++",
+                "-std=c++17",
+                "-O2",
+                "-I" + str(inc / "src"),
+                "-I" + str(inc / "include"),
+                "-I" + str(sdk / "include"),
+                "-I" + str(here),
+                str(here / "probe.cpp"),
+            ]
+            if profiled:
+                argv += [str(here / "costs.cpp"), "-DVANE_WRITE_PROFILE"]
+            argv += [
+                str(core),
+                str(sdk / "lib/libsqlite3.a"),
+                "-ldl",
+                "-pthread",
+                "-Wl,--wrap=sqlite3_wal_hook",
+                "-o",
+                str(binary),
+            ]
+            if profiled:
+                argv += ["-Wl,--wrap=" + name for name in WRAPS]
+            run("borrow-probe-build-" + label, argv)
+            report["binaries"][str(binary)] = digest(binary)
+            owned = Path(tempfile.mkdtemp(prefix="owned-borrow-probe-", dir="/dev/shm"))
+            try:
+                row = execute(binary, owned, 4, out / ("test-" + label + ".json"))
+                if not profiled:
+                    validate(row, False)
+                else:
+                    assert row["content_and_integrity"]
+                    counters = next(p for p in row["phases"] if p["name"] == "writes")["stages"]
+                    assert counters["step_payload"][0] == counters["step_version"][0] == 16
+                    report["allocation_controls"].append(
+                        dict(
+                            label=label,
+                            cpp_allocations=sum(v[5] for v in counters.values()),
+                            cpp_allocated_bytes=sum(v[6] for v in counters.values()),
+                            vm_steps={s: counters[s][8] for s in ("step_payload", "step_version")},
+                        )
+                    )
+            finally:
+                clean(owned, report)
+        base, candidate = report["allocation_controls"]
+        assert base["vm_steps"] == candidate["vm_steps"]
+        assert base["cpp_allocated_bytes"] - candidate["cpp_allocated_bytes"] >= 8 * 1024**2
+        for p in [
+            release / "libvane_fs.a",
+            release / "vane-fs-mount",
+            sanitized / "libvane_fs.a",
+            target / "venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+        ]:
+            report["binaries"][str(p)] = digest(p)
+        assert all(digest(Path(p)) == sha for p, sha in report["sources"].items())
+        report.update(status="PASS", ended_epoch=time.time())
+    except BaseException as error:
+        report.update(status="FAIL", ended_epoch=time.time(), error=repr(error))
+        raise
+    finally:
+        save(out / "borrow-build.json", report)
+
+
+if __name__ == "__main__":
+    main()

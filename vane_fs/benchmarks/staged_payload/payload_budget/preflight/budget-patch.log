@@ -1,0 +1,3 @@
+patching file src/staging.hpp
+patching file src/checkpoint.hpp
+patching file src/workspace.cpp

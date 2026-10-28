@@ -1,0 +1,26 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -23,6 +23,7 @@
+ public:
+ 	static constexpr int64_t START_BYTES = 16 * 1024 * 1024;
+ 	static constexpr int64_t LIMIT_BYTES = 64 * 1024 * 1024;
++	static constexpr int64_t CLEAN_BYTES = 256 * 1024;
+ 
+ 	Checkpointer(sqlite3 *writer, int page_size, int timeout_ms, Staging &staging)
+ 	    : staging(staging), page_size(page_size), timeout_ms(timeout_ms),
+@@ -175,10 +176,11 @@
+ 							if (pending) {
+ 								// Preserve the existing OPEN publication budget.
+ 								deferred = small;
+-							} else if (small && frames > copied) {
+-								// FULL commits are already durable. Coalesce their small
+-								// CLEAN maintenance from the first request, never by sliding
+-								// the deadline on subsequent commits. Large tails bypass it.
++							} else if (small && frames > copied &&
++							           Bytes(frames - copied) <= CLEAN_BYTES) {
++								// Backfill a large CLEAN prefix before external writes turn
++								// it OPEN and require payload publication to make progress.
++								// Small maintenance retains a fixed, non-sliding window.
+ 								auto now = std::chrono::steady_clock::now();
+ 								if (clean_deadline == std::chrono::steady_clock::time_point {})
+ 									clean_deadline = now + std::chrono::milliseconds(5);

@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from vane_packaging.media_publish import preflight, promote_github, publish_github, stage_index, verify_index
+from vane_packaging.media_publish import preflight, promote_github, publish_github, resume, stage_index, verify_index
 
 
 def main() -> None:
@@ -24,6 +24,10 @@ def main() -> None:
     prepare = commands.add_parser("preflight")
     prepare.add_argument("--release", action="store_true")
     prepare.add_argument("--output", type=Path, required=True)
+    recover = commands.add_parser("resume")
+    recover.add_argument("--release-tag", required=True)
+    recover.add_argument("--manifest-sha256", dest="digest", required=True)
+    recover.add_argument("--output", type=Path, required=True)
     for name in ("stage-index", "verify-index", "publish-candidate", "promote-github"):
         command = commands.add_parser(name)
         command.add_argument("--directory", type=Path, required=True)
@@ -31,11 +35,15 @@ def main() -> None:
         if name.endswith("index"):
             command.add_argument("--channel", choices=("pypi", "testpypi"), required=True)
             command.add_argument("--output", type=Path, required=True)
+        else:
+            command.add_argument("--release-tag", help="Original Vane tag when recovering from protected main")
     arguments = vars(parser.parse_args())
     command = arguments.pop("command")
     github_output = arguments.pop("github_output")
     if command == "preflight":
         result = preflight(**arguments)
+    elif command == "resume":
+        result = resume(**arguments)
     elif command == "stage-index":
         result = {"publish": "true" if stage_index(**arguments) else "false"}
     elif command == "verify-index":

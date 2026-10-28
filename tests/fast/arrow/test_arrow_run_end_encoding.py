@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
 pa = pytest.importorskip("pyarrow", "21.0.0", reason="Needs pyarrow >= 21")
@@ -315,6 +321,44 @@ class TestArrowREE:
         actual = duckdb_cursor.query("select * from result").fetchall()
 
         assert expected == actual
+
+    @pytest.mark.parametrize("run_end_type", [pa.int16(), pa.int32(), pa.int64()])
+    @pytest.mark.parametrize("physical_offset", [0, 1])
+    @pytest.mark.parametrize("offset,length", [(1, 3), (4, 8), (6, 3), (11, 3)])
+    def test_arrow_ree_sliced_struct_validity(self, duckdb_cursor, run_end_type, physical_offset, offset, length):
+        # Child array offsets address compressed entries, while the outer
+        # struct's slice addresses logical rows in [1] * 5 + [None] * 5 + [3] * 5.
+        run_ends = pa.array([1] * physical_offset + [5, 10, 15], type=run_end_type).slice(physical_offset)
+        values = pa.array([None] * physical_offset + [1, None, 3], type=pa.int64()).slice(physical_offset)
+        encoded = pa.RunEndEncodedArray.from_arrays(run_ends, values)
+        inner = pa.StructArray.from_arrays([encoded], names=["v"])
+        outer = pa.StructArray.from_arrays([inner], names=["inner"]).slice(offset, length)
+        table = pa.table({"outer": outer})
+
+        assert duckdb_cursor.from_arrow(table).to_arrow_table().to_pylist() == table.to_pylist()
+
+    @pytest.mark.parametrize("container", ["struct", "list"])
+    def test_arrow_ree_sliced_nested_offsets(self, duckdb_cursor, container):
+        encoded = pc.run_end_encode(pa.array([1] * 5 + [None] * 5 + [3] * 5, type=pa.int64())).slice(1)
+        inner = pa.StructArray.from_arrays([encoded], names=["v"]).slice(1)
+        if container == "struct":
+            column = pa.StructArray.from_arrays([inner], names=["inner"]).slice(1, 8)
+        else:
+            column = pa.ListArray.from_arrays([0, 1, 9], inner).slice(1)
+        table = pa.table({"value": column})
+
+        assert duckdb_cursor.from_arrow(table).to_arrow_table().to_pylist() == table.to_pylist()
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_arrow_ree_sliced_struct_scan_batches(self, duckdb_cursor, chunked):
+        encoded = pc.run_end_encode(pa.array([1] * 2300 + [None] * 1700 + [3] * 2300, type=pa.int64()))
+        inner = pa.StructArray.from_arrays([encoded], names=["v"])
+        column = pa.StructArray.from_arrays([inner], names=["inner"]).slice(1, 5500)
+        if chunked:
+            column = pa.chunked_array([column.slice(0, 3000), column.slice(3000)])
+        table = pa.table({"outer": column})
+
+        assert duckdb_cursor.from_arrow(table).to_arrow_table().to_pylist() == table.to_pylist()
 
     def test_arrow_ree_union(self, duckdb_cursor):
         size = 1000

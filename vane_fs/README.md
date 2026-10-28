@@ -1,0 +1,609 @@
+# VaneFS
+
+VaneFS is a local, branchable filesystem implemented in **C++17 with SQLite**.
+The native library owns file and directory operations, 4 KiB block copy-on-write,
+256-bit visibility intervals, snapshots, three-way merge and garbage collection.
+Python provides pybind11 bindings and an optional read-only fsspec adapter.
+
+This is a separately installed experimental component. It supports local
+workspaces, Linux FUSE mounts and native Vane FILE, CSV/Parquet and media reads
+over immutable snapshots, including same-host Ray workers. Remote access remains
+a later stage in the [architecture and roadmap](DESIGN.md).
+The [performance closeout roadmap](PERFORMANCE_ROADMAP.md) records the fixed
+experiment budget, adoption decisions and delivery criteria for the current work.
+
+## Build and install
+
+The tested build is Linux x86-64. Use CMake 3.29+, Ninja, a C++17 compiler, and
+the vcpkg baseline pinned in `vcpkg.json`. The native library requires SQLite
+3.51.3 or later; this manifest resolves SQLite 3.53.2. It uses its own SQLite
+library, independently of the version linked into Python's `sqlite3` module.
+
+From this directory, point `VCPKG_ROOT` at a bootstrapped vcpkg checkout at
+`44819aa2a6c10e56065e2b0330e7d6c89d1d2574`, then install the dependency:
+
+```bash
+"$VCPKG_ROOT/vcpkg" install \
+  --x-manifest-root="$PWD" --x-install-root="$PWD/vcpkg_installed" \
+  --triplet=x64-linux-release --host-triplet=x64-linux-release \
+  --clean-buildtrees-after-build --clean-packages-after-build
+export CMAKE_PREFIX_PATH="$PWD/vcpkg_installed/x64-linux-release"
+```
+
+Build the C++ library and native tests without Python:
+
+```bash
+cmake -S . -B build/core -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+  -DVANE_FS_BUILD_TOOLS=ON
+cmake --build build/core -j 2
+ctest --test-dir build/core --output-on-failure
+```
+
+Install the Python binding in an activated virtual environment:
+
+```bash
+uv pip install 'scikit-build-core>=0.11.4' 'pybind11>=3.0'
+export SKBUILD_BUILD_DIR="$PWD/build/python-release"
+export SKBUILD_CMAKE_BUILD_TYPE=Release
+uv pip install '.[fsspec,test]' --no-build-isolation
+```
+
+Use a non-editable install after changing C++ or Python. The build links SQLite
+statically and includes its notice in the wheel. It does not rebuild the Vane
+engine. Other platforms need the corresponding static vcpkg triplet and their
+own validation before release.
+
+### Optional Linux SQLite fdatasync build
+
+On Linux x86-64, `triplets/x64-linux-fdatasync-release.cmake` builds SQLite with
+`HAVE_FDATASYNC=1`. It is opt-in: `x64-linux-release` retains the existing build.
+The triplet uses vcpkg's
+[per-port compiler flags](https://learn.microsoft.com/en-us/vcpkg/users/triplets#per-port-customization)
+for SQLite only, with a separate target triplet and binary-cache identity.
+There is no runtime switch and no database migration. FULL/NORMAL settings and
+VaneFS's durability barriers retain their existing meaning.
+
+Install this SDK separately, then use a fresh VaneFS build directory so an old
+cached package path cannot select the default SQLite library:
+
+```bash
+"$VCPKG_ROOT/vcpkg" install \
+  --x-manifest-root="$PWD" --x-install-root="$PWD/build/sqlite-fdatasync" \
+  --overlay-triplets="$PWD/triplets" \
+  --triplet=x64-linux-fdatasync-release --host-triplet=x64-linux-release \
+  --clean-buildtrees-after-build --clean-packages-after-build
+export CMAKE_PREFIX_PATH="$PWD/build/sqlite-fdatasync/x64-linux-fdatasync-release"
+cmake -S . -B build/fdatasync -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+  -DVANE_FS_BUILD_TOOLS=ON -DVANE_FS_TEST_SQLITE_SYNC=fdatasync
+cmake --build build/fdatasync -j 2
+ctest --test-dir build/fdatasync --output-on-failure
+```
+
+With that prefix selected, install the Python wheel using a separate
+`SKBUILD_BUILD_DIR`, for example `build/python-fdatasync`, and the non-editable
+install command above. Add `VANE_FS_BUILD_FUSE=ON` when building the mount tool.
+The triplet is included in source distributions.
+
+On Linux, `VANE_FS_TEST_SQLITE_SYNC=fsync|fdatasync` asserts the actual WAL
+syscall used by the linked static SQLite library. It only configures the test
+expectation; it does not rebuild SQLite or select a durability mode. The test's
+default `auto` accepts either primitive, while still requiring observable
+barriers and verifying sync failures, rollback and retries. CI tests both
+triplets with explicit expectations. SQLite does not report `HAVE_FDATASYNC`
+through its compile-options API, so checking that API alone is insufficient.
+
+The [production-format comparison](benchmarks/production_sync/README.md) found
+lower common small-write costs but retained long stalls and a strict small-file
+total-time regression. This option is for evaluation on the intended storage;
+it is not a default performance recommendation. The
+[strict-mode diagnosis](benchmarks/strict_sync/README.md) locates the remaining
+waits in per-mutation WAL synchronization and checkpoint I/O.
+
+The [strict background-checkpoint experiment](benchmarks/strict_checkpoint/README.md)
+retains a tested C++ candidate that reuses the fsync worker. It is not enabled:
+frequent small checkpoints regress several workloads despite faster large
+writes. The report includes the patch, reproduction steps and complete results.
+The [batching follow-up](benchmarks/strict_checkpoint/batching/README.md)
+eliminates those repeated checkpoints and preserves retries across worker
+restart, but retains write regressions associated with WAL growth. It also
+remains an isolated experiment, with strict FULL commits unchanged.
+The [WAL capacity follow-up](benchmarks/strict_checkpoint/wal_reuse/README.md)
+retains up to 64 MiB between generations while holding batching and FULL
+commits fixed. It removes repeated growth during reuse and improves common
+small-write costs, but cold-write and random-write stalls remain. The report
+includes initialization, shutdown and retained-space costs; the candidate is
+not enabled by default.
+The [allocation and fsync-worker evaluation](benchmarks/checkpoint_headroom/README.md)
+tests allocation hints, unbackfilled-work batching, and early checkpoints near
+the admission budget. Neither worker candidate is adopted: fewer background
+syncs shift work into foreground barriers, and plain fresh/post-GC comparisons
+retain large-write and metadata regressions.
+
+## Native commands and Linux mounts
+
+`build/core/vane-fs` provides `init`, `branches`, `fork SOURCE NAME`,
+`snapshot [BRANCH]`, `recover`, and `gc`. These commands do not require Python.
+For example, from this directory:
+
+```bash
+build/core/vane-fs /tmp/workspace.sqlite init
+build/core/vane-fs /tmp/workspace.sqlite fork main candidate
+```
+
+To build the optional mount executable, install the platform's libfuse3
+development package and `fusermount3` (Ubuntu: `libfuse3-dev` and `fuse3`), then:
+
+```bash
+cmake -S . -B build/core -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVANE_FS_BUILD_PYTHON=OFF -DVANE_FS_BUILD_TESTS=ON \
+  -DVANE_FS_BUILD_TOOLS=ON -DVANE_FS_BUILD_FUSE=ON
+cmake --build build/core -j 2
+mkdir -p /tmp/vane-fs-live
+build/core/vane-fs-mount /tmp/workspace.sqlite --branch candidate /tmp/vane-fs-live
+```
+
+The mount runs in the foreground. In another terminal, use ordinary commands
+such as `ls`, `cat`, `cp`, or an editor in `/tmp/vane-fs-live`. Unmount with
+`fusermount3 -u /tmp/vane-fs-live`; the process exits and releases its branch.
+An empty mountpoint and a database outside that mountpoint are required.
+Append `--debug` for libfuse request diagnostics.
+
+After unmounting, retain and mount a read-only snapshot:
+
+```bash
+snapshot_id="$(build/core/vane-fs /tmp/workspace.sqlite snapshot candidate)"
+mkdir -p /tmp/vane-fs-snapshot
+build/core/vane-fs-mount /tmp/workspace.sqlite --snapshot "$snapshot_id" /tmp/vane-fs-snapshot
+```
+
+The C++ adapter uses libfuse's low-level inode interface. Kernel lookup and
+open references retain unlinked inodes; rename, replacement and unlink cannot
+retarget an existing file descriptor. The final reference release reclaims an
+orphan. Appends select the current EOF inside the write transaction. The default
+`--durability=strict` commits each file write and namespace/attribute mutation
+with SQLite WAL `synchronous=FULL` before replying.
+
+Use `--durability=fsync` to commit ordinary mutations with `synchronous=NORMAL`.
+Each operation still commits immediately and remains visible to other handles
+and Workspace connections. A successful `fsync` or `fdatasync` performs a FULL
+commit that changes a dedicated barrier row, synchronizing all preceding WAL
+commits, including namespace changes. Directory `fsync` uses the same barrier.
+An empty transaction would not guarantee a WAL sync. `O_SYNC` and `O_DSYNC`
+writes use FULL within the write transaction. Kernel writeback remains disabled
+in both modes; no application buffer delays read visibility.
+
+```bash
+build/core/vane-fs-mount /tmp/workspace.sqlite --branch candidate /tmp/vane-fs-live --durability=fsync
+```
+
+In `fsync` mode, writes without a successful barrier can be lost after an OS
+crash or power failure. Ordinary file close is not a barrier. Clean unmount
+performs a final FULL commit; wait for the mount process to exit successfully
+to check that result. A failed barrier returns an error and can be retried;
+the connection conservatively remains at FULL until a successful synchronous
+commit. These guarantees depend on the underlying storage honoring sync.
+Snapshot mounts remain read-only and use strict mode.
+
+C++ callers can select `Workspace(path, timeout_ms, Durability::Fsync)` and call
+`Workspace::Sync()` for the same database-wide barrier. Call `Close()` explicitly
+to observe errors during final synchronization; destructors cannot report them.
+The Python Workspace API continues to use strict mode. The optional barrier
+table is compatible with existing format-2 databases and does not change file
+content storage, branch intervals, or snapshot isolation.
+
+Strict mode retains automatic checkpoints at 4,096 pages. In fsync mode, each
+Workspace uses a separate connection and thread for passive checkpoints,
+woken by commits once the current WAL reaches 16 MiB. This moves routine
+database-page copying and checkpoint syncs out of the write request.
+
+Before another mutation, a fsync-mode connection checks actual WAL frame
+counts. At 64 MiB it waits for a restart checkpoint, using `timeout_ms`; a
+long SQLite read transaction can cause a retryable `Busy` error before any
+changes. `Sync()` and explicit `Close()` still synchronize prior commits under
+this backpressure. Application snapshots do not hold long SQLite transactions.
+The timeout limits SQLite lock contention; actual disk writes and syncs,
+including waiting for this connection's running checkpoint, may take longer.
+This is an admission budget, not a file quota: one atomic operation can exceed
+it, and writes from strict-mode or external SQLite connections are not limited
+by this policy. After restart, the writer reduces retained WAL allocation to
+16 MiB. Background storage errors reach the next mutation, barrier or explicit
+close; a failed close leaves the connection and worker available for retry.
+
+The first inode reference persists a pin; intermediate opens and releases update
+exact counts in a connection-private in-memory SQLite table. The final release
+removes the pin and reclaims an orphan atomically. Temporary counts participate
+in transaction rollback, while durable owner pins protect live handles from GC
+and allow recovery after a mount crash. Reference operations retain writer-lock
+serialization but avoid repeated WAL writes and syncs for an already-pinned inode.
+
+A writable mount exclusively leases its branch. Other connections may read
+it, but writes, fork, snapshot, merge and deletion involving that branch require
+unmounting first. Other branches and existing snapshots remain usable. Positive
+directory entries and attributes have a 60-second kernel cache timeout. All live
+mutations go through this mount, so Linux invalidates the affected cached
+metadata as part of each operation. Writes and O_TRUNC also send an explicit
+attribute invalidation to preserve the atime/mtime alias, including for statx
+queries that request only atime. Missing entries are not cached. Live mounts
+still use direct I/O; read-only snapshots can retain immutable file data in the
+kernel cache. Requests run through one native dispatch loop and one SQLite
+connection. Allowing future out-of-band writers would require a notification
+protocol before retaining these cache timeouts.
+
+Each directory handle captures its sorted entry list on the first read and
+retains it across pagination and rewind. Opening a directory for `openat` or
+`chdir` does not enumerate its contents. Child inode attributes are fetched in
+one query at the same branch or snapshot view point. Removing, renaming or adding
+entries cannot skip or duplicate unrelated entries after a stream's first read.
+Open a new directory handle to see the latest listing. Listing memory is
+proportional to the entries in each enumerated directory handle and is released
+when the handle closes or the mount exits.
+
+This is a filesystem subset: regular files, directories, modes through `0777`,
+mtime, seek/read/write, append, truncate, rename, unlink and directory removal.
+All entries belong to the mounting user/group; atime and ctime report mtime.
+Hard links, symlinks, ownership changes, special mode bits, xattrs, advisory
+locking, special files and writable mmap are not supported. The executable
+dynamically links the system libfuse3; it is not included in the Python wheel.
+
+## Recovery and format compatibility
+
+On POSIX systems each connection holds an OS lock in
+`DATABASE.vane_fs-locks/`. `recover` takes a SQLite writer transaction and only
+retires another owner after acquiring its lock and verifying the lock file's
+device/inode identity. It releases that owner's snapshot pins, mount lease and
+inode references, then reclaims unlinked orphans. A stopped or slow process
+continues to hold its lock and is never expired by a timer.
+
+```bash
+build/core/vane-fs /tmp/workspace.sqlite recover
+build/core/vane-fs /tmp/workspace.sqlite gc
+```
+
+The Python equivalent is `workspace.recover_owners()`. Mount startup performs
+this recovery automatically. After a mount process is killed, unmount its
+disconnected kernel mount with `fusermount3 -u` before mounting again.
+
+Opening format 1 performs a transactional upgrade to format 2, which adds owner,
+mount, open-inode and orphan records. Older binaries reject the upgraded format.
+Legacy pins without owner information, missing/replaced lock files and platforms
+without supported OS locks remain conservatively retained. Automatic recovery
+does not infer that an unknown owner is dead. Keep the database and lock
+directory in place while connections are active; close all connections and
+unmount before moving or cloning a workspace. Reopen connections after `fork()`;
+inherited SQLite connections are rejected.
+
+## C++ API
+
+Include `vane_fs/workspace.hpp` and link the `vane_fs` CMake target. The library
+does not depend on DuckDB or Python.
+
+```cpp
+#include "vane_fs/workspace.hpp"
+
+vane_fs::Workspace workspace("/tmp/workspace.sqlite");
+auto main = workspace.Checkout();
+main->WriteFile("/config.txt", "base");
+
+auto child = workspace.Fork("main", "candidate");
+auto candidate = workspace.Checkout(child.id);
+candidate->WriteFile("/config.txt", "candidate");
+// main->Read("/config.txt") still returns "base".
+
+auto snapshot_id = workspace.Snapshot(child.id);
+auto snapshot = workspace.OpenSnapshot(snapshot_id);
+auto bytes = snapshot->Read("/config.txt");
+
+auto preview = workspace.PreviewMerge(child.id, "main");
+workspace.Merge(preview); // Fails atomically on conflicts or a stale preview.
+```
+
+`Session` also exposes `MakeDirectory`, `Stat`, `ListDirectory`, `Write` with an
+offset, `Truncate`, `Rename`, `Unlink` and `RemoveDirectory`. Every operation is
+one transaction. Independent connections and processes can share a database on
+the same local filesystem; SQLite serializes writers. One connection serializes
+its own calls with a mutex. Errors carry a native `ErrorCode`.
+
+`WriteFile` replaces the complete file or creates it in an existing directory.
+`Write` edits an existing file and supports sparse extension. Paths are rooted
+in the virtual workspace, use case-sensitive names, and reject every `..`
+component. Parent directories must exist. Modes are stored metadata; this API
+does not enforce an operating-system permission model.
+
+## Python bindings
+
+The corresponding operations execute in C++ and release the GIL during database
+work. File contents use `bytes`.
+
+```python
+from vane_fs import Workspace
+
+with Workspace("/tmp/example.sqlite") as workspace:
+    main = workspace.checkout()
+    main.write_file("/data.csv", b"id,value\n1,original\n")
+    child = workspace.fork("main", "candidate")
+    candidate = workspace.checkout(child.id)
+    candidate.write_file("/data.csv", b"id,value\n1,candidate\n")
+
+    frozen = workspace.snapshot(child.id)
+    with workspace.open_snapshot(frozen) as snapshot:
+        assert snapshot.read("/data.csv") == b"id,value\n1,candidate\n"
+
+    preview = workspace.preview_merge(child.id, "main")
+    assert not preview.conflicts
+    workspace.merge(preview)
+    workspace.delete_branch(child.id)
+    workspace.drop_snapshot(frozen)
+    workspace.collect_garbage()
+```
+
+Common filesystem failures become the corresponding Python filesystem
+exceptions. `ConflictError`, `StalePreviewError`, and `CapacityError` distinguish
+merge and allocation failures. Recompute a stale preview before publishing.
+Resolve a conflict with a path mapping such as
+`workspace.merge(preview, {"/config.txt": "source"})`; the other choice is
+`"target"`. Namespace inconsistencies also reject the complete merge.
+This includes a selected child whose parent path now names a different inode.
+Resolve the parent and affected entries together to keep a consistent tree.
+
+## Vane queries
+
+With a Vane build that includes the native connector, register an existing
+workspace on a local or same-host Ray connection. The optional `vane-fs` package
+owns SQLite; the base Vane wheel does not link it.
+
+```python
+import os
+
+os.environ["VANE_RUNNER"] = "local"
+import vane
+from vane_fs import Workspace, register_workspace, snapshot_url, unregister_workspace
+
+database = "/tmp/query.sqlite"
+with Workspace(database) as workspace, vane.connect() as connection:
+    workspace.checkout().write_file("/data.csv", b"id,value\n1,example\n")
+    frozen = workspace.snapshot()
+    identity = register_workspace(connection, database)
+    url = snapshot_url(identity, frozen, "/data.csv")
+    assert connection.execute("SELECT * FROM read_csv(?)", [url]).fetchall() == [(1, "example")]
+    value = connection.execute("SELECT to_file(?)", [url]).fetchall()[0][0]
+    with value.open(connection=connection) as reader:
+        assert reader.read(2) == b"id"
+    unregister_workspace(connection, identity)
+    workspace.drop_snapshot(frozen)
+```
+
+Native file opens, metadata and positional reads call C++ directly through a
+versioned C interface. They do not call Python/fsspec for file I/O or share
+private DuckDB C++ objects between extension modules. This supports `File.open`,
+`to_file`, range-limited FILE values, CSV/Parquet, `ImageFile` metadata/decoding,
+and `VideoFile` metadata/frames with Vane's applicable media dependencies.
+
+Each connection, including a cursor, must register its own mapping from
+workspace ID to database. URLs contain immutable snapshot IDs and literal
+UTF-8 paths, without URL decoding or embedded database filenames. Registration
+opens an independent native workspace: closing the original `Workspace` does
+not invalidate registered reads. Queries retain each accessed snapshot until
+completion, failure or cancellation; standalone file readers retain it until
+closed. A streaming result keeps its query pin until exhausted or closed;
+`fetchone()` alone may leave that result active. Standalone reads do not attach
+pins to unrelated active results. Unregistering prevents new opens without
+invalidating open readers.
+`drop_snapshot` fails while either kind of reference remains.
+
+The native connector is read-only and supports `local` (including its
+`local-fast` alias) and same-host `ray` execution. It supports explicit file paths, not
+wildcard expansion or directory listing.
+SQLite write access is required to record/release retention pins. Interrupts
+are checked between 1 MiB read chunks; a SQLite lock wait is bounded by
+`timeout_ms` (default 5000), not immediately interrupted. Query completion
+releases pins; it does not delete explicitly retained snapshots.
+If a write lock prevents pin cleanup during reader close or query completion,
+the next write transaction on that database in the same process retries it.
+Both `recover_owners()` and `drop_snapshot()` perform this retry, without
+unregistering the workspace. A failed retry or rolled-back transaction keeps
+the cleanup pending. An explicit snapshot session `close()` instead raises
+the SQLite error and leaves the session available for another close attempt.
+
+For single-host Ray queries, select `VANE_RUNNER=ray` and call the same
+`register_workspace(connection, database)` API. Install matching Vane and
+`vane-fs` packages in the driver and worker environments. The query snapshot
+carries the absolute database path, workspace ID, timeout and host name;
+each planning/worker connection creates its own native provider and verifies
+the workspace ID before opening any snapshot. A different host is rejected.
+The SQLite database and its retention/owner-lock files must be accessible on
+the same local filesystem. No file data or native pointers travel in the plan.
+
+Binding retains referenced snapshots in the driver plan while it is submitted.
+Worker query replay state keeps both those references and snapshots first
+opened at runtime until query cleanup, including between task attempts.
+Failure and cancellation use the existing query cleanup path. Runner teardown
+explicitly releases driver binding pins, even when Python result cycles retain
+the submitted logical plan. If COPY submission and reconciliation time out,
+the client retains its source plan and snapshot pins while the outcome is
+unknown. A confirmed completion of the original RPC, or completed session/client
+cleanup, releases those references. A failed cleanup keeps them for retry;
+waiting again does not resubmit the write. Unexecuted logical/physical plan objects retain
+their binding pins until released. Multi-host storage, a remote read service
+and remote leases remain separate delivery work.
+
+The older fsspec adapter remains available for listing, globbing and clients
+that use Python file objects. Use it on a separate Vane database instance from
+the native connector; its nonblocking-open limitation still prevents FILE and
+media access through `connection.register_filesystem`.
+
+```python
+import os
+
+os.environ["VANE_RUNNER"] = "local"
+import vane
+from vane_fs import Workspace
+from vane_fs.fsspec import SnapshotFileSystem
+
+with Workspace("/tmp/query.sqlite") as workspace:
+    workspace.checkout().write_file("/data.csv", b"id,value\n1,example\n")
+    frozen = workspace.snapshot()
+    with SnapshotFileSystem(workspace, frozen) as fs, vane.connect() as connection:
+        connection.register_filesystem(fs)
+        rows = connection.execute(
+            "SELECT * FROM read_csv(?)", [fs.url("/data.csv")]
+        ).fetchall()
+        assert rows == [(1, "example")]
+        connection.unregister_filesystem("vanefs")
+    workspace.drop_snapshot(frozen)
+```
+
+The adapter also supports Parquet reads, seeking, metadata, listing and globbing.
+Each URL identifies the workspace and immutable snapshot. Each open file pins
+the snapshot separately, so closing an adapter does not invalidate existing
+read handles. Explicitly closing the workspace invalidates all its sessions.
+
+## Retention and current limits
+
+- Forks and snapshots copy no file rows. Mutating an inherited block splits its
+  visibility metadata and stores only the changed block's new bytes.
+- A live branch is mutable. Create a snapshot for stable reads across multiple
+  operations. Snapshot creation advances the branch's writable frontier.
+- Interval space is finite and never silently recycled. Terminal branches have
+  one writable point: they can be edited and merged, but cannot fork or create a
+  snapshot until sealed. Exhaustion fails without changing state.
+- Merge supports a leaf child into its direct parent and seals it on success.
+  Same-file divergent changes require explicit resolution; mtime-only differences
+  do not. Diff reports paths, not text or byte ranges.
+- Explicit snapshots survive branch deletion until dropped. Fork bases remain
+  until no live branch needs them. Closing a session releases its pin; closing
+  a workspace releases pins owned by that connection. Recover crashed owners
+  using the lock-based protocol above; unverifiable owners remain retained.
+- GC scans retained states and version tables; it is not yet optimized for large
+  histories. SQLite checkpointing and page reuse do not guarantee that the main
+  database file immediately shrinks on disk.
+- Directory import, SQL COPY writes and remote/multi-host access are not
+  implemented. Put the database on local storage outside managed file content.
+
+## Verification
+
+Run the native test command above, then, from the repository root with the
+non-editable package installed:
+
+```bash
+scripts/run_installed_pytest.sh "$PWD/vane_fs/tests" --rootdir="$PWD/vane_fs"
+scripts/run_release_tests.sh
+```
+
+Set `VANE_FS_MOUNT_BINARY="$PWD/vane_fs/build/core/vane-fs-mount"` to require the
+real Linux mount tests; they are explicitly skipped when it is not set. With
+the variable set, unavailable mount support is a test failure. The dedicated
+[VaneFS CI workflow](../.github/workflows/vane-fs.yml) builds SQLite at the pinned
+baseline, tests the native core, rebuilds a wheel from its source archive,
+executes real mounts, checks ASan/UBSan, and verifies benchmark cleanup.
+The main [CI workflow](../.github/workflows/ci.yml) additionally installs both
+packages on Python 3.12 and runs native FILE/media acceptance against the built
+Vane wheel. Those tests cover connection isolation, reader and query lifetimes,
+streaming results, cancellation, range reads, and image/video parity.
+The optional-package CI step also runs `tests/fast/test_vane_fs_ray.py` in
+separate non-Ray and real-Ray processes. Its acceptance covers native snapshot
+CSV/Parquet scans, joins and aggregates, FILE checksums, logical/physical plan
+transport, workspace identity failures and query-owned snapshot retention.
+
+The component root avoids pytest constructing a source-tree `vane_fs` namespace
+over the installed package. The fsspec Vane integration test requires Vane and
+PyArrow. Native media acceptance also requires Pillow, PyAV and NumPy; the
+storage tests require only the installed component and pytest.
+
+Coverage includes reopen, no-copy forks, snapshot retention, sparse and
+cross-block writes, shrink/re-extend, rename, conflict and stale-preview rejection,
+namespace validation, GC, randomized branch traces, concurrent connections and
+processes, and process interruption. Native tests inject a SQLite write failure
+and deterministically kill a child inside fork, merge and GC transactions to
+verify rollback and recovery. Mounted tests cover open-unlink, overwritten
+destinations, directory descriptors across rename, concurrent append, cache
+isolation, read-only snapshots and recovery after killing the mount process.
+These checks do not establish every possible power-loss
+behavior or a production performance claim.
+
+## Performance measurements
+
+The native benchmark validates content and branch isolation while measuring
+forks, first and repeated block writes, directory lookup, sequential I/O,
+four-writer contention, version growth, WAL size and GC. Run from the repository
+root after building the Release tools:
+
+```bash
+python vane_fs/benchmarks/run.py \
+  --binary vane_fs/build/core/vane-fs-benchmark \
+  --output vane_fs/build/benchmarks --repeat 3
+```
+
+The profiles separate 1,000/10,000 small files from a 64 MiB file and include
+64 sibling forks plus 16 levels of nesting. `--quick --repeat 1` runs a small
+validation case. Measurements include per-operation samples and p50/p95,
+configuration, source and binary hashes, and physical row/page counts. The
+runner checks free space, waits for every owned process to exit, records data
+hashes, and removes generated databases outside measured windows. Results,
+logs and `cleanup.json` remain. These are warm-cache core measurements; they do
+not measure FUSE throughput or establish performance for large video workloads.
+
+The [2026-10-05 baseline](benchmarks/BASELINE.md) records three repetitions per
+profile, including the GC payload-reference index investigation and its
+before/after measurements.
+
+The [FUSE I/O optimization measurements](benchmarks/IO_OPTIMIZATION.md) compare
+the prepared-statement and block-range changes against the previous core using
+the same 64 MiB workloads, with unchanged FULL durability and live-mount caching.
+The later [new-block batching results](benchmarks/IO_OPTIMIZATION.md#new-block-batching-2026-10-06)
+measure bounded bulk inserts for vacant block ranges against the existing fsync
+mode. Logical blocks, version visibility and per-operation commits are retained.
+
+The subsequent [metadata cache measurements](benchmarks/METADATA_OPTIMIZATION.md)
+record stat, directory and Git workloads after enabling kernel metadata caching
+under the exclusive mount lease, including invalidation checks and an I/O
+regression comparison.
+
+The [inode reference measurements](benchmarks/REFERENCE_OPTIMIZATION.md) record
+directory and Git workloads after moving exact reference counts into
+connection-private memory, while retaining durable first/last pins and FULL
+file-mutation commits. They include rollback/lifetime tests and syscall counts.
+
+The [WAL checkpoint measurements](benchmarks/WRITE_OPTIMIZATION.md) record
+sequential-write gains, read and WAL-size tradeoffs, and closing costs after
+raising the automatic checkpoint threshold. Crash tests verify acknowledged
+writes survive a killed mount without an intervening fsync or close.
+
+The [directory enumeration measurements](benchmarks/DIRECTORY_OPTIMIZATION.md)
+record lazy first-read capture and batched child-inode queries, including stable
+pagination tests, SQL counts, Git results and the separate write-through
+experiment that leaves the production cache mode unchanged.
+
+The [optional fsync measurements](benchmarks/FSYNC_OPTIMIZATION.md) compare the
+strict default with immediate NORMAL commits and explicit FULL barriers. They
+include sync-failure injection, recovery from synchronized file images, actual
+write-plus-fsync timing, read regression checks and shutdown results.
+
+The [background checkpoint measurements](benchmarks/CHECKPOINT_OPTIMIZATION.md)
+record fsync-mode checkpoints at 16 MiB, write admission at 64 MiB, and the
+before/after throughput and WAL tradeoffs. They include reader backpressure,
+background I/O failures, slow storage, crash recovery and monitored reruns.
+
+The isolated [external-payload experiment](benchmarks/external_payload/README.md)
+implements a C++ hybrid store with immutable external data, inline small updates,
+ordered durable publication and coordinated garbage collection. It compares
+the stock backend with external payloads and a checkpoint batching follow-up,
+including fault injection and allocation aging. These prototypes use a separate
+experimental format; the production storage format and defaults remain unchanged.
+
+The [SQLite synchronization experiment](benchmarks/staged_payload/wal_sync/README.md)
+isolates WAL growth and reuse from the Unix VFS sync primitive. It includes
+matched SQLite builds, actual syscall failure/retry tests and monitored FUSE
+comparisons after garbage collection.
+
+The [WAL writeback investigation](benchmarks/staged_payload/block_sync/README.md)
+separates page writeback from final durability barriers. Whole-device flush
+counters and thread waits explain remaining slow samples and show why an extra
+writeback wait does not remove the fsync tail.
+
+The [production BLOB synchronization comparison](benchmarks/production_sync/README.md)
+evaluates the SQLite build option on the existing v2 format in strict and fsync
+modes, with matched builds, syscall fault injection and cross-build database
+compatibility checks. It retains slow samples and leaves the production default
+unchanged.

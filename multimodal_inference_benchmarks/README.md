@@ -146,6 +146,15 @@ A limited audio shard or video directory can be run directly by all three system
 
 Run commands from the corresponding benchmark directory. `NUM_GPU_NODES=1` uses one GPU actor. `VANE_RUNNER=ray` explicitly selects Vane's local Ray runner.
 
+The original audio entrypoint also supports `VANE_RUNNER=local-fast` with one
+whole GPU per actor. Both runners use its table UDFs and native Parquet writer.
+For a runner comparison, use the same installed Vane revision, environment,
+input files, model snapshot and batch size, and run them serially with distinct
+output directories. Change only `VANE_RUNNER` and `OUTPUT_PATH`; an explicit
+local model runtime or a rewritten expression/PyArrow pipeline is unnecessary.
+See [query-owned GPU actors](../LOCAL_MODEL_RUNTIME.md#query-owned-gpu-table-udfs)
+for device discovery, residency and supported GPU configurations.
+
 Before running:
 
 ```bash
@@ -203,11 +212,19 @@ export NUM_GPU_NODES=1
 
 ### Video object detection
 
+The Vane detector and crop UDFs use `map_batches(batch_format="numpy")`.
+The execution framework converts Tensor/IMAGE columns to pixel arrays and
+encodes UDF outputs. Eligible single-chunk fixed-size inputs share read-only
+Arrow buffers; combining chunks and decoding variable-size images can allocate.
+The benchmark checks uint8 RGB frames at 640x640 and keeps model preprocessing,
+GPU transfer and PNG cropping in the application. Both UDFs use ordinary
+callables without an application-owned executor.
+
 The Vane video benchmark uses an explicit Python DataSource for video decoding
 and Pillow cropping/PNG encoding. It does not require the optional
 `native_media` extension. The source retains uint8 tensor batches instead of
-opting into the built-in source's automatic `IMAGE` conversion. The Python
-frame helper also accepts `IMAGE` buffers for compatibility.
+opting into the built-in source's automatic `IMAGE` conversion. The framework
+also prepares pixel arrays from `IMAGE` inputs for these UDFs.
 Use PyAV 17.1 (as specified in `video_object_detection/requirements.in`) with
 the current Vane engine.
 
@@ -232,6 +249,15 @@ reaches the threshold, independently of its row count. Vane disables
 insertion-order preservation for this write because DuckDB requires it when
 `ROW_GROUP_SIZE_BYTES` is set; output row order is not part of this
 benchmark's result contract.
+
+Ray Actor transport can group several compute batches within the existing
+input byte budget. `BATCH_SIZE` continues to control each model call. For
+640x640 RGB uint8 frames, batch32 and a 128 MiB input budget usually allow
+96-frame transport tasks; this target is estimated from input bytes, not a
+fixed row count. Ready Actors can start smaller complete batches immediately.
+Input end and byte pressure drain tails. Task retries may replay several model
+calls, so UDF side effects must remain idempotent. Measure the complete query
+with identical model batches and pixels when comparing transport changes.
 
 ## Batch-size sweep
 

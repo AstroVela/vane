@@ -1,0 +1,19 @@
+Test project /home/kaka/astrovela_vane-fs/vane_fs/build/python-release
+    Start 1: vane_fs_core
+1/7 Test #1: vane_fs_core .....................   Passed    0.61 sec
+    Start 2: vane_fs_inode_refs
+2/7 Test #2: vane_fs_inode_refs ...............   Passed    0.64 sec
+    Start 3: vane_fs_checkpoint
+3/7 Test #3: vane_fs_checkpoint ...............   Passed    7.62 sec
+    Start 4: vane_fs_durability
+4/7 Test #4: vane_fs_durability ...............   Passed    0.17 sec
+    Start 5: vane_fs_crash
+5/7 Test #5: vane_fs_crash ....................   Passed    0.25 sec
+    Start 6: vane_fs_lookup_validation
+6/7 Test #6: vane_fs_lookup_validation ........   Passed    0.29 sec
+    Start 7: vane_fs_sync_syscalls
+7/7 Test #7: vane_fs_sync_syscalls ............   Passed    0.09 sec
+
+100% tests passed, 0 tests failed out of 7
+
+Total Test time (real) =   9.66 sec

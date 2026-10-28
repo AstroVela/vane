@@ -29,7 +29,7 @@ public:
 
 	static string Get(ClientContext &context) {
 		auto state = context.registered_state->Get<RunnerClientState>("vane.runner");
-		return state ? state->runner : "local-fast";
+		return state ? state->runner : "local";
 	}
 
 private:

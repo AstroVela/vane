@@ -30,7 +30,13 @@ from typing import Any, Generic, TypeVar, overload
 
 T = TypeVar("T")
 _PUBLIC_RUNNER_VALUES = frozenset({"local", "ray"})
-_PUBLIC_RUNNER_ERROR = "runner must be 'local' or 'ray'"
+_PUBLIC_RUNNER_ERROR = "runner must be 'local' (or its alias 'local-fast') or 'ray'"
+
+
+def _normalize_runner(value: Any) -> str:
+    runner = str(value or "").strip().lower() or "ray"
+    return "local" if runner == "local-fast" else runner
+
 
 # ---------------------------------------------------------------------------
 # Descriptor
@@ -96,7 +102,7 @@ class _RunnerVar(_Var[str]):
     """Runner variable with the same normalization as the C++ resolver."""
 
     def _parse(self, raw: str) -> str:
-        return raw.strip().lower() or self.default
+        return _normalize_runner(raw)
 
     def __set__(self, obj: Any, value: str) -> None:
         normalized = self._parse(str(value))
@@ -124,7 +130,7 @@ class EnvRegistry:
         "VANE_RUNNER",
         str,
         "ray",
-        "Execution backend. Unset, empty, or 'ray' = Ray distributed; 'local' = Vane local FTE runner.",
+        "Execution backend. Unset, empty, or 'ray' = Ray distributed; 'local' (alias 'local-fast') = native local execution.",
     )
 
     # -- Ray runner ---------------------------------------------------------
@@ -141,6 +147,13 @@ class EnvRegistry:
         0,
         "Minimum split-planning hint passed to distributed table functions. "
         "0 = use the available worker slots. FTE remains responsible for grouping splits into tasks.",
+    )
+    ndjson_max_split_bytes = _Var(
+        "VANE_NDJSON_MAX_SPLIT_BYTES",
+        int,
+        256 * 1024 * 1024,
+        "Maximum nominal distributed NDJSON range size in bytes (minimum 2 MiB). "
+        "Read during coordinator planning; line alignment can extend ranges beyond this size.",
     )
     ray_init_sql = _Var(
         "VANE_RAY_INIT_SQL",

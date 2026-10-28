@@ -27,8 +27,21 @@ def runtime_format():
     return module
 
 
+def provider_release_number(root: Path) -> int:
+    """Read the public native_media release number without changing runtime identity."""
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+    with (root / "native-media-release.toml").open("rb") as source:
+        value = tomllib.load(source)["providers"]["native_media"]["release_number"]
+    if type(value) is not int or value < 1:
+        raise ValueError("native_media release_number must be a positive integer")
+    return value
+
+
 def identity_version(identity: dict) -> str:
-    """Reuse the version encoder used by Iceberg and all Vane provider wheels."""
+    """Keep the historical content-derived encoder for internal runtime identities."""
     from vane_packaging.extension_wheel import (
         _extension_distribution_version_from_digest,
     )

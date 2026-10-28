@@ -1,0 +1,179 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,3 +91,20 @@
+     set_tests_properties(vane_fs_crash PROPERTIES TIMEOUT 60)
+   endif()
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND UNIX)
++ target_link_options(vane_fs_durability_test PRIVATE "LINKER:--wrap=fdatasync")
++endif()
++
++if(VANE_FS_BUILD_TESTS AND UNIX)
++ add_executable(vane_fs_staging_test tests/test_staging.cpp)
++ target_link_libraries(vane_fs_staging_test PRIVATE vane_fs unofficial::sqlite3::sqlite3 Threads::Threads)
++ target_link_options(vane_fs_staging_test PRIVATE "LINKER:--wrap=pwrite" "LINKER:--wrap=fdatasync")
++ add_test(NAME vane_fs_staging COMMAND vane_fs_staging_test)
++ set_tests_properties(vane_fs_staging PROPERTIES TIMEOUT 120)
++ add_executable(vane_fs_external_faults_test tests/test_external_faults.cpp)
++ target_link_libraries(vane_fs_external_faults_test PRIVATE vane_fs unofficial::sqlite3::sqlite3 Threads::Threads)
++ target_link_options(vane_fs_external_faults_test PRIVATE "LINKER:--wrap=pwrite" "LINKER:--wrap=pread" "LINKER:--wrap=fdatasync" "LINKER:--wrap=fallocate")
++ add_test(NAME vane_fs_external_faults COMMAND vane_fs_external_faults_test "${CMAKE_CURRENT_BINARY_DIR}/owned-external-faults")
++ set_tests_properties(vane_fs_external_faults PROPERTIES TIMEOUT 120)
++endif()
+--- a/tests/test_checkpoint.cpp
++++ b/tests/test_checkpoint.cpp
+@@ -200,12 +200,23 @@
+ 	inspector.SQL("BEGIN; SELECT * FROM format");
+ 	int writes = 0;
+ 	for (; writes < 80; ++writes) {
+-		try {
+-			(writes % 2 ? second : session)->Write("/file", std::string(MIB, 'p'), int64_t(writes) * MIB);
+-		} catch (const Error &error) {
+-			Require(error.code == ErrorCode::Busy, error.what());
++		bool budget_busy = false;
++		Wait([&] {
++			try {
++				(writes % 2 ? second : session)->Write("/file", std::string(MIB, 'p'), int64_t(writes) * MIB);
++				return true;
++			} catch (const Error &error) {
++				Require(error.code == ErrorCode::Busy, error.what());
++				Require(session->Stat("/file").size == int64_t(writes) * MIB, "Contended write partially committed");
++				// The publication gate also serializes checkpoints across
++				// native connections. Retry transient gate contention below
++				// the WAL budget; the rejected operation must remain atomic.
++				budget_busy = std::filesystem::file_size(path + "-wal") >= 64 * MIB;
++				return budget_busy;
++			}
++		});
++		if (budget_busy)
+ 			break;
+-		}
+ 	}
+ 	Require(writes > 0 && writes < 80, "Pinned reader did not apply backpressure");
+ 	Require(session->Stat("/file").size == int64_t(writes) * MIB, "Rejected write partially committed");
+--- a/tests/test_durability.cpp
++++ b/tests/test_durability.cpp
+@@ -39,6 +39,24 @@
+ static std::map<sqlite3_file *, FileHooks> files;
+ static sqlite3_vfs *original_vfs = nullptr;
+ static std::filesystem::path synced_images;
++extern "C" int __real_fdatasync(int);
++extern "C" int __wrap_fdatasync(int fd) {
++	auto rc = __real_fdatasync(fd);
++	if (!rc && !synced_images.empty()) {
++		char target[4096];
++		auto name = "/proc/self/fd/" + std::to_string(fd);
++		auto n = readlink(name.c_str(), target, sizeof(target));
++		if (n <= 0)
++			return -1;
++		auto path = std::filesystem::path(std::string(target, size_t(n)));
++		std::error_code error;
++		std::filesystem::copy_file(path, synced_images / path.filename(),
++		                           std::filesystem::copy_options::overwrite_existing, error);
++		if (error)
++			return -1;
++	}
++	return rc;
++}
+ static int Sync(sqlite3_file *file, int flags) {
+ 	++syncs;
+ 	if (fail_sync)
+@@ -51,18 +69,6 @@
+ 		                           std::filesystem::copy_options::overwrite_existing, error);
+ 		if (error)
+ 			return SQLITE_IOERR_FSYNC;
+-		// External bytes have already passed fdatasync before their metadata
+-		// commit. Include the sidecar in the simulated durable file image.
+-		auto database = hook.path;
+-		if (hook.flags & SQLITE_OPEN_WAL)
+-			database.resize(database.size() - 4);
+-		auto payload = database + ".payload";
+-		if (std::filesystem::exists(payload)) {
+-			std::filesystem::copy_file(payload, synced_images / std::filesystem::path(payload).filename(),
+-			                           std::filesystem::copy_options::overwrite_existing, error);
+-			if (error)
+-				return SQLITE_IOERR_FSYNC;
+-		}
+ 	}
+ 	return result;
+ }
+--- a/tests/test_external.py
++++ b/tests/test_external.py
+@@ -127,7 +127,7 @@
+         workspace.checkout().write_file("/file", data(256))
+     if fault == "missing":
+         sidecar.unlink()
+-        with pytest.raises(Error, match="Opening payload file"):
++        with pytest.raises(Error, match="Missing staged payload file"):
+             Workspace(path)
+         assert not sidecar.exists()
+     elif fault == "truncated":
+@@ -138,7 +138,7 @@
+         with Workspace(tmp_path / "other.sqlite"):
+             pass
+         sidecar.write_bytes((tmp_path / "other.sqlite.payload").read_bytes())
+-        with pytest.raises(Error, match="different workspace"):
++        with pytest.raises(Error, match="UUID differs"):
+             Workspace(path)
+ 
+ 
+--- a/tests/test_recovery.py
++++ b/tests/test_recovery.py
+@@ -120,7 +120,7 @@
+                 first.drop_snapshot(frozen)
+ 
+ 
+-@pytest.mark.skip(reason="Isolated external format 1003 has no production v1 migration")
++@pytest.mark.skip(reason="Isolated external format 1004 has no production v1 migration")
+ def test_v1_upgrade_preserves_unverifiable_legacy_pins(tmp_path):
+     path = tmp_path / "workspace.sqlite"
+     with Workspace(path) as workspace:
+--- a/tests/test_external_faults.cpp
++++ b/tests/test_external_faults.cpp
+@@ -110,7 +110,7 @@
+ }
+ 
+ static void Failures(const std::string &path) {
+-	Workspace workspace(path, 100, Durability::Fsync);
++	Workspace workspace(path, 100, Durability::Strict);
+ 	auto session = workspace.Checkout();
+ 	short_io = true;
+ 	session->WriteFile("/stable", std::string(MIB, 's'));
+@@ -210,8 +210,10 @@
+ 			crash_point = point;
+ 			if (point == 3)
+ 				workspace.CollectGarbage();
+-			else
++			else {
+ 				workspace.Checkout()->WriteFile("/unpublished", std::string(MIB, 'u'));
++				workspace.Sync();
++			}
+ 		} catch (...) {
+ 		}
+ 		_exit(82);
+@@ -237,18 +239,21 @@
+ }
+ 
+ int main(int argc, char **argv) {
++	if (argc != 2)
++		return 2;
++	auto root = std::filesystem::path(std::string(argv[1]) + "-" + std::to_string(getpid()));
+ 	try {
+-		Require(argc == 2, "Expected an empty owned test directory");
+-		auto root = std::filesystem::path(argv[1]);
+-		std::filesystem::create_directory(root);
++		Require(std::filesystem::create_directory(root), "Expected a new owned test directory");
+ 		Failures((root / "failures.sqlite").string());
+ 		ReaderAndGC((root / "reader.sqlite").string());
+ 		for (int point : {1, 2, 3})
+ 			CrashRecovery((root / ("crash-" + std::to_string(point) + ".sqlite")).string(), point);
+ 		std::cout << "PASS: short I/O, errors/retry, read/GC exclusion and three SIGKILL boundaries\n";
++		std::filesystem::remove_all(root);
+ 		return 0;
+ 	} catch (const std::exception &error) {
+ 		std::cerr << error.what() << '\n';
++		std::filesystem::remove_all(root);
+ 		return 1;
+ 	}
+ }

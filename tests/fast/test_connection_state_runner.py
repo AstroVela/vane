@@ -294,7 +294,7 @@ def test_connection_state_isolated_between_concurrent_connections(forbid_ray):
 def test_metadata_queries_reject_native_verification(forbid_ray, entry):
     with vane.connect() as connection:
         connection.execute("PRAGMA enable_verification")
-        with pytest.raises(vane.NotImplementedException, match="query verification requires a local-fast"):
+        with pytest.raises(vane.NotImplementedException, match="query verification requires a local"):
             query(connection, entry, "SELECT * FROM duckdb_tables()")
         connection.execute("PRAGMA disable_verification")
         assert query(connection, entry, "SELECT * FROM duckdb_tables()") == []

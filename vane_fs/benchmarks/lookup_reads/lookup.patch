@@ -1,0 +1,399 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -2178,6 +2178,26 @@
+ 		Fail(ErrorCode::Storage, "Directory has multiple parents");
+ 	return result;
+ }
++
++Record LookupChild(sqlite3 *db, int64_t parent, const std::string &name, const View &view) {
++	if (name == "." || name == "..") {
++		auto directory = OpenedInode(db, parent, view);
++		if (!directory.fields[0])
++			Fail(ErrorCode::NotDirectory, "Parent is not a directory");
++		return Inode(db, name == "." ? parent : ParentInode(db, parent, view), view);
++	}
++	auto key = ChildKey(db, parent, name, view);
++	Record entry;
++	if (!Get(db, DIRENTS, key, view.point, entry))
++		Fail(ErrorCode::NotFound, "Entry does not exist");
++	return Inode(db, entry.fields[0], view);
++}
++
++unsigned DataVersion(sqlite3 *db) {
++	unsigned version = 0;
++	Check(db, sqlite3_file_control(db, "main", SQLITE_FCNTL_DATA_VERSION, &version));
++	return version;
++}
+ } // namespace
+ 
+ FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate, bool synchronous) {
+@@ -2196,20 +2216,47 @@
+ }
+ 
+ FileStat Session::LookupInode(int64_t parent, const std::string &name) {
+-	Transaction tx(*database, !snapshot);
+-	auto view = SessionView(database->db, id, snapshot, closed);
+ 	Record node;
+-	if (name == "." || name == "..") {
+-		auto directory = OpenedInode(database->db, parent, view);
+-		if (!directory.fields[0])
+-			Fail(ErrorCode::NotDirectory, "Parent is not a directory");
+-		node = Inode(database->db, name == "." ? parent : ParentInode(database->db, parent, view), view);
+-	} else {
+-		auto key = ChildKey(database->db, parent, name, view);
+-		Record entry;
+-		if (!Get(database->db, DIRENTS, key, view.point, entry))
+-			Fail(ErrorCode::NotFound, "Entry does not exist");
+-		node = Inode(database->db, entry.fields[0], view);
++	View view;
++	unsigned version;
++	int64_t changes;
++	{
++		// A miss needs no pin and must not wait for SQLite's writer lock.
++		Transaction tx(*database, false);
++		view = SessionView(database->db, id, snapshot, closed);
++		node = LookupChild(database->db, parent, name, view);
++		if (!snapshot) {
++			// Existing connection-local references imply a durable pin. The
++			// database mutex prevents its last release while we increment the
++			// temporary count; this does not acquire the main database write lock.
++			Statement retain(database->db, "UPDATE temp.inode_references SET refs=refs+1 WHERE branch=? AND inode=?");
++			retain.Bind(1, view.branch);
++			retain.Bind(2, node.key.inode);
++			retain.Step();
++			if (sqlite3_changes64(database->db)) {
++				RequireOwnMount(database->db, view);
++				tx.Commit();
++				return Describe(node);
++			}
++		} else {
++			tx.Commit();
++			return Describe(node);
++		}
++		version = DataVersion(database->db);
++		changes = sqlite3_total_changes64(database->db);
++		tx.Commit();
++	}
++	// A first reference still needs an atomic durable pin. Check both other
++	// connections' commits and this connection's intervening writes (including
++	// local reference releases). Reuse the result only if neither changed;
++	// otherwise resolve again under the writer lock. Never upgrade a stale
++	// SQLite read snapshot, which could fail with SQLITE_BUSY_SNAPSHOT.
++	Transaction tx(*database, true);
++	if (closed)
++		Fail(ErrorCode::Closed, "Session is closed");
++	if (version != DataVersion(database->db) || changes != sqlite3_total_changes64(database->db)) {
++		view = SessionView(database->db, id, snapshot, closed);
++		node = LookupChild(database->db, parent, name, view);
+ 	}
+ 	PinInode(database->db, node.key.inode, view);
+ 	tx.Commit();
+--- a/include/vane_fs/workspace.hpp
++++ b/include/vane_fs/workspace.hpp
+@@ -77,7 +77,7 @@
+ 
+ class Database;
+ 
+-// Sessions are thread-safe. Every method is one transaction. Live branch
++// Sessions are thread-safe. Mutations are atomic transactions. Live branch
+ // sessions refresh their writable interval under the database writer lock.
+ class Session {
+ public:
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,6 +91,16 @@
+     set_tests_properties(vane_fs_crash PROPERTIES TIMEOUT 60)
+   endif()
+   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    add_executable(vane_fs_lookup_validation_test
++                   tests/test_lookup_validation.cpp)
++    target_link_libraries(vane_fs_lookup_validation_test
++                          PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++    target_link_options(
++      vane_fs_lookup_validation_test PRIVATE "LINKER:--wrap=sqlite3_exec"
++      "LINKER:--wrap=sqlite3_step")
++    add_test(NAME vane_fs_lookup_validation
++             COMMAND vane_fs_lookup_validation_test)
++    set_tests_properties(vane_fs_lookup_validation PROPERTIES TIMEOUT 30)
+     set(VANE_FS_TEST_SQLITE_SYNC
+         "auto"
+         CACHE STRING
+--- a/tests/test_inode_refs.cpp
++++ b/tests/test_inode_refs.cpp
+@@ -3,10 +3,12 @@
+ 
+ #include "vane_fs/workspace.hpp"
+ #include <sqlite3.h>
++#include <atomic>
+ #include <chrono>
+ #include <filesystem>
+ #include <iostream>
+ #include <limits>
++#include <thread>
+ 
+ using namespace vane_fs;
+ 
+@@ -140,12 +142,124 @@
+ 	Require(inspect.Integer("SELECT count(*) FROM open_inodes") == 0, "References leaked across leases");
+ }
+ 
++static void CheckLookupReads(const std::string &path, Durability durability) {
++	Workspace workspace(path, 20, durability);
++	auto main = workspace.Checkout();
++	main->WriteFile("/file", "retained bytes");
++	main->WriteFile("/first", "first reference");
++	main->MakeDirectory("/dir");
++	auto snapshot_id = workspace.Snapshot();
++	auto snapshot = workspace.OpenSnapshot(snapshot_id);
++	workspace.AcquireMount("main");
++	auto root = main->OpenDirectory("/");
++	auto file = main->LookupInode(root.inode, "file");
++	auto directory = main->LookupInode(root.inode, "dir");
++	Inspector inspect(path);
++	auto version = inspect.Integer("PRAGMA data_version");
++	auto pins = inspect.Integer("SELECT count(*) FROM open_inodes");
++	inspect.Exec("BEGIN IMMEDIATE");
++	Expect(ErrorCode::NotFound, [&] { main->LookupInode(root.inode, "missing"); });
++	Require(main->LookupInode(root.inode, "file").inode == file.inode, "Repeated lookup changed identity");
++	Require(main->LookupInode(directory.inode, ".").inode == directory.inode, "Dot changed identity");
++	Require(main->LookupInode(directory.inode, "..").inode == root.inode, "Dot-dot changed identity");
++	Expect(ErrorCode::Invalid, [&] { main->LookupInode(root.inode, "bad/name"); });
++	Expect(ErrorCode::NotDirectory, [&] { main->LookupInode(file.inode, "child"); });
++	Expect(ErrorCode::Closed, [&] { main->LookupInode(987654321, "child"); });
++	Require(snapshot->LookupInode(1, "first").inode == main->Stat("/first").inode, "Snapshot lookup changed");
++	Expect(ErrorCode::NotFound, [&] { snapshot->LookupInode(1, "missing"); });
++	// The first pin must still obtain the writer lock, and a failed pin must
++	// not retain a temporary reference or publish a durable one.
++	Expect(ErrorCode::Busy, [&] { main->LookupInode(root.inode, "first"); });
++	Require(inspect.Integer("SELECT count(*) FROM open_inodes") == pins, "Failed first lookup leaked a pin");
++	inspect.Exec("ROLLBACK");
++	Require(inspect.Integer("PRAGMA data_version") == version, "Read lookups modified the main database");
++	auto first = main->LookupInode(root.inode, "first");
++	main->CloseFile(first.inode);
++	Expect(ErrorCode::Closed, [&] { main->StatInode(first.inode); });
++
++	main->Rename("/dir", "/moved");
++	main->MakeDirectory("/dir");
++	main->WriteFile("/dir/new", "different parent");
++	Expect(ErrorCode::NotFound, [&] { main->LookupInode(directory.inode, "new"); });
++	main->RemoveDirectory("/moved");
++	Expect(ErrorCode::NotFound, [&] { main->LookupInode(directory.inode, "child"); });
++	main->CloseFile(directory.inode, 2);
++	main->Unlink("/file");
++	workspace.CollectGarbage();
++	main->CloseFile(file.inode);
++	Require(main->ReadInode(file.inode, 0, 100) == "retained bytes", "Read-only lookup lost its reference");
++	main->CloseFile(file.inode);
++	Expect(ErrorCode::Closed, [&] { main->StatInode(file.inode); });
++	main->CloseFile(root.inode, 2);
++	workspace.ReleaseMount("main");
++	snapshot->Close();
++	workspace.DropSnapshot(snapshot_id);
++	main->Close();
++	Expect(ErrorCode::Closed, [&] { main->LookupInode(1, "file"); });
++}
++
++static void CheckConcurrentLookups(const std::string &path) {
++	Workspace workspace(path, 1000, Durability::Fsync);
++	workspace.AcquireMount("main");
++	auto writer = workspace.Checkout();
++	auto reader = workspace.Checkout();
++	auto root = reader->OpenDirectory("/");
++	writer->WriteFile("/entry", "pinned content");
++	std::atomic<bool> started {false};
++	std::exception_ptr failure;
++	std::thread changes([&] {
++		try {
++			while (!started.load())
++				std::this_thread::yield();
++			for (int i = 0; i < 200; ++i) {
++				writer->Rename("/entry", "/moved");
++				writer->WriteFile("/entry", "pinned content");
++				writer->Unlink("/moved");
++				workspace.CollectGarbage();
++			}
++		} catch (...) {
++			failure = std::current_exception();
++		}
++	});
++	std::exception_ptr read_failure;
++	try {
++		started.store(true);
++		for (int i = 0; i < 400; ++i) {
++			FileStat file;
++			try {
++				file = reader->LookupInode(root.inode, "entry");
++			} catch (const Error &error) {
++				if (error.code == ErrorCode::NotFound)
++					continue;
++				throw;
++			}
++			Require(reader->ReadInode(file.inode, 0, 100) == "pinned content", "Lookup returned an unpinned inode");
++			reader->CloseFile(file.inode);
++		}
++	} catch (...) {
++		read_failure = std::current_exception();
++	}
++	changes.join();
++	if (failure)
++		std::rethrow_exception(failure);
++	if (read_failure)
++		std::rethrow_exception(read_failure);
++	reader->CloseFile(root.inode);
++	workspace.ReleaseMount("main");
++	Inspector inspect(path);
++	Require(inspect.Integer("SELECT count(*) FROM open_inodes") == 0, "Concurrent lookup leaked references");
++	Require(inspect.Integer("SELECT count(*) FROM orphans") == 0, "Concurrent lookup leaked orphan data");
++}
++
+ int main() {
+ 	auto root = std::filesystem::temp_directory_path() /
+ 	            ("vane-fs-inode-refs-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+ 	try {
+ 		std::filesystem::create_directory(root);
+ 		CheckReferences((root / "workspace.sqlite").string());
++		CheckLookupReads((root / "lookup-strict.sqlite").string(), Durability::Strict);
++		CheckLookupReads((root / "lookup-fsync.sqlite").string(), Durability::Fsync);
++		CheckConcurrentLookups((root / "lookup-concurrent.sqlite").string());
+ 		std::filesystem::remove_all(root);
+ 		std::cout << "Inode reference persistence, rollback, orphan lifetime and lease isolation passed\n";
+ 		return 0;
+--- /dev/null
++++ b/tests/test_lookup_validation.cpp
+@@ -0,0 +1,136 @@
++// SPDX-FileCopyrightText: 2026 Vane contributors
++// SPDX-License-Identifier: Apache-2.0
++
++#include "vane_fs/workspace.hpp"
++#include <sqlite3.h>
++#include <chrono>
++#include <cstring>
++#include <filesystem>
++#include <iostream>
++
++using namespace vane_fs;
++
++namespace {
++thread_local bool armed = false, injected = false;
++thread_local sqlite3 *other = nullptr;
++thread_local std::string mutation;
++
++void Require(bool ok, const char *message) {
++	if (!ok)
++		throw std::runtime_error(message);
++}
++} // namespace
++
++extern "C" int __real_sqlite3_exec(sqlite3 *, const char *, int (*)(void *, int, char **, char **), void *, char **);
++extern "C" int __real_sqlite3_step(sqlite3_stmt *);
++
++static void AfterCommit(sqlite3 *db) {
++	if (!armed)
++		return;
++	armed = false;
++	// Precisely interleave after the read transaction releases its SQLite lock,
++	// before the subsequent BEGIN IMMEDIATE. Direct SQL also lets us exercise
++	// other-connection invalidation despite the public API's mount exclusion.
++	Require(sqlite3_get_autocommit(db), "Injection did not run between transactions");
++	auto target = other ? other : db;
++	Require(__real_sqlite3_exec(target, mutation.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK,
++	        "Interleaved mutation failed");
++	injected = true;
++}
++
++extern "C" int __wrap_sqlite3_exec(sqlite3 *db, const char *sql, int (*callback)(void *, int, char **, char **),
++                                   void *context, char **error) {
++	auto code = __real_sqlite3_exec(db, sql, callback, context, error);
++	if (code == SQLITE_OK && std::strcmp(sql, "COMMIT") == 0)
++		AfterCommit(db);
++	return code;
++}
++
++extern "C" int __wrap_sqlite3_step(sqlite3_stmt *statement) {
++	auto code = __real_sqlite3_step(statement);
++	if (code == SQLITE_DONE && std::strcmp(sqlite3_sql(statement), "COMMIT") == 0)
++		AfterCommit(sqlite3_db_handle(statement));
++	return code;
++}
++
++static void Check(const std::string &path, bool external, const std::string &operation) {
++	Workspace workspace(path);
++	auto session = workspace.Checkout();
++	session->WriteFile("/file", "original");
++	session->WriteFile("/replacement", "replacement");
++	auto replacement = session->Stat("/replacement").inode;
++	workspace.AcquireMount("main");
++	auto root = session->OpenDirectory("/");
++	sqlite3 *inspection = nullptr;
++	Require(sqlite3_open(path.c_str(), &inspection) == SQLITE_OK, "Opening second connection");
++	other = external ? inspection : nullptr;
++	if (operation == "unlink")
++		mutation = "DELETE FROM dirent_versions WHERE name='file'";
++	else if (operation == "replace")
++		mutation = "UPDATE dirent_versions SET inode=" + std::to_string(replacement) + " WHERE name='file'";
++	else if (operation == "parent")
++		mutation = "DELETE FROM open_inodes WHERE inode=1";
++	else
++		mutation = "CREATE TRIGGER fail_lookup_pin BEFORE INSERT ON open_inodes "
++		           "BEGIN SELECT RAISE(ABORT,'injected pin failure'); END";
++	injected = false;
++	armed = true;
++	bool expected_error = false;
++	try {
++		auto file = session->LookupInode(root.inode, "file");
++		Require(operation == "replace" && file.inode == replacement, "Lookup reused stale namespace data");
++		Require(session->ReadInode(file.inode, 0, 100) == "replacement", "Replacement was not pinned");
++		session->CloseFile(file.inode);
++	} catch (const Error &error) {
++		expected_error = (operation == "unlink" && error.code == ErrorCode::NotFound) ||
++		                 (operation == "parent" && error.code == ErrorCode::Closed) ||
++		                 (operation == "pin_failure" && error.code == ErrorCode::Storage);
++		Require(expected_error, "Unexpected validation error");
++	}
++	armed = false;
++	other = nullptr;
++	sqlite3_close(inspection);
++	Require(injected, "Lookup did not reach the interleaving point");
++	Require(operation == "replace" || expected_error, "Lookup ignored an interleaved mutation");
++	if (operation == "pin_failure") {
++		// Removing the injected failure must allow exactly one successful pin.
++		sqlite3 *remove = nullptr;
++		Require(sqlite3_open(path.c_str(), &remove) == SQLITE_OK, "Opening trigger cleanup connection");
++		Require(sqlite3_exec(remove, "DROP TRIGGER fail_lookup_pin", nullptr, nullptr, nullptr) == SQLITE_OK,
++		        "Removing trigger");
++		sqlite3_close(remove);
++		auto file = session->LookupInode(root.inode, "file");
++		session->CloseFile(file.inode);
++		bool closed = false;
++		try {
++			session->StatInode(file.inode);
++		} catch (const Error &error) {
++			closed = error.code == ErrorCode::Closed;
++		}
++		Require(closed, "Failed pin retained a reference");
++	}
++	workspace.ReleaseMount("main");
++}
++
++int main() {
++	auto root =
++	    std::filesystem::temp_directory_path() /
++	    ("vane-fs-lookup-validation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++	try {
++		std::filesystem::create_directory(root);
++		for (bool external : {false, true}) {
++			for (const auto *operation : {"unlink", "replace", "parent", "pin_failure"}) {
++				auto name = std::to_string(external) + "-" + operation + ".sqlite";
++				Check((root / name).string(), external, operation);
++			}
++		}
++		std::filesystem::remove_all(root);
++		std::cout << "First lookup revalidates same/other-connection changes and rolls back failed pins\n";
++		return 0;
++	} catch (const std::exception &error) {
++		armed = false;
++		std::cerr << error.what() << '\n';
++		std::filesystem::remove_all(root);
++		return 1;
++	}
++}

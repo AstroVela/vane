@@ -29,15 +29,29 @@ if typing.TYPE_CHECKING:
     from vane._audio_file import AudioMetadata
     from vane._file import FileStat, VaneFileReader
     from vane._image_file import ImageMetadata
+    from vane._video_clip import VideoClip
     from vane._video_file import VideoFrameData, VideoMetadata
-    from vane.ai.options import EmbedOptions, PromptOptions
+    from vane.ai.embedding import EmbeddingInput
+    from vane.ai.options import (
+        EmbedOptions,
+        JevOptions,
+        PromptOptions,
+    )
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
+    from vane.execution.local_query import LocalQueryRuntime
+    from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.resources import ResourceVector
+    from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
+
+def _check_python_callback_entry() -> None: ...
 
 _ExpressionLike: typing.TypeAlias = (
     "Expression"
@@ -109,6 +123,19 @@ class DuckDBPyConnection:
     def checkpoint(self) -> DuckDBPyConnection: ...
     def close(self) -> None: ...
     def commit(self) -> DuckDBPyConnection: ...
+    def configure_local_runtime(
+        self,
+        *,
+        request_limit: RequestAdmissionLimits,
+        resident_limit: ResourceVector | None = None,
+        gpu_devices: typing.Sequence[str] | None = None,
+        task_limit: TaskAdmissionLimits | None = None,
+        data_limit: DataAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
+        track_data: bool = False,
+        track_graph: bool = False,
+        execution_timeout: float | None = None,
+    ) -> LocalQueryRuntime: ...
     def _create_vane_batch_function(
         self,
         name: str,
@@ -141,10 +168,19 @@ class DuckDBPyConnection:
     def execute(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection:
         """Execute queries and writes through shared bound-plan runner dispatch.
 
-        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local-fast. Connection
+        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local. Connection
         and catalog operations remain native. Distributed execution requires auto-commit.
         """
         ...
+    def execute_result(
+        self,
+        query: Statement | str,
+        parameters: object = None,
+        *,
+        delivery_timeout: float | None = None,
+        stream: bool = False,
+        rows_per_batch: int = 2048,
+    ) -> ManagedResult: ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...
     def extract_statements(self, query: str) -> lst[Statement]: ...
     def fetch_arrow_table(self, rows_per_batch: typing.SupportsInt = 1000000) -> pyarrow.lib.Table:
@@ -475,14 +511,25 @@ class DuckDBPyRelation:
     def distinct(self) -> DuckDBPyRelation: ...
     def embed(
         self,
-        text: Expression,
+        input: EmbeddingInput,
         *,
         provider: str | Provider = "openai",
         model: str | None = None,
         dimensions: int | None = None,
         on_error: typing.Literal["raise", "ignore"] = "raise",
+        where: Expression | None = None,
         output_column: str = "embedding",
         **options: Unpack[EmbedOptions],
+    ) -> DuckDBPyRelation: ...
+    def jev(
+        self,
+        state: Expression,
+        *,
+        questions: typing.Mapping[str, typing.Any],
+        model: str = "jev-latest",
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "response",
+        **options: Unpack[JevOptions],
     ) -> DuckDBPyRelation: ...
     def prompt(
         self,
@@ -499,6 +546,9 @@ class DuckDBPyRelation:
     ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...
+    def execute_result(
+        self, *, delivery_timeout: float | None = None, stream: bool = False, rows_per_batch: int = 2048
+    ) -> ManagedResult: ...
     def explain(self, type: ExplainType | str | int = ...) -> str: ...
     def explode(self, column: str) -> DuckDBPyRelation: ...
     def favg(
@@ -580,6 +630,7 @@ class DuckDBPyRelation:
     def _mark_datasink(self, operation_id: str) -> DuckDBPyRelation: ...
     def _take_udf_actor_cleanup_warnings(self) -> lst[str]: ...
     def _get_runner_type(self) -> str: ...
+    def _collect_local_resource_graph(self) -> dict[str, typing.Any]: ...
     def _run_datasink(self) -> dict[str, typing.Any]: ...
     def map(
         self,
@@ -597,6 +648,8 @@ class DuckDBPyRelation:
         function: Callable[..., typing.Any],
         schema: dict[str, sqltypes.DuckDBPyType] | None = None,
         *,
+        batch_format: typing.Literal["pyarrow", "numpy", "pandas", "cudf"] = "pyarrow",
+        zero_copy_batch: bool = True,
         batch_size: int | None = None,
         output_batch_size: int | None = None,
         min_task_batch_size: int | None = None,
@@ -827,6 +880,14 @@ class DuckDBPyRelation:
         write_partition_columns: bool | None = None,
     ) -> None: ...
     def write_file(self, file_name: str, *, format: str) -> None: ...
+    def _write_file_batch(
+        self,
+        connection: DuckDBPyConnection,
+        path: str,
+        format: str,
+        compression: str | None = None,
+        partition_by: typing.Sequence[str] = (),
+    ) -> dict[str, typing.Any]: ...
     def write_parquet(
         self,
         file_name: str,
@@ -982,6 +1043,20 @@ class Expression:
         self, *, max_bytes: int | Expression = 1048576, max_pixels: int | Expression = 100000000
     ) -> Expression: ...
     def video_metadata(self, *, max_bytes: int | Expression = 8388608) -> Expression: ...
+    def video_clip(
+        self,
+        start_time: float | Expression,
+        end_time: float | Expression,
+        *,
+        include_audio: bool | Expression = True,
+        max_duration: float | Expression = 300,
+        max_input_bytes: int | Expression = 1073741824,
+        max_decoded_frames: int | Expression = 100000,
+        max_decoded_samples: int | Expression = 100000000,
+        max_pixels: int | Expression = 33554432,
+        max_output_bytes: int | Expression = 67108864,
+        timeout_seconds: float | Expression = 60,
+    ) -> Expression: ...
     def video_frames(
         self,
         *,
@@ -1142,6 +1217,21 @@ class AudioFile(File):
 
 @typing.final
 class VideoFile(File):
+    def clip(
+        self,
+        start_time: float,
+        end_time: float,
+        *,
+        include_audio: bool = True,
+        max_duration: float = 300,
+        max_input_bytes: int = 1073741824,
+        max_decoded_frames: int = 100000,
+        max_decoded_samples: int = 100000000,
+        max_pixels: int = 33554432,
+        max_output_bytes: int = 67108864,
+        timeout_seconds: float = 60,
+        connection: DuckDBPyConnection | None = None,
+    ) -> VideoClip: ...
     def frames(
         self,
         start_time: int | float = 0,
@@ -1796,11 +1886,6 @@ def row_type(
 ) -> sqltypes.DuckDBPyType: ...
 def rowcount(*, connection: DuckDBPyConnection | None = None) -> int: ...
 def set_default_connection(connection: DuckDBPyConnection) -> None: ...
-def set_runner_local(
-    num_workers: object = None,
-    max_running_tasks: object = None,
-    execution_mode: object = None,
-) -> _Runner: ...
 def set_runner_ray(
     address: object = None,
     noop_if_initialized: bool = False,

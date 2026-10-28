@@ -725,12 +725,14 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 		run_end_encoding.run_ends = make_uniq<Vector>(run_ends_type.GetDuckType(), compressed_size);
 		run_end_encoding.values = make_uniq<Vector>(values_type.GetDuckType(), compressed_size);
 
-		ArrowToDuckDBConversion::ColumnArrowToDuckDB(*run_end_encoding.run_ends, run_ends_array, chunk_offset,
-		                                             array_state, compressed_size, run_ends_type);
+		// These children contain one entry per run, not per logical row. Only
+		// their own physical array offsets apply; logical offsets are used below
+		// when selecting and expanding the runs.
+		ArrowToDuckDBConversion::ColumnArrowToDuckDB(*run_end_encoding.run_ends, run_ends_array, 0, array_state,
+		                                             compressed_size, run_ends_type);
 		auto &values = *run_end_encoding.values;
-		ArrowToDuckDBConversion::SetValidityMask(values, values_array, chunk_offset, compressed_size,
-		                                         NumericCast<int64_t>(parent_offset), nested_offset);
-		ArrowToDuckDBConversion::ColumnArrowToDuckDB(values, values_array, chunk_offset, array_state, compressed_size,
+		ArrowToDuckDBConversion::SetValidityMask(values, values_array, 0, compressed_size, 0, -1);
+		ArrowToDuckDBConversion::ColumnArrowToDuckDB(values, values_array, 0, array_state, compressed_size,
 		                                             values_type);
 	}
 
@@ -1162,6 +1164,10 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 	}
 	case LogicalTypeId::STRUCT: {
 		//! Fill the children
+		// A nested struct inherits every ancestor's offset. List offsets already
+		// include those ancestors, but still need this struct's own slice offset.
+		auto child_parent_offset = parent_offset + NumericCast<uint64_t>(array.offset);
+		auto child_nested_offset = nested_offset == -1 ? -1 : nested_offset + array.offset;
 		auto &struct_info = arrow_type.GetTypeInfo<ArrowStructInfo>();
 		auto &child_entries = StructVector::GetEntries(vector);
 		auto &struct_validity_mask = FlatVector::Validity(vector);
@@ -1171,8 +1177,8 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			auto &child_type = struct_info.GetChild(child_idx);
 			auto &child_state = array_state.GetChild(child_idx);
 
-			ArrowToDuckDBConversion::SetValidityMask(child_entry, child_array, chunk_offset, size, array.offset,
-			                                         nested_offset);
+			ArrowToDuckDBConversion::SetValidityMask(child_entry, child_array, chunk_offset, size,
+			                                         NumericCast<int64_t>(child_parent_offset), child_nested_offset);
 			if (!struct_validity_mask.AllValid()) {
 				auto &child_validity_mark = FlatVector::Validity(child_entry);
 				for (idx_t i = 0; i < size; i++) {
@@ -1186,17 +1192,16 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			switch (array_physical_type) {
 			case ArrowArrayPhysicalType::DICTIONARY_ENCODED:
 				ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(
-				    child_entry, child_array, chunk_offset, child_state, size, child_type, nested_offset,
-				    &struct_validity_mask, NumericCast<uint64_t>(array.offset));
+				    child_entry, child_array, chunk_offset, child_state, size, child_type, child_nested_offset,
+				    &struct_validity_mask, child_parent_offset);
 				break;
 			case ArrowArrayPhysicalType::RUN_END_ENCODED:
 				ColumnArrowToDuckDBRunEndEncoded(child_entry, child_array, chunk_offset, child_state, size, child_type,
-				                                 nested_offset, &struct_validity_mask,
-				                                 NumericCast<uint64_t>(array.offset));
+				                                 child_nested_offset, &struct_validity_mask, child_parent_offset);
 				break;
 			case ArrowArrayPhysicalType::DEFAULT:
 				ColumnArrowToDuckDB(child_entry, child_array, chunk_offset, child_state, size, child_type,
-				                    nested_offset, &struct_validity_mask, NumericCast<uint64_t>(array.offset), false);
+				                    child_nested_offset, &struct_validity_mask, child_parent_offset, false);
 				break;
 			default:
 				throw NotImplementedException("ArrowArrayPhysicalType not recognized");

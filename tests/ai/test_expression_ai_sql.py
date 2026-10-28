@@ -233,16 +233,93 @@ def _round_trip_ai_plan(relation):
 
 
 def _execute_ai_physical_plan(target, physical):
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from tests.local_plan_helpers import execute_local_physical_plan
 
-    pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
-    try:
-        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
-        payloads = list(result.partition_payloads)
-        return pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
-    finally:
-        for pool in pools:
-            pool.shutdown(kill=True)
+    return execute_local_physical_plan(target, physical)
+
+
+@pytest.mark.parametrize("function", ["ai_prompt", "ai_embed"])
+@pytest.mark.parametrize("argument", ["provider", "model", "on_error", "options"])
+def test_ai_sql_prepared_call_configuration_defers_until_execute(function, argument):
+    arguments = {
+        "provider": "'mock_ai_sql'",
+        "model": "'prepared-model'",
+        "on_error": "'raise'",
+        "options": "struct_pack(actor_number := 1, batch_size := 2, max_retries := 0)",
+    }
+    if function == "ai_embed":
+        arguments["dimensions"] = "4"
+    value = arguments[argument]
+    arguments[argument] = "$1"
+    named = ", ".join(f"{key} := {item}" for key, item in arguments.items())
+    expected = "prepared-model:alpha" if function == "ai_prompt" else (5.0,) * 4
+    with vane.connect() as connection:
+        connection.execute(f"PREPARE ai_query AS SELECT {function}('alpha', {named})")
+        for _ in range(2):
+            assert connection.execute(f"EXECUTE ai_query({value})").fetchall() == [(expected,)]
+
+
+@pytest.mark.parametrize("function", ["ai_prompt", "ai_embed"])
+@pytest.mark.parametrize(
+    "argument,value,error",
+    [
+        ("on_error", "'invalid'", "on_error"),
+        ("options", "42", "foldable STRUCT"),
+        ("options", "struct_pack(batch_size := 0)", "batch_size"),
+    ],
+)
+def test_ai_sql_prepared_configuration_is_validated_at_execute(function, argument, value, error):
+    with vane.connect() as connection:
+        connection.execute(
+            f"PREPARE ai_query AS SELECT {function}('alpha', provider := 'mock_ai_sql', {argument} := $1)"
+        )
+        # SQL EXECUTE wraps Python validation errors in the database error hierarchy.
+        with pytest.raises(vane.Error, match=error):
+            connection.execute(f"EXECUTE ai_query({value})").fetchall()
+
+
+@pytest.mark.parametrize("function", ["ai_prompt", "ai_embed"])
+def test_ai_sql_prepared_parameter_does_not_allow_row_dependent_configuration(function):
+    with vane.connect() as connection:
+        connection.execute(f"""
+            PREPARE ai_query AS
+            SELECT {function}('alpha', provider := 'mock_ai_sql', model := concat(model, $1))
+            FROM (VALUES ('row-model')) AS source(model)
+        """)
+        with pytest.raises(vane.BinderException, match="'model' must be constant"):
+            connection.execute("EXECUTE ai_query('-suffix')").fetchall()
+
+
+def test_ai_embed_sql_prepared_dimensions_refresh_result_type():
+    with vane.connect() as connection:
+        connection.execute("""
+            PREPARE embed_query AS
+            SELECT ai_embed('abc', provider := 'mock_ai_sql', dimensions := $1)
+        """)
+        for dimensions in (3, 5):
+            result = connection.execute(f"EXECUTE embed_query({dimensions})")
+            assert result.description[0][1] == vane.sqltype(f"FLOAT[{dimensions}]")
+            assert result.fetchall() == [((3.0,) * dimensions,)]
+
+
+def test_ai_prompt_sql_prepared_schema_refreshes_result_type():
+    with vane.connect() as connection:
+        connection.execute("""
+            PREPARE prompt_query AS
+            SELECT ai_prompt('alpha', provider := 'mock_ai_sql', model := 'prepared', return_format := $1)
+        """)
+        for score_type, sql_type in (("integer", "BIGINT"), ("number", "DOUBLE")):
+            schema = json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}, "score": {"type": score_type}},
+                    "required": ["answer", "score"],
+                    "additionalProperties": False,
+                }
+            )
+            result = connection.execute(f"EXECUTE prompt_query('{schema}')")
+            assert result.description[0][1] == vane.sqltype(f"STRUCT(answer VARCHAR, score {sql_type})")
+            assert result.fetchall() == [({"answer": "prepared:alpha", "score": len("prepared:alpha")},)]
 
 
 def test_ai_prompt_sql_exact_text_overload_and_named_parameters():
@@ -1441,6 +1518,7 @@ def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors(media):
                 'describe',
                 {media},
                 provider := 'vllm',
+                model := 'configured-text-model',
                 on_error := 'ignore'
             )
         """).fetchall()
@@ -1564,7 +1642,13 @@ def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypa
     import vane.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor()
-    monkeypatch.setattr(vllm_executor, "build_executor", lambda model, options: executor)
+
+    def build_executor(model, options):
+        assert model == "round-trip-vllm"
+        assert vllm_executor.normalize_options(options)["use_ray"] is False
+        return executor
+
+    monkeypatch.setattr(vllm_executor, "build_executor", build_executor)
     source = vane.connect()
     relation = source.sql("""
         SELECT ai_prompt(
@@ -1577,7 +1661,13 @@ def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypa
     """)
 
     target, physical, serialized = _round_trip_ai_plan(relation)
-    table = _execute_ai_physical_plan(target, physical)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        with target.cursor() as cursor:
+            result = runner.execute_native(cursor, physical, None, None)
+            table = pa.concat_tables(list(result.partition_payloads))
+    finally:
+        runner.shutdown()
 
     assert physical.collect_udf_nodes() == []
     assert table.column(0).to_pylist() == ["native:alpha", "native:beta"]

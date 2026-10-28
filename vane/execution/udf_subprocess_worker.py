@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import socket
 import struct
@@ -16,24 +17,30 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
     from multiprocessing import shared_memory
 
 from vane import pickle as vane_pickle
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution._subprocess_error import error_payload
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
+    PreparedLocalShmBlock,
+    _create_shm,
     _open_existing_shm,
     _require_shm_buffer,
-    make_local_shm_ref_bundle_descriptor,
+    make_pooled_shm_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
+    prepare_local_shm_block,
     release_local_shm_ref_bundle_descriptor,
 )
 from vane.execution.udf_row_preserving import (
     fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
+from vane.execution.udf_shm_store import initialize_worker_shm_client, worker_shm_client
 from vane.execution.udf_threading import configure_loaded_torch_threads
 
 _MSG_READY = 0x01
@@ -52,6 +59,12 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+_MSG_REF_BUNDLE_CHUNK = 0x11
+_MSG_OUTPUT_GRANT_FAILED = 0x12
+_MSG_STREAM_NEXT = 0x13
+_MSG_STREAM_CONTINUE = 0x14
+_MSG_INPUT_RETAINED = 0x15
+_MSG_IPC_RESULT = 0x16
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -217,15 +230,26 @@ def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory
     if required <= capacity:
         return shm
     new_size = max(required, capacity * 2, _DEFAULT_SHM_SIZE)
-    name = shm.name
-    path = f"/dev/shm/{name}"
-    fd = os.open(path, os.O_RDWR)
-    try:
-        os.ftruncate(fd, new_size)
-    finally:
-        os.close(fd)
-    shm.close()
-    return _open_existing_shm(name, track=False)
+    if sys.platform == "win32":
+        # Named Windows mappings cannot grow while either process holds one.
+        # Keep the replacement alive until the parent adopts its new name.
+        replacement = _create_shm(new_size, track=False)
+        try:
+            shm.close()
+        except BaseException:
+            replacement.close()
+            raise
+        return replacement
+    else:
+        name = shm.name
+        path = f"/dev/shm/{name}"
+        fd = os.open(path, os.O_RDWR)
+        try:
+            os.ftruncate(fd, new_size)
+        finally:
+            os.close(fd)
+        shm.close()
+        return _open_existing_shm(name, track=False)
 
 
 def _arrow_table_from_ipc_bytes(data: bytes) -> pa.Table:
@@ -390,6 +414,8 @@ def _send_input_consume_failed(
     sock: socket.socket,
     ref_bundle: dict[str, Any],
     exc: BaseException,
+    *,
+    invalid_ipc_block: int | None = None,
 ) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
@@ -399,6 +425,8 @@ def _send_input_consume_failed(
         "worker_pid": os.getpid(),
         "error": _format_exception(exc),
     }
+    if invalid_ipc_block is not None:
+        payload["invalid_ipc_block"] = invalid_ipc_block
     _send_message(sock, _MSG_INPUT_CONSUME_FAILED, vane_pickle.dumps(payload))
 
 
@@ -408,12 +436,13 @@ def _request_output_grant(
     submit_count: int,
     size: int,
     input_lease_id: int | None = None,
-) -> int:
+) -> dict[str, Any]:
     payload = {
         "request_id": int(submit_count),
         "worker_pid": os.getpid(),
         "size_bytes": int(size),
         "priority": "consumer",
+        "input_tokens": worker_shm_client().retained_inputs(),
     }
     if input_lease_id is not None:
         payload["input_lease_id"] = int(input_lease_id)
@@ -422,10 +451,12 @@ def _request_output_grant(
     if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
         error = payload_data.decode("utf-8", errors="replace") or "local_shm output grant cancelled"
         raise _TaskCancelledError(error)
+    if msg_type == _MSG_OUTPUT_GRANT_FAILED:
+        raise RuntimeError(payload_data.decode("utf-8", errors="replace"))
     if msg_type != _MSG_OUTPUT_GRANT_GRANTED:
         raise RuntimeError(f"unexpected output grant response: {msg_type:#x}")
     response = vane_pickle.loads(payload_data)
-    return int(response["grant_id"])
+    return {"grant_id": int(response["grant_id"]), "allocation": response["allocation"]}
 
 
 def _release_output_grant(sock: socket.socket, grant_id: int) -> None:
@@ -456,44 +487,78 @@ def _concat_executor_outputs(result_tables: list[pa.Table]) -> pa.Table:
     return pa.concat_tables(result_tables, promote_options="default")
 
 
-def _ipc_response_size(table: pa.Table) -> int:
-    return _IPC_HEADER.size + len(_arrow_table_to_ipc_bytes(table))
-
-
 def _make_local_shm_ref_bundle_descriptor_for_tables(
-    tables: list[pa.Table],
+    blocks: list[PreparedLocalShmBlock],
     *,
-    grant_id: int | None = None,
+    grant_id: int,
+    allocation: dict[str, Any],
 ) -> dict[str, Any]:
-    if not tables:
+    if not blocks:
         raise RuntimeError("UDF returned no result")
+    if any(block.names != blocks[0].names for block in blocks):
+        raise ValueError("UDF output block schemas have different column names")
+    return make_pooled_shm_descriptor(blocks, allocation=allocation, grant_id=grant_id)
 
-    descriptor: dict[str, Any] = {
-        "block_refs": [],
-        "metadata": [],
-        "names": list(tables[0].schema.names),
-    }
+
+def _streaming_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload_requests_local_ref_bundle_output(payload) and payload.get("call_mode") in {"map_batches", "flat_map"}:
+        return {**payload, "stream_output": True, "prebatched_input": False}
+    return payload
+
+
+def _publish_output_block(
+    table: pa.Table, sock: socket.socket, *, submit_count: int, input_lease_id: int | None
+) -> None:
+    block = prepare_local_shm_block(table)
+    grant = _request_output_grant(
+        sock, submit_count=submit_count, size=block.ipc_size_bytes, input_lease_id=input_lease_id
+    )
+    grant_id = grant["grant_id"]
+    descriptor = None
     try:
-        for table in tables:
-            block_descriptor = make_local_shm_ref_bundle_descriptor(table)
-            try:
-                block_names = list(block_descriptor.get("names") or [])
-                if block_names != descriptor["names"]:
-                    raise ValueError(
-                        "UDF output block schemas have different column names: "
-                        f"expected={descriptor['names']!r} got={block_names!r}"
-                    )
-                descriptor["block_refs"].extend(block_descriptor.get("block_refs") or [])
-                descriptor["metadata"].extend(block_descriptor.get("metadata") or [])
-            except Exception:
-                release_local_shm_ref_bundle_descriptor(block_descriptor)
-                raise
-        if grant_id is not None:
-            descriptor["grant_id"] = int(grant_id)
-        return descriptor
-    except Exception:
-        release_local_shm_ref_bundle_descriptor(descriptor)
+        descriptor = make_pooled_shm_descriptor([block], allocation=grant["allocation"], grant_id=grant_id)
+        _send_message(sock, _MSG_REF_BUNDLE_CHUNK, vane_pickle.dumps(descriptor))
+    except BaseException:
+        try:
+            if descriptor is not None:
+                release_local_shm_ref_bundle_descriptor(descriptor)
+        finally:
+            _release_output_grant(sock, grant_id)
         raise
+
+
+def _publish_output_iterator(
+    outputs: Iterable[pa.Table], sock: socket.socket, *, submit_count: int, input_lease_id: int | None
+) -> None:
+    iterator = iter(outputs)
+    try:
+        while True:
+            _send_message(sock, _MSG_STREAM_NEXT)
+            msg_type, response = _recv_message(sock)
+            if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
+                raise _TaskCancelledError(response.decode("utf-8", errors="replace"))
+            if msg_type == _MSG_OUTPUT_GRANT_FAILED:
+                raise RuntimeError(response.decode("utf-8", errors="replace"))
+            if msg_type != _MSG_STREAM_CONTINUE or response:
+                raise RuntimeError("unexpected local output stream permit response")
+            try:
+                output = next(iterator)
+            except StopIteration:
+                return
+            _publish_output_block(output, sock, submit_count=submit_count, input_lease_id=input_lease_id)
+            del output
+    except BaseException as error:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            try:
+                close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+        raise
+    finally:
+        # Normal exhaustion closes generator frames itself. On failure the
+        # explicit close above preserves the original task/cancellation error.
+        del iterator
 
 
 def _execute_submit(
@@ -511,6 +576,17 @@ def _execute_submit(
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
     payload = getattr(executor, "_payload", {}) or {}
     call_mode = str(payload.get("call_mode") or "")
+    if produce_ref_bundle_output and call_mode in {"map_batches", "flat_map"}:
+        # Each bounded runtime output owns its own exact-byte grant. The
+        # terminal response follows executor cleanup in task mode.
+        def outputs() -> Iterator[pa.Table]:
+            yield from executor.iter_submit(input_table)
+            if finish_before_drain:
+                executor.finished_submitting()
+            yield from executor.drain_outputs()
+
+        _publish_output_iterator(outputs(), sock, submit_count=submit_count, input_lease_id=input_lease_id)
+        return data_shm, _MSG_OK, struct.pack("<Q", 0)
     row_preserving = call_mode == "map_batches_rows" or (
         call_mode == "map" and payload.get("scalar_arg_count") is not None
     )
@@ -531,16 +607,20 @@ def _execute_submit(
             mode=f"{call_mode} subprocess",
         )
     if produce_ref_bundle_output:
-        required = sum(_ipc_response_size(output_table) for output_table in output_tables)
-        grant_id = _request_output_grant(
+        blocks = [prepare_local_shm_block(table) for table in output_tables]
+        required = sum(block.ipc_size_bytes for block in blocks)
+        grant = _request_output_grant(
             sock,
             submit_count=submit_count,
             size=required,
             input_lease_id=input_lease_id,
         )
+        grant_id = grant["grant_id"]
         descriptor = None
         try:
-            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(output_tables, grant_id=grant_id)
+            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(
+                blocks, grant_id=grant_id, allocation=grant["allocation"]
+            )
             result_payload = vane_pickle.dumps(descriptor)
         except Exception:
             if descriptor is not None:
@@ -559,49 +639,15 @@ def _execute_submit(
     required = _IPC_HEADER.size + len(output_ipc)
     data_shm = _resize_shm(data_shm, required)
     result_size = _write_ipc_to_shm(data_shm, output_ipc)
-    return data_shm, _MSG_OK, struct.pack("<Q", result_size)
+    if sys.platform == "win32":
+        return data_shm, _MSG_IPC_RESULT, struct.pack("<Q", result_size) + data_shm.name.encode("ascii")
+    else:
+        return data_shm, _MSG_OK, struct.pack("<Q", result_size)
 
 
-def _execute_task_submit(
-    payload: dict[str, Any],
-    input_table: pa.Table,
-    data_shm: shared_memory.SharedMemory,
-    produce_ref_bundle_output: bool,
-    submit_count: int,
-    log_submit: bool,
-    sock: socket.socket,
-    input_lease_id: int | None = None,
-) -> tuple[shared_memory.SharedMemory, int, bytes]:
-    if input_table.num_rows == 0:
-        return data_shm, _MSG_OK, struct.pack("<Q", 0)
-    executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
-    configure_loaded_torch_threads()
-    try:
-        if log_submit:
-            _worker_thread_log(
-                "task_executor_ready",
-                payload,
-                submit_count=submit_count,
-                rows=input_table.num_rows,
-            )
-        return _execute_submit(
-            executor,
-            input_table,
-            data_shm,
-            produce_ref_bundle_output,
-            sock=sock,
-            submit_count=submit_count,
-            input_lease_id=input_lease_id,
-            finish_before_drain=True,
-        )
-    finally:
-        # close() flushes via finished_submitting() and releases the callable
-        # under its own finally, so cleanup runs even if the flush raises.
-        executor.close()
-
-
-def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str) -> None:
+def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str, shm_fd: int) -> None:
     sock = socket.socket(fileno=sock_fd)
+    shm_client = initialize_worker_shm_client(shm_fd)
     payload_shm = _open_existing_shm(payload_shm_name, track=False)
     data_shm = _open_existing_shm(data_shm_name, track=False)
 
@@ -609,13 +655,13 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
     try:
         payload_bytes = _read_ipc_from_shm(payload_shm, payload_size)
         payload = vane_pickle.loads(payload_bytes)
-        configure_loaded_torch_threads()
         produce_ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
         subprocess_mode = _payload_subprocess_mode(payload)
+        configure_loaded_torch_threads(explicit_only=subprocess_mode == "actor")
         _worker_thread_log("worker_started", payload, mode=subprocess_mode)
         if subprocess_mode == "actor":
-            executor = RuntimeUDFExecutor(payload)
-            configure_loaded_torch_threads()
+            executor = RuntimeUDFExecutor(_streaming_payload(payload))
+            configure_loaded_torch_threads(explicit_only=True)
             executor.warm_up()
             _worker_thread_log("actor_executor_ready", payload, mode=subprocess_mode)
         _send_message(sock, _MSG_READY)
@@ -635,7 +681,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     _send_message(
                         sock,
                         _MSG_ERROR,
-                        _format_exception(cleanup_error).encode("utf-8", errors="replace"),
+                        error_payload(cleanup_error, _format_exception(cleanup_error)),
                     )
                     # The parent may decide to force termination after this
                     # bounded attempt. Retain the executor until then so its
@@ -648,7 +694,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         executor.finished_submitting()
                     _send_message(sock, _MSG_ACK)
                 except Exception as exc:
-                    _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                    _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
                 continue
             if msg_type not in (_MSG_SUBMIT, _MSG_SUBMIT_REF_BUNDLE):
                 raise ValueError(f"unknown UDF subprocess message type: {msg_type:#x}")
@@ -656,6 +702,8 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 raise ValueError("submit message payload must contain the shared-memory byte size")
 
             try:
+                if subprocess_mode == "task" and executor is not None:
+                    raise RuntimeError("subprocess task worker still owns an executor awaiting cleanup")
                 input_lease_id = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
@@ -669,16 +717,30 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     ref_bundle = vane_pickle.loads(payload_data)
                     lease_id_raw = ref_bundle.get("input_lease_id")
                     input_lease_id = int(lease_id_raw) if lease_id_raw is not None else None
+                    invalid_ipc_block: int | None = None
+
+                    def input_decode_failed(block_index: int, error: BaseException) -> None:
+                        nonlocal invalid_ipc_block
+                        # An allocation failure in this process says nothing
+                        # about the producer's IPC. Record only decoder evidence,
+                        # not subsequent projection/concatenation/cleanup errors.
+                        if not isinstance(error, MemoryError):
+                            invalid_ipc_block = block_index
+
                     try:
+                        shm_client.begin_input(ref_bundle)
                         input_table = materialize_ref_bundle(
                             ref_bundle["block_refs"],
                             ref_bundle.get("slices"),
                             ref_bundle.get("metadata"),
                             ref_bundle.get("names"),
+                            on_decode_error=input_decode_failed,
                         )
                     except Exception as exc:
-                        _send_input_consume_failed(sock, ref_bundle, exc)
+                        _send_input_consume_failed(sock, ref_bundle, exc, invalid_ipc_block=invalid_ipc_block)
                         raise
+                    finally:
+                        shm_client.end_input()
                     _send_input_consumed(sock, ref_bundle, input_table)
                 submit_count += 1
                 log_submit = _should_log_submit(submit_count)
@@ -692,16 +754,38 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         msg_type=msg_type,
                     )
                 if subprocess_mode == "task":
-                    data_shm, result_msg_type, result_payload = _execute_task_submit(
-                        payload,
-                        input_table,
-                        data_shm,
-                        produce_ref_bundle_output,
-                        submit_count,
-                        log_submit,
-                        sock,
-                        input_lease_id=input_lease_id,
-                    )
+                    if input_table.num_rows == 0:
+                        result_msg_type, result_payload = _MSG_OK, struct.pack("<Q", 0)
+                    else:
+                        # Publish ownership before setup or execution can fail.
+                        # A failed close remains owned by this control loop for
+                        # _MSG_CLOSE and final teardown; it cannot be replaced
+                        # by the next task or acknowledged as already cleaned.
+                        executor = RuntimeUDFExecutor(
+                            _streaming_payload(payload), cache_callable=_callable_cache_enabled(payload)
+                        )
+                        try:
+                            configure_loaded_torch_threads()
+                            if log_submit:
+                                _worker_thread_log(
+                                    "task_executor_ready",
+                                    payload,
+                                    submit_count=submit_count,
+                                    rows=input_table.num_rows,
+                                )
+                            data_shm, result_msg_type, result_payload = _execute_submit(
+                                executor,
+                                input_table,
+                                data_shm,
+                                produce_ref_bundle_output,
+                                sock=sock,
+                                submit_count=submit_count,
+                                input_lease_id=input_lease_id,
+                                finish_before_drain=True,
+                            )
+                        finally:
+                            executor.close()
+                            executor = None
                 else:
                     if executor is None:
                         raise RuntimeError("subprocess actor worker executor is not initialized")
@@ -723,21 +807,28 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         rows=input_table.num_rows,
                         result_msg_type=result_msg_type,
                     )
+                input_table = None
+                _send_message(sock, _MSG_INPUT_RETAINED, vane_pickle.dumps(shm_client.retained_inputs()))
                 _send_message(sock, result_msg_type, result_payload)
             except _TaskCancelledError as exc:
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
             except Exception as exc:
-                _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+                _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
+            finally:
+                input_table = None
     except Exception as exc:
         try:
-            _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
+            _send_message(sock, _MSG_ERROR, error_payload(exc, _format_exception(exc)))
         except Exception:
             pass
     finally:
+        cleanup_error = None
         if executor is not None:
-            _close_executor_with_retry(executor)
-            executor = None
-            gc.collect()
+            cleanup_error = _close_executor_with_retry(executor)
+            if cleanup_error is None:
+                executor = None
+                gc.collect()
+        shm_client.close()
         try:
             payload_shm.close()
         except Exception:
@@ -750,12 +841,30 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
             sock.close()
         except Exception:
             pass
+        if cleanup_error is not None:
+            # Failed engine cleanup is not a successful worker exit. The
+            # parent still owns this worker's process group and descendants.
+            raise cleanup_error
 
 
 def _main(argv: list[str]) -> int:
-    if len(argv) != 5:
+    if len(argv) != 6:
         return 2
-    worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4])
+    if sys.platform == "win32":
+        # Read the parent's private bootstrap pipe before loading user code.
+        shares = json.loads(sys.stdin.buffer.readline(16384))
+        if not isinstance(shares, list) or len(shares) != 2:
+            raise ValueError("invalid UDF worker socket bootstrap")
+        sockets = []
+        try:
+            for share in shares:
+                sockets.append(socket.fromshare(bytes.fromhex(share)))
+            worker_main(sockets[0].detach(), argv[2], int(argv[3]), argv[4], sockets[1].detach())
+        finally:
+            for sock in sockets:
+                sock.close()
+    else:
+        worker_main(int(argv[1]), argv[2], int(argv[3]), argv[4], int(argv[5]))
     return 0
 
 

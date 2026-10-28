@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/aggregate/aggregate_object.hpp"
 
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -54,6 +60,15 @@ idx_t AggregateFilterData::ApplyFilter(DataChunk &payload) {
 }
 
 AggregateFilterDataSet::AggregateFilterDataSet() {
+}
+
+void AggregateFilterDataSet::ResetInput() {
+	for (auto &filter : filter_data) {
+		if (filter) {
+			filter->filtered_payload.Reset();
+			filter->filter_executor.ResetInput();
+		}
+	}
 }
 
 void AggregateFilterDataSet::Initialize(ClientContext &context, const vector<AggregateObject> &aggregates,

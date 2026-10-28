@@ -128,6 +128,11 @@ unique_ptr<FunctionData> JSONScanData::Copy() const {
 	result->InitializeTransformOptions();
 	result->max_threads = max_threads;
 	result->estimated_cardinality_per_file = estimated_cardinality_per_file;
+	result->distributed_worker = distributed_worker;
+	result->distributed_splits_applied = distributed_splits_applied;
+	result->distributed_assignment_restricted = distributed_assignment_restricted;
+	result->distributed_allowed_files = distributed_allowed_files;
+	result->distributed_split_ids = distributed_split_ids;
 	return std::move(result);
 }
 
@@ -308,7 +313,7 @@ static void ValidateJSONBindData(const MultiFileBindData &bind_data, const strin
 
 static void ValidateJSONFiles(const vector<JSONFileSnapshot> &files, const string &function_name,
                               const string &operation) {
-	set<idx_t> ordinals;
+	set<string> identities;
 	for (const auto &file : files) {
 		if (file.path.empty()) {
 			throw SerializationException("Cannot %s %s with an empty JSON file path", operation, function_name);
@@ -317,7 +322,12 @@ static void ValidateJSONFiles(const vector<JSONFileSnapshot> &files, const strin
 			throw SerializationException("Cannot %s %s with nested JSON file ordinal metadata", operation,
 			                             function_name);
 		}
-		if (!ordinals.insert(file.ordinal).second) {
+		JSONScanRange range;
+		const bool has_range = JSONScanRange::TryGet(file.ToOpenFileInfo(), range);
+		const auto identity =
+		    std::to_string(file.ordinal) +
+		    (has_range ? ":" + std::to_string(range.start) + ":" + std::to_string(range.end) : ":file");
+		if (!identities.insert(identity).second) {
 			throw SerializationException("Cannot %s %s with duplicate JSON file ordinal %llu", operation, function_name,
 			                             static_cast<unsigned long long>(file.ordinal));
 		}
@@ -355,6 +365,12 @@ void JSONScan::Serialize(Serializer &serializer, const optional_ptr<FunctionData
 	serialized_data.max_threads = json_data.max_threads;
 	serialized_data.estimated_cardinality_per_file = json_data.estimated_cardinality_per_file;
 	serialized_data.reader_column_ids = json_data.column_ids;
+	ValidateJSONDistributedState(json_data, files);
+	serialized_data.distributed_worker = json_data.distributed_worker;
+	serialized_data.distributed_splits_applied = json_data.distributed_splits_applied;
+	serialized_data.distributed_assignment_restricted = json_data.distributed_assignment_restricted;
+	serialized_data.distributed_allowed_files = json_data.distributed_allowed_files;
+	serialized_data.distributed_split_ids = json_data.distributed_split_ids;
 	serializer.WriteProperty(100, "json_data", serialized_data);
 }
 
@@ -400,6 +416,12 @@ unique_ptr<FunctionData> JSONScan::Deserialize(Deserializer &deserializer, Table
 	json_data.max_threads = serialized_data.max_threads;
 	json_data.estimated_cardinality_per_file = serialized_data.estimated_cardinality_per_file;
 	json_data.column_ids = std::move(serialized_data.reader_column_ids);
+	json_data.distributed_worker = serialized_data.distributed_worker;
+	json_data.distributed_splits_applied = serialized_data.distributed_splits_applied;
+	json_data.distributed_assignment_restricted = serialized_data.distributed_assignment_restricted;
+	json_data.distributed_allowed_files = std::move(serialized_data.distributed_allowed_files);
+	json_data.distributed_split_ids = std::move(serialized_data.distributed_split_ids);
+	ValidateJSONDistributedState(json_data, result->file_list->GetAllFiles());
 
 	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
 	virtual_column_map_t virtual_columns;
@@ -419,6 +441,7 @@ void JSONScan::TableFunctionDefaults(TableFunction &table_function) {
 
 	table_function.serialize = Serialize;
 	table_function.deserialize = Deserialize;
+	table_function.SetDistributedScanCallbacks(JSONDistributedScanCallbacks());
 
 	table_function.projection_pushdown = true;
 	table_function.filter_pushdown = false;

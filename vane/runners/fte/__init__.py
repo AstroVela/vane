@@ -79,9 +79,6 @@ from vane.runners.fte.fte_execution import (
     FteWorkerReservationUnavailable as FteWorkerReservationUnavailable,
 )
 from vane.runners.fte.fte_scheduler import (
-    FteAttemptStatusWatcher as FteAttemptStatusWatcher,
-)
-from vane.runners.fte.fte_scheduler import (
     FteEventDrivenTaskSource as FteEventDrivenTaskSource,
 )
 from vane.runners.fte.fte_scheduler import (

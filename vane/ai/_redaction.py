@@ -9,8 +9,8 @@ sensitive-key table and matching logic defined here.
 Layer 1 — the SQL binding rejects inline credentials outright.
 ``vane.ai._sql._reject_inline_credentials`` raises on any sensitive-keyed
 option at any nesting depth before a provider is ever constructed;
-environment variables are the supported way to configure credentials for
-the SQL surface.
+application environment variables are captured when binding the SQL surface.
+Python callers can also configure credentials on provider constructors.
 
 Layer 2 — the Python descriptor path seals credentials. Provider descriptors
 wrap every sensitive-keyed value in their option mappings in :class:`Secret`

@@ -60,8 +60,8 @@ class UDFExecutor(ABC):
         ...
 
     @abstractmethod
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
-        """Register a callback to be called when a result becomes available."""
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
+        """Register a result notification callback, or clear it with None."""
         ...
 
     @abstractmethod
@@ -77,7 +77,15 @@ def build_unified_executor(
     """Build a UDF executor from the unified payload."""
     from vane.execution.udf import build_executor
 
-    return build_executor(payload, options)
+    try:
+        return build_executor(payload, options)
+    except Exception as error:
+        from vane.ai._errors import DiagnosticError
+
+        # The native dispatcher stringifies this exception. Capture its typed
+        # cause/cleanup chain here, before Python type identity is lost.
+        diagnostic = DiagnosticError("UDF executor initialization failed", error)
+    raise diagnostic from None
 
 
 __all__ = ["UDFExecutor", "build_unified_executor"]

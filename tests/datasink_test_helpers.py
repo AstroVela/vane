@@ -29,16 +29,9 @@ def datasink_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
         from vane.runners.ray.runner import RayRunner
 
         runner = RayRunner(address=None, max_task_backlog=None)
-    elif runner_type == "local":
-        from vane.runners.local.runner import LocalRunner
-
-        monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
-        monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
-        runner = LocalRunner(num_workers=2)
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     if runner is not None:
-        factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
-        monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
+        monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
     try:
         yield runner_type
     finally:
@@ -53,7 +46,7 @@ def recording_sdk_sink(
     *,
     sdk_module: str,
     sdk_loader: str,
-    sdk: tuple[type[Any], Any],
+    sdk: tuple[Any, ...],
 ) -> DataSink:
     # Carry the fake SDK in the serialized bound sink so it reaches subprocesses
     # too. Each caller's autouse SDK fixture restores the driver module, and

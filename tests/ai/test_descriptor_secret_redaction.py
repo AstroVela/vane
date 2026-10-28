@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Provider descriptors reject inline credentials and keep option rendering safe."""
+"""Provider client credentials stay separate from inference options and render safely."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def _google_prompt_descriptor(options):
 def _vllm_prompt_plan(options):
     from vane.ai.providers.vllm import NativeVLLMPromptPlan
 
-    return NativeVLLMPromptPlan(vllm_options=options)
+    return NativeVLLMPromptPlan(model_name="test-model", vllm_options=options)
 
 
 ALL_DESCRIPTOR_FACTORIES = [
@@ -145,8 +145,9 @@ def _install_fake_google(monkeypatch, client):
             self.attempts = attempts
 
     class HttpOptions:
-        def __init__(self, *, retry_options):
+        def __init__(self, *, retry_options, base_url):
             self.retry_options = retry_options
+            self.base_url = base_url
 
     fake_genai = SimpleNamespace(
         Client=client,
@@ -204,12 +205,30 @@ class TestDescriptorReprRedaction:
         _assert_no_plaintext(repr(plan))
         _assert_no_plaintext(repr(plan.get_options()))
 
+    @pytest.mark.parametrize("family", ["vllm", "sglang"])
+    @pytest.mark.parametrize("kind", ["text", "image", "video"])
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"engine_args": {"hf_token": HUB_TOKEN}},
+            {"processor_kwargs": {"token": HUB_TOKEN}},
+            {"engine_args": {"extra_config": [{"Authorization": API_KEY}]}},
+        ],
+    )
+    def test_native_embedding_descriptors_reject_sensitive_options(self, family, kind, options):
+        from vane.ai.provider import load_provider
+
+        with pytest.raises(ValueError, match="sensitive field") as exc_info:
+            getattr(load_provider(family), f"get_{kind}_embedder")("configured-model", 2, options=options)
+        _assert_no_plaintext(str(exc_info.value))
+
     def test_credential_kwarg_cannot_land_in_embed_options(self):
         from vane.ai.providers.google import GoogleProvider
 
-        with pytest.raises(TypeError, match="api_key") as exc_info:
-            GoogleProvider(api_key=API_KEY)
-        assert API_KEY not in str(exc_info.value)
+        descriptor = GoogleProvider(api_key=API_KEY).get_text_embedder()
+        assert "api_key" not in descriptor.get_options()
+        assert descriptor.client_options["api_key"].reveal() == API_KEY
+        assert API_KEY not in repr(descriptor)
 
     def test_transformers_embedder_rejects_hub_token(self):
         from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
@@ -323,29 +342,39 @@ class TestExceptionRedaction:
 
 
 class TestOptionsAtExecutionBoundary:
-    def test_openai_embedder_client_receives_non_sensitive_client_options(self, monkeypatch):
+    def test_openai_embedder_client_receives_captured_credentials_and_endpoint(self, monkeypatch):
         client = _fresh_recording_client()
         _install_fake_openai(monkeypatch, client)
         _openai_embedder_descriptor().instantiate()
         assert client.calls == [
             {
                 "base_url": "https://api.example",
+                "api_key": "application-test-key",
+                "organization": "",
+                "project": "",
                 "max_retries": 0,
             }
         ]
 
     @pytest.mark.parametrize("kind", ["embed", "prompt"])
-    def test_openai_default_endpoint_ignores_sdk_environment_override(self, monkeypatch, kind):
+    def test_openai_default_endpoint_ignores_later_worker_environment_override(self, monkeypatch, kind):
         from vane.ai.providers.openai import OpenAIPrompterDescriptor, OpenAITextEmbedderDescriptor
 
         client = _fresh_recording_client()
         _install_fake_openai(monkeypatch, client)
-        monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
-
         descriptor = OpenAITextEmbedderDescriptor() if kind == "embed" else OpenAIPrompterDescriptor()
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
         descriptor.instantiate()
 
-        assert client.calls == [{"base_url": "https://api.openai.com/v1", "max_retries": 0}]
+        assert client.calls == [
+            {
+                "api_key": "application-test-key",
+                "base_url": "https://api.openai.com/v1",
+                "organization": "",
+                "project": "",
+                "max_retries": 0,
+            }
+        ]
 
     def test_openai_unknown_dimensions_do_not_probe_with_plaintext(self, monkeypatch):
         from vane.ai.providers.openai import OpenAITextEmbedderDescriptor
@@ -372,7 +401,7 @@ class TestOptionsAtExecutionBoundary:
         _install_fake_google(monkeypatch, client)
         _google_embedder_descriptor().instantiate()
         assert len(client.calls) == 1
-        assert "api_key" not in client.calls[0]
+        assert client.calls[0]["api_key"] == "application-test-key"
         assert client.calls[0]["http_options"].retry_options.attempts == 1
 
     def test_transformers_get_dimensions_uses_static_metadata_without_loading_config(self, monkeypatch):
@@ -424,7 +453,15 @@ class TestOptionsAtExecutionBoundary:
             options={"base_url": "https://api.example"},
             model="text-embedding-3-small",
         )
-        assert client.calls == [{"base_url": "https://api.example", "max_retries": 0}]
+        assert client.calls == [
+            {
+                "api_key": "application-test-key",
+                "base_url": "https://api.example",
+                "organization": "",
+                "project": "",
+                "max_retries": 0,
+            }
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +483,12 @@ class TestPickleRoundTrip:
         assert client.calls == [
             {
                 "base_url": "https://api.example",
+                "api_key": "application-test-key",
+                "organization": "",
+                "project": "",
                 "max_retries": 0,
             }
         ]
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

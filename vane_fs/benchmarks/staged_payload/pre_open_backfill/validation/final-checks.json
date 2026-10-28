@@ -1,0 +1,19 @@
+{
+  "epoch": 1791879105.5207283,
+  "format_changed": "PASS",
+  "ruff_changed": "PASS",
+  "copyleft": "PASS",
+  "whitespace_changed": "PASS",
+  "source_headers": {
+    "changed": "PASS",
+    "changed_count": 7,
+    "whole_root": "FAIL_PREEXISTING",
+    "missing_unchanged_files": {
+      "vane_fs/benchmarks/io_interference/monitor.py": "51c820a9431443c2be1bcd19374237a931363b80617819e476fca5c828c0e607",
+      "vane_fs/benchmarks/io_interference/run.py": "204d0941cc459e87c9fe54e52ced86861225dc780cf42e8ea927102dee9b1976",
+      "vane_fs/benchmarks/staged_payload/block_sync/prepare.py": "c6ef32d008573fe55fe641641fb145d7254ed144c87384f7327256726751474a",
+      "vane_fs/benchmarks/staged_payload/block_sync/raw_probe.py": "7289dbd08f43c5d73b1ec1b572f7492c48e7d76f01af3d2eba1fe9ab90bf8775",
+      "vane_fs/benchmarks/staged_payload/block_sync/timeline.cpp": "fac5ee32e7d3c7623961493093d7223af7846971061d5289b0eedab6dd084a04"
+    }
+  }
+}

@@ -79,7 +79,9 @@ from vane._image_file import (
     image_file_metadata,
 )
 from vane._image_operators import convert_image, crop, decode_image, encode_image, image_hash, resize
+from vane._media_probe import MediaProbe, MediaStream, probe_media
 from vane._read_video_frames import read_video_frames
+from vane._video_clip import VideoClip, video_clip
 from vane._video_expressions import (
     build_video_index,
     get_video_frame_by_idx,
@@ -355,20 +357,15 @@ def use_native_media_runtime(directory: str, *, allow_distributed: bool = False)
     select_runtime(directory, allow_distributed=allow_distributed)
 
 
-def set_runner_local(
-    num_workers: int | None = 1,
-    *,
-    max_running_tasks: _typing.Any = None,
-    execution_mode: str | None = "in_process",
-) -> "_Runner":
-    """Configure Vane to execute through the local FTE runner."""
+def set_runner_local() -> None:
+    """Select native local execution for new connections.
+
+    Existing connections keep their execution mode. Use connection configuration
+    and ``configure_local_runtime()`` to control threads and shared admission.
+    """
     from vane.runners.local import set_runner_local as _set_runner_local
 
-    return _set_runner_local(
-        num_workers,
-        max_running_tasks=max_running_tasks,
-        execution_mode=execution_mode,
-    )
+    _set_runner_local()
 
 
 def set_runner_ray(
@@ -423,6 +420,9 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "MediaProbe",
+    "MediaStream",
+    "probe_media",
     "read_video_frames",
     "DEFAULT_EXTENSION_CATALOG_URL",
     "AudioFile",
@@ -713,6 +713,8 @@ __all__: list[str] = [
     "try_to_file",
     "video_file",
     "video_metadata",
+    "video_clip",
+    "VideoClip",
     "build_video_index",
     "video_index_info",
     "video_scan_stats",

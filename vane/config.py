@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any
 
-from vane._env import _PUBLIC_RUNNER_ERROR, _PUBLIC_RUNNER_VALUES, EnvRegistry, _Var, env
+from vane._env import _PUBLIC_RUNNER_ERROR, _PUBLIC_RUNNER_VALUES, EnvRegistry, _normalize_runner, _Var, env
 
 # Dynamically build the dataclass fields from the registry descriptors
 # so we don't have to duplicate the list of variables.
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         """Statically typed view of the runtime-generated configuration."""
 
         local_exchange_buffer: str = "32MB"
+        ndjson_max_split_bytes: int = 256 * 1024 * 1024
         ray_init_sql: str = ""
         ray_max_task_backlog: int = 0
         ray_scan_split_min_count: int = 0
@@ -75,6 +76,10 @@ else:
 
 def configure(**kw: Any) -> VaneConfig:
     """Create a config from keyword arguments and apply it to the environment.
+
+    ``runner="local"`` selects native execution; ``"local-fast"`` is a
+    compatibility alias normalized to ``"local"``. Existing connections keep
+    the runner selected when they were created.
 
     Unknown keys raise ``AttributeError``.  Returns the applied config for
     inspection.
@@ -90,7 +95,7 @@ def configure(**kw: Any) -> VaneConfig:
                 f"Unknown config field: {key!r}. Use current_config().__dict__.keys() to see available names."
             )
     if "runner" in kw:
-        runner = str(kw["runner"] or "").strip().lower() or "ray"
+        runner = _normalize_runner(kw["runner"])
         if runner not in _PUBLIC_RUNNER_VALUES:
             raise ValueError(_PUBLIC_RUNNER_ERROR)
         kw["runner"] = runner

@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,10 @@ from vane.runners.ray.safe_get import (
     resolve_object_refs_blocking,
 )
 
+# Cancellation may wait for Ray's IO thread. It must never run on the event
+# loop that drives status progress and query lifecycle callbacks.
+_FTE_CANCEL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vane-fte-cancel")
+
 
 class FteControlBarrierPendingError(RuntimeError):
     """The query control cut still owns at least one non-terminal ObjectRef."""
@@ -73,6 +78,43 @@ class FteWorkerTaskControlMixin:
     if TYPE_CHECKING:
 
         def _drop_fragment_registration_state(self, query_id: str) -> None: ...
+
+    @staticmethod
+    def _rpc_target_is_dead(error: BaseException) -> bool:
+        import ray
+
+        # A task running on a live actor can itself fail with ActorDiedError
+        # from a child actor. Only the RPC target's terminal death proves this
+        # worker incarnation cannot issue any more storage side effects.
+        return isinstance(error, ray.exceptions.ActorDiedError) and not isinstance(error, ray.exceptions.RayTaskError)
+
+    def _drop_dead_actor_query(self, query_id: str) -> None:
+        close_fte_registry_for_query(query_id)
+        with self._fte_control_lock:
+            self._fte_drop_incomplete_queries.add(query_id)
+        # The remote process is gone, but local submissions/observers must
+        # still join before their registry or capacity can be released.
+        quiesce_fte_registry_for_query(query_id)
+        try:
+            self.close_and_flush_fte_controls(query_id, rpc_target_dead=True)
+        except (FteControlBarrierPendingError, FteControlBarrierTerminalError):
+            # Completed failures are now recorded for final cleanup. The
+            # target's death also permits releasing its unresolved controls.
+            pass
+        with self._fte_control_lock:
+            for task_key, owner_query_id in list(self._fte_control_query_by_task.items()):
+                if owner_query_id == query_id:
+                    self._fte_control_tails_by_task.pop(task_key, None)
+                    self._fte_control_query_by_task.pop(task_key, None)
+                    self._fte_control_operation_by_task.pop(task_key, None)
+        self._drop_fragment_registration_state(query_id)
+        _drop_fragment_plan_refs_for_query(query_id)
+        _drop_fte_registry_for_query(query_id)
+        # Keep recorded control failures until fte_cleanup_query reports them
+        # after final cleanup, even when the worker is already dead.
+        with self._fte_control_lock:
+            self._fte_drop_incomplete_queries.discard(query_id)
+            self._fragment_drop_incomplete_queries.discard(query_id)
 
     @staticmethod
     def _validated_fte_add_splits_status(
@@ -587,10 +629,30 @@ class FteWorkerTaskControlMixin:
             assert last_error is not None
             raise last_error
 
+        cancellation: asyncio.Future[Any] | None = None
+
+        async def cancel_wait() -> None:
+            nonlocal cancellation
+            if cancellation is None:
+                cancellation = asyncio.get_running_loop().run_in_executor(
+                    _FTE_CANCEL_EXECUTOR, self._cancel_fte_control_ref, ref, None
+                )
+            interrupted = False
+            while not cancellation.done():
+                try:
+                    await asyncio.shield(cancellation)
+                except asyncio.CancelledError:
+                    # Keep the single cancellation action owned until it has
+                    # really settled, including repeated caller cancellation.
+                    interrupted = True
+            cancellation.result()
+            if interrupted:
+                raise asyncio.CancelledError
+
         try:
             resolved_timeout_s = configured_ray_get_timeout_s(client_timeout_s)
         except BaseException:
-            self._cancel_fte_control_ref(ref, None)
+            await cancel_wait()
             raise
 
         ref_waiter = asyncio.ensure_future(ref)
@@ -604,47 +666,28 @@ class FteWorkerTaskControlMixin:
                     timeout=resolved_timeout_s,
                 )
                 if not done:
-                    self._cancel_fte_control_ref(ref, None)
+                    await cancel_wait()
                     ref_waiter.cancel()
                     configured_ray_get_timeout_s(None)
                     raise TimeoutError(f"fte_wait_task_status did not complete within {resolved_timeout_s:.3f}s")
                 raw_status = ref_waiter.result()
         except asyncio.CancelledError:
-            self._cancel_fte_control_ref(ref, None)
+            await cancel_wait()
             ref_waiter.cancel()
             raise
         except BaseException as exc:
             restored_error = restore_remote_ray_exception(exc)
             if restored_error is None:
                 raise
+        finally:
+            if not ref_waiter.done():
+                ref_waiter.cancel()
+            await asyncio.gather(ref_waiter, return_exceptions=True)
         if restored_error is not None:
             # Raise outside the handler so Python does not replace a restored
             # remote exception context with the local RayTaskError.
             raise restored_error
 
-        if not isinstance(raw_status, dict):
-            raise TypeError("worker actor fte_wait_task_status must return a dict")
-        return dict(raw_status)
-
-    def fte_wait_task_status_interruptible(
-        self,
-        task_id: str | dict[str, Any],
-        min_version: int | None,
-        timeout_s: float | None,
-        stop_event: Any,
-    ) -> dict[str, Any]:
-        server_timeout_s = None if timeout_s is None else max(0.0, float(timeout_s))
-        client_timeout_s = None
-        if server_timeout_s is not None:
-            client_timeout_s = max(30.0, server_timeout_s + 5.0)
-        raw_status = self._fte_control_rpc(
-            "fte_wait_task_status",
-            task_id,
-            min_version,
-            server_timeout_s,
-            timeout_s=client_timeout_s,
-            cancel_event=stop_event,
-        )
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_wait_task_status must return a dict")
         return dict(raw_status)
@@ -704,7 +747,7 @@ class FteWorkerTaskControlMixin:
     def enqueue_fte_release_task_result(self, task_id: str | dict[str, Any]) -> Any:
         return self._enqueue_ordered_fte_control_ref("fte_release_task_result", task_id)
 
-    def close_and_flush_fte_controls(self, query_id: str) -> list[dict[str, Any]]:
+    def close_and_flush_fte_controls(self, query_id: str, *, rpc_target_dead: bool = False) -> list[dict[str, Any]]:
         query_key = str(query_id or "").strip()
         if not query_key:
             return []
@@ -724,17 +767,20 @@ class FteWorkerTaskControlMixin:
 
         raw_statuses: list[Any] | None = None
         barrier_resolution_error: BaseException | None = None
-        try:
-            resolved = resolve_object_refs_blocking(
-                [ref for _, ref, _ in pending],
-                timeout=_fte_control_rpc_timeout_s(),
-                honor_query_deadline=False,
-            )
-            if not isinstance(resolved, list) or len(resolved) != len(pending):
-                raise TypeError("FTE result-control barrier must return one status per task")
-            raw_statuses = resolved
-        except BaseException as exc:
-            barrier_resolution_error = exc
+        if rpc_target_dead:
+            import ray
+        else:
+            try:
+                resolved = resolve_object_refs_blocking(
+                    [ref for _, ref, _ in pending],
+                    timeout=_fte_control_rpc_timeout_s(),
+                    honor_query_deadline=False,
+                )
+                if not isinstance(resolved, list) or len(resolved) != len(pending):
+                    raise TypeError("FTE result-control barrier must return one status per task")
+                raw_statuses = resolved
+            except BaseException as exc:
+                barrier_resolution_error = exc
 
         status_entries: list[tuple[str, Any, dict[str, Any]]] = []
         terminal_entries: list[tuple[str, Any, str]] = []
@@ -747,6 +793,27 @@ class FteWorkerTaskControlMixin:
                 task_key, ref, _ = entry
                 if not self._is_current_ordered_fte_control_ref(task_key, ref):
                     continue
+                if rpc_target_dead and isinstance(ref, ray.ObjectRef):
+                    # A fresh future bridge may still be pending for an already
+                    # completed ObjectRef. Probe the object itself without
+                    # waiting before discarding the dead worker's references.
+                    try:
+                        raw_status = ray.get(ref, timeout=0)
+                    except BaseException as exc:
+                        if isinstance(exc, ray.exceptions.GetTimeoutError) and not isinstance(
+                            exc, ray.exceptions.RayTaskError
+                        ):
+                            pending_entries.append(entry)
+                            continue
+                        terminal_entries.append(entry)
+                        if not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
+                    else:
+                        terminal_entries.append(entry)
+                        resolved_entries.append((entry, raw_status))
+                    continue
                 future_method = getattr(ref, "future", None)
                 if not callable(future_method):
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
@@ -758,7 +825,10 @@ class FteWorkerTaskControlMixin:
                 except BaseException as exc:
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
                         terminal_entries.append(entry)
-                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
+                        if not rpc_target_dead or not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
                     continue
                 try:
                     raw_status = future.result(timeout=0)
@@ -776,13 +846,14 @@ class FteWorkerTaskControlMixin:
                         except BaseException as terminal_exc:
                             if self._is_current_ordered_fte_control_ref(task_key, ref):
                                 terminal_entries.append(entry)
-                                terminal_error_entries.append(
-                                    (
-                                        task_key,
-                                        ref,
-                                        f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}",
+                                if not rpc_target_dead or not self._rpc_target_is_dead(terminal_exc):
+                                    terminal_error_entries.append(
+                                        (
+                                            task_key,
+                                            ref,
+                                            f"task={task_key}: {type(terminal_exc).__name__}: {terminal_exc}",
+                                        )
                                     )
-                                )
                         else:
                             if self._is_current_ordered_fte_control_ref(task_key, ref):
                                 terminal_entries.append(entry)
@@ -793,7 +864,10 @@ class FteWorkerTaskControlMixin:
                 except BaseException as exc:
                     if self._is_current_ordered_fte_control_ref(task_key, ref):
                         terminal_entries.append(entry)
-                        terminal_error_entries.append((task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}"))
+                        if not rpc_target_dead or not self._rpc_target_is_dead(exc):
+                            terminal_error_entries.append(
+                                (task_key, ref, f"task={task_key}: {type(exc).__name__}: {exc}")
+                            )
                     continue
                 if self._is_current_ordered_fte_control_ref(task_key, ref):
                     terminal_entries.append(entry)
@@ -946,6 +1020,9 @@ class FteWorkerTaskControlMixin:
             # still teardown-owned, and a retry can issue another idempotent
             # interrupt before attempting the remote drop again.
             interrupt_error = exc
+        if interrupt_error is not None and self._rpc_target_is_dead(interrupt_error):
+            self._drop_dead_actor_query(query_id)
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
         barrier_error: FteControlBarrierTerminalError | None = None
         barrier_pending_error: BaseException | None = None
         try:
@@ -997,6 +1074,9 @@ class FteWorkerTaskControlMixin:
                 raise TypeError("worker actor fte_prepare_drop_query must return a dict")
             result = {str(key): int(value) for key, value in raw_result.items()}
         except BaseException as exc:
+            if self._rpc_target_is_dead(exc):
+                self._drop_dead_actor_query(query_id)
+                return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
             drop_error = exc
         if drop_error is None:
             try:
@@ -1040,7 +1120,14 @@ class FteWorkerTaskControlMixin:
                 raise TypeError("worker actor fte_cleanup_query must return a dict")
             result = {str(key): int(value) for key, value in raw_result.items()}
         except BaseException as exc:
-            raise RuntimeError(f"FTE query storage cleanup failed for {query_id}: {exc}") from exc
+            if not self._rpc_target_is_dead(exc):
+                raise RuntimeError(f"FTE query storage cleanup failed for {query_id}: {exc}") from exc
+            self._drop_dead_actor_query(query_id)
+            result = {
+                "flight_shuffle_registry_entries_removed": 0,
+                "flight_shuffle_storage_entries_removed": 0,
+                "flight_shuffle_cleanup_errors": 0,
+            }
         with self._fte_control_lock:
             self._fte_drop_incomplete_queries.discard(query_id)
             terminal_error = self._fte_prepare_terminal_errors.pop(query_id, None)

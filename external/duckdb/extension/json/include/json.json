@@ -226,6 +226,31 @@
         "id": 113,
         "name": "reader_column_ids",
         "type": "vector<idx_t>"
+      },
+      {
+        "id": 114,
+        "name": "distributed_worker",
+        "type": "bool"
+      },
+      {
+        "id": 115,
+        "name": "distributed_splits_applied",
+        "type": "bool"
+      },
+      {
+        "id": 116,
+        "name": "distributed_allowed_files",
+        "type": "vector<JSONFileSnapshot>"
+      },
+      {
+        "id": 117,
+        "name": "distributed_split_ids",
+        "type": "vector<string>"
+      },
+      {
+        "id": 118,
+        "name": "distributed_assignment_restricted",
+        "type": "bool"
       }
     ],
     "pointer_type": "none"

@@ -48,6 +48,16 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+      - name: Isolate HOME for the verified artifact cache
+        run: |
+          # The container mounts /github/home from the host runner under a
+          # foreign uid. Vane's verified artifact cache fail-closes on
+          # ancestors it does not own, so point HOME at a fresh euid-owned
+          # directory before any step loads an extension. /tmp is root-owned
+          # with the sticky bit set, which the ownership gate accepts.
+          isolated_home="$(mktemp -d /tmp/media-acceptance-home.XXXXXX)"
+          chmod 700 "$isolated_home"
+          echo "HOME=$isolated_home" >> "$GITHUB_ENV"
       - name: Install acceptance tools
         run: |
           dnf install -y nasm perl-IPC-Cmd zip unzip autoconf automake libtool

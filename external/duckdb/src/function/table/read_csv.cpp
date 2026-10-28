@@ -37,6 +37,7 @@
 
 #include <limits>
 #include <algorithm>
+#include <cmath>
 #include "duckdb/execution/operator/csv_scanner/csv_schema.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_multi_file_info.hpp"
@@ -641,6 +642,26 @@ static bool SupportsCSVByteRangePlanning(const CSVReaderOptions &options, const 
 	       properties.compression == FileCompressionType::UNCOMPRESSED && properties.can_seek && !properties.is_pipe;
 }
 
+static optional_ptr<const CSVReaderOptions> GetCSVRangePlanningOptions(const MultiFileBindData &bind_data,
+                                                                       const ReadCSVData &csv_data,
+                                                                       const CSVFileSnapshot &file,
+                                                                       bool multiple_files) {
+	if (bind_data.file_options.union_by_name) {
+		for (const auto &info : csv_data.column_info) {
+			if (CSVFileSnapshotMatches(info.file, file.ToOpenFileInfo())) {
+				return info.options.options;
+			}
+		}
+		throw InvalidInputException("Missing CSV union reader information for file \"%s\"", file.path);
+	}
+	// Ordinary multi-file auto detection can adapt the dialect and header for each file at reader creation.
+	// A range reader disables sniffing, so only use options already fixed for every assigned file.
+	if (multiple_files && csv_data.options.auto_detect) {
+		return nullptr;
+	}
+	return csv_data.options;
+}
+
 static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunctionDistributedScanPlanningInput &input) {
 	auto &bind_data = GetCSVDistributedBind(input);
 	auto &csv_data = bind_data.bind_data->Cast<ReadCSVData>();
@@ -686,9 +707,16 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 
 	vector<CSVPlanningFileProperties> properties;
 	properties.reserve(files.size());
+	vector<optional_ptr<const CSVReaderOptions>> range_options;
+	range_options.reserve(files.size());
+	long double splittable_bytes = 0;
+	const bool multiple_files =
+	    csv_data.distributed_worker ? csv_data.distributed_source_multiple_files : files.size() > 1;
 	for (idx_t file_idx = 0; file_idx < snapshots.size(); file_idx++) {
+		auto options = GetCSVRangePlanningOptions(bind_data, csv_data, snapshots[file_idx], multiple_files);
+		const auto &inspection_options = options ? *options : csv_data.options;
 		try {
-			properties.push_back(InspectCSVPlanningFile(input, snapshots[file_idx], csv_data.options));
+			properties.push_back(InspectCSVPlanningFile(input, snapshots[file_idx], inspection_options));
 		} catch (const InterruptException &) {
 			throw;
 		} catch (const FatalException &) {
@@ -702,7 +730,7 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 			// stores can reopen an already-bound file only with execution-context
 			// credentials; in that case retain an unknown byte estimate and let the
 			// worker open the exact coordinator-selected OpenFileInfo.
-			properties.push_back({NumericLimits<idx_t>::Maximum(), false, false, csv_data.options.compression});
+			properties.push_back({NumericLimits<idx_t>::Maximum(), false, false, inspection_options.compression});
 		}
 		if (properties.back().is_pipe) {
 			throw InvalidInputException(
@@ -710,44 +738,60 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 			    "source \"%s\"",
 			    snapshots[file_idx].path);
 		}
+		if (!options || properties.back().size == NumericLimits<idx_t>::Maximum() ||
+		    !SupportsCSVByteRangePlanning(*options, properties.back())) {
+			options = nullptr;
+		} else {
+			splittable_bytes += static_cast<long double>(properties.back().size);
+		}
+		range_options.push_back(options);
 	}
 
-	// target_split_count is a scheduling hint. If this reader configuration is
-	// not byte-range safe, retain one explicit whole-file task instead of
-	// turning the requested granularity into a correctness requirement.
-	if (files.size() == 1 && input.target_split_count > 1 && properties[0].size > 0 &&
-	    SupportsCSVByteRangePlanning(csv_data.options, properties[0])) {
-		const auto minimum_range_size = MaxValue<idx_t>(2, CSVIterator::BytesPerThread(csv_data.options));
-		const auto safe_range_count = MaxValue<idx_t>(1, properties[0].size / minimum_range_size);
-		const auto range_count = MinValue<idx_t>(input.target_split_count, safe_range_count);
+	vector<DistributedScanSplit> result;
+	result.reserve(files.size());
+	for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {
+		const auto &property = properties[file_idx];
+		const auto options = range_options[file_idx];
+		const auto file_cardinality = CSVCardinalityEstimate(input.estimated_cardinality, file_idx, files.size());
+		idx_t minimum_range_size = 0;
+		idx_t range_count = 1;
+		if (options && input.target_split_count > 1 && property.size > 0) {
+			minimum_range_size = MaxValue<idx_t>(2, CSVIterator::BytesPerThread(*options));
+			const auto safe_range_count = MaxValue<idx_t>(1, property.size / minimum_range_size);
+			range_count = MinValue<idx_t>(input.target_split_count, safe_range_count);
+			// Share the granularity hint by file size, rather than producing target_split_count ranges per file.
+			// Whole files and rounding may exceed the hint; every input occurrence must still have its own work.
+			const auto proportional_count = std::ceil(static_cast<long double>(property.size) / splittable_bytes *
+			                                          static_cast<long double>(input.target_split_count));
+			if (proportional_count < static_cast<long double>(range_count)) {
+				range_count = MaxValue<idx_t>(1, static_cast<idx_t>(proportional_count));
+			}
+		}
 		if (range_count > 1) {
-			vector<DistributedScanSplit> result;
-			result.reserve(range_count);
-			const auto scan_unit_count = properties[0].size / minimum_range_size;
+			const auto scan_unit_count = property.size / minimum_range_size;
 			const auto units_per_range = scan_unit_count / range_count;
 			const auto extra_units = scan_unit_count % range_count;
 			idx_t range_start = 0;
 			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
 				const auto range_units = units_per_range + (range_idx < extra_units ? 1 : 0);
 				const auto range_end =
-				    range_idx + 1 == range_count ? properties[0].size : range_start + range_units * minimum_range_size;
+				    range_idx + 1 == range_count ? property.size : range_start + range_units * minimum_range_size;
 				DistributedCSVSplitPayload payload;
-				payload.file = snapshots[0];
+				payload.file = snapshots[file_idx];
 				payload.has_range = true;
 				payload.range_start = range_start;
 				payload.range_end = range_end;
 				result.push_back(MakeDistributedCSVSplit(
-				    payload, CSVCardinalityEstimate(input.estimated_cardinality, range_idx, range_count),
+				    payload,
+				    file_cardinality.IsValid()
+				        ? CSVCardinalityEstimate(file_cardinality.GetIndex(), range_idx, range_count)
+				        : optional_idx(),
 				    optional_idx(range_end - range_start)));
 				range_start = range_end;
 			}
-			return result;
+			continue;
 		}
-	}
 
-	vector<DistributedScanSplit> result;
-	result.reserve(files.size());
-	for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {
 		DistributedCSVSplitPayload payload;
 		payload.file = snapshots[file_idx];
 		optional_idx bytes;

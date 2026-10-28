@@ -1,0 +1,1 @@
+{"status":"PASS","runs":[{"label":"sanitize-tests","argv":["ctest","--test-dir","/home/kaka/astrovela_vane-fs/vane_fs/build/payload-presync-20261012T080704Z/updated/sanitize","--output-on-failure"],"returncode":0,"started_epoch":1791792737.687573,"ended_epoch":1791792775.913478}]}

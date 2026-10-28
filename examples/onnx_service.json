@@ -1,0 +1,15 @@
+{
+  "path": "/private/onnx/engine.json",
+  "service_id": "embeddinggemma2-onnx",
+  "family": "onnx",
+  "model": "onnx-community/embeddinggemma-2-ONNX",
+  "dimensions": 768,
+  "options": {
+    "model_path": "/models/embeddinggemma2-onnx",
+    "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dtype": "fp32",
+    "backend": "cpu",
+    "max_length": 2048,
+    "num_threads": 2
+  }
+}

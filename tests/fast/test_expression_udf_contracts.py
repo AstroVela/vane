@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.local_admission_helpers import linear_metadata
+
 
 @pytest.fixture
 def sql_udf_contract_connection():
@@ -57,6 +59,90 @@ def sql_udf_contract_connection():
         yield con
     finally:
         con.close()
+
+
+@pytest.fixture
+def recorded_local_actor_pools(monkeypatch):
+    from vane.execution import udf_subprocess
+
+    original = udf_subprocess.LocalSubprocessActorPool
+    pools = []
+
+    def create_pool(*args, **kwargs):
+        pool = original(*args, **kwargs)
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", create_pool)
+    try:
+        yield pools
+    finally:
+        for pool in pools:
+            pool.shutdown(kill=True)
+
+
+def _assert_local_actor_pools_released(pools):
+    for pool in pools:
+        assert pool.worker_pids() == []
+        assert not pool.cleanup_pending()
+
+
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_prepared_actor_udf_recreates_query_scoped_resources(
+    sql_udf_contract_connection, recorded_local_actor_pools, parameterized
+):
+    con = sql_udf_contract_connection
+    pools = recorded_local_actor_pools
+    argument = "$1::INTEGER" if parameterized else "42"
+    con.execute(f"PREPARE actor_query AS SELECT actor_contract({argument})")
+    assert pools == []
+    for execution_count, value in enumerate((42, 73), start=1):
+        execute = f"EXECUTE actor_query({value})" if parameterized else "EXECUTE actor_query"
+        expected = value if parameterized else 42
+        assert con.execute(execute).fetchall() == [(expected,)]
+        assert len(pools) == execution_count
+        _assert_local_actor_pools_released(pools)
+
+
+def test_executemany_actor_udf_recreates_query_scoped_resources(
+    sql_udf_contract_connection, recorded_local_actor_pools
+):
+    con = sql_udf_contract_connection
+    con.executemany("SELECT actor_contract(?::INTEGER)", [[42], [73]])
+    assert con.fetchall() == [(73,)]
+    assert len(recorded_local_actor_pools) == 2
+    _assert_local_actor_pools_released(recorded_local_actor_pools)
+
+
+def test_prepared_actor_udf_releases_failed_query_and_can_execute_again(
+    sql_udf_contract_connection, recorded_local_actor_pools
+):
+    import vane
+
+    @vane.cls(actor_number=1, return_dtype="INTEGER", name="recoverable_actor_contract")
+    class RecoverableActorContract:
+        def __call__(self, value):
+            if value < 0:
+                raise ValueError("actor contract rejects negative values")
+            return value
+
+    con = sql_udf_contract_connection
+    vane.attach_function(
+        RecoverableActorContract(),
+        alias="recoverable_actor_contract",
+        connection=con,
+        parameters=["INTEGER"],
+    )
+    con.execute("PREPARE actor_query AS SELECT recoverable_actor_contract($1::INTEGER)")
+    assert recorded_local_actor_pools == []
+    for execution_count, value in enumerate((42, -1, 73), start=1):
+        if value < 0:
+            with pytest.raises(Exception, match="actor contract rejects negative values"):
+                con.execute(f"EXECUTE actor_query({value})").fetchall()
+        else:
+            assert con.execute(f"EXECUTE actor_query({value})").fetchall() == [(value,)]
+        assert len(recorded_local_actor_pools) == execution_count
+        _assert_local_actor_pools_released(recorded_local_actor_pools)
 
 
 @pytest.mark.parametrize(
@@ -321,9 +407,12 @@ def test_actor_gpu_reservation_follows_resolved_backend(
         monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", FakeLocalPool)
         pools, _ = udf_subprocess.ensure_local_subprocess_actor_pools_for_nodes(
             nodes,
+            resource_graph=linear_metadata(nodes),
             plan_identity=f"gpu-order-{decorator_runner}-{resolved_runner}",
         )
-        assert len(pools) == 1
+        assert sum(isinstance(owner, FakeLocalPool) for owner in pools) == 1
+        for owner in reversed(pools):
+            owner.shutdown()
         assert len(created) == 1
         assert created[0][0] == payload
         return

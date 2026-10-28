@@ -4,101 +4,36 @@
 //
 // Modified by Vane contributors.
 
-#include "duckdb/execution/distributed/client_state.hpp"
-#include "vane_python/query_parameters.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
-#include "duckdb/main/relation/write_file_relation.hpp"
-#include "duckdb/parser/statement/copy_statement.hpp"
-#include "vane_python/audio_file_functions.hpp"
-#include "vane_python/image_file_functions.hpp"
-#include "vane_python/image_functions.hpp"
-#include "vane_python/video_file_functions.hpp"
 #include "datasource_function.hpp"
-#include "vane_python/ai_sql_functions.hpp"
-#include "vane_python/pybind11/gil_wrapper.hpp"
-#include "vane_python/python_udf_actor_resources.hpp"
-
-#include "duckdb/catalog/default/default_types.hpp"
+#include "vane_python/vllm_executor.hpp"
+#include "vane_python/udf_executor.hpp"
+#include "duckdb/execution/execution_runtime.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/common/arrow/arrow.hpp"
-#include "duckdb/common/enums/file_compression_type.hpp"
-#include "duckdb/common/enums/profiler_format.hpp"
 #include "duckdb/common/printer.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types.hpp"
-#include "duckdb/common/types/hash.hpp"
-#include "duckdb/common/types/vector.hpp"
-#include "duckdb/function/table/read_csv.hpp"
+#include "duckdb/execution/distributed/client_state.hpp"
+#include "duckdb/function/scalar/vllm_functions.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/db_instance_cache.hpp"
 #include "duckdb/main/extension_helper.hpp"
-#include "duckdb/main/prepared_statement.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
-#include "duckdb/main/relation/read_csv_relation.hpp"
-#include "duckdb/main/relation/read_json_relation.hpp"
-#include "duckdb/main/relation/value_relation.hpp"
-#include "duckdb/main/relation/view_relation.hpp"
-#include "duckdb/planner/operator/logical_data_sink.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/explain_statement.hpp"
-#include "duckdb/parser/statement/select_statement.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "vane_python/arrow/arrow_array_stream.hpp"
-#include "vane_python/pandas/pandas_scan.hpp"
-#include "vane_python/python_udf_utils.hpp"
-#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
-#include "duckdb/function/scalar/udf_functions.hpp"
-#include "duckdb/main/config.hpp"
-#include "vane_python/pyrelation.hpp"
-#include "vane_python/bound_plan.hpp"
-#include "vane_python/pystatement.hpp"
-#include "vane_python/pyresult.hpp"
-#include "vane_python/python_conversion.hpp"
-#include "vane_python/numpy/numpy_type.hpp"
-#include "duckdb/main/prepared_statement.hpp"
-#include "vane_python/jupyter_progress_bar_display.hpp"
-#include "vane_python/pyfilesystem.hpp"
-#include "duckdb/main/client_config.hpp"
-#include "duckdb/function/table/read_csv.hpp"
-#include "duckdb/common/enums/file_compression_type.hpp"
-#include "duckdb/catalog/default/default_types.hpp"
-#include "duckdb/main/relation/value_relation.hpp"
-#include "vane_python/filesystem_object.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/function/scalar/vllm_functions.hpp"
-#include "vane_python/pandas/pandas_scan.hpp"
-#include "vane_python/python_objects.hpp"
-#include "duckdb/function/function.hpp"
-#include "vane_python/pybind11/conversions/exception_handling_enum.hpp"
-#include "duckdb/parser/parsed_data/drop_info.hpp"
-#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
-#include "duckdb/main/pending_query_result.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
-#include "vane_python/python_replacement_scan.hpp"
-#include "duckdb/common/shared_ptr.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/main/stream_query_result.hpp"
-#include "duckdb/main/relation/materialized_relation.hpp"
-#include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/statement/load_statement.hpp"
-#include "vane_python/expression/pyexpression.hpp"
-
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <random>
-#include <sstream>
-
-#include "duckdb/common/printer.hpp"
+#include "duckdb/planner/operator/logical_data_sink.hpp"
+#include "vane_python/ai_sql_functions.hpp"
+#include "vane_python/audio_file_functions.hpp"
+#include "vane_python/image_file_functions.hpp"
+#include "vane_python/image_functions.hpp"
+#include "vane_python/jupyter_progress_bar_display.hpp"
+#include "vane_python/pandas/pandas_scan.hpp"
+#include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/python_input_callback.hpp"
+#include "vane_python/python_replacement_scan.hpp"
+#include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/video_file_functions.hpp"
 
 namespace duckdb {
 
@@ -107,477 +42,6 @@ DBInstanceCache instance_cache;                                                 
 shared_ptr<PythonImportCache> DuckDBPyConnection::import_cache = nullptr;              // NOLINT: allow global
 PythonEnvironmentType DuckDBPyConnection::environment = PythonEnvironmentType::NORMAL; // NOLINT: allow global
 std::string DuckDBPyConnection::formatted_python_version = "";
-
-namespace {
-
-static string PicklePythonUDFCallable(const py::function &udf) {
-	auto pickle_module = py::module_::import("vane.pickle");
-	auto dumps = pickle_module.attr("dumps");
-	bool annotations_rewritten = false;
-	py::object original_annotations;
-	if (py::hasattr(udf, "__annotations__") && py::isinstance<py::dict>(udf.attr("__annotations__"))) {
-		original_annotations = py::reinterpret_borrow<py::object>(udf.attr("__annotations__"));
-		py::dict sanitized_annotations;
-		for (auto item : py::reinterpret_borrow<py::dict>(original_annotations)) {
-			shared_ptr<DuckDBPyType> pytype;
-			// A None annotation (e.g. `-> None`) casts to a null shared_ptr; keep it verbatim
-			// instead of dereferencing it below.
-			if (py::try_cast<shared_ptr<DuckDBPyType>>(item.second, pytype) && pytype) {
-				sanitized_annotations[item.first] = py::str(pytype->ToString());
-				annotations_rewritten = true;
-			} else {
-				sanitized_annotations[item.first] = py::reinterpret_borrow<py::object>(item.second);
-			}
-		}
-		if (annotations_rewritten) {
-			udf.attr("__annotations__") = std::move(sanitized_annotations);
-		}
-	}
-	py::object pickled_obj;
-	try {
-		pickled_obj = dumps(udf);
-	} catch (...) {
-		if (annotations_rewritten) {
-			udf.attr("__annotations__") = original_annotations;
-		}
-		throw;
-	}
-	if (annotations_rewritten) {
-		udf.attr("__annotations__") = original_annotations;
-	}
-	auto pickled_bytes = py::reinterpret_borrow<py::bytes>(pickled_obj);
-	return py::cast<string>(pickled_bytes);
-}
-
-static bool IsPythonClassCallable(const py::object &fun) {
-	auto inspect_module = py::module_::import("inspect");
-	return py::cast<bool>(inspect_module.attr("isclass")(fun));
-}
-
-static string ResolveDefaultUDFExecutionBackend(const py::object &fun, const string &runner_type) {
-	const bool use_actor = IsPythonClassCallable(fun);
-	return ExpressionUDFExecutionBackendForRunner(runner_type, use_actor);
-}
-
-static string HashToHex(hash_t value) {
-	std::ostringstream buffer;
-	buffer << std::hex << static_cast<uint64_t>(value);
-	return buffer.str();
-}
-
-static void CombineDigest(hash_t &digest, const string &value) {
-	digest = CombineHash(digest, Hash(value.c_str(), value.size()));
-}
-
-static void CombineDigest(hash_t &digest, bool value) {
-	digest = CombineHash(digest, Hash(static_cast<uint64_t>(value ? 1 : 0)));
-}
-
-static void CombineDigest(hash_t &digest, idx_t value) {
-	digest = CombineHash(digest, Hash(static_cast<uint64_t>(value)));
-}
-
-static void CombineDigest(hash_t &digest, int32_t value) {
-	digest = CombineHash(digest, Hash(static_cast<int64_t>(value)));
-}
-
-static void CombineDigest(hash_t &digest, double value) {
-	digest = CombineHash(digest, Hash(value));
-}
-
-static bool GetStructValueField(const Value &payload, const string &name, Value &result) {
-	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
-		return false;
-	}
-	auto &children = StructValue::GetChildren(payload);
-	auto child_count = StructType::GetChildCount(payload.type());
-	for (idx_t i = 0; i < child_count; i++) {
-		if (StructType::GetChildName(payload.type(), i) != name) {
-			continue;
-		}
-		if (i >= children.size() || children[i].IsNull()) {
-			return false;
-		}
-		result = children[i];
-		return true;
-	}
-	return false;
-}
-
-static std::pair<bool, string> GetStructStringField(const Value &payload, const string &name) {
-	Value child;
-	if (!GetStructValueField(payload, name, child)) {
-		return std::make_pair(false, string());
-	}
-	if (child.type().id() == LogicalTypeId::VARCHAR) {
-		return std::make_pair(true, StringValue::Get(child));
-	}
-	return std::make_pair(true, child.ToString());
-}
-
-static bool GetStructShapeField(const Value &payload, const string &name, vector<idx_t> &shape) {
-	Value child;
-	if (!GetStructValueField(payload, name, child)) {
-		return false;
-	}
-	if (child.IsNull() || child.type().id() != LogicalTypeId::LIST) {
-		throw InvalidInputException("python_udf output_schema tensor field '%s' must be a LIST<BIGINT>", name);
-	}
-	shape.clear();
-	auto &children = ListValue::GetChildren(child);
-	shape.reserve(children.size());
-	for (auto &entry : children) {
-		auto dim = entry.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-		if (dim <= 0) {
-			throw InvalidInputException("python_udf output_schema tensor shape dimensions must be positive");
-		}
-		shape.push_back(NumericCast<idx_t>(dim));
-	}
-	if (shape.empty()) {
-		throw InvalidInputException("python_udf output_schema tensor shape must be non-empty");
-	}
-	return true;
-}
-
-static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &output_names,
-                                        vector<LogicalType> &output_types) {
-	Value output_schema;
-	if (!GetStructValueField(payload, "output_schema", output_schema)) {
-		return false;
-	}
-	auto &entries = ListValue::GetChildren(output_schema);
-	vector<LogicalType> contract_types;
-	Value output_contracts;
-	if (GetStructValueField(payload, "output_contract_types", output_contracts)) {
-		if (output_contracts.type().id() != LogicalTypeId::LIST) {
-			throw InvalidInputException("python_udf output_contract_types must be a LIST<VARCHAR>");
-		}
-		auto &contracts = ListValue::GetChildren(output_contracts);
-		if (contracts.size() != entries.size()) {
-			throw InvalidInputException("python_udf output contract count does not match output_schema");
-		}
-		contract_types.reserve(contracts.size());
-		for (auto &contract : contracts) {
-			if (contract.IsNull() || contract.type().id() != LogicalTypeId::VARCHAR) {
-				throw InvalidInputException("python_udf output_contract_types must contain VARCHAR values");
-			}
-			contract_types.push_back(DBConfig::ParseLogicalType(StringValue::Get(contract)));
-		}
-	}
-	output_names.clear();
-	output_types.clear();
-	output_names.reserve(entries.size());
-	output_types.reserve(entries.size());
-	for (idx_t index = 0; index < entries.size(); index++) {
-		auto &entry = entries[index];
-		if (entry.IsNull() || entry.type().id() != LogicalTypeId::STRUCT) {
-			throw InvalidInputException("python_udf output_schema entries must be STRUCT values");
-		}
-		auto entry_name = GetStructStringField(entry, "name");
-		if (!entry_name.first || entry_name.second.empty()) {
-			throw InvalidInputException("python_udf output_schema entry is missing name");
-		}
-		auto entry_kind = GetStructStringField(entry, "kind");
-		if (!entry_kind.first || entry_kind.second.empty() || StringUtil::CIEquals(entry_kind.second, "duckdb_type")) {
-			auto entry_type = GetStructStringField(entry, "type");
-			if (!entry_type.first || entry_type.second.empty()) {
-				throw InvalidInputException("python_udf output_schema duckdb_type entry is missing type");
-			}
-			output_names.push_back(entry_name.second);
-			output_types.push_back(contract_types.empty() ? DBConfig::ParseLogicalType(entry_type.second)
-			                                              : contract_types[index]);
-			continue;
-		}
-		if (StringUtil::CIEquals(entry_kind.second, "tensor")) {
-			auto entry_dtype = GetStructStringField(entry, "dtype");
-			if (!entry_dtype.first || entry_dtype.second.empty()) {
-				throw InvalidInputException("python_udf output_schema tensor entry is missing dtype");
-			}
-			vector<idx_t> shape;
-			if (!GetStructShapeField(entry, "shape", shape)) {
-				throw InvalidInputException("python_udf output_schema tensor entry is missing shape");
-			}
-			output_names.push_back(entry_name.second);
-			output_types.push_back(contract_types.empty()
-			                           ? TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape)
-			                           : contract_types[index]);
-			continue;
-		}
-		throw InvalidInputException("Unsupported python_udf output_schema kind '%s'", entry_kind.second);
-	}
-	return true;
-}
-
-static string GetRegistrationDigest(const py::dict &spec) {
-	auto digest_obj = spec[py::str("digest")];
-	return py::cast<string>(digest_obj);
-}
-
-static py::dict BuildDistributedScalarUDFRegistration(const string &name, const py::function &udf,
-                                                      const vector<LogicalType> &parameter_types,
-                                                      const LogicalType &return_type, PythonUDFType type,
-                                                      FunctionNullHandling null_handling,
-                                                      PythonExceptionHandling exception_handling, bool side_effects) {
-	auto function_pickle = PicklePythonUDFCallable(udf);
-
-	py::list parameters;
-	for (auto &entry : parameter_types) {
-		parameters.append(py::str(entry.ToString()));
-	}
-
-	hash_t digest = Hash("scalar", 6);
-	CombineDigest(digest, name);
-	CombineDigest(digest, function_pickle);
-	for (auto &entry : parameter_types) {
-		CombineDigest(digest, entry.ToString());
-	}
-	CombineDigest(digest, return_type.ToString());
-	CombineDigest(digest, static_cast<int32_t>(type));
-	CombineDigest(digest, static_cast<int32_t>(null_handling));
-	CombineDigest(digest, static_cast<int32_t>(exception_handling));
-	CombineDigest(digest, side_effects);
-
-	py::dict spec;
-	spec[py::str("kind")] = py::str("scalar");
-	spec[py::str("name")] = py::str(name);
-	spec[py::str("digest")] = py::str(HashToHex(digest));
-	spec[py::str("function_pickle")] = py::bytes(function_pickle);
-	spec[py::str("parameters")] = std::move(parameters);
-	spec[py::str("return_type")] = py::str(return_type.ToString());
-	spec[py::str("udf_type")] = py::str(type == PythonUDFType::ARROW ? "arrow" : "native");
-	spec[py::str("null_handling")] = py::int_(static_cast<int32_t>(null_handling));
-	spec[py::str("exception_handling")] = py::int_(static_cast<int32_t>(exception_handling));
-	spec[py::str("side_effects")] = py::bool_(side_effects);
-	return spec;
-}
-
-static py::dict BuildDistributedTableUDFRegistration(const string &name, const py::function &udf,
-                                                     const vector<string> &output_names,
-                                                     const vector<LogicalType> &output_types,
-                                                     const Optional<py::object> &batch_size) {
-	auto function_pickle = PicklePythonUDFCallable(udf);
-
-	py::dict schema;
-	for (idx_t i = 0; i < output_names.size(); i++) {
-		schema[py::str(output_names[i])] = py::str(output_types[i].ToString());
-	}
-
-	py::object batch_size_obj = batch_size.is_none() ? py::none() : py::reinterpret_borrow<py::object>(batch_size);
-
-	hash_t digest = Hash("table", 5);
-	CombineDigest(digest, name);
-	CombineDigest(digest, function_pickle);
-	for (idx_t i = 0; i < output_names.size(); i++) {
-		CombineDigest(digest, output_names[i]);
-		CombineDigest(digest, output_types[i].ToString());
-	}
-	CombineDigest(digest, !batch_size_obj.is_none());
-	if (!batch_size_obj.is_none()) {
-		CombineDigest(digest, static_cast<idx_t>(py::cast<int64_t>(batch_size_obj)));
-	}
-
-	py::dict spec;
-	spec[py::str("kind")] = py::str("table");
-	spec[py::str("name")] = py::str(name);
-	spec[py::str("digest")] = py::str(HashToHex(digest));
-	spec[py::str("function_pickle")] = py::bytes(function_pickle);
-	spec[py::str("schema")] = std::move(schema);
-	spec[py::str("batch_size")] = batch_size_obj;
-	return spec;
-}
-
-static Value UpsertStructStringField(const Value &payload, const string &field_name, const string &field_value) {
-	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
-		return payload;
-	}
-	auto &existing_children = StructValue::GetChildren(payload);
-	auto &existing_type = payload.type();
-	child_list_t<Value> new_children;
-	bool found = false;
-	for (idx_t i = 0; i < StructType::GetChildCount(existing_type); i++) {
-		auto child_name = StructType::GetChildName(existing_type, i);
-		if (child_name == field_name) {
-			new_children.emplace_back(child_name, Value(field_value));
-			found = true;
-		} else {
-			new_children.emplace_back(child_name, existing_children[i]);
-		}
-	}
-	if (!found) {
-		new_children.emplace_back(field_name, Value(field_value));
-	}
-	return Value::STRUCT(std::move(new_children));
-}
-
-static vector<LogicalType> ParseVaneSQLParameters(const py::object &parameters, const string &required_message) {
-	if (parameters.is_none()) {
-		throw InvalidInputException(required_message);
-	}
-	if (!py::isinstance<py::list>(parameters) && !py::isinstance<py::tuple>(parameters)) {
-		throw InvalidInputException("parameters must be a list or tuple of DuckDB types");
-	}
-	auto params = py::list(parameters);
-	vector<LogicalType> result;
-	result.reserve(params.size());
-	for (auto &param : params) {
-		auto type = py::cast<shared_ptr<DuckDBPyType>>(param);
-		result.push_back(type->Type());
-	}
-	return result;
-}
-
-static vector<string> ParseVaneSQLInputNames(const py::object &input_names) {
-	if (!py::isinstance<py::list>(input_names) && !py::isinstance<py::tuple>(input_names)) {
-		throw InvalidInputException("input_names must be a non-empty list or tuple");
-	}
-	auto names = py::list(input_names);
-	if (names.empty()) {
-		throw InvalidInputException("input_names must be a non-empty list or tuple");
-	}
-	vector<string> result;
-	result.reserve(names.size());
-	for (auto &name_obj : names) {
-		if (!py::isinstance<py::str>(name_obj)) {
-			throw InvalidInputException("input_names must contain only strings");
-		}
-		auto name = py::cast<string>(name_obj);
-		if (name.empty()) {
-			throw InvalidInputException("input_names must contain only non-empty strings");
-		}
-		for (auto &existing_name : result) {
-			if (StringUtil::CIEquals(existing_name, name)) {
-				throw InvalidInputException("input_names must be unique (case-insensitive); duplicate name: '%s'",
-				                            name);
-			}
-		}
-		result.push_back(std::move(name));
-	}
-	return result;
-}
-
-static void ValidateVaneSQLSingleOutputSchema(const py::object &schema) {
-	if (schema.is_none()) {
-		throw InvalidInputException("schema is required for batch SQL registration");
-	}
-	if (!py::isinstance<py::dict>(schema)) {
-		throw InvalidInputException("'schema' should be given as a Dict[str, DuckDBType]");
-	}
-	auto schema_dict = py::reinterpret_borrow<py::dict>(schema);
-	if (schema_dict.size() != 1) {
-		throw InvalidInputException("map_batches expression requires exactly one output column");
-	}
-}
-
-static unique_ptr<FunctionData> RegisteredVaneUDFBind(ClientContext &, ScalarFunction &bound_function,
-                                                      vector<unique_ptr<Expression>> &) {
-	if (!bound_function.function_info) {
-		throw BinderException("vane SQL UDF is missing registered payload metadata");
-	}
-	auto info = dynamic_cast<RegisteredUDFFunctionInfo *>(bound_function.function_info.get());
-	if (!info) {
-		throw BinderException("vane SQL UDF has invalid registered payload metadata");
-	}
-	if (info->payload.IsNull()) {
-		throw BinderException("vane SQL UDF payload cannot be NULL");
-	}
-	auto payload = info->payload;
-	auto return_type = udf_helpers::ResolvePayloadReturnType(payload);
-	bound_function.SetReturnType(return_type);
-	return make_uniq<UDFFunctionData>(std::move(payload), std::move(return_type));
-}
-
-static void RegisteredVaneUDFExecute(DataChunk &, ExpressionState &, Vector &) {
-	throw InvalidInputException("vane SQL UDF can only be used in a projection");
-}
-
-static bool InjectVaneCatalogRegistrationFailureForTesting(const string &name) {
-	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
-	if (!test_hooks || string(test_hooks) != "1") {
-		return false;
-	}
-	const char *target_alias = std::getenv("VANE_TEST_FAIL_UDF_CATALOG_REGISTRATION");
-	return target_alias && name == string(target_alias);
-}
-
-static void RegisterVaneScalarFunctionAtomically(
-    ClientContext &context, case_insensitive_map_t<unique_ptr<ExternalDependency>> &registered_functions,
-    ScalarFunction scalar_function, unique_ptr<ExternalDependency> new_dependency, bool replace) {
-	auto owned_entry = registered_functions.find(scalar_function.name);
-	const bool owns_existing_alias = owned_entry != registered_functions.end();
-	if (owns_existing_alias && !replace) {
-		throw NotImplementedException("A function by the name of '%s' is already created, creating multiple "
-		                              "functions with the same name is not supported yet; pass replace=True",
-		                              scalar_function.name);
-	}
-
-	CreateScalarFunctionInfo info(std::move(scalar_function));
-	const auto name = info.name;
-	bool dependency_swapped = false;
-	bool dependency_inserted = false;
-	try {
-		context.RunFunctionInTransaction([&]() {
-			auto catalog_entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
-			                                                                   name, OnEntryNotFound::RETURN_NULL);
-			if (!owns_existing_alias) {
-				if (replace && catalog_entry) {
-					throw InvalidInputException("Cannot replace function '%s': the catalog entry is not a Vane alias "
-					                            "owned by this connection (it may be builtin or registered elsewhere)",
-					                            name);
-				}
-			} else {
-				if (!catalog_entry) {
-					throw InvalidInputException("Cannot replace owned Vane alias '%s': its catalog entry is missing",
-					                            name);
-				}
-				if (catalog_entry->functions.functions.size() != 1 || info.functions.functions.size() != 1) {
-					throw InvalidInputException("Cannot replace owned Vane alias '%s': expected exactly one overload",
-					                            name);
-				}
-				auto &existing_function = catalog_entry->functions.functions.front();
-				if (!dynamic_cast<RegisteredUDFFunctionInfo *>(existing_function.function_info.get())) {
-					throw InvalidInputException(
-					    "Cannot replace function '%s': the existing entry is not a registered Vane "
-					    "SQL alias owned by this connection",
-					    name);
-				}
-				if (!info.functions.functions.front().Equal(existing_function)) {
-					throw InvalidInputException("Cannot replace owned Vane alias '%s' with a different SQL signature",
-					                            name);
-				}
-				info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-			}
-
-			auto &catalog = Catalog::GetSystemCatalog(context);
-			catalog.CreateFunction(context, info);
-			if (owns_existing_alias) {
-				std::swap(owned_entry->second, new_dependency);
-				dependency_swapped = true;
-			} else {
-				auto insertion = registered_functions.emplace(name, std::move(new_dependency));
-				if (!insertion.second) {
-					throw InternalException("Failed to record dependency for newly registered Vane alias '%s'", name);
-				}
-				dependency_inserted = true;
-			}
-			if (InjectVaneCatalogRegistrationFailureForTesting(name)) {
-				throw InternalException("injected Vane catalog registration failure after dependency swap for '%s'",
-				                        name);
-			}
-		});
-	} catch (...) {
-		// RunFunctionInTransaction commits after its callback. Cover both callback and commit failures so the
-		// Python dependency map always describes the catalog version that survived the transaction.
-		if (dependency_swapped) {
-			std::swap(owned_entry->second, new_dependency);
-		}
-		if (dependency_inserted) {
-			registered_functions.erase(name);
-		}
-		throw;
-	}
-}
-
-} // namespace
 
 DuckDBPyConnection::~DuckDBPyConnection() {
 	if (!PythonIsFinalizing()) {
@@ -595,22 +59,6 @@ DuckDBPyConnection::~DuckDBPyConnection() {
 		con.SetConnection(nullptr);
 	} catch (...) { // NOLINT
 	}
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::CreateRelation(shared_ptr<Relation> rel) {
-	PythonGILWrapper gil;
-	// DuckDBPyRelation owns Python objects, so construction must hold the GIL.
-	auto py_rel = make_uniq<DuckDBPyRelation>(std::move(rel));
-	py_rel->SetConnectionOwner(py::cast(shared_from_this()));
-	return py_rel;
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::CreateRelation(shared_ptr<DuckDBPyResult> result) {
-	PythonGILWrapper gil;
-	// DuckDBPyRelation owns Python objects, so construction must hold the GIL.
-	auto py_rel = make_uniq<DuckDBPyRelation>(std::move(result));
-	py_rel->SetConnectionOwner(py::cast(shared_from_this()));
-	return py_rel;
 }
 
 void DuckDBPyConnection::DetectEnvironment() {
@@ -662,2057 +110,38 @@ std::string DuckDBPyConnection::FormattedPythonVersion() {
 	return DuckDBPyConnection::formatted_python_version;
 }
 
-// NOTE: this function is generated by tools/pythonpkg/scripts/generate_connection_methods.py.
-// Do not edit this function manually, your changes will be overwritten!
-
-static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>> &m) {
-	m.def("cursor", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
-	m.def("register_filesystem", &DuckDBPyConnection::RegisterFilesystem, "Register a fsspec compliant filesystem",
-	      py::arg("filesystem"));
-	m.def("unregister_filesystem", &DuckDBPyConnection::UnregisterFilesystem, "Unregister a filesystem",
-	      py::arg("name"));
-	m.def("list_filesystems", &DuckDBPyConnection::ListFilesystems,
-	      "List registered filesystems, including builtin ones");
-	m.def("filesystem_is_registered", &DuckDBPyConnection::FileSystemIsRegistered,
-	      "Check if a filesystem with the provided name is currently registered", py::arg("name"));
-	m.def("remove_function", &DuckDBPyConnection::UnregisterUDF, "Remove a previously created function",
-	      py::arg("name"));
-	m.def("_create_vane_function", &DuckDBPyConnection::CreateVaneFunctionInternal,
-	      "Internal helper used by vane.attach_function for scalar expression UDF SQL registration", py::arg("name"),
-	      py::arg("function"), py::arg("parameters") = py::none(), py::arg("return_type") = nullptr, py::kw_only(),
-	      py::arg("replace"));
-	m.def("_create_vane_batch_function", &DuckDBPyConnection::CreateVaneBatchFunctionInternal,
-	      "Internal helper used by vane.attach_function for row-preserving batch UDF SQL registration", py::arg("name"),
-	      py::arg("function"), py::arg("input_names"), py::arg("schema"), py::arg("parameters") = py::none(),
-	      py::kw_only(), py::arg("batch_size") = py::none(), py::arg("gpus") = py::none(),
-	      py::arg("actor_number") = py::none(), py::arg("row_preserving"), py::arg("replace"));
-	m.def("sqltype", &DuckDBPyConnection::Type, "Create a type object by parsing the 'type_str' string",
-	      py::arg("type_str"));
-	m.def("dtype", &DuckDBPyConnection::Type, "Create a type object by parsing the 'type_str' string",
-	      py::arg("type_str"));
-	m.def("type", &DuckDBPyConnection::Type, "Create a type object by parsing the 'type_str' string",
-	      py::arg("type_str"));
-	m.def("array_type", &DuckDBPyConnection::ArrayType, "Create an array type object of 'type'",
-	      py::arg("type").none(false), py::arg("size"));
-	m.def("list_type", &DuckDBPyConnection::ListType, "Create a list type object of 'type'",
-	      py::arg("type").none(false));
-	m.def("tensor_type", &DuckDBPyConnection::TensorType, "Create a Tensor type; None shape dimensions vary by row",
-	      py::arg("type").none(false), py::arg("shape").none(false));
-	m.def("union_type", &DuckDBPyConnection::UnionType, "Create a union type object from 'members'",
-	      py::arg("members").none(false));
-	m.def("string_type", &DuckDBPyConnection::StringType, "Create a string type with an optional collation",
-	      py::arg("collation") = "");
-	m.def("enum_type", &DuckDBPyConnection::EnumType,
-	      "Create an enum type of underlying 'type', consisting of the list of 'values'", py::arg("name"),
-	      py::arg("type"), py::arg("values"));
-	m.def("decimal_type", &DuckDBPyConnection::DecimalType, "Create a decimal type with 'width' and 'scale'",
-	      py::arg("width"), py::arg("scale"));
-	m.def("struct_type", &DuckDBPyConnection::StructType, "Create a struct type object from 'fields'",
-	      py::arg("fields"));
-	m.def("row_type", &DuckDBPyConnection::StructType, "Create a struct type object from 'fields'", py::arg("fields"));
-	m.def("map_type", &DuckDBPyConnection::MapType, "Create a map type object from 'key_type' and 'value_type'",
-	      py::arg("key").none(false), py::arg("value").none(false));
-	m.def("duplicate", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
-	m.def("execute", &DuckDBPyConnection::Execute,
-	      "Execute SQL with optional parameters. Queries and writes share bound-plan dispatch with the runner selected "
-	      "when connecting; "
-	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Connection and catalog operations "
-	      "execute on the "
-	      "client. "
-	      "Distributed execution requires auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::arg("parameters") = py::none());
-	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
-	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
-	      py::arg("query"), py::arg("parameters") = py::none());
-	m.def("close", &DuckDBPyConnection::Close, "Close the connection");
-	m.def("interrupt", &DuckDBPyConnection::Interrupt, "Interrupt pending operations");
-	m.def("query_progress", &DuckDBPyConnection::QueryProgress, "Query progress of pending operation");
-	m.def("fetchone", &DuckDBPyConnection::FetchOne, "Fetch a single row from a result following execute");
-	m.def("fetchmany", &DuckDBPyConnection::FetchMany, "Fetch the next set of rows from a result following execute",
-	      py::arg("size") = 1);
-	m.def("fetchall", &DuckDBPyConnection::FetchAll, "Fetch all rows from a result following execute");
-	m.def("fetchnumpy", &DuckDBPyConnection::FetchNumpy, "Fetch a result as list of NumPy arrays following execute");
-	m.def("fetchdf", &DuckDBPyConnection::FetchDF, "Fetch a result as DataFrame following execute()", py::kw_only(),
-	      py::arg("date_as_object") = false);
-	m.def("fetch_df", &DuckDBPyConnection::FetchDF, "Fetch a result as DataFrame following execute()", py::kw_only(),
-	      py::arg("date_as_object") = false);
-	m.def("df", &DuckDBPyConnection::FetchDF, "Fetch a result as DataFrame following execute()", py::kw_only(),
-	      py::arg("date_as_object") = false);
-	m.def("fetch_df_chunk", &DuckDBPyConnection::FetchDFChunk,
-	      "Fetch a chunk of the result as DataFrame following execute()", py::arg("vectors_per_chunk") = 1,
-	      py::kw_only(), py::arg("date_as_object") = false);
-	m.def("pl", &DuckDBPyConnection::FetchPolars, "Fetch a result as Polars DataFrame following execute()",
-	      py::arg("rows_per_batch") = 1000000, py::kw_only(), py::arg("lazy") = false);
-	m.def("to_arrow_table", &DuckDBPyConnection::FetchArrow, "Fetch a result as Arrow table following execute()",
-	      py::arg("batch_size") = 1000000);
-	m.def("to_arrow_reader", &DuckDBPyConnection::FetchRecordBatchReader,
-	      "Fetch an Arrow RecordBatchReader following execute()", py::arg("batch_size") = 1000000);
-	m.def(
-	    "fetch_arrow_table",
-	    [](DuckDBPyConnection &self, idx_t rows_per_batch) {
-		    PyErr_WarnEx(PyExc_DeprecationWarning, "fetch_arrow_table() is deprecated, use to_arrow_table() instead.",
-		                 0);
-		    return self.FetchArrow(rows_per_batch);
-	    },
-	    "Fetch a result as Arrow table following execute()", py::arg("rows_per_batch") = 1000000);
-	m.def(
-	    "fetch_record_batch",
-	    [](DuckDBPyConnection &self, idx_t rows_per_batch) {
-		    PyErr_WarnEx(PyExc_DeprecationWarning, "fetch_record_batch() is deprecated, use to_arrow_reader() instead.",
-		                 0);
-		    return self.FetchRecordBatchReader(rows_per_batch);
-	    },
-	    "Fetch an Arrow RecordBatchReader following execute()", py::arg("rows_per_batch") = 1000000);
-	m.def("arrow", &DuckDBPyConnection::FetchRecordBatchReader,
-	      "Alias of to_arrow_reader(). We recommend using to_arrow_reader() instead.",
-	      py::arg("rows_per_batch") = 1000000);
-	m.def("torch", &DuckDBPyConnection::FetchPyTorch, "Fetch a result as dict of PyTorch Tensors following execute()");
-	m.def("tf", &DuckDBPyConnection::FetchTF, "Fetch a result as dict of TensorFlow Tensors following execute()");
-	m.def("begin", &DuckDBPyConnection::Begin, "Start a new transaction");
-	m.def("commit", &DuckDBPyConnection::Commit, "Commit changes performed within a transaction");
-	m.def("rollback", &DuckDBPyConnection::Rollback, "Roll back changes performed within a transaction");
-	m.def("checkpoint", &DuckDBPyConnection::Checkpoint,
-	      "Synchronizes data in the write-ahead log (WAL) to the database data file (no-op for in-memory connections)");
-	m.def("append", &DuckDBPyConnection::Append, "Append the passed DataFrame to the named table",
-	      py::arg("table_name"), py::arg("df"), py::kw_only(), py::arg("by_name") = false);
-	m.def("register", &DuckDBPyConnection::RegisterPythonObject,
-	      "Register the passed Python Object value for querying with a view", py::arg("view_name"),
-	      py::arg("python_object"));
-	m.def("unregister", &DuckDBPyConnection::UnregisterPythonObject, "Unregister the view name", py::arg("view_name"));
-	m.def("table", &DuckDBPyConnection::Table, "Create a relation object for the named table", py::arg("table_name"));
-	m.def("view", &DuckDBPyConnection::View, "Create a relation object for the named view", py::arg("view_name"));
-	m.def("values", &DuckDBPyConnection::Values, "Create a relation object from the passed values");
-	m.def("table_function", &DuckDBPyConnection::TableFunction,
-	      "Create a relation object from the named table function with given parameters", py::arg("name"),
-	      py::arg("parameters") = py::none());
-	m.def("read_json", &DuckDBPyConnection::ReadJSON, "Create a relation object from the JSON file in 'name'",
-	      py::arg("path_or_buffer"), py::kw_only(), py::arg("columns") = py::none(),
-	      py::arg("sample_size") = py::none(), py::arg("maximum_depth") = py::none(), py::arg("records") = py::none(),
-	      py::arg("format") = py::none(), py::arg("date_format") = py::none(), py::arg("timestamp_format") = py::none(),
-	      py::arg("compression") = py::none(), py::arg("maximum_object_size") = py::none(),
-	      py::arg("ignore_errors") = py::none(), py::arg("convert_strings_to_integers") = py::none(),
-	      py::arg("field_appearance_threshold") = py::none(), py::arg("map_inference_threshold") = py::none(),
-	      py::arg("maximum_sample_files") = py::none(), py::arg("filename") = py::none(),
-	      py::arg("hive_partitioning") = py::none(), py::arg("union_by_name") = py::none(),
-	      py::arg("hive_types") = py::none(), py::arg("hive_types_autocast") = py::none());
-	m.def("extract_statements", &DuckDBPyConnection::ExtractStatements,
-	      "Parse the query string and extract the Statement object(s) produced", py::arg("query"));
-	m.def("sql", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("from_query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
-	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
-	      "local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
-	      py::arg("path_or_buffer"), py::kw_only());
-	m.def("from_csv_auto", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
-	      py::arg("path_or_buffer"), py::kw_only());
-	m.def("from_df", &DuckDBPyConnection::FromDF, "Create a relation object from the DataFrame in df", py::arg("df"));
-	m.def("from_arrow", &DuckDBPyConnection::FromArrow, "Create a relation object from an Arrow object",
-	      py::arg("arrow_object"));
-	m.def("from_datasource", &DuckDBPyConnection::FromDataSource, "Create a relation object from a DataSource",
-	      py::arg("source"));
-	m.def("_read_video_frames", &DuckDBPyConnection::ReadVideoFrames,
-	      "Construct the public video table function without executing it", py::arg("parameters"), py::arg("options"));
-	m.def("from_parquet", &DuckDBPyConnection::FromParquet,
-	      "Create a relation object from the Parquet files in file_glob", py::arg("file_glob"),
-	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
-	      py::arg("filename") = false, py::arg("hive_partitioning") = false, py::arg("union_by_name") = false,
-	      py::arg("compression") = py::none());
-	m.def("read_parquet", &DuckDBPyConnection::FromParquet,
-	      "Create a relation object from the Parquet files in file_glob", py::arg("file_glob"),
-	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
-	      py::arg("filename") = false, py::arg("hive_partitioning") = false, py::arg("union_by_name") = false,
-	      py::arg("compression") = py::none());
-	m.def("from_parquet", &DuckDBPyConnection::FromParquets,
-	      "Create a relation object from the Parquet files in file_globs", py::arg("file_globs"),
-	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
-	      py::arg("filename") = false, py::arg("hive_partitioning") = false, py::arg("union_by_name") = false,
-	      py::arg("compression") = py::none());
-	m.def("read_parquet", &DuckDBPyConnection::FromParquets,
-	      "Create a relation object from the Parquet files in file_globs", py::arg("file_globs"),
-	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
-	      py::arg("filename") = false, py::arg("hive_partitioning") = false, py::arg("union_by_name") = false,
-	      py::arg("compression") = py::none());
-	m.def("get_table_names", &DuckDBPyConnection::GetTableNames, "Extract the required table names from a query",
-	      py::arg("query"), py::kw_only(), py::arg("qualified") = false);
-	m.def("install_extension", &DuckDBPyConnection::InstallExtension,
-	      "Install an extension by name, with an optional version and/or repository to get the extension from",
-	      py::arg("extension"), py::kw_only(), py::arg("force_install") = false, py::arg("repository") = py::none(),
-	      py::arg("repository_url") = py::none(), py::arg("version") = py::none());
-	m.def("load_extension", &DuckDBPyConnection::LoadExtension, "Load an installed extension", py::arg("extension"));
-	m.def("_compare_and_record_dynamic_extension_snapshot_entry",
-	      &DuckDBPyConnection::CompareAndRecordDynamicExtensionSnapshotEntry, py::arg("expected_entries"),
-	      py::arg("entry"));
-	m.def("_export_dynamic_extension_snapshot_entries", &DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries);
-	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation,
-	      "Get profiling information for a query", py::arg("format") = "json");
-	m.def("enable_profiling", &DuckDBPyConnection::EnableProfiling, "Enable profiling for subsequent queries");
-	m.def("disable_profiling", &DuckDBPyConnection::DisableProfiling, "Disable profiling for subsequent queries");
-} // END_OF_CONNECTION_METHODS
-
-void DuckDBPyConnection::UnregisterFilesystem(const py::str &name) {
-	auto &database = con.GetDatabase();
-	auto &fs = database.GetFileSystem();
-
-	fs.ExtractSubSystem(name);
-}
-
-void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
-	PythonGILWrapper gil_wrapper;
-
-	auto &database = con.GetDatabase();
-	if (!py::isinstance<AbstractFileSystem>(filesystem)) {
-		throw InvalidInputException("Bad filesystem instance");
-	}
-
-	auto &fs = database.GetFileSystem();
-
-	auto protocol = filesystem.attr("protocol");
-	if (protocol.is_none() || py::str("abstract").equal(protocol)) {
-		throw InvalidInputException("Must provide concrete fsspec implementation");
-	}
-
-	vector<string> protocols;
-	if (py::isinstance<py::str>(protocol)) {
-		protocols.push_back(py::str(protocol));
-	} else {
-		for (const auto &sub_protocol : protocol) {
-			protocols.push_back(py::str(sub_protocol));
-		}
-	}
-
-	// fsspec does not expose a general capability that distinguishes concrete
-	// directories from object-store prefixes. Its LocalFileSystem hierarchy has
-	// concrete directory semantics; other hierarchical implementations can opt
-	// in explicitly without relying on protocol-name heuristics.
-	bool directory_semantics;
-	if (py::hasattr(filesystem, "vane_directory_semantics")) {
-		directory_semantics = py::bool_(filesystem.attr("vane_directory_semantics"));
-	} else {
-		auto local_filesystem = py::module::import("fsspec.implementations.local").attr("LocalFileSystem");
-		directory_semantics = py::isinstance(filesystem, local_filesystem);
-	}
-
-	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
-}
-
-py::list DuckDBPyConnection::ListFilesystems() {
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
-	py::list names;
-	for (auto &name : subsystems) {
-		names.append(py::str(name));
-	}
-	return names;
-}
-
-py::str DuckDBPyConnection::GetProfilingInformation(const py::str &format) {
-	// We want to expose ProfilerPrintFormat as a string to Python users
-	ProfilerPrintFormat format_enum;
-	if (format == "query_tree") {
-		format_enum = ProfilerPrintFormat::QUERY_TREE;
-	} else if (format == "json") {
-		format_enum = ProfilerPrintFormat::JSON;
-	} else if (format == "query_tree_optimizer") {
-		format_enum = ProfilerPrintFormat::QUERY_TREE_OPTIMIZER;
-	} else if (format == "no_output") {
-		format_enum = ProfilerPrintFormat::NO_OUTPUT;
-	} else if (format == "html") {
-		format_enum = ProfilerPrintFormat::HTML;
-	} else if (format == "graphviz") {
-		format_enum = ProfilerPrintFormat::GRAPHVIZ;
-	} else {
-		throw InvalidInputException(
-		    "Invalid ProfilerPrintFormat string: " + std::string(format) +
-		    ". Valid options are: query_tree, json, query_tree_optimizer, no_output, html, graphviz.");
-	}
-	auto &connection = con.GetConnection();
-	py::str profiling_info = connection.GetProfilingInformation(format_enum);
-	return profiling_info;
-}
-
-void DuckDBPyConnection::EnableProfiling() {
-	auto &connection = con.GetConnection();
-	connection.EnableProfiling();
-}
-
-void DuckDBPyConnection::DisableProfiling() {
-	auto &connection = con.GetConnection();
-	connection.DisableProfiling();
-}
-
-py::list DuckDBPyConnection::ExtractStatements(const string &query) {
-	unique_lock<std::recursive_mutex> connection_lock;
-	{
-		py::gil_scoped_release release;
-		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
-	}
-	py::list result;
-	auto context = con.GetConnection().context;
-	auto statements = ExtractVaneStatements(*context, query);
-	for (auto &statement : statements) {
-		result.append(make_uniq<DuckDBPyStatement>(std::move(statement)));
-	}
-	return result;
-}
-
-bool DuckDBPyConnection::FileSystemIsRegistered(const string &name) {
-	auto &database = con.GetDatabase();
-	auto subsystems = database.GetFileSystem().ListSubSystems();
-	return std::find(subsystems.begin(), subsystems.end(), name) != subsystems.end();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::UnregisterUDF(const string &name) {
-	auto entry = registered_functions.find(name);
-	if (entry == registered_functions.end()) {
-		// Not registered or already unregistered
-		throw InvalidInputException("No function by the name of '%s' was found in the list of registered functions",
-		                            name);
-	}
-	auto catalog_type_entry = registered_function_catalog_types.find(name);
-	if (catalog_type_entry == registered_function_catalog_types.end()) {
-		throw InternalException("Registered Python function '%s' is missing its catalog type", name);
-	}
-	const auto catalog_type = catalog_type_entry->second;
-
-	auto &connection = con.GetConnection();
-	auto &context = *connection.context;
-
-	context.RunFunctionInTransaction([&]() {
-		auto &catalog = Catalog::GetCatalog(context, SYSTEM_CATALOG);
-		if (catalog_type == PythonUDFCatalogType::SCALAR) {
-			auto scalar_entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
-			                                                                  name, OnEntryNotFound::RETURN_NULL);
-			if (!scalar_entry) {
-				throw InvalidInputException("No scalar function by the name of '%s' was found in the catalog", name);
-			}
-			DropInfo info;
-			info.type = CatalogType::SCALAR_FUNCTION_ENTRY;
-			info.name = name;
-			info.allow_drop_internal = true;
-			info.cascade = false;
-			info.if_not_found = OnEntryNotFound::THROW_EXCEPTION;
-			catalog.DropEntry(context, info);
-		} else {
-			auto table_entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
-			                                                                name, OnEntryNotFound::RETURN_NULL);
-			if (!table_entry) {
-				throw InvalidInputException("No table function by the name of '%s' was found in the catalog", name);
-			}
-			DropInfo info;
-			info.type = CatalogType::TABLE_FUNCTION_ENTRY;
-			info.name = name;
-			info.allow_drop_internal = true;
-			info.cascade = false;
-			info.if_not_found = OnEntryNotFound::THROW_EXCEPTION;
-			catalog.DropEntry(context, info);
-		}
-	});
-	registered_functions.erase(entry);
-	registered_function_catalog_types.erase(catalog_type_entry);
-	distributed_python_udf_registrations.erase(name);
-	applied_distributed_python_udf_digests.erase(name);
-
-	return shared_from_this();
-}
-
-py::list DuckDBPyConnection::ExportDistributedPythonUDFRegistrations() const {
-	py::list registrations;
-	for (auto &entry : distributed_python_udf_registrations) {
-		registrations.append(entry.second);
-	}
-	return registrations;
-}
-
-void DuckDBPyConnection::ApplyDistributedPythonUDFRegistrations(const py::object &registrations_obj) {
-	if (registrations_obj.is_none()) {
-		return;
-	}
-	if (!py::isinstance<py::iterable>(registrations_obj)) {
-		throw InvalidInputException("distributed Python UDF registrations must be iterable");
-	}
-
-	auto pickle_module = py::module_::import("vane.pickle");
-	auto loads = pickle_module.attr("loads");
-
-	for (auto item : py::iterable(registrations_obj)) {
-		auto spec = py::reinterpret_borrow<py::dict>(item);
-		auto kind = py::cast<string>(spec[py::str("kind")]);
-		auto name = py::cast<string>(spec[py::str("name")]);
-		auto digest = GetRegistrationDigest(spec);
-
-		auto existing_digest = applied_distributed_python_udf_digests.find(name);
-		if (existing_digest != applied_distributed_python_udf_digests.end()) {
-			if (existing_digest->second == digest) {
-				continue;
-			}
-			UnregisterUDF(name);
-		}
-
-		auto pickled_fn = spec[py::str("function_pickle")].cast<py::bytes>();
-		auto udf = py::cast<py::function>(loads(pickled_fn));
-
-		if (StringUtil::CIEquals(kind, "scalar")) {
-			py::list parameters;
-			for (auto &entry : py::reinterpret_borrow<py::list>(spec[py::str("parameters")])) {
-				parameters.append(Type(py::cast<string>(entry)));
-			}
-
-			auto return_type_str = py::cast<string>(spec[py::str("return_type")]);
-			auto return_type = Type(return_type_str);
-			auto udf_type_str = py::cast<string>(spec[py::str("udf_type")]);
-			auto udf_type = StringUtil::CIEquals(udf_type_str, "arrow") ? PythonUDFType::ARROW : PythonUDFType::NATIVE;
-			auto null_handling = static_cast<FunctionNullHandling>(py::cast<int32_t>(spec[py::str("null_handling")]));
-			auto exception_handling =
-			    static_cast<PythonExceptionHandling>(py::cast<int32_t>(spec[py::str("exception_handling")]));
-			auto side_effects = py::cast<bool>(spec[py::str("side_effects")]);
-			RegisterScalarUDF(name, udf, parameters, return_type, udf_type, null_handling, exception_handling,
-			                  side_effects);
-		} else if (StringUtil::CIEquals(kind, "table")) {
-			py::dict schema;
-			for (auto &entry : py::reinterpret_borrow<py::dict>(spec[py::str("schema")])) {
-				schema[py::reinterpret_borrow<py::object>(entry.first)] = Type(py::cast<string>(entry.second));
-			}
-
-			auto batch_size = py::reinterpret_borrow<py::object>(spec[py::str("batch_size")]);
-
-			RegisterTableUDF(name, udf, schema, nullptr, batch_size);
-		} else {
-			throw InvalidInputException("Unknown distributed Python UDF registration kind '%s'", kind);
-		}
-
-		applied_distributed_python_udf_digests[name] = std::move(digest);
-	}
-}
-
-shared_ptr<DuckDBPyConnection>
-DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &udf, const py::object &parameters_p,
-                                      const shared_ptr<DuckDBPyType> &return_type_p, PythonUDFType type,
-                                      FunctionNullHandling null_handling, PythonExceptionHandling exception_handling,
-                                      bool side_effects) {
-	ValidateSynchronousUDFCallable(udf);
-	auto &connection = con.GetConnection();
-	auto &context = *connection.context;
-
-	if (context.transaction.HasActiveTransaction()) {
-		context.CancelTransaction();
-	}
-	if (registered_functions.find(name) != registered_functions.end()) {
-		throw NotImplementedException("A function by the name of '%s' is already created, creating multiple "
-		                              "functions with the same name is not supported yet, please remove it first",
-		                              name);
-	}
-	auto scalar_function = CreateScalarUDF(name, udf, parameters_p, return_type_p, type == PythonUDFType::ARROW,
-	                                       null_handling, exception_handling, side_effects);
-	CreateScalarFunctionInfo info(scalar_function);
-
-	context.RegisterFunction(info);
-
-	auto dependency = make_uniq<ExternalDependency>();
-	dependency->AddDependency("function", PythonDependencyItem::Create(udf));
-	registered_functions[name] = std::move(dependency);
-	registered_function_catalog_types[name] = PythonUDFCatalogType::SCALAR;
-	auto registration =
-	    BuildDistributedScalarUDFRegistration(name, udf, scalar_function.arguments, scalar_function.return_type, type,
-	                                          null_handling, exception_handling, side_effects);
-	applied_distributed_python_udf_digests[name] = GetRegistrationDigest(registration);
-	distributed_python_udf_registrations[name] = std::move(registration);
-
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection>
-DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::object &callable,
-                                               const py::object &parameters,
-                                               const shared_ptr<DuckDBPyType> &return_type, bool replace) {
-	PythonGILWrapper gil;
-	auto helpers = py::module_::import("vane._expression_udf");
-	auto unwrap = helpers.attr("_unwrap_vane_function");
-	auto normalize_parameters = helpers.attr("_normalize_sql_type_list");
-
-	auto unwrapped = py::cast<py::tuple>(unwrap(callable));
-	auto udf = py::cast<py::function>(unwrapped[0]);
-	auto decorator_return_type = py::reinterpret_borrow<py::object>(unwrapped[1]);
-
-	shared_ptr<DuckDBPyType> resolved_return_type = return_type;
-	if (!resolved_return_type && !decorator_return_type.is_none()) {
-		if (py::isinstance<py::str>(decorator_return_type)) {
-			resolved_return_type = Type(py::cast<string>(decorator_return_type));
-		} else {
-			resolved_return_type = py::cast<shared_ptr<DuckDBPyType>>(decorator_return_type);
-		}
-	}
-	if (!resolved_return_type) {
-		throw InvalidInputException("return_dtype is required for SQL vane.func registration");
-	}
-
-	py::object normalized_parameters = normalize_parameters(parameters);
-	auto parameter_types =
-	    ParseVaneSQLParameters(normalized_parameters, "parameters is required for SQL vane.func registration");
-
-	auto &connection = con.GetConnection();
-	auto &context = *connection.context;
-	if (context.transaction.HasActiveTransaction()) {
-		context.CancelTransaction();
-	}
-	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload = BuildExpressionScalarUDFPayload(name, udf, resolved_return_type,
-	                                               ExpressionUDFExecutionBackendForRunner(GetRunnerType(), false),
-	                                               default_parallelism, parameter_types.size(), py::none());
-
-	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
-	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
-	                               FunctionStability::VOLATILE);
-	scalar_function.SetExtraFunctionInfo(
-	    make_shared_ptr<RegisteredUDFFunctionInfo>(payload, vector<string> {}, /*allow_named_arguments=*/false));
-	scalar_function.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
-
-	auto dependency = make_uniq<ExternalDependency>();
-	dependency->AddDependency("function", PythonDependencyItem::Create(udf));
-	RegisterVaneScalarFunctionAtomically(context, registered_functions, std::move(scalar_function),
-	                                     std::move(dependency), replace);
-	registered_function_catalog_types[name] = PythonUDFCatalogType::SCALAR;
-
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionInternal(
-    const string &name, const py::object &udf, const py::object &input_names, const py::object &schema,
-    const py::object &parameters, const Optional<py::object> &batch_size, const Optional<py::object> &gpus,
-    const Optional<py::object> &actor_number, bool row_preserving, bool replace) {
-	PythonGILWrapper gil;
-	if (!row_preserving) {
-		throw InvalidInputException("row_preserving=False is supported by the expression API, but SQL attach v1 "
-		                            "requires row-preserving batch UDFs");
-	}
-	auto helpers = py::module_::import("vane._expression_udf");
-	auto normalize_parameters = helpers.attr("_normalize_sql_type_list");
-	auto normalize_schema = helpers.attr("_normalize_schema");
-
-	auto udf_function = py::cast<py::function>(udf);
-	auto parsed_input_names = ParseVaneSQLInputNames(input_names);
-	auto normalized_schema = py::reinterpret_borrow<py::object>(normalize_schema(schema));
-	ValidateVaneSQLSingleOutputSchema(normalized_schema);
-
-	py::object normalized_parameters = normalize_parameters(parameters);
-	auto parameter_types =
-	    ParseVaneSQLParameters(normalized_parameters, "parameters is required for batch SQL vane.func registration");
-	if (parsed_input_names.size() != parameter_types.size()) {
-		throw InvalidInputException("input_names count must match parameters count");
-	}
-
-	auto &connection = con.GetConnection();
-	auto &context = *connection.context;
-	if (context.transaction.HasActiveTransaction()) {
-		context.CancelTransaction();
-	}
-	const bool use_actor_backend = !actor_number.is_none();
-	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload = BuildExpressionMapBatchesUDFPayload(
-	    name, udf_function, normalized_schema,
-	    ExpressionUDFExecutionBackendForRunner(GetRunnerType(), use_actor_backend), default_parallelism,
-	    parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
-
-	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
-	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
-	                               FunctionStability::VOLATILE);
-	scalar_function.SetExtraFunctionInfo(
-	    make_shared_ptr<RegisteredUDFFunctionInfo>(payload, parsed_input_names, /*allow_named_arguments=*/true));
-	scalar_function.SetBindExpressionCallback(LowerRegisteredExpressionUDF);
-
-	auto dependency = make_uniq<ExternalDependency>();
-	dependency->AddDependency("function", PythonDependencyItem::Create(udf_function));
-	dependency->AddDependency("schema", PythonDependencyItem::Create(normalized_schema));
-	RegisterVaneScalarFunctionAtomically(context, registered_functions, std::move(scalar_function),
-	                                     std::move(dependency), replace);
-	registered_function_catalog_types[name] = PythonUDFCatalogType::SCALAR;
-
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string &name, const py::function &udf,
-                                                                    const py::object &schema,
-                                                                    const shared_ptr<DuckDBPyType> &return_type_p,
-                                                                    const Optional<py::object> &batch_size) {
-	ValidateSynchronousUDFCallable(udf);
-	auto &connection = con.GetConnection();
-	auto &context = *connection.context;
-
-	if (context.transaction.HasActiveTransaction()) {
-		context.CancelTransaction();
-	}
-	if (registered_functions.find(name) != registered_functions.end()) {
-		throw NotImplementedException("A function by the name of '%s' is already created, creating multiple "
-		                              "functions with the same name is not supported yet, please remove it first",
-		                              name);
-	}
-
-	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload =
-	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf, GetRunnerType()),
-	                          default_parallelism, py::none(), py::none(), py::none(), batch_size, py::none(),
-	                          py::none(), py::none(), py::none(), py::none(), py::none(), py::none());
-
-	// Parse output types/names from the payload for MakeUDFRegisteredTableFunction
-	vector<LogicalType> output_types;
-	vector<string> output_names;
-	if (!TryParsePayloadOutputSchema(payload, output_names, output_types)) {
-		throw InvalidInputException("python_udf payload is missing output_schema");
-	}
-
-	auto registration_output_types = output_types;
-	auto registration_output_names = output_names;
-	auto registration = BuildDistributedTableUDFRegistration(name, udf, registration_output_names,
-	                                                         registration_output_types, batch_size);
-	auto registration_digest = GetRegistrationDigest(registration);
-	payload = UpsertStructStringField(payload, "udf_id", registration_digest);
-	auto function =
-	    MakeUDFRegisteredTableFunction(name, std::move(payload), std::move(output_types), std::move(output_names));
-	CreateTableFunctionInfo info(std::move(function));
-	context.RegisterFunction(info);
-
-	auto dependency = make_uniq<ExternalDependency>();
-	dependency->AddDependency("function", PythonDependencyItem::Create(udf));
-	if (!schema.is_none()) {
-		dependency->AddDependency("schema", PythonDependencyItem::Create(schema));
-	}
-	registered_functions[name] = std::move(dependency);
-	registered_function_catalog_types[name] = PythonUDFCatalogType::TABLE;
-	applied_distributed_python_udf_digests[name] = std::move(registration_digest);
-	distributed_python_udf_registrations[name] = std::move(registration);
-
-	return shared_from_this();
-}
-
-void DuckDBPyConnection::Initialize(py::handle &m) {
-	auto connection_module =
-	    py::class_<DuckDBPyConnection, shared_ptr<DuckDBPyConnection>>(m, "DuckDBPyConnection", py::module_local());
-
-	connection_module.def("__enter__", &DuckDBPyConnection::Enter)
-	    .def("__exit__", &DuckDBPyConnection::Exit, py::arg("exc_type"), py::arg("exc"), py::arg("traceback"));
-	connection_module.def("__del__", &DuckDBPyConnection::Close);
-
-	InitializeConnectionMethods(connection_module);
-	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
-	                                        "Get result set attributes, mainly column names");
-	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");
-	PyDateTime_IMPORT; // NOLINT
-	DuckDBPyConnection::ImportCache();
-}
-
-case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
-                                                                       optional_ptr<PreparedStatement> prep = {});
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
-	PythonGILWrapper gil;
-	con.SetResult(nullptr);
-	if (params_p.is_none()) {
-		params_p = py::list();
-	}
-
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		// TODO: should we throw?
-		return nullptr;
-	}
-
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	// First immediately execute any preceding statements (if any)
-	// FIXME: DBAPI says to not accept an 'executemany' call with multiple statements
-	ExecuteImmediately(std::move(statements));
-
-	if (!py::is_list_like(params_p)) {
-		throw InvalidInputException("executemany requires a list of parameter sets to be provided");
-	}
-	auto outer_list = py::list(params_p);
-	if (outer_list.empty()) {
-		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
-	}
-	auto interrupt_check = CreateQueryInterruptCheck();
-	unique_ptr<PreparedStatement> native_prepared;
-	const bool local_fast = GetRunnerType() == "local-fast";
-	for (idx_t index = 0; index < outer_list.size(); index++) {
-		unique_ptr<DuckDBPyRelation> result;
-		if (local_fast && last_statement->type != StatementType::MULTI_STATEMENT) {
-			auto params = py::reinterpret_borrow<py::object>(outer_list[index]);
-			auto parameters =
-			    TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params, native_prepared.get());
-			auto context = con.GetConnection().context;
-			auto execution = ExecuteWithRunner(context, last_statement->Copy(), nullptr, std::move(parameters),
-			                                   CreateWeakOwner(shared_from_this()), interrupt_check, true, nullptr,
-			                                   &native_prepared);
-			result = make_uniq<DuckDBPyRelation>(execution.TakeResult());
-		} else {
-			result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
-		}
-		if (result && index + 1 < outer_list.size()) {
-			while (py::len(result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
-			}
-		}
-		con.SetResult(std::move(result));
-	}
-
-	return shared_from_this();
-}
-
-unique_ptr<QueryResult> DuckDBPyConnection::CompletePendingQuery(PendingQueryResult &pending_query) {
-	PendingExecutionResult execution_result;
-	if (pending_query.HasError()) {
-		pending_query.ThrowError();
-	}
-	while (!PendingQueryResult::IsResultReady(execution_result = pending_query.ExecuteTask())) {
-		{
-			PythonGILWrapper gil;
-			if (PyErr_CheckSignals() != 0) {
-				throw std::runtime_error("Query interrupted");
-			}
-		}
-		if (execution_result == PendingExecutionResult::BLOCKED) {
-			pending_query.WaitForTask();
-		}
-	}
-	if (execution_result == PendingExecutionResult::EXECUTION_ERROR) {
-		pending_query.ThrowError();
-	}
-	return pending_query.Execute();
-}
-
-py::list TransformNamedParameters(const case_insensitive_map_t<idx_t> &named_param_map, const py::dict &params) {
-	py::list new_params(params.size());
-
-	for (auto &item : params) {
-		const std::string &item_name = item.first.cast<std::string>();
-		auto entry = named_param_map.find(item_name);
-		if (entry == named_param_map.end()) {
-			throw InvalidInputException(
-			    "Named parameters could not be transformed, because query string is missing named parameter '%s'",
-			    item_name);
-		}
-		auto param_idx = entry->second;
-		// Add the value of the named parameter to the list
-		new_params[param_idx - 1] = item.second;
-	}
-
-	if (named_param_map.size() != params.size()) {
-		// One or more named parameters were expected, but not found
-		vector<string> missing_params;
-		missing_params.reserve(named_param_map.size());
-		for (auto &entry : named_param_map) {
-			auto &name = entry.first;
-			if (!params.contains(name)) {
-				missing_params.push_back(name);
-			}
-		}
-		auto message = StringUtil::Join(missing_params, ", ");
-		throw InvalidInputException("Not all named parameters have been located, missing: %s", message);
-	}
-
-	return new_params;
-}
-
-case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
-                                                                       optional_ptr<PreparedStatement> prep) {
-	case_insensitive_map_t<BoundParameterData> named_values;
-	if (py::is_list_like(params)) {
-		if (prep && prep->named_param_map.size() != py::len(params)) {
-			if (py::len(params) == 0) {
-				throw InvalidInputException("Expected %d parameters, but none were supplied",
-				                            prep->named_param_map.size());
-			}
-			throw InvalidInputException("Prepared statement needs %d parameters, %d given",
-			                            prep->named_param_map.size(), py::len(params));
-		}
-		auto unnamed_values = DuckDBPyConnection::TransformPythonParamList(params);
-		for (idx_t i = 0; i < unnamed_values.size(); i++) {
-			auto &value = unnamed_values[i];
-			auto identifier = std::to_string(i + 1);
-			named_values[identifier] = BoundParameterData(std::move(value));
-		}
-	} else if (py::is_dict_like(params)) {
-		auto dict = py::cast<py::dict>(params);
-		named_values = DuckDBPyConnection::TransformPythonParamDict(dict);
-	} else {
-		throw InvalidInputException("Prepared parameters can only be passed as a list or a dictionary");
-	}
-	return named_values;
-}
-
-vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::object &query) {
-	unique_lock<std::recursive_mutex> connection_lock;
-	{
-		py::gil_scoped_release release;
-		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
-	}
-	con.GetConnection();
-	shared_ptr<DuckDBPyStatement> statement_obj;
-	if (py::try_cast(query, statement_obj)) {
-		vector<unique_ptr<SQLStatement>> result;
-		result.push_back(statement_obj->GetStatement());
-		return result;
-	}
-	if (py::isinstance<py::str>(query)) {
-		auto sql_query = std::string(py::str(query));
-		auto context = con.GetConnection().context;
-		auto statements = ExtractVaneStatements(*context, sql_query);
-		return std::move(statements);
-	}
-	throw InvalidInputException("Please provide either a Vane DuckDBPyStatement or a string representing the query");
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const string &query) {
-	return Execute(py::str(query));
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
-	PythonGILWrapper gil;
-	con.SetResult(nullptr);
-	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Append(const string &name, const PandasDataFrame &value,
-                                                          bool by_name) {
-	RegisterPythonObject("__append_df", value);
-	string columns = "";
-	if (by_name) {
-		auto df_columns = value.attr("columns");
-		vector<string> column_names;
-		for (auto &column : df_columns) {
-			column_names.push_back(std::string(py::str(column)));
-		}
-		columns += "(";
-		for (idx_t i = 0; i < column_names.size(); i++) {
-			auto &column = column_names[i];
-			if (i != 0) {
-				columns += ", ";
-			}
-			columns += StringUtil::Format("%s", SQLIdentifier(column));
-		}
-		columns += ")";
-	}
-
-	auto sql_query = StringUtil::Format("INSERT INTO %s %s SELECT * FROM __append_df", SQLIdentifier(name), columns);
-	return Execute(py::str(sql_query));
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterPythonObject(const string &name,
-                                                                        const py::object &python_object) {
-	auto &connection = con.GetConnection();
-	auto &client = *connection.context;
-	auto object = PythonReplacementScan::ReplacementObject(python_object, name, client);
-	auto view_rel = make_shared_ptr<ViewRelation>(connection.context, std::move(object), name);
-	bool replace = registered_objects.count(name);
-	view_rel->CreateView(name, replace, true);
-	registered_objects.insert(name);
-	return shared_from_this();
-}
-
-static void ParseMultiFileOptions(named_parameter_map_t &options, const Optional<py::object> &filename,
-                                  const Optional<py::object> &hive_partitioning,
-                                  const Optional<py::object> &union_by_name, const Optional<py::object> &hive_types,
-                                  const Optional<py::object> &hive_types_autocast) {
-	if (!py::none().is(filename)) {
-		auto val = TransformPythonValue(filename);
-		options["filename"] = val;
-	}
-
-	if (!py::none().is(hive_types)) {
-		auto val = TransformPythonValue(hive_types);
-		options["hive_types"] = val;
-	}
-
-	if (!py::none().is(hive_partitioning)) {
-		if (!py::isinstance<py::bool_>(hive_partitioning)) {
-			string actual_type = py::str(py::type::of(hive_partitioning));
-			throw BinderException("read_json only accepts 'hive_partitioning' as a boolean, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(hive_partitioning, LogicalTypeId::BOOLEAN);
-		options["hive_partitioning"] = val;
-	}
-
-	if (!py::none().is(union_by_name)) {
-		if (!py::isinstance<py::bool_>(union_by_name)) {
-			string actual_type = py::str(py::type::of(union_by_name));
-			throw BinderException("read_json only accepts 'union_by_name' as a boolean, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(union_by_name, LogicalTypeId::BOOLEAN);
-		options["union_by_name"] = val;
-	}
-
-	if (!py::none().is(hive_types_autocast)) {
-		if (!py::isinstance<py::bool_>(hive_types_autocast)) {
-			string actual_type = py::str(py::type::of(hive_types_autocast));
-			throw BinderException("read_json only accepts 'hive_types_autocast' as a boolean, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(hive_types_autocast, LogicalTypeId::BOOLEAN);
-		options["hive_types_autocast"] = val;
-	}
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
-    const py::object &name_p, const Optional<py::object> &columns, const Optional<py::object> &sample_size,
-    const Optional<py::object> &maximum_depth, const Optional<py::str> &records, const Optional<py::str> &format,
-    const Optional<py::object> &date_format, const Optional<py::object> &timestamp_format,
-    const Optional<py::object> &compression, const Optional<py::object> &maximum_object_size,
-    const Optional<py::object> &ignore_errors, const Optional<py::object> &convert_strings_to_integers,
-    const Optional<py::object> &field_appearance_threshold, const Optional<py::object> &map_inference_threshold,
-    const Optional<py::object> &maximum_sample_files, const Optional<py::object> &filename,
-    const Optional<py::object> &hive_partitioning, const Optional<py::object> &union_by_name,
-    const Optional<py::object> &hive_types, const Optional<py::object> &hive_types_autocast) {
-
-	named_parameter_map_t options;
-
-	auto &connection = con.GetConnection();
-	auto path_like = GetPathLike(name_p);
-	auto &name = path_like.files;
-	auto file_like_object_wrapper = std::move(path_like.dependency);
-
-	ParseMultiFileOptions(options, filename, hive_partitioning, union_by_name, hive_types, hive_types_autocast);
-
-	if (!py::none().is(columns)) {
-		if (!py::is_dict_like(columns)) {
-			throw BinderException("read_json only accepts 'columns' as a dict[str, str]");
-		}
-		py::dict columns_dict = columns;
-		child_list_t<Value> struct_fields;
-
-		for (auto &kv : columns_dict) {
-			auto &column_name = kv.first;
-			auto &type = kv.second;
-			if (!py::isinstance<py::str>(column_name)) {
-				string actual_type = py::str(py::type::of(column_name));
-				throw BinderException("The provided column name must be a str, not of type '%s'", actual_type);
-			}
-			if (!py::isinstance<py::str>(type)) {
-				string actual_type = py::str(py::type::of(column_name));
-				throw BinderException("The provided column type must be a str, not of type '%s'", actual_type);
-			}
-			struct_fields.emplace_back(py::str(column_name), Value(py::str(type)));
-		}
-		auto dtype_struct = Value::STRUCT(std::move(struct_fields));
-		options["columns"] = std::move(dtype_struct);
-	}
-
-	if (!py::none().is(records)) {
-		if (!py::isinstance<py::str>(records)) {
-			string actual_type = py::str(py::type::of(records));
-			throw BinderException("read_json only accepts 'records' as a string, not '%s'", actual_type);
-		}
-		auto records_s = py::reinterpret_borrow<py::str>(records);
-		auto records_option = std::string(py::str(records_s));
-		options["records"] = Value(records_option);
-	}
-
-	if (!py::none().is(format)) {
-		if (!py::isinstance<py::str>(format)) {
-			string actual_type = py::str(py::type::of(format));
-			throw BinderException("read_json only accepts 'format' as a string, not '%s'", actual_type);
-		}
-		auto format_s = py::reinterpret_borrow<py::str>(format);
-		auto format_option = std::string(py::str(format_s));
-		options["format"] = Value(format_option);
-	}
-
-	if (!py::none().is(date_format)) {
-		if (!py::isinstance<py::str>(date_format)) {
-			string actual_type = py::str(py::type::of(date_format));
-			throw BinderException("read_json only accepts 'date_format' as a string, not '%s'", actual_type);
-		}
-		auto date_format_s = py::reinterpret_borrow<py::str>(date_format);
-		auto date_format_option = std::string(py::str(date_format_s));
-		options["date_format"] = Value(date_format_option);
-	}
-
-	if (!py::none().is(timestamp_format)) {
-		if (!py::isinstance<py::str>(timestamp_format)) {
-			string actual_type = py::str(py::type::of(timestamp_format));
-			throw BinderException("read_json only accepts 'timestamp_format' as a string, not '%s'", actual_type);
-		}
-		auto timestamp_format_s = py::reinterpret_borrow<py::str>(timestamp_format);
-		auto timestamp_format_option = std::string(py::str(timestamp_format_s));
-		options["timestamp_format"] = Value(timestamp_format_option);
-	}
-
-	if (!py::none().is(compression)) {
-		if (!py::isinstance<py::str>(compression)) {
-			string actual_type = py::str(py::type::of(compression));
-			throw BinderException("read_json only accepts 'compression' as a string, not '%s'", actual_type);
-		}
-		auto compression_s = py::reinterpret_borrow<py::str>(compression);
-		auto compression_option = std::string(py::str(compression_s));
-		options["compression"] = Value(compression_option);
-	}
-
-	if (!py::none().is(sample_size)) {
-		if (!py::isinstance<py::int_>(sample_size)) {
-			string actual_type = py::str(py::type::of(sample_size));
-			throw BinderException("read_json only accepts 'sample_size' as an integer, not '%s'", actual_type);
-		}
-		options["sample_size"] = Value::INTEGER(py::int_(sample_size));
-	}
-
-	if (!py::none().is(maximum_depth)) {
-		if (!py::isinstance<py::int_>(maximum_depth)) {
-			string actual_type = py::str(py::type::of(maximum_depth));
-			throw BinderException("read_json only accepts 'maximum_depth' as an integer, not '%s'", actual_type);
-		}
-		options["maximum_depth"] = Value::INTEGER(py::int_(maximum_depth));
-	}
-
-	if (!py::none().is(maximum_object_size)) {
-		if (!py::isinstance<py::int_>(maximum_object_size)) {
-			string actual_type = py::str(py::type::of(maximum_object_size));
-			throw BinderException("read_json only accepts 'maximum_object_size' as an unsigned integer, not '%s'",
-			                      actual_type);
-		}
-		auto val = TransformPythonValue(maximum_object_size, LogicalTypeId::UINTEGER);
-		options["maximum_object_size"] = val;
-	}
-
-	if (!py::none().is(ignore_errors)) {
-		if (!py::isinstance<py::bool_>(ignore_errors)) {
-			string actual_type = py::str(py::type::of(ignore_errors));
-			throw BinderException("read_json only accepts 'ignore_errors' as a boolean, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(ignore_errors, LogicalTypeId::BOOLEAN);
-		options["ignore_errors"] = val;
-	}
-
-	if (!py::none().is(convert_strings_to_integers)) {
-		if (!py::isinstance<py::bool_>(convert_strings_to_integers)) {
-			string actual_type = py::str(py::type::of(convert_strings_to_integers));
-			throw BinderException("read_json only accepts 'convert_strings_to_integers' as a boolean, not '%s'",
-			                      actual_type);
-		}
-		auto val = TransformPythonValue(convert_strings_to_integers, LogicalTypeId::BOOLEAN);
-		options["convert_strings_to_integers"] = val;
-	}
-
-	if (!py::none().is(field_appearance_threshold)) {
-		if (!py::isinstance<py::float_>(field_appearance_threshold)) {
-			string actual_type = py::str(py::type::of(field_appearance_threshold));
-			throw BinderException("read_json only accepts 'field_appearance_threshold' as a float, not '%s'",
-			                      actual_type);
-		}
-		auto val = TransformPythonValue(field_appearance_threshold, LogicalTypeId::DOUBLE);
-		options["field_appearance_threshold"] = val;
-	}
-
-	if (!py::none().is(map_inference_threshold)) {
-		if (!py::isinstance<py::int_>(map_inference_threshold)) {
-			string actual_type = py::str(py::type::of(map_inference_threshold));
-			throw BinderException("read_json only accepts 'map_inference_threshold' as an integer, not '%s'",
-			                      actual_type);
-		}
-		auto val = TransformPythonValue(map_inference_threshold, LogicalTypeId::BIGINT);
-		options["map_inference_threshold"] = val;
-	}
-
-	if (!py::none().is(maximum_sample_files)) {
-		if (!py::isinstance<py::int_>(maximum_sample_files)) {
-			string actual_type = py::str(py::type::of(maximum_sample_files));
-			throw BinderException("read_json only accepts 'maximum_sample_files' as an integer, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(maximum_sample_files, LogicalTypeId::BIGINT);
-		options["maximum_sample_files"] = val;
-	}
-
-	bool auto_detect = false;
-	if (!options.count("columns")) {
-		options["auto_detect"] = Value::BOOLEAN(true);
-		auto_detect = true;
-	}
-
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release gil;
-	auto read_json_relation =
-	    make_shared_ptr<ReadJSONRelation>(connection.context, name, std::move(options), auto_detect);
-	if (read_json_relation == nullptr) {
-		throw BinderException("read_json can only be used when the JSON extension is (statically) loaded");
-	}
-	if (file_like_object_wrapper) {
-		read_json_relation->AddExternalDependency(std::move(file_like_object_wrapper));
-	}
-	return CreateRelation(std::move(read_json_relation));
-}
-
-PathLike DuckDBPyConnection::GetPathLike(const py::object &object) {
-	return PathLike::Create(object, *this);
-}
-
-static void AcceptableCSVOptions(const string &unkown_parameter) {
-	// List of strings to match against
-	const unordered_set<string> valid_parameters = {"header",
-	                                                "strict_mode",
-	                                                "compression",
-	                                                "comment"
-	                                                "sep",
-	                                                "delimiter",
-	                                                "files_to_sniff",
-	                                                "dtype",
-	                                                "na_values",
-	                                                "skiprows",
-	                                                "quotechar",
-	                                                "escapechar",
-	                                                "encoding",
-	                                                "parallel",
-	                                                "date_format",
-	                                                "timestamp_format",
-	                                                "sample_size",
-	                                                "all_varchar",
-	                                                "normalize_names",
-	                                                "null_padding",
-	                                                "names",
-	                                                "lineterminator",
-	                                                "columns",
-	                                                "auto_type_candidates",
-	                                                "max_line_size",
-	                                                "ignore_errors",
-	                                                "store_rejects",
-	                                                "rejects_table",
-	                                                "rejects_scan",
-	                                                "rejects_limit",
-	                                                "force_not_null",
-	                                                "buffer_size",
-	                                                "decimal",
-	                                                "allow_quoted_nulls",
-	                                                "filename",
-	                                                "hive_partitioning",
-	                                                "union_by_name",
-	                                                "hive_types",
-	                                                "hive_types_autocast",
-	                                                "thousands"};
-
-	std::ostringstream error;
-	error << "The methods read_csv and read_csv_auto do not have the \"" << unkown_parameter << "\" argument." << '\n';
-	error << "Possible arguments as suggestions: " << '\n';
-	vector<string> parameters(valid_parameters.begin(), valid_parameters.end());
-	auto suggestions = StringUtil::TopNJaroWinkler(parameters, unkown_parameter, 3);
-	for (auto &suggestion : suggestions) {
-		error << "* " << suggestion << '\n';
-	}
-	throw InvalidInputException(error.str());
-}
-void ConvertBooleanValue(const py::object &value, string param_name, named_parameter_map_t &bind_parameters) {
-	if (!py::none().is(value)) {
-
-		bool value_as_int = py::isinstance<py::int_>(value);
-		bool value_as_bool = py::isinstance<py::bool_>(value);
-
-		bool converted_value;
-		if (value_as_bool) {
-			converted_value = py::bool_(value);
-		} else if (value_as_int) {
-			if (static_cast<int>(py::int_(value)) != 0) {
-				throw InvalidInputException("read_csv only accepts 0 if '%s' is given as an integer", param_name);
-			}
-			converted_value = true;
-		} else {
-			throw InvalidInputException("read_csv only accepts '%s' as an integer, or a boolean", param_name);
-		}
-		bind_parameters[param_name] = Value::BOOLEAN(converted_value);
-	}
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_p, py::kwargs &kwargs) {
-	py::object header = py::none();
-	py::object strict_mode = py::none();
-	py::object auto_detect = py::none();
-	py::object compression = py::none();
-	py::object sep = py::none();
-	py::object delimiter = py::none();
-	py::object files_to_sniff = py::none();
-	py::object dtype = py::none();
-	py::object na_values = py::none();
-	py::object skiprows = py::none();
-	py::object quotechar = py::none();
-	py::object escapechar = py::none();
-	py::object encoding = py::none();
-	py::object parallel = py::none();
-	py::object date_format = py::none();
-	py::object timestamp_format = py::none();
-	py::object sample_size = py::none();
-	py::object all_varchar = py::none();
-	py::object normalize_names = py::none();
-	py::object null_padding = py::none();
-	py::object names_p = py::none();
-	py::object lineterminator = py::none();
-	py::object columns = py::none();
-	py::object auto_type_candidates = py::none();
-	py::object max_line_size = py::none();
-	py::object ignore_errors = py::none();
-	py::object store_rejects = py::none();
-	py::object rejects_table = py::none();
-	py::object rejects_scan = py::none();
-	py::object rejects_limit = py::none();
-	py::object force_not_null = py::none();
-	py::object buffer_size = py::none();
-	py::object decimal = py::none();
-	py::object allow_quoted_nulls = py::none();
-	py::object filename = py::none();
-	py::object hive_partitioning = py::none();
-	py::object union_by_name = py::none();
-	py::object hive_types = py::none();
-	py::object hive_types_autocast = py::none();
-	py::object comment = py::none();
-	py::object thousands_separator = py::none();
-
-	for (auto &arg : kwargs) {
-		const auto &arg_name = py::str(arg.first).cast<std::string>();
-		if (arg_name == "header") {
-			header = kwargs[arg_name.c_str()];
-		} else if (arg_name == "compression") {
-			compression = kwargs[arg_name.c_str()];
-		} else if (arg_name == "sep") {
-			sep = kwargs[arg_name.c_str()];
-		} else if (arg_name == "delimiter") {
-			delimiter = kwargs[arg_name.c_str()];
-		} else if (arg_name == "files_to_sniff") {
-			files_to_sniff = kwargs[arg_name.c_str()];
-		} else if (arg_name == "comment") {
-			comment = kwargs[arg_name.c_str()];
-		} else if (arg_name == "thousands") {
-			thousands_separator = kwargs[arg_name.c_str()];
-		} else if (arg_name == "dtype") {
-			dtype = kwargs[arg_name.c_str()];
-		} else if (arg_name == "na_values") {
-			na_values = kwargs[arg_name.c_str()];
-		} else if (arg_name == "skiprows") {
-			skiprows = kwargs[arg_name.c_str()];
-		} else if (arg_name == "quotechar") {
-			quotechar = kwargs[arg_name.c_str()];
-		} else if (arg_name == "escapechar") {
-			escapechar = kwargs[arg_name.c_str()];
-		} else if (arg_name == "encoding") {
-			encoding = kwargs[arg_name.c_str()];
-		} else if (arg_name == "parallel") {
-			parallel = kwargs[arg_name.c_str()];
-		} else if (arg_name == "date_format") {
-			date_format = kwargs[arg_name.c_str()];
-		} else if (arg_name == "timestamp_format") {
-			timestamp_format = kwargs[arg_name.c_str()];
-		} else if (arg_name == "sample_size") {
-			sample_size = kwargs[arg_name.c_str()];
-		} else if (arg_name == "auto_detect") {
-			auto_detect = kwargs[arg_name.c_str()];
-		} else if (arg_name == "all_varchar") {
-			all_varchar = kwargs[arg_name.c_str()];
-		} else if (arg_name == "normalize_names") {
-			normalize_names = kwargs[arg_name.c_str()];
-		} else if (arg_name == "null_padding") {
-			null_padding = kwargs[arg_name.c_str()];
-		} else if (arg_name == "names") {
-			names_p = kwargs[arg_name.c_str()];
-		} else if (arg_name == "lineterminator") {
-			lineterminator = kwargs[arg_name.c_str()];
-		} else if (arg_name == "columns") {
-			columns = kwargs[arg_name.c_str()];
-		} else if (arg_name == "auto_type_candidates") {
-			auto_type_candidates = kwargs[arg_name.c_str()];
-		} else if (arg_name == "max_line_size") {
-			max_line_size = kwargs[arg_name.c_str()];
-		} else if (arg_name == "ignore_errors") {
-			ignore_errors = kwargs[arg_name.c_str()];
-		} else if (arg_name == "store_rejects") {
-			store_rejects = kwargs[arg_name.c_str()];
-		} else if (arg_name == "rejects_table") {
-			rejects_table = kwargs[arg_name.c_str()];
-		} else if (arg_name == "rejects_scan") {
-			rejects_scan = kwargs[arg_name.c_str()];
-		} else if (arg_name == "rejects_limit") {
-			rejects_limit = kwargs[arg_name.c_str()];
-		} else if (arg_name == "force_not_null") {
-			force_not_null = kwargs[arg_name.c_str()];
-		} else if (arg_name == "buffer_size") {
-			buffer_size = kwargs[arg_name.c_str()];
-		} else if (arg_name == "decimal") {
-			decimal = kwargs[arg_name.c_str()];
-		} else if (arg_name == "allow_quoted_nulls") {
-			allow_quoted_nulls = kwargs[arg_name.c_str()];
-		} else if (arg_name == "filename") {
-			filename = kwargs[arg_name.c_str()];
-		} else if (arg_name == "hive_partitioning") {
-			hive_partitioning = kwargs[arg_name.c_str()];
-		} else if (arg_name == "union_by_name") {
-			union_by_name = kwargs[arg_name.c_str()];
-		} else if (arg_name == "hive_types") {
-			hive_types = kwargs[arg_name.c_str()];
-		} else if (arg_name == "hive_types_autocast") {
-			hive_types_autocast = kwargs[arg_name.c_str()];
-		} else if (arg_name == "strict_mode") {
-			strict_mode = kwargs[arg_name.c_str()];
-		} else {
-			AcceptableCSVOptions(arg_name);
-		}
-	}
-
-	auto &connection = con.GetConnection();
-	CSVReaderOptions options;
-	auto path_like = GetPathLike(name_p);
-	auto &name = path_like.files;
-	auto file_like_object_wrapper = std::move(path_like.dependency);
-	named_parameter_map_t bind_parameters;
-
-	ParseMultiFileOptions(bind_parameters, filename, hive_partitioning, union_by_name, hive_types, hive_types_autocast);
-
-	// First check if the header is explicitly set
-	// when false this affects the returned types, so it needs to be known at initialization of the relation
-	ConvertBooleanValue(header, "header", bind_parameters);
-	ConvertBooleanValue(strict_mode, "strict_mode", bind_parameters);
-
-	if (!py::none().is(compression)) {
-		if (!py::isinstance<py::str>(compression)) {
-			throw InvalidInputException("read_csv only accepts 'compression' as a string");
-		}
-		bind_parameters["compression"] = Value(py::str(compression));
-	}
-
-	if (!py::none().is(dtype)) {
-		if (py::is_dict_like(dtype)) {
-			child_list_t<Value> struct_fields;
-			py::dict dtype_dict = dtype;
-			for (auto &kv : dtype_dict) {
-				shared_ptr<DuckDBPyType> sql_type;
-				if (!py::try_cast(kv.second, sql_type)) {
-					struct_fields.emplace_back(py::str(kv.first), py::str(kv.second));
-				} else {
-					struct_fields.emplace_back(py::str(kv.first), Value(sql_type->ToString()));
-				}
-			}
-			auto dtype_struct = Value::STRUCT(std::move(struct_fields));
-			bind_parameters["dtypes"] = std::move(dtype_struct);
-		} else if (py::is_list_like(dtype)) {
-			vector<Value> list_values;
-			py::list dtype_list = dtype;
-			for (auto &child : dtype_list) {
-				shared_ptr<DuckDBPyType> sql_type;
-				if (!py::try_cast(child, sql_type)) {
-					list_values.push_back(Value(py::str(child)));
-				} else {
-					list_values.push_back(sql_type->ToString());
-				}
-			}
-			bind_parameters["dtypes"] = Value::LIST(LogicalType::VARCHAR, std::move(list_values));
-		} else {
-			throw InvalidInputException("read_csv only accepts 'dtype' as a dictionary or a list of strings");
-		}
-	}
-
-	bool has_sep = !py::none().is(sep);
-	bool has_delimiter = !py::none().is(delimiter);
-	if (has_sep && has_delimiter) {
-		throw InvalidInputException("read_csv takes either 'delimiter' or 'sep', not both");
-	}
-	if (has_sep) {
-		bind_parameters["delim"] = Value(py::str(sep));
-	} else if (has_delimiter) {
-		bind_parameters["delim"] = Value(py::str(delimiter));
-	}
-
-	if (!py::none().is(files_to_sniff)) {
-		if (!py::isinstance<py::int_>(files_to_sniff)) {
-			throw InvalidInputException("read_csv only accepts 'files_to_sniff' as an integer");
-		}
-		bind_parameters["files_to_sniff"] = Value::INTEGER(py::int_(files_to_sniff));
-	}
-
-	if (!py::none().is(names_p)) {
-		if (!py::is_list_like(names_p)) {
-			throw InvalidInputException("read_csv only accepts 'names' as a list of strings");
-		}
-		vector<Value> names;
-		py::list names_list = names_p;
-		for (auto &elem : names_list) {
-			if (!py::isinstance<py::str>(elem)) {
-				throw InvalidInputException("read_csv 'names' list has to consist of only strings");
-			}
-			names.push_back(Value(std::string(py::str(elem))));
-		}
-		bind_parameters["names"] = Value::LIST(LogicalType::VARCHAR, std::move(names));
-	}
-
-	if (!py::none().is(na_values)) {
-		vector<Value> null_values;
-		if (!py::isinstance<py::str>(na_values) && !py::is_list_like(na_values)) {
-			throw InvalidInputException("read_csv only accepts 'na_values' as a string or a list of strings");
-		} else if (py::isinstance<py::str>(na_values)) {
-			null_values.push_back(Value(py::str(na_values)));
-		} else {
-			py::list null_list = na_values;
-			for (auto &elem : null_list) {
-				if (!py::isinstance<py::str>(elem)) {
-					throw InvalidInputException("read_csv 'na_values' list has to consist of only strings");
-				}
-				null_values.push_back(Value(std::string(py::str(elem))));
-			}
-		}
-		bind_parameters["nullstr"] = Value::LIST(LogicalType::VARCHAR, std::move(null_values));
-	}
-
-	if (!py::none().is(skiprows)) {
-		if (!py::isinstance<py::int_>(skiprows)) {
-			throw InvalidInputException("read_csv only accepts 'skiprows' as an integer");
-		}
-		bind_parameters["skip"] = Value::INTEGER(py::int_(skiprows));
-	}
-
-	if (!py::none().is(parallel)) {
-		if (!py::isinstance<py::bool_>(parallel)) {
-			throw InvalidInputException("read_csv only accepts 'parallel' as a boolean");
-		}
-		bind_parameters["parallel"] = Value::BOOLEAN(py::bool_(parallel));
-	}
-
-	if (!py::none().is(quotechar)) {
-		if (!py::isinstance<py::str>(quotechar)) {
-			throw InvalidInputException("read_csv only accepts 'quotechar' as a string");
-		}
-		bind_parameters["quote"] = Value(py::str(quotechar));
-	}
-
-	if (!py::none().is(comment)) {
-		if (!py::isinstance<py::str>(comment)) {
-			throw InvalidInputException("read_csv only accepts 'comment' as a string");
-		}
-		bind_parameters["comment"] = Value(py::str(comment));
-	}
-
-	if (!py::none().is(thousands_separator)) {
-		if (!py::isinstance<py::str>(thousands_separator)) {
-			throw InvalidInputException("read_csv only accepts 'thousands' as a string");
-		}
-		bind_parameters["thousands"] = Value(py::str(thousands_separator));
-	}
-
-	if (!py::none().is(escapechar)) {
-		if (!py::isinstance<py::str>(escapechar)) {
-			throw InvalidInputException("read_csv only accepts 'escapechar' as a string");
-		}
-		bind_parameters["escape"] = Value(py::str(escapechar));
-	}
-
-	if (!py::none().is(encoding)) {
-		if (!py::isinstance<py::str>(encoding)) {
-			throw InvalidInputException("read_csv only accepts 'encoding' as a string");
-		}
-		string encoding_str = StringUtil::Lower(py::str(encoding));
-		if (encoding_str != "utf8" && encoding_str != "utf-8") {
-			throw BinderException("Copy is only supported for UTF-8 encoded files, ENCODING 'UTF-8'");
-		}
-	}
-
-	if (!py::none().is(date_format)) {
-		if (!py::isinstance<py::str>(date_format)) {
-			throw InvalidInputException("read_csv only accepts 'date_format' as a string");
-		}
-		bind_parameters["dateformat"] = Value(py::str(date_format));
-	}
-
-	if (!py::none().is(auto_detect)) {
-		bool auto_detect_as_int = py::isinstance<py::int_>(auto_detect);
-		bool auto_detect_as_bool = py::isinstance<py::bool_>(auto_detect);
-		bool auto_detect_value;
-		if (auto_detect_as_bool) {
-			auto_detect_value = py::bool_(auto_detect);
-		} else if (auto_detect_as_int) {
-			if ((int)py::int_(auto_detect) != 0) {
-				throw InvalidInputException("read_csv only accepts 0 if 'auto_detect' is given as an integer");
-			}
-			auto_detect_value = true;
-		} else {
-			throw InvalidInputException("read_csv only accepts 'auto_detect' as an integer, or a boolean");
-		}
-		bind_parameters["auto_detect"] = Value::BOOLEAN(auto_detect_value);
-	}
-
-	if (!py::none().is(timestamp_format)) {
-		if (!py::isinstance<py::str>(timestamp_format)) {
-			throw InvalidInputException("read_csv only accepts 'timestamp_format' as a string");
-		}
-		bind_parameters["timestampformat"] = Value(py::str(timestamp_format));
-	}
-
-	if (!py::none().is(sample_size)) {
-		if (!py::isinstance<py::int_>(sample_size)) {
-			throw InvalidInputException("read_csv only accepts 'sample_size' as an integer");
-		}
-		bind_parameters["sample_size"] = Value::INTEGER(py::int_(sample_size));
-	}
-
-	if (!py::none().is(all_varchar)) {
-		if (!py::isinstance<py::bool_>(all_varchar)) {
-			throw InvalidInputException("read_csv only accepts 'all_varchar' as a boolean");
-		}
-		bind_parameters["all_varchar"] = Value::BOOLEAN(py::bool_(all_varchar));
-	}
-
-	if (!py::none().is(normalize_names)) {
-		if (!py::isinstance<py::bool_>(normalize_names)) {
-			throw InvalidInputException("read_csv only accepts 'normalize_names' as a boolean");
-		}
-		bind_parameters["normalize_names"] = Value::BOOLEAN(py::bool_(normalize_names));
-	}
-
-	if (!py::none().is(null_padding)) {
-		if (!py::isinstance<py::bool_>(null_padding)) {
-			throw InvalidInputException("read_csv only accepts 'null_padding' as a boolean");
-		}
-		bind_parameters["null_padding"] = Value::BOOLEAN(py::bool_(null_padding));
-	}
-
-	if (!py::none().is(lineterminator)) {
-		PythonCSVLineTerminator::Type new_line_type;
-		if (!py::try_cast<PythonCSVLineTerminator::Type>(lineterminator, new_line_type)) {
-			string actual_type = py::str(py::type::of(lineterminator));
-			throw BinderException("read_csv only accepts 'lineterminator' as a string or CSVLineTerminator, not '%s'",
-			                      actual_type);
-		}
-		bind_parameters["new_line"] = Value(PythonCSVLineTerminator::ToString(new_line_type));
-	}
-
-	if (!py::none().is(max_line_size)) {
-		if (!py::isinstance<py::str>(max_line_size) && !py::isinstance<py::int_>(max_line_size)) {
-			string actual_type = py::str(py::type::of(max_line_size));
-			throw BinderException("read_csv only accepts 'max_line_size' as a string or an integer, not '%s'",
-			                      actual_type);
-		}
-		auto val = TransformPythonValue(max_line_size, LogicalTypeId::VARCHAR);
-		bind_parameters["max_line_size"] = val;
-	}
-
-	if (!py::none().is(auto_type_candidates)) {
-		if (!py::isinstance<py::list>(auto_type_candidates)) {
-			string actual_type = py::str(py::type::of(auto_type_candidates));
-			throw BinderException("read_csv only accepts 'auto_type_candidates' as a list[str], not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(auto_type_candidates, LogicalType::LIST(LogicalTypeId::VARCHAR));
-		bind_parameters["auto_type_candidates"] = val;
-	}
-
-	if (!py::none().is(ignore_errors)) {
-		if (!py::isinstance<py::bool_>(ignore_errors)) {
-			string actual_type = py::str(py::type::of(ignore_errors));
-			throw BinderException("read_csv only accepts 'ignore_errors' as a bool, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(ignore_errors, LogicalTypeId::BOOLEAN);
-		bind_parameters["ignore_errors"] = val;
-	}
-
-	if (!py::none().is(store_rejects)) {
-		if (!py::isinstance<py::bool_>(store_rejects)) {
-			string actual_type = py::str(py::type::of(store_rejects));
-			throw BinderException("read_csv only accepts 'store_rejects' as a bool, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(store_rejects, LogicalTypeId::BOOLEAN);
-		bind_parameters["store_rejects"] = val;
-	}
-
-	if (!py::none().is(rejects_table)) {
-		if (!py::isinstance<py::str>(rejects_table)) {
-			string actual_type = py::str(py::type::of(rejects_table));
-			throw BinderException("read_csv only accepts 'rejects_table' as a string, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(rejects_table, LogicalTypeId::VARCHAR);
-		bind_parameters["rejects_table"] = val;
-	}
-
-	if (!py::none().is(rejects_scan)) {
-		if (!py::isinstance<py::str>(rejects_scan)) {
-			string actual_type = py::str(py::type::of(rejects_scan));
-			throw BinderException("read_csv only accepts 'rejects_scan' as a string, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(rejects_scan, LogicalTypeId::VARCHAR);
-		bind_parameters["rejects_scan"] = val;
-	}
-
-	if (!py::none().is(rejects_limit)) {
-		if (!py::isinstance<py::int_>(rejects_limit)) {
-			string actual_type = py::str(py::type::of(rejects_limit));
-			throw BinderException("read_csv only accepts 'rejects_limit' as an int, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(rejects_limit, LogicalTypeId::BIGINT);
-		bind_parameters["rejects_limit"] = val;
-	}
-
-	if (!py::none().is(force_not_null)) {
-		if (!py::isinstance<py::list>(force_not_null)) {
-			string actual_type = py::str(py::type::of(force_not_null));
-			throw BinderException("read_csv only accepts 'force_not_null' as a list[str], not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(force_not_null, LogicalType::LIST(LogicalTypeId::VARCHAR));
-		bind_parameters["force_not_null"] = val;
-	}
-
-	if (!py::none().is(buffer_size)) {
-		if (!py::isinstance<py::int_>(buffer_size)) {
-			string actual_type = py::str(py::type::of(buffer_size));
-			throw BinderException("read_csv only accepts 'buffer_size' as a list[str], not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(buffer_size, LogicalTypeId::UBIGINT);
-		bind_parameters["buffer_size"] = val;
-	}
-
-	if (!py::none().is(decimal)) {
-		if (!py::isinstance<py::str>(decimal)) {
-			string actual_type = py::str(py::type::of(decimal));
-			throw BinderException("read_csv only accepts 'decimal' as a string, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(decimal, LogicalTypeId::VARCHAR);
-		bind_parameters["decimal_separator"] = val;
-	}
-
-	if (!py::none().is(allow_quoted_nulls)) {
-		if (!py::isinstance<py::bool_>(allow_quoted_nulls)) {
-			string actual_type = py::str(py::type::of(allow_quoted_nulls));
-			throw BinderException("read_csv only accepts 'allow_quoted_nulls' as a bool, not '%s'", actual_type);
-		}
-		auto val = TransformPythonValue(allow_quoted_nulls, LogicalTypeId::BOOLEAN);
-		bind_parameters["allow_quoted_nulls"] = val;
-	}
-
-	if (!py::none().is(columns)) {
-		if (!py::is_dict_like(columns)) {
-			throw BinderException("read_csv only accepts 'columns' as a dict[str, str]");
-		}
-		py::dict columns_dict = columns;
-		child_list_t<Value> struct_fields;
-
-		for (auto &kv : columns_dict) {
-			auto &column_name = kv.first;
-			auto &type = kv.second;
-			if (!py::isinstance<py::str>(column_name)) {
-				string actual_type = py::str(py::type::of(column_name));
-				throw BinderException("The provided column name must be a str, not of type '%s'", actual_type);
-			}
-			if (!py::isinstance<py::str>(type)) {
-				string actual_type = py::str(py::type::of(column_name));
-				throw BinderException("The provided column type must be a str, not of type '%s'", actual_type);
-			}
-			struct_fields.emplace_back(py::str(column_name), Value(py::str(type)));
-		}
-		auto dtype_struct = Value::STRUCT(std::move(struct_fields));
-		bind_parameters["columns"] = std::move(dtype_struct);
-	}
-
-	// Create the ReadCSV Relation using the 'options'
-
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release gil;
-	auto read_csv_p = connection.ReadCSV(name, std::move(bind_parameters));
-	auto &read_csv = read_csv_p->Cast<ReadCSVRelation>();
-	if (file_like_object_wrapper) {
-		read_csv.AddExternalDependency(std::move(file_like_object_wrapper));
-	}
-
-	return CreateRelation(read_csv_p->Alias(read_csv.alias));
-}
-
-void DuckDBPyConnection::ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements) {
-	ExecutePrecedingStatements(std::move(statements), CreateQueryInterruptCheck());
-}
-
-void DuckDBPyConnection::ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements,
-                                                    const py::object &interrupt_check) {
-	for (auto &statement : statements) {
-		if (!statement->named_param_map.empty()) {
-			throw NotImplementedException("Prepared parameters are only supported for the last statement, please "
-			                              "split your query up into separate calls");
-		}
-		auto discarded_result = RunStatement(std::move(statement), "", py::none(), true, interrupt_check);
-		if (discarded_result) {
-			while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
-			}
-		}
-	}
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &query, string alias, py::object params) {
-	return RunQueryInternal(query, std::move(alias), std::move(params), false);
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
-                                                                  py::object params, bool for_connection) {
-	auto interrupt_check = CreateQueryInterruptCheck();
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		return nullptr;
-	}
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	ExecutePrecedingStatements(std::move(statements), interrupt_check);
-	return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
-	                    interrupt_check);
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStatement> statement, string alias,
-                                                              py::object params, bool for_connection,
-                                                              const py::object &interrupt_check) {
-	if (statement->type == StatementType::MULTI_STATEMENT) {
-		unique_lock<std::recursive_mutex> connection_lock;
-		vector<unique_ptr<SQLStatement>> statements;
-		{
-			py::gil_scoped_release release;
-			connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
-			auto context = con.GetConnection().context;
-			statements = PreprocessVaneStatement(*context, std::move(statement));
-		}
-		if (statements.empty()) {
-			return nullptr;
-		}
-		auto last_statement = std::move(statements.back());
-		statements.pop_back();
-		ExecutePrecedingStatements(std::move(statements), interrupt_check);
-		return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
-		                    interrupt_check);
-	}
-	auto query = statement->query;
-	if (alias.empty()) {
-		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
-	}
-	auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
-	PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
-	// Parameter conversion can close the connection or begin a transaction.
-	// Resolve its live context afterward; execution admission validates the plan.
-	unique_lock<std::recursive_mutex> execution_lock;
-	{
-		py::gil_scoped_release release;
-		execution_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
-	}
-	auto context = con.GetConnection().context;
-	interrupt_check();
-	if (statement->type == StatementType::SELECT_STATEMENT) {
-		shared_ptr<Relation> relation;
-		try {
-			py::gil_scoped_release release;
-			if (for_connection) {
-				// QueryRelation binds during construction. Clean up the previous
-				// query first, as PendingQuery does, while retaining the relation's
-				// source dependencies for the lifetime of the result stream.
-				context->CancelTransaction();
-			}
-			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
-			auto original_query = select->ToString();
-			if (!parameters.empty()) {
-				CaptureQueryParameters(*select->node, parameters);
-				select->named_param_map.clear();
-			}
-			relation = CreateVaneQueryRelation(context, std::move(select), alias, original_query);
-		} catch (const Exception &exception) {
-			ErrorData error(exception);
-			context->ProcessError(error, query);
-			error.Throw();
-		}
-		if (!for_connection) {
-			return CreateRelation(std::move(relation));
-		}
-		auto query_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
-		query_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
-		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
-	}
-
-	// Retain the execution lock until command sql() streams become relations.
-	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
-	                                   CreateWeakOwner(shared_from_this()), interrupt_check, true);
-	if (for_connection) {
-		return make_uniq<DuckDBPyRelation>(execution.TakeResult());
-	}
-	if (execution.return_type != StatementReturnType::QUERY_RESULT) {
-		return nullptr;
-	}
-	if (execution.native_result) {
-		auto res = std::move(execution.native_result);
-		if (res->type == QueryResultType::STREAM_RESULT) {
-			py::gil_scoped_release release;
-			res = res->Cast<StreamQueryResult>().Materialize();
-		}
-		if (res->HasError()) {
-			res->ThrowError();
-		}
-		auto &materialized = res->Cast<MaterializedQueryResult>();
-		return CreateRelation(
-		    make_shared_ptr<MaterializedRelation>(context, materialized.TakeCollection(), res->names, alias));
-	}
-	auto result = execution.TakeResult();
-	auto collection = make_uniq<ColumnDataCollection>(*context, result->GetTypes());
-	while (true) {
-		unique_ptr<DataChunk> chunk;
-		{
-			py::gil_scoped_release release;
-			chunk = result->FetchChunk();
-		}
-		if (!chunk || chunk->size() == 0) {
-			break;
-		}
-		collection->Append(*chunk);
-	}
-	return CreateRelation(
-	    make_shared_ptr<MaterializedRelation>(context, std::move(collection), result->GetNames(), alias));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Table(const string &tname) {
-	auto &connection = con.GetConnection();
-	auto qualified_name = QualifiedName::Parse(tname);
-	if (qualified_name.schema.empty()) {
-		qualified_name.schema = DEFAULT_SCHEMA;
-	}
-	try {
-		return CreateRelation(connection.Table(qualified_name.catalog, qualified_name.schema, qualified_name.name));
-	} catch (const CatalogException &) {
-		// CatalogException will be of the type '... is not a table'
-		// Not a table in the database, make a query relation that can perform replacement scans
-		auto sql_query = StringUtil::Format("from %s", KeywordHelper::WriteOptionallyQuoted(tname));
-		return RunQuery(py::str(sql_query), tname);
-	}
-}
-
-static vector<unique_ptr<ParsedExpression>> ValueListFromExpressions(const py::args &expressions) {
-	vector<unique_ptr<ParsedExpression>> result;
-	auto arg_count = expressions.size();
-	if (arg_count == 0) {
-		throw InvalidInputException("Please provide a non-empty tuple");
-	}
-
-	for (idx_t i = 0; i < arg_count; i++) {
-		py::handle arg = expressions[i];
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-			throw InvalidInputException("Please provide arguments of type Expression!");
-		}
-		auto expr = py_expr->GetExpression().Copy();
-		result.push_back(std::move(expr));
-	}
-	return result;
-}
-
-static vector<vector<unique_ptr<ParsedExpression>>> ValueListsFromTuples(const py::args &tuples) {
-	auto arg_count = tuples.size();
-	if (arg_count == 0) {
-		throw InvalidInputException("Please provide a non-empty tuple");
-	}
-
-	idx_t expected_length = 0;
-	vector<vector<unique_ptr<ParsedExpression>>> result;
-	for (idx_t i = 0; i < arg_count; i++) {
-		py::handle arg = tuples[i];
-		if (!py::isinstance<py::tuple>(arg)) {
-			string actual_type = py::str(py::type::of(arg));
-			throw InvalidInputException("Expected objects of type tuple, not %s", actual_type);
-		}
-		auto expressions = py::cast<py::args>(arg);
-		auto value_list = ValueListFromExpressions(expressions);
-		if (i && value_list.size() != expected_length) {
-			throw InvalidInputException("Mismatch between length of tuples in input, expected %d but found %d",
-			                            expected_length, value_list.size());
-		}
-		expected_length = value_list.size();
-		result.push_back(std::move(value_list));
-	}
-	return result;
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Values(const py::args &args) {
-	auto &connection = con.GetConnection();
-
-	auto arg_count = args.size();
-	if (arg_count == 0) {
-		throw InvalidInputException("Could not create a ValueRelation without any inputs");
-	}
-
-	D_ASSERT(py::gil_check());
-	py::handle first_arg = args[0];
-	if (arg_count == 1 && py::isinstance<py::list>(first_arg)) {
-		vector<vector<Value>> values {DuckDBPyConnection::TransformPythonParamList(first_arg)};
-		return CreateRelation(connection.Values(values));
-	} else {
-		vector<vector<unique_ptr<ParsedExpression>>> expressions;
-		if (py::isinstance<py::tuple>(first_arg)) {
-			expressions = ValueListsFromTuples(args);
-		} else {
-			auto values = ValueListFromExpressions(args);
-			expressions.push_back(std::move(values));
-		}
-		return CreateRelation(connection.Values(std::move(expressions)));
-	}
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::View(const string &vname) {
-	auto &connection = con.GetConnection();
-	return CreateRelation(connection.View(vname));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fname, py::object params) {
-	auto &connection = con.GetConnection();
-	if (params.is_none()) {
-		params = py::list();
-	}
-	if (!py::is_list_like(params)) {
-		throw InvalidInputException("'params' has to be a list of parameters");
-	}
-
-	return CreateRelation(connection.TableFunction(fname, DuckDBPyConnection::TransformPythonParamList(params)));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
-	named_parameter_map_t named_parameters;
-	for (auto &entry : options) {
-		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
-	}
-	// Retain constant arguments in the relation so execution and Ray planning
-	// see the scan itself.
-	auto &connection = con.GetConnection();
-	return CreateRelation(
-	    connection.TableFunction("read_video_frames", TransformPythonParamList(params), named_parameters));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
-	auto &connection = con.GetConnection();
-	string name = "df_" + StringUtil::GenerateRandomName();
-	auto tableref = PythonReplacementScan::ReplacementObject(value, name, *connection.context);
-	D_ASSERT(tableref);
-	auto rel = make_shared_ptr<ViewRelation>(connection.context, std::move(tableref), name);
-	return CreateRelation(std::move(rel));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquetInternal(Value &&file_param, bool binary_as_string,
-                                                                     bool file_row_number, bool filename,
-                                                                     bool hive_partitioning, bool union_by_name,
-                                                                     const py::object &compression) {
-	auto &connection = con.GetConnection();
-	string name = "parquet_" + StringUtil::GenerateRandomName();
-	vector<Value> params;
-	params.emplace_back(std::move(file_param));
-	named_parameter_map_t named_parameters({{"binary_as_string", Value::BOOLEAN(binary_as_string)},
-	                                        {"file_row_number", Value::BOOLEAN(file_row_number)},
-	                                        {"filename", Value::BOOLEAN(filename)},
-	                                        {"hive_partitioning", Value::BOOLEAN(hive_partitioning)},
-	                                        {"union_by_name", Value::BOOLEAN(union_by_name)}});
-
-	if (!py::none().is(compression)) {
-		if (!py::isinstance<py::str>(compression)) {
-			throw InvalidInputException("from_parquet only accepts 'compression' as a string");
-		}
-		named_parameters["compression"] = Value(py::str(compression));
-	}
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release gil;
-	return CreateRelation(connection.TableFunction("parquet_scan", params, named_parameters)->Alias(name));
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquet(const string &file_glob, bool binary_as_string,
-                                                             bool file_row_number, bool filename,
-                                                             bool hive_partitioning, bool union_by_name,
-                                                             const py::object &compression) {
-	auto file_param = Value(file_glob);
-	return FromParquetInternal(std::move(file_param), binary_as_string, file_row_number, filename, hive_partitioning,
-	                           union_by_name, compression);
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquets(const vector<string> &file_globs, bool binary_as_string,
-                                                              bool file_row_number, bool filename,
-                                                              bool hive_partitioning, bool union_by_name,
-                                                              const py::object &compression) {
-	vector<Value> params;
-	auto file_globs_as_value = vector<Value>();
-	for (const auto &file : file_globs) {
-		file_globs_as_value.emplace_back(file);
-	}
-	auto file_param = Value::LIST(file_globs_as_value);
-	return FromParquetInternal(std::move(file_param), binary_as_string, file_row_number, filename, hive_partitioning,
-	                           union_by_name, compression);
-}
-
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_object) {
-	auto &connection = con.GetConnection();
-	string name = "arrow_object_" + StringUtil::GenerateRandomName();
-	if (!IsAcceptedArrowObject(arrow_object)) {
-		auto py_object_type = string(py::str(py::type::of(arrow_object).attr("__name__")));
-		throw InvalidInputException("Python Object Type %s is not an accepted Arrow Object.", py_object_type);
-	}
-	auto tableref = PythonReplacementScan::ReplacementObject(arrow_object, name, *connection.context, true);
-	D_ASSERT(tableref);
-	auto rel = make_shared_ptr<ViewRelation>(connection.context, std::move(tableref), name);
-	return CreateRelation(std::move(rel));
-}
-
-unordered_set<string> DuckDBPyConnection::GetTableNames(const string &query, bool qualified) {
-	auto &connection = con.GetConnection();
-	return connection.GetTableNames(query, qualified);
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::UnregisterPythonObject(const string &name) {
-	auto &connection = con.GetConnection();
-	if (!registered_objects.count(name)) {
-		return shared_from_this();
-	}
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release release;
-	// FIXME: DROP TEMPORARY VIEW? doesn't exist?
-	const auto quoted_name = KeywordHelper::WriteOptionallyQuoted(name, '\"');
-	connection.Query("DROP VIEW " + quoted_name + "");
-	registered_objects.erase(name);
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Begin() {
-	ExecuteFromString("BEGIN TRANSACTION");
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Commit() {
-	auto &connection = con.GetConnection();
-	if (connection.context->transaction.IsAutoCommit()) {
-		return shared_from_this();
-	}
-	ExecuteFromString("COMMIT");
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Rollback() {
-	ExecuteFromString("ROLLBACK");
-	return shared_from_this();
-}
-
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Checkpoint() {
-	ExecuteFromString("CHECKPOINT");
-	return shared_from_this();
-}
-
-Optional<py::list> DuckDBPyConnection::GetDescription() {
-	if (!con.HasResult()) {
-		return py::none();
-	}
-	auto &result = con.GetResult();
-	return result.Description();
-}
-
-int DuckDBPyConnection::GetRowcount() {
-	return -1;
-}
-
 void DuckDBPyConnection::Close() {
 	D_ASSERT(py::gil_check());
+	CheckCallbackEntry();
+	CheckLocalQueryCloseReentrancy();
+	local_query_closing = true;
+	if (!local_query_stream.is_none()) {
+		auto result = local_query_stream();
+		if (!result.is_none()) {
+			result.attr("_close_stream")();
+		}
+	}
+	if (vane_session && !vane_session->local_query_runtime.is_none()) {
+		if (vane_session_owner) {
+			{
+				lock_guard<mutex> guard(vane_session->lock);
+				vane_session->local_runtime_closing = true;
+			}
+			vane_session->local_query_runtime.attr("drain")();
+		}
+		// A queued request must be cancelled before waiting for its execution
+		// lock. Running requests keep their owners until native cleanup ends.
+		if (!local_query_request.is_none()) {
+			local_query_request.attr("cancel")();
+		}
+	}
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> closing_functions;
 	try {
 		{
 			unique_lock<std::recursive_mutex> lock;
 			{
 				py::gil_scoped_release release;
-				lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+				lock = LockConnection(py_connection_lock);
 			}
 			con.SetResult(nullptr);
 			{
@@ -2736,7 +165,7 @@ void DuckDBPyConnection::Close() {
 	} catch (...) {
 		// A later Close must retain the dependencies of children still awaiting cleanup.
 		py::gil_scoped_release release;
-		unique_lock<std::recursive_mutex> lock(py_connection_lock);
+		auto lock = LockConnection(py_connection_lock);
 		for (auto &entry : closing_functions) {
 			registered_functions.emplace(entry.first, std::move(entry.second));
 		}
@@ -2745,11 +174,23 @@ void DuckDBPyConnection::Close() {
 }
 
 void DuckDBPyConnection::Interrupt() {
-	auto &connection = con.GetConnection();
+	D_ASSERT(py::gil_check());
+	auto context = con.GetConnection().context;
+	auto request = local_query_request;
+	// Python cancellation can yield after the request retires. Fence that
+	// entire operation, retaining both its request and native context.
 	interrupts_in_progress.fetch_add(1);
 	try {
-		connection.Interrupt();
+		if (!request.is_none()) {
+			// The request's fenced callback interrupts only its own execution.
+			// An unconditional native interrupt afterward could hit a reused cursor.
+			request.attr("cancel")();
+		} else {
+			context->Interrupt();
+			CancelPythonUDFActorResourcePreparation(*context);
+		}
 	} catch (...) {
+		interrupt_generation.fetch_add(1);
 		interrupts_in_progress.fetch_sub(1);
 		throw;
 	}
@@ -2787,6 +228,8 @@ double DuckDBPyConnection::QueryProgress() {
 
 void DuckDBPyConnection::InstallExtension(const string &extension, bool force_install, const py::object &repository,
                                           const py::object &repository_url, const py::object &version) {
+	auto query_lock = LockForQuery();
+	PythonInputCallbackScope callback(nullptr);
 	auto &connection = con.GetConnection();
 
 	auto install_statement = make_uniq<LoadStatement>();
@@ -2831,6 +274,7 @@ void DuckDBPyConnection::InstallExtension(const string &extension, bool force_in
 }
 
 void DuckDBPyConnection::LoadExtension(const string &extension) {
+	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
 	ExtensionHelper::LoadExternalExtension(*connection.context, extension);
 }
@@ -2842,6 +286,11 @@ shared_ptr<DuckDBPyConnection> DefaultConnectionHolder::Get() {
 		connection = DuckDBPyConnection::Connect(py::str(":memory:"), false, config_dict);
 	}
 	return connection;
+}
+
+shared_ptr<DuckDBPyConnection> DefaultConnectionHolder::GetIfOpen() {
+	lock_guard<mutex> guard(l);
+	return connection && !connection->con.ConnectionIsClosed() ? connection : nullptr;
 }
 
 void DefaultConnectionHolder::Set(shared_ptr<DuckDBPyConnection> conn) {
@@ -2924,7 +373,24 @@ void DuckDBPyConnection::Cursors::ClearCursors() {
 	}
 }
 
+void DuckDBPyConnection::Cursors::CheckLocalQueryCloseReentrancy() {
+	vector<shared_ptr<DuckDBPyConnection>> children;
+	{
+		lock_guard<mutex> guard(lock);
+		for (auto &entry : cursors) {
+			auto child = entry.lock();
+			if (child) {
+				children.push_back(std::move(child));
+			}
+		}
+	}
+	for (auto &child : children) {
+		child->CheckLocalQueryCloseReentrancy();
+	}
+}
+
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
+	auto query_lock = LockForQuery();
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
 	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
@@ -2935,95 +401,6 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	res->applied_distributed_python_udf_digests = applied_distributed_python_udf_digests;
 	cursors.AddCursor(res);
 	return res;
-}
-
-// these should be functions on the result but well
-Optional<py::tuple> DuckDBPyConnection::FetchOne() {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchOne();
-}
-
-py::list DuckDBPyConnection::FetchMany(idx_t size) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchMany(size);
-}
-
-py::list DuckDBPyConnection::FetchAll() {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchAll();
-}
-
-py::dict DuckDBPyConnection::FetchNumpy() {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchNumpyInternal();
-}
-
-PandasDataFrame DuckDBPyConnection::FetchDF(bool date_as_object) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchDF(date_as_object);
-}
-
-PandasDataFrame DuckDBPyConnection::FetchDFChunk(const idx_t vectors_per_chunk, bool date_as_object) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchDFChunk(vectors_per_chunk, date_as_object);
-}
-
-duckdb::pyarrow::Table DuckDBPyConnection::FetchArrow(idx_t rows_per_batch) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.ToArrowTable(rows_per_batch);
-}
-
-py::dict DuckDBPyConnection::FetchPyTorch() {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchPyTorch();
-}
-
-py::dict DuckDBPyConnection::FetchTF() {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchTF();
-}
-
-PolarsDataFrame DuckDBPyConnection::FetchPolars(idx_t rows_per_batch, bool lazy) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.ToPolars(rows_per_batch, lazy);
-}
-
-duckdb::pyarrow::RecordBatchReader DuckDBPyConnection::FetchRecordBatchReader(const idx_t rows_per_batch) {
-	if (!con.HasResult()) {
-		throw InvalidInputException("No open result set");
-	}
-	auto &result = con.GetResult();
-	return result.FetchRecordBatchReader(rows_per_batch);
 }
 
 case_insensitive_map_t<Value> TransformPyConfigDict(const py::dict &py_config_dict) {
@@ -3071,8 +448,8 @@ void DuckDBPyConnection::InitializeVaneSession() {
 	}
 
 	py::dict captured;
-	auto environ = py::module_::import("os").attr("environ");
-	auto environ_dict = py::module_::import("builtins").attr("dict")(environ).cast<py::dict>();
+	auto process_environment = py::module_::import("os").attr("environ");
+	auto environ_dict = py::module_::import("builtins").attr("dict")(process_environment).cast<py::dict>();
 	for (auto item : environ_dict) {
 		auto key = py::str(item.first).cast<string>();
 		if (!IsVaneSessionEnvironmentKey(key)) {
@@ -3083,6 +460,7 @@ void DuckDBPyConnection::InitializeVaneSession() {
 	captured[py::str("VANE_RUNNER")] = py::str(GetRunnerType());
 	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
 	vane_session_attached = true;
+	vane_session_owner = true;
 }
 
 string DuckDBPyConnection::GetRunnerType() const {
@@ -3096,12 +474,126 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 	vane_session = owner.vane_session;
 	{
 		lock_guard<mutex> guard(vane_session->lock);
-		if (vane_session->connection_count == 0) {
+		if (vane_session->connection_count == 0 || vane_session->local_runtime_closing) {
 			throw InternalException("Cannot inherit closed Vane connection session");
+		}
+		if (!vane_session->local_query_runtime.is_none()) {
+			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
 		}
 		vane_session->connection_count++;
 	}
 	vane_session_attached = true;
+	vane_session_owner = false;
+}
+
+py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) {
+	auto query_lock = LockForQuery();
+	unique_lock<std::recursive_mutex> execution_lock;
+	{
+		py::gil_scoped_release release;
+		execution_lock = LockConnection(py_connection_lock);
+	}
+	auto &context = *con.GetConnection().context;
+	if (GetRunnerType() != "local") {
+		throw InvalidInputException("configure_local_runtime requires a local connection");
+	}
+	if (context.transaction.HasActiveTransaction()) {
+		throw InvalidInputException("configure_local_runtime requires an idle auto-commit connection");
+	}
+	{
+		lock_guard<mutex> guard(vane_session->lock);
+		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
+		    !vane_session_owner || vane_session->connection_count != 1 ||
+		    !vane_session->local_query_runtime.is_none()) {
+			throw InvalidInputException(
+			    "configure_local_runtime must run once on the session owner before creating cursors");
+		}
+	}
+	py::dict config(options);
+	if (config.contains("session_id") || config.contains("session_config") || config.contains("_connection")) {
+		throw InvalidInputException("local runtime session identity is owned by the connection");
+	}
+	config["session_id"] = py::str(GetVaneSessionId());
+	config["session_config"] = ExportVaneSessionConfig();
+	config["_connection"] = py::cast(shared_from_this());
+	py::object runtime;
+	{
+		// Configuration can iterate application-supplied device inventories.
+		// Reject callback entry before it can wait on another connection while
+		// this connection's locks remain held.
+		PythonInputCallbackScope callback(con.GetConnection().context);
+		runtime = py::module_::import("vane.execution.local_query").attr("LocalQueryRuntime")(**config);
+	}
+	{
+		lock_guard<mutex> guard(vane_session->lock);
+		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
+		    vane_session->connection_count != 1 || !vane_session->local_query_runtime.is_none()) {
+			throw InvalidInputException("Vane session changed while configuring its local runtime");
+		}
+		EnableLocalRuntimeInputPolicy(context);
+		vane_session->local_query_runtime = runtime;
+	}
+	return runtime;
+}
+
+py::object DuckDBPyConnection::GetLocalQueryRuntime() const {
+	if (!vane_session || !vane_session_attached) {
+		return py::none();
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	return vane_session->local_query_runtime;
+}
+
+unique_lock<std::recursive_mutex> DuckDBPyConnection::LockForQuery() const {
+	CheckCallbackEntry();
+	D_ASSERT(py::gil_check());
+	// Check before taking either connection lock. Python input callbacks can
+	// run on another thread while their caller holds those locks, so checking
+	// only the owning thread would still deadlock. Concurrent queries use cursors.
+	if (!local_query_request.is_none()) {
+		throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
+	}
+	const auto generation = InterruptGeneration();
+	const auto interrupting = InterruptInProgress();
+	auto lock = LockConnection(py_connection_lock);
+	// Entry guards may wait before the query-specific interrupt check is made.
+	// Preserve cancellation accepted during that wait.
+	if (interrupting || InterruptInProgress() || InterruptGeneration() != generation) {
+		throw InterruptException();
+	}
+	return lock;
+}
+
+void DuckDBPyConnection::CheckCallbackEntry() {
+	// Callback code must never wait on a connection, even an idle sibling: a
+	// nested query may dispatch workers that need the input invoking this callback.
+	// This scope exists before open/metadata callbacks too, without a file handle.
+	if (PythonInputCallbackScope::IsActive()) {
+		throw InvalidInputException("cannot call connection APIs reentrantly from a Python input callback");
+	}
+}
+
+unique_lock<std::recursive_mutex> DuckDBPyConnection::LockConnection(const shared_ptr<std::recursive_mutex> &mutex) {
+	CheckCallbackEntry();
+	unique_lock<std::recursive_mutex> lock(*mutex, std::defer_lock);
+	if (py::gil_check()) {
+		py::gil_scoped_release release;
+		lock.lock();
+	} else {
+		lock.lock();
+	}
+	return lock;
+}
+
+void DuckDBPyConnection::CheckLocalQueryCloseReentrancy() {
+	D_ASSERT(py::gil_check());
+	if (!local_query_request.is_none() && (local_query_thread == std::this_thread::get_id() ||
+	                                       PythonInputCallbackScope::Contains(*con.GetConnection().context))) {
+		throw InvalidInputException("cannot close a cursor reentrantly during its local runtime query");
+	}
+	// Closing an owner also waits for its children. Reject before draining or
+	// detaching any of them when the caller is a child's runtime initializer.
+	cursors.CheckLocalQueryCloseReentrancy();
 }
 
 const string &DuckDBPyConnection::GetVaneSessionId() const {
@@ -3175,7 +667,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 	if (!vane_session) {
 		throw InternalException("DuckDB connection is missing its attached Vane session");
 	}
-	lock_guard<mutex> guard(vane_session->lock);
+	unique_lock<mutex> guard(vane_session->lock);
 	if (vane_session->connection_count == 0) {
 		throw InternalException("DuckDB connection Vane session reference count underflow");
 	}
@@ -3183,6 +675,15 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		vane_session->connection_count--;
 		vane_session_attached = false;
 		return;
+	}
+	if (!vane_session->local_query_runtime.is_none() && !PythonIsFinalizing()) {
+		vane_session->local_runtime_closing = true;
+		auto runtime = vane_session->local_query_runtime;
+		guard.unlock();
+		// Failed cleanup keeps the final session attachment and runtime for retry.
+		runtime.attr("close")();
+		guard.lock();
+		vane_session->local_query_runtime = py::none();
 	}
 	if (vane_session->ray_session_opened && !vane_session->id.empty() && !PythonIsFinalizing()) {
 		py::module_::import("vane.runners.ray.runner").attr("notify_connection_closed")(py::str(vane_session->id));
@@ -3278,6 +779,12 @@ void InstantiateNewInstance(DuckDB &db) {
 	CreateScalarFunctionInfo video_file_info(std::move(video_file_set));
 	video_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, video_file_info);
+	CreateScalarFunctionInfo video_clip_info(VideoFileFunctions::GetClipFunctions());
+	video_clip_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, video_clip_info);
+	auto video_clip_macro = VideoFileFunctions::GetClipMacro();
+	video_clip_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *video_clip_macro);
 	auto read_video_set = VideoFileFunctions::GetReadFunctions();
 	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
 	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -3319,6 +826,15 @@ void InstantiateNewInstance(DuckDB &db) {
 	auto ai_embed_macro = AISQLFunction::GetEmbedMacro();
 	ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, *ai_embed_macro);
+
+	auto ai_jev_implementation_set = AISQLFunction::GetJevImplementationFunctions();
+	CreateScalarFunctionInfo ai_jev_implementation_info(std::move(ai_jev_implementation_set));
+	ai_jev_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_jev_implementation_info);
+
+	auto ai_jev_macro = AISQLFunction::GetJevMacro();
+	ai_jev_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_jev_macro);
 }
 
 static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,
@@ -3329,9 +845,18 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<std::recursive_mutex> lock(res->py_connection_lock);
+		auto lock = DuckDBPyConnection::LockConnection(res->py_connection_lock);
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
+		// Install before exposing this connection, including when the database
+		// comes from the instance cache. Preserve any later per-database
+		// registrations instead of resetting them whenever a connection opens.
+		std::call_once(database->instance->GetExecutionRuntime().initialization, [&] {
+			RegisterUDFExecutorFactory(*database->instance);
+			RegisterVLLMExecutorFactory(*database->instance);
+			RegisterDataSourceCallbacks(*database->instance);
+			RegisterPythonUDFConnectionCallbacks(*database->instance);
+		});
 		res->con.SetDatabase(std::move(database));
 		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
 		RunnerClientState::Initialize(*res->con.GetConnection().context, runner_type);
@@ -3364,6 +889,7 @@ static string GetPathString(const py::object &path) {
 static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database_p, bool read_only,
                                                       const py::dict &config_options, bool use_instance_cache,
                                                       const string &runner_type = string()) {
+	DuckDBPyConnection::CheckCallbackEntry();
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
 	if (IsDefaultConnectionString(database, read_only, config_dict)) {
@@ -3419,27 +945,6 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectWithRunner(const py::o
 	return ConnectInternal(database_p, read_only, config_options, use_instance_cache, runner_type);
 }
 
-vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &params) {
-	vector<Value> args;
-	args.reserve(py::len(params));
-
-	for (auto param : params) {
-		args.emplace_back(TransformPythonValue(param, LogicalType::UNKNOWN, false));
-	}
-	return args;
-}
-
-case_insensitive_map_t<BoundParameterData> DuckDBPyConnection::TransformPythonParamDict(const py::dict &params) {
-	case_insensitive_map_t<BoundParameterData> args;
-
-	for (auto pair : params) {
-		auto &key = pair.first;
-		auto &value = pair.second;
-		args[std::string(py::str(key))] = BoundParameterData(TransformPythonValue(value, LogicalType::UNKNOWN, false));
-	}
-	return args;
-}
-
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::DefaultConnection() {
 	return default_connection.Get();
 }
@@ -3453,22 +958,6 @@ PythonImportCache *DuckDBPyConnection::ImportCache() {
 		import_cache = make_shared_ptr<PythonImportCache>();
 	}
 	return import_cache.get();
-}
-
-ModifiedMemoryFileSystem &DuckDBPyConnection::GetObjectFileSystem() {
-	if (!internal_object_filesystem) {
-		D_ASSERT(!FileSystemIsRegistered("VANE_INTERNAL_OBJECTSTORE"));
-		auto &import_cache_py = *ImportCache();
-		auto modified_memory_fs = import_cache_py.vane.filesystem.ModifiedMemoryFileSystem();
-		if (modified_memory_fs.ptr() == nullptr) {
-			throw InvalidInputException(
-			    "This operation could not be completed because required module 'fsspec' is not installed");
-		}
-		internal_object_filesystem = make_shared_ptr<ModifiedMemoryFileSystem>(modified_memory_fs());
-		auto &abstract_fs = reinterpret_cast<AbstractFileSystem &>(*internal_object_filesystem);
-		RegisterFilesystem(abstract_fs);
-	}
-	return *internal_object_filesystem;
 }
 
 bool DuckDBPyConnection::IsInteractive() {
@@ -3493,107 +982,6 @@ void DuckDBPyConnection::Cleanup() {
 	ClearDataSourceFactoryRegistry();
 	default_connection.Set(nullptr);
 	import_cache.reset();
-}
-
-bool DuckDBPyConnection::IsPandasDataframe(const py::object &object) {
-	if (!ModuleIsLoaded<PandasCacheItem>()) {
-		return false;
-	}
-	auto &import_cache_py = *DuckDBPyConnection::ImportCache();
-	return py::isinstance(object, import_cache_py.pandas.DataFrame());
-}
-
-bool IsValidNumpyDimensions(const py::handle &object, int &dim) {
-	// check the dimensions of numpy arrays
-	// should only be called by IsAcceptedNumpyObject
-	auto &import_cache = *DuckDBPyConnection::ImportCache();
-	if (!py::isinstance(object, import_cache.numpy.ndarray())) {
-		return false;
-	}
-	auto shape = (py::cast<py::array>(object)).attr("shape");
-	if (py::len(shape) != 1) {
-		return false;
-	}
-	int cur_dim = (shape.attr("__getitem__")(0)).cast<int>();
-	dim = dim == -1 ? cur_dim : dim;
-	return dim == cur_dim;
-}
-NumpyObjectType DuckDBPyConnection::IsAcceptedNumpyObject(const py::object &object) {
-	if (!ModuleIsLoaded<NumpyCacheItem>()) {
-		return NumpyObjectType::INVALID;
-	}
-	auto &import_cache = *DuckDBPyConnection::ImportCache();
-	if (py::isinstance(object, import_cache.numpy.ndarray())) {
-		auto len = py::len((py::cast<py::array>(object)).attr("shape"));
-		switch (len) {
-		case 1:
-			return NumpyObjectType::NDARRAY1D;
-		case 2:
-			return NumpyObjectType::NDARRAY2D;
-		default:
-			return NumpyObjectType::INVALID;
-		}
-	} else if (py::is_dict_like(object)) {
-		int dim = -1;
-		for (auto item : py::cast<py::dict>(object)) {
-			if (!IsValidNumpyDimensions(item.second, dim)) {
-				return NumpyObjectType::INVALID;
-			}
-		}
-		return NumpyObjectType::DICT;
-	} else if (py::is_list_like(object)) {
-		int dim = -1;
-		for (auto item : py::cast<py::list>(object)) {
-			if (!IsValidNumpyDimensions(item, dim)) {
-				return NumpyObjectType::INVALID;
-			}
-		}
-		return NumpyObjectType::LIST;
-	}
-	return NumpyObjectType::INVALID;
-}
-
-PyArrowObjectType DuckDBPyConnection::GetArrowType(const py::handle &obj) {
-	D_ASSERT(py::gil_check());
-
-	if (py::isinstance<py::capsule>(obj)) {
-		auto capsule = py::reinterpret_borrow<py::capsule>(obj);
-		if (string(capsule.name()) != "arrow_array_stream") {
-			throw InvalidInputException("Expected a 'arrow_array_stream' PyCapsule, got: %s", string(capsule.name()));
-		}
-		auto stream = capsule.get_pointer<struct ArrowArrayStream>();
-		if (!stream->release) {
-			throw InvalidInputException("The ArrowArrayStream was already released");
-		}
-		return PyArrowObjectType::PyCapsule;
-	}
-
-	if (ModuleIsLoaded<PyarrowCacheItem>()) {
-		auto &import_cache = *DuckDBPyConnection::ImportCache();
-		// MessageReader requires nanoarrow, separate scan function
-		if (py::isinstance(obj, import_cache.pyarrow.ipc.MessageReader())) {
-			return PyArrowObjectType::MessageReader;
-		}
-
-		if (ModuleIsLoaded<PyarrowDatasetCacheItem>()) {
-			// Scanner/Dataset don't have __arrow_c_stream__, need dedicated handling
-			if (py::isinstance(obj, import_cache.pyarrow.dataset.Scanner())) {
-				return PyArrowObjectType::Scanner;
-			} else if (py::isinstance(obj, import_cache.pyarrow.dataset.Dataset())) {
-				return PyArrowObjectType::Dataset;
-			}
-		}
-	}
-
-	if (py::hasattr(obj, "__arrow_c_stream__")) {
-		return PyArrowObjectType::PyCapsuleInterface;
-	}
-
-	return PyArrowObjectType::Invalid;
-}
-
-bool DuckDBPyConnection::IsAcceptedArrowObject(const py::object &object) {
-	return DuckDBPyConnection::GetArrowType(object) != PyArrowObjectType::Invalid;
 }
 
 } // namespace duckdb

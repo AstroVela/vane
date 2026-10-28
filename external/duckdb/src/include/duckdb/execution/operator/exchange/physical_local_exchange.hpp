@@ -73,6 +73,7 @@ public:
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+	vector<const_reference<PhysicalOperator>> GetMaterializedInputChildren(ClientContext &context) const override;
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,

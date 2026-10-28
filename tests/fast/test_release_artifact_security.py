@@ -19,6 +19,7 @@ from email.message import Message
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 from packaging.version import Version
 
 from scripts import check_release_artifacts, verify_duckdb_coexistence
@@ -364,6 +365,54 @@ def test_sdist_public_stubs_must_use_their_exact_project_paths(required_path):
 
 
 @pytest.mark.parametrize(
+    "paths",
+    [
+        [],
+        ["decoy/native-media-release.toml"],
+        ["native-media-release.toml", "native-media-release.toml"],
+    ],
+    ids=["missing", "misplaced", "duplicate"],
+)
+def test_sdist_requires_one_native_media_release_configuration(paths):
+    artifact = _NamesOnlyArtifact([f"{TEST_LAYOUT.archive_root}/{path}" for path in paths])
+
+    with pytest.raises(ValueError, match="expected one project file 'native-media-release.toml'"):
+        check_release_artifacts._check_sdist(artifact, TEST_LAYOUT)
+
+
+@pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
+@pytest.mark.parametrize(
+    "selector",
+    ["", "::test_case", "::test_case[param-case]", "::test_case[sample.py::value]", "::TestCase::test_method"],
+)
+def test_sdist_must_include_every_test_referenced_by_its_release_launcher(omitted_test, selector):
+    root = TEST_LAYOUT.archive_root
+    launcher = f"""release_tests=(
+      "$project_root/tests/fast/test_existing.py"
+      "$project_root/tests/fast/test_new.py{selector}"
+    )
+    """.encode()
+    members = {f"{root}/scripts/run_release_tests.sh": launcher}
+    for name in ("existing", "new"):
+        # A copy under a different directory cannot satisfy the release gate.
+        prefix = "decoy/" if name == omitted_test else ""
+        members[f"{root}/{prefix}tests/fast/test_{name}.py"] = b""
+    artifact = _MemoryWheelArtifact(members)
+
+    if omitted_test is None:
+        check_release_artifacts._check_sdist_release_tests(artifact)
+    else:
+        with pytest.raises(ValueError, match=f"tests/fast/test_{omitted_test}.py"):
+            check_release_artifacts._check_sdist_release_tests(artifact)
+
+
+def test_sdist_release_launcher_cannot_skip_test_inventory_validation():
+    artifact = _MemoryWheelArtifact({f"{TEST_LAYOUT.archive_root}/scripts/run_release_tests.sh": b"release_tests=()"})
+    with pytest.raises(ValueError, match="explicitly list its test files"):
+        check_release_artifacts._check_sdist_release_tests(artifact)
+
+
+@pytest.mark.parametrize(
     "member_name",
     [
         "vane/_native.pyi",
@@ -433,6 +482,52 @@ def test_release_metadata_rejects_invalid_requirements():
 
     with pytest.raises(ValueError, match="invalid Requires-Dist metadata"):
         check_release_artifacts._check_no_official_duckdb_dependency(artifact, metadata)
+
+
+@pytest.mark.parametrize(
+    "condition, expected",
+    [
+        (None, 'extra == "test-extra"'),
+        (
+            'platform_system == "Linux" or platform_system == "Windows"',
+            '(platform_system == "Linux" or platform_system == "Windows") and extra == "test-extra"',
+        ),
+        (
+            'sys_platform == "darwin" and platform_machine == "arm64"',
+            'sys_platform == "darwin" and platform_machine == "arm64" and extra == "test-extra"',
+        ),
+        (
+            '(platform_system == "Linux" or platform_system == "Windows") and python_version >= "3.12"',
+            '(platform_system == "Linux" or platform_system == "Windows") and python_version >= "3.12" and extra == "test-extra"',
+        ),
+        (
+            'platform_release == "build or release" and python_version >= "3.12"',
+            'platform_release == "build or release" and python_version >= "3.12" and extra == "test-extra"',
+        ),
+    ],
+)
+def test_optional_dependency_markers_preserve_grouping_and_extra_gate(monkeypatch, condition, expected):
+    dependency = "accelerator>=1" + (f"; {condition}" if condition else "")
+    monkeypatch.setattr(
+        check_release_artifacts,
+        "PROJECT_METADATA",
+        {"optional-dependencies": {"test_extra": [dependency]}},
+    )
+    assert check_release_artifacts._expected_project_requires_dist() == (f"accelerator>=1; {expected}",)
+
+
+@pytest.mark.parametrize("platform", ["Linux", "Windows", "Darwin"])
+@pytest.mark.parametrize("extra", ["", "onnx", "onnx-cuda"])
+def test_onnx_cuda_metadata_requires_the_extra_on_every_supported_platform(platform, extra):
+    requirement = next(
+        item
+        for raw in check_release_artifacts.EXPECTED_REQUIRES_DIST
+        if (item := Requirement(raw)).name == "onnxruntime-gpu"
+    )
+    assert requirement.marker is not None
+    assert requirement.marker.evaluate({"platform_system": platform, "extra": extra}) == (
+        extra == "onnx-cuda" and platform in {"Linux", "Windows"}
+    )
 
 
 @pytest.mark.parametrize(

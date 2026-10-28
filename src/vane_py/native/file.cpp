@@ -221,6 +221,16 @@ static void BindAudioFileMethods(py::class_<PythonAudioFile, PythonFile> &file) 
 
 static void BindVideoFileMethods(py::class_<PythonVideoFile, PythonFile> &file) {
 	file.def(
+	    "clip",
+	    [](const PythonVideoFile &value, const py::object &start_time, const py::object &end_time,
+	       const py::kwargs &options) {
+		    return py::module_::import("vane._video_clip")
+		        .attr("_video_file_clip_value")(py::cast(value, py::return_value_policy::copy), start_time, end_time,
+		                                        **options);
+	    },
+	    "Transcode a bounded video interval to MP4 with source-time provenance", py::arg("start_time"),
+	    py::arg("end_time"));
+	file.def(
 	    "metadata",
 	    [](const PythonVideoFile &value, const py::object &buffer_size, const py::object &max_bytes,
 	       shared_ptr<DuckDBPyConnection> connection) {
@@ -295,13 +305,14 @@ static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyC
 	if (!connection) {
 		connection = DuckDBPyConnection::DefaultConnection();
 	}
+	auto query_lock = connection->LockForQuery();
 	parameters.insert(parameters.begin(), file.ToValue());
 	Value value;
 	ClientProperties client_properties;
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<std::recursive_mutex> lock(connection->py_connection_lock);
+		auto lock = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 		auto &native_connection = connection->con.GetConnection();
 		auto pending = native_connection.PendingQuery(query, parameters);
 		if (pending->HasError()) {

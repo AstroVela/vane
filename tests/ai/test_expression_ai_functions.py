@@ -253,8 +253,17 @@ def test_ai_embed_runtime_signature_matches_public_contract():
     signature = inspect.signature(vane.ai.embed, eval_str=True)
     parameters = signature.parameters
 
-    assert parameters["first"].annotation == vane.Expression | vane.Relation
-    assert parameters["text"].annotation is vane.Expression
+    input_type = (
+        vane.Expression
+        | vane.ai.TextInput
+        | vane.ai.ImageInput
+        | vane.ai.VideoInput
+        | vane.ai.AudioInput
+        | vane.ai.MultimodalInput
+    )
+    assert parameters["first"].annotation == input_type | vane.Relation
+    assert parameters["input"].annotation == input_type
+    assert "text" not in parameters
     assert parameters["rel"].annotation is vane.Relation
     assert parameters["provider"].annotation == str | Provider
     assert parameters["on_error"].annotation == Literal["raise", "ignore"]
@@ -389,15 +398,16 @@ def test_ai_embed_accepts_registered_embedding_provider_name(monkeypatch):
     assert expr is not None
 
 
-def test_ai_embed_rejects_provider_without_text_embedder():
-    with pytest.raises((AttributeError, TypeError, ValueError), match=r"get_text_embedder|embedding provider"):
-        vane.ai.embed(vane.col("text"), provider="vllm")
+@pytest.mark.parametrize("provider", ["vllm", "sglang"])
+def test_ai_embed_native_provider_requires_explicit_model(provider):
+    with pytest.raises(ValueError, match="explicit model"):
+        vane.ai.embed(vane.col("text"), provider=provider)
 
 
 def test_ai_embed_rejects_non_provider_objects_and_undocumented_first_keyword():
     with pytest.raises(TypeError, match="Provider object"):
         vane.ai.embed(vane.col("text"), provider=object())
-    with pytest.raises((TypeError, ValueError), match="first|text Expression"):
+    with pytest.raises((TypeError, ValueError), match="first|embedding input"):
         vane.ai.embed(first=vane.col("text"), provider=MockProvider())
 
 
@@ -426,16 +436,17 @@ def test_ai_embed_rejects_inline_credentials(option):
         ("google", "api_key"),
     ],
 )
-def test_builtin_provider_constructors_reject_legacy_credentials(provider_kind, field):
+def test_builtin_provider_credentials_stay_out_of_inference_options(provider_kind, field):
     from vane.ai.providers.google import GoogleProvider
     from vane.ai.providers.openai import OpenAIProvider
 
     secret = "embed-provider-secret-sentinel"
     provider_type = OpenAIProvider if provider_kind == "openai" else GoogleProvider
 
-    with pytest.raises(TypeError, match=field) as exc_info:
-        provider_type(**{field: secret})
-    assert secret not in str(exc_info.value)
+    descriptor = provider_type(**{field: secret}).get_text_embedder()
+    assert descriptor.client_options[field].reveal() == secret
+    assert field not in descriptor.get_options()
+    assert secret not in repr(descriptor)
 
 
 @pytest.mark.parametrize("dimensions", [True, 0, -1, 1.5, "4"])
@@ -491,7 +502,7 @@ def test_ai_embed_relation_rejects_non_string_output_column(output_column):
 def test_ai_embed_python_entries_reject_non_varchar_during_planning(relation_api, text_sql):
     rel = vane.connect().sql(f"SELECT {text_sql} AS text")
 
-    with pytest.raises(vane.BinderException, match="ai SQL input argument must be VARCHAR"):
+    with pytest.raises(vane.BinderException, match="ai_embed text input requires VARCHAR"):
         if relation_api:
             vane.ai.embed(
                 rel,
@@ -1126,10 +1137,11 @@ def test_openai_known_structured_output_models_enforce_strict_schema(model, opti
         )
 
 
-def test_openai_environment_base_url_cannot_change_static_capability(monkeypatch):
+def test_openai_worker_environment_cannot_change_captured_static_capability(monkeypatch):
     from vane.ai._schema import SchemaValidationError
     from vane.ai.providers.openai import OpenAIProvider
 
+    provider = OpenAIProvider(base_url="https://api.openai.com/v1")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
     loose_schema = {
         "type": "object",
@@ -1139,7 +1151,7 @@ def test_openai_environment_base_url_cannot_change_static_capability(monkeypatch
     with pytest.raises(SchemaValidationError, match="additionalProperties"):
         vane.ai.prompt(
             vane.col("message"),
-            provider=OpenAIProvider(),
+            provider=provider,
             model="gpt-4o",
             return_format=loose_schema,
         )
@@ -1695,7 +1707,7 @@ def test_ai_prompt_options_are_provider_closed(provider, options, offending):
         ("openai", None, {}),
         ("anthropic", "claude-test", {"max_tokens": 8}),
         ("google", "gemini-test", {}),
-        ("vllm", None, {}),
+        ("vllm", "test-model", {}),
     ],
 )
 def test_builtin_prompt_rejects_negative_temperature_during_planning(provider, model, required_options):
@@ -1715,7 +1727,7 @@ def test_builtin_prompt_rejects_negative_temperature_during_planning(provider, m
         ("openai", None, {}),
         ("anthropic", "claude-test", {"max_tokens": 8}),
         ("google", "gemini-test", {}),
-        ("vllm", None, {}),
+        ("vllm", "test-model", {}),
     ],
 )
 def test_builtin_prompt_accepts_zero_temperature_during_planning(provider, model, required_options):
@@ -1820,6 +1832,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
             vane.ai.prompt(
                 vane.col("prompt"),
                 provider="vllm",
+                model="test-model",
                 return_format=schema,
                 on_error="ignore",
             ).alias("response"),
@@ -1829,6 +1842,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
             relation,
             vane.col("prompt"),
             provider="vllm",
+            model="test-model",
             return_format=schema,
             on_error="ignore",
         )
@@ -1843,7 +1857,7 @@ def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monke
 
 def test_ai_prompt_vllm_rejects_raw_response_during_planning():
     with pytest.raises(ValueError, match="does not support return_raw_response"):
-        vane.ai.prompt(vane.col("prompt"), provider="vllm", return_raw_response=True)
+        vane.ai.prompt(vane.col("prompt"), provider="vllm", model="test-model", return_raw_response=True)
 
 
 @pytest.mark.parametrize(
@@ -1858,7 +1872,7 @@ def test_ai_prompt_vllm_rejects_raw_response_during_planning():
 def test_vllm_prompt_rejects_invalid_options_during_planning(options):
     error = (TypeError, ValueError)
     with pytest.raises(error):
-        vane.ai.prompt(vane.col("text"), provider="vllm", **options)
+        vane.ai.prompt(vane.col("text"), provider="vllm", model="test-model", **options)
 
 
 @pytest.mark.parametrize(
@@ -1894,13 +1908,14 @@ def test_vllm_prompt_rejects_invalid_options_during_planning(options):
 )
 def test_sglang_prompt_rejects_invalid_options_during_planning(options, message):
     with pytest.raises((TypeError, ValueError), match=message):
-        vane.ai.prompt(vane.col("text"), provider="sglang", **options)
+        vane.ai.prompt(vane.col("text"), provider="sglang", model="test-model", **options)
 
 
 def test_sglang_prompt_accepts_resource_and_sampling_boundaries():
     vane.ai.prompt(
         vane.col("text"),
         provider="sglang",
+        model="test-model",
         max_tokens=1,
         max_new_tokens=1,
         temperature=0,
@@ -1921,12 +1936,14 @@ def test_ai_prompt_vllm_rejects_images_and_execution_backend():
             relation,
             [vane.col("question"), vane.col("image")],
             provider="vllm",
+            model="test-model",
         )
     with pytest.raises(TypeError, match="execution_backend"):
         vane.ai.prompt(
             relation,
             vane.col("question"),
             provider="vllm",
+            model="test-model",
             execution_backend="ray_actor",
         )
 
@@ -1945,6 +1962,7 @@ def test_ai_prompt_expression_vllm_rejects_mixed_media_input_during_planning(med
     expression = vane.ai.prompt(
         [vane.col("question"), vane.col("media")],
         provider="vllm",
+        model="test-model",
     )
 
     with pytest.raises(Exception, match="VARCHAR"):

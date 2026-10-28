@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build the bounded CLEAN candidate without modifying the installed default."""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from prepare import digest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--parent", type=Path, required=True)
+    args = parser.parse_args()
+    out, parent = args.output.resolve(), args.parent.resolve()
+    here = Path('/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_tail_budget')
+    repo = here.parents[3]
+    source = parent / "coalesced"
+    expected = json.loads((parent / "candidates.json").read_text())["variants"]["coalesced"]["sources"]
+    assert all(digest(source / p) == h for p, h in expected.items())
+    out.mkdir()
+    component = out / "updated"
+    sdk, fuse = repo / "vane_fs/vcpkg_installed/x64-linux-release", repo / ".cache/fuse-sdk/root/usr"
+    report = dict(
+        status="RUNNING",
+        parent=str(parent),
+        commands=[],
+        frozen_policy=dict(
+            clean_generation_below=None,
+            clean_uncopied_at_most=256 * 1024,
+            clean_fixed_ms=5,
+            open_uncopied_bytes=16 * 1024 * 1024,
+            admission_bytes=64 * 1024 * 1024,
+        ),
+        inputs={str(p): digest(p) for p in (Path(__file__), here / "budget.patch", sdk / "lib/libsqlite3.a")},
+    )
+
+    def run(label, argv, cwd=None, env=None):
+        start = time.time()
+        with (out / (label + ".log")).open("w") as log:
+            result = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=log, timeout=600)
+        report["commands"].append(
+            dict(label=label, argv=argv, cwd=str(cwd), start=start, end=time.time(), returncode=result.returncode)
+        )
+        result.check_returncode()
+        print(label, "PASS", flush=True)
+
+    try:
+        shutil.copytree(
+            source,
+            component,
+            ignore=shutil.ignore_patterns("build", "venv", "sanitize", "allocation", "__pycache__", "*.orig"),
+        )
+        run(
+            "budget-patch",
+            ["patch", "--batch", "--fuzz=0", "--no-backup-if-mismatch", "-p1", "-i", str(here / "budget.patch")],
+            component,
+        )
+        restored = subprocess.check_output(
+            [
+                "patch",
+                "--quiet",
+                "--reverse",
+                "--fuzz=0",
+                "--output=-",
+                str(component / "src/checkpoint.hpp"),
+                str(here / "budget.patch"),
+            ]
+        )
+        assert restored == (source / "src/checkpoint.hpp").read_bytes()
+        assert {p for p, h in expected.items() if digest(component / p) != h} == {"src/checkpoint.hpp"}
+        python = component / "venv/bin/python"
+        run("venv", ["uv", "venv", "--python", str(repo / ".venv/bin/python"), str(component / "venv")])
+        (component / "venv/lib/python3.12/site-packages/support.pth").write_text(
+            str(repo / ".venv/lib/python3.12/site-packages")
+            + "\n"
+            + str(repo.parent / "astrovela_vane-batch-udf-20260930/.venv-gpu/lib/python3.12/site-packages")
+            + "\n"
+        )
+        env = dict(
+            os.environ,
+            SKBUILD_BUILD_DIR=str(component / "build/python-release"),
+            SKBUILD_CMAKE_BUILD_TYPE="Release",
+            CMAKE_BUILD_PARALLEL_LEVEL="2",
+            PKG_CONFIG_PATH=str(fuse / "lib/x86_64-linux-gnu/pkgconfig"),
+            PKG_CONFIG_SYSROOT_DIR=str(fuse.parent),
+        )
+        run(
+            "install",
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                ".",
+                "--no-build-isolation",
+                "-Ccmake.define.unofficial-sqlite3_DIR=" + str(sdk / "share/unofficial-sqlite3"),
+                "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+                "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+                "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+                "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=fsync",
+            ],
+            component,
+            env,
+        )
+        report.update(
+            status="PASS",
+            changed_sources=["src/checkpoint.hpp"],
+            reverse_patch_exact=True,
+            sources={p: digest(component / p) for p in expected},
+            binaries={
+                str(p): digest(p)
+                for p in (
+                    component / "build/python-release/vane-fs-mount",
+                    component / "build/python-release/libvane_fs.a",
+                    component / "venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+                )
+            },
+        )
+    except BaseException as error:
+        report.update(status="FAIL", error=repr(error))
+        raise
+    finally:
+        (out / "candidate.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

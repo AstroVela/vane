@@ -5,6 +5,7 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"

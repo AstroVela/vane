@@ -16,8 +16,9 @@ from vane import configure, current_config, env
 def test_configure_sets_registered_environment_variables(monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     monkeypatch.delenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", raising=False)
+    monkeypatch.delenv("VANE_NDJSON_MAX_SPLIT_BYTES", raising=False)
 
-    cfg = configure(runner="ray", ray_scan_split_min_count=16)
+    cfg = configure(runner="ray", ray_scan_split_min_count=16, ndjson_max_split_bytes=128 * 1024 * 1024)
 
     assert cfg.runner == "ray"
     assert cfg.ray_scan_split_min_count == 16
@@ -25,25 +26,30 @@ def test_configure_sets_registered_environment_variables(monkeypatch):
     assert os.environ["VANE_RAY_SCAN_SPLIT_MIN_COUNT"] == "16"
     assert current_config().runner == "ray"
     assert env.ray_scan_split_min_count == 16
+    assert cfg.ndjson_max_split_bytes == 128 * 1024 * 1024
+    assert os.environ["VANE_NDJSON_MAX_SPLIT_BYTES"] == "134217728"
+    assert current_config().ndjson_max_split_bytes == 128 * 1024 * 1024
 
 
-def test_configure_accepts_local_runner(monkeypatch):
+@pytest.mark.parametrize("runner", ["local", "local-fast", "  LOCAL-FAST  ", "  LoCaL  "])
+def test_configure_accepts_local_runner(monkeypatch, runner):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
-
-    cfg = configure(runner="local")
-
-    assert cfg.runner == "local"
+    cfg = configure(runner=runner)
+    assert cfg.runner == current_config().runner == "local"
     assert os.environ["VANE_RUNNER"] == "local"
+    env.runner = runner
+    assert env.runner == "local"
+    assert os.environ["VANE_RUNNER"] == "local"
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    assert current_config().runner == "local"
 
 
-def test_public_configuration_rejects_internal_direct_runner(monkeypatch):
+def test_public_configuration_rejects_unknown_runner(monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
-
-    with pytest.raises(ValueError, match="runner must be 'local' or 'ray'"):
-        configure(runner="local-fast")
-    with pytest.raises(ValueError, match="runner must be 'local' or 'ray'"):
-        env.runner = "local-fast"
-
+    with pytest.raises(ValueError, match="runner must be"):
+        configure(runner="unknown")
+    with pytest.raises(ValueError, match="runner must be"):
+        env.runner = "unknown"
     assert "VANE_RUNNER" not in os.environ
 
 
@@ -66,20 +72,14 @@ def test_configure_normalizes_empty_runner_to_ray(monkeypatch):
     assert os.environ["VANE_RUNNER"] == "ray"
 
 
-def test_get_or_create_runner_does_not_create_runner_for_local_fast():
-    script = """
-import os
-import vane.runners as runners
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_native_local_execution_does_not_create_runner(monkeypatch, runner):
+    import vane
 
-os.environ["VANE_RUNNER"] = "local-fast"
-try:
-    runners.get_or_create_runner()
-except RuntimeError as exc:
-    assert "does not create a runner" in str(exc)
-else:
-    raise AssertionError("expected no runner for local-fast")
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    assert vane.get_runner() is None
+    with pytest.raises(RuntimeError, match="does not create a runner"):
+        vane.get_or_create_runner()
 
 
 @pytest.mark.parametrize("configured", [None, "", "   "])
@@ -102,7 +102,7 @@ assert runners.get_or_infer_runner_type() == "ray"
     ("configured", "expected"),
     [
         ("   ", "ray"),
-        ("  LOCAL-FAST  ", "local-fast"),
+        ("  LOCAL-FAST  ", "local"),
         ("  LoCaL  ", "local"),
         ("  RaY  ", "ray"),
     ],
@@ -147,19 +147,6 @@ else:
         relation.select(identity(vane.col("value"))).explain()
 
 
-def test_get_or_create_runner_creates_local_runner():
-    script = """
-import os
-import vane.runners as runners
-
-os.environ["VANE_RUNNER"] = "local"
-runner = runners.get_or_create_runner()
-assert runner.name == "local"
-assert runners.get_or_infer_runner_type() == "local"
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
 def test_concurrent_runner_initialization_does_not_deadlock_on_gil():
     script = r"""
 import faulthandler
@@ -171,11 +158,11 @@ sys.setswitchinterval(1000.0)
 faulthandler.dump_traceback_later(5.0, repeat=False)
 
 import vane
-import vane.runners.local.runner as local_runner_module
+import vane.runners.ray.runner as ray_runner_module
 
 vane_runners = vane
 vane_runners.teardown_runner()
-os.environ["VANE_RUNNER"] = "local"
+os.environ["VANE_RUNNER"] = "ray"
 
 barrier = threading.Barrier(2)
 initializer_entered = threading.Event()
@@ -184,10 +171,10 @@ results = []
 errors = []
 
 
-class BlockingLocalRunner:
-    name = "local"
+class BlockingRayRunner:
+    name = "ray"
 
-    def __init__(self, **_kwargs):
+    def __init__(self, *_args, **_kwargs):
         constructor_calls.append(None)
         initializer_entered.set()
         # The first initializer releases the GIL here. The second thread is
@@ -196,7 +183,7 @@ class BlockingLocalRunner:
         barrier.wait(timeout=5.0)
 
 
-local_runner_module.LocalRunner = BlockingLocalRunner
+ray_runner_module.RayRunner = BlockingRayRunner
 
 
 def initialize():
@@ -240,18 +227,18 @@ def test_failed_runner_initialization_is_not_published_and_can_retry():
 import os
 
 import vane
-import vane.runners.local.runner as local_runner_module
+import vane.runners.ray.runner as ray_runner_module
 
 vane_runners = vane
 vane_runners.teardown_runner()
-os.environ["VANE_RUNNER"] = "local"
+os.environ["VANE_RUNNER"] = "ray"
 attempts = 0
 
 
-class FlakyLocalRunner:
-    name = "local"
+class FlakyRayRunner:
+    name = "ray"
 
-    def __init__(self, **_kwargs):
+    def __init__(self, *_args, **_kwargs):
         global attempts
         attempts += 1
         self.ready = False
@@ -260,7 +247,7 @@ class FlakyLocalRunner:
         self.ready = True
 
 
-local_runner_module.LocalRunner = FlakyLocalRunner
+ray_runner_module.RayRunner = FlakyRayRunner
 
 try:
     vane_runners.get_or_create_runner()
@@ -290,11 +277,11 @@ sys.setswitchinterval(1000.0)
 faulthandler.dump_traceback_later(5.0, repeat=False)
 
 import vane
-import vane.runners.local.runner as local_runner_module
+import vane.runners.ray.runner as ray_runner_module
 
 vane_runners = vane
 vane_runners.teardown_runner()
-os.environ["VANE_RUNNER"] = "local"
+os.environ["VANE_RUNNER"] = "ray"
 
 barrier = threading.Barrier(2)
 initializer_entered = threading.Event()
@@ -304,10 +291,10 @@ expected_errors = []
 unexpected_errors = []
 
 
-class FailOnceLocalRunner:
-    name = "local"
+class FailOnceRayRunner:
+    name = "ray"
 
-    def __init__(self, **_kwargs):
+    def __init__(self, *_args, **_kwargs):
         global attempts
         attempts += 1
         if attempts == 1:
@@ -317,7 +304,7 @@ class FailOnceLocalRunner:
         self.ready = True
 
 
-local_runner_module.LocalRunner = FailOnceLocalRunner
+ray_runner_module.RayRunner = FailOnceRayRunner
 
 
 def initialize():
@@ -363,127 +350,104 @@ assert vane_runners.get_runner() is results[0]
 @pytest.mark.parametrize("first", ["local", "ray"])
 @pytest.mark.parametrize("configured", [False, True])
 def test_connection_runners_coexist_and_preserve_configuration(monkeypatch, tmp_path, first, configured):
+    import pyarrow.parquet as pq
+
     import vane
-    import vane.runners.local.runner as local_module
     import vane.runners.ray.runner as ray_module
 
-    created = {}
+    created = []
 
-    class CapturingRunner:
-        def __init__(self, name, options):
-            self.name = name
-            self.options = options
+    class CapturingRayRunner:
+        def __init__(self, address, max_task_backlog):
+            self.options = (address, max_task_backlog)
             self.calls = 0
             self.closed = False
-            assert name not in created
-            created[name] = self
+            created.append(self)
 
-        def run_write(self, relation):
-            assert isinstance(relation, vane.ray_cxx.PyLogicalPlan)
-            assert relation.__getstate__()[3]["vane_session"]["config"]["VANE_RUNNER"] == self.name
+        def run_write(self, plan):
+            assert plan.session_config()["VANE_RUNNER"] == "ray"
             self.calls += 1
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
+            return {"copy_operation_id": plan.idx(), "rows_copied": 1}
 
         def close(self):
             self.closed = True
 
-    class LocalRunner(CapturingRunner):
-        def __init__(self, **options):
-            super().__init__("local", options)
-
-    class RayRunner(CapturingRunner):
-        def __init__(self, address, max_task_backlog):
-            super().__init__("ray", (address, max_task_backlog))
-
     vane.teardown_runner()
-    monkeypatch.setattr(local_module, "LocalRunner", LocalRunner)
-    monkeypatch.setattr(ray_module, "RayRunner", RayRunner)
+    monkeypatch.setattr(ray_module, "RayRunner", CapturingRayRunner)
     order = [first, "ray" if first == "local" else "local"]
     connections = {}
     try:
         for kind in order:
             monkeypatch.setenv("VANE_RUNNER", kind)
             connections[kind] = vane.connect()
-        assert created == {}
+        assert created == []
         if configured:
             for kind in order:
                 if kind == "local":
-                    vane.set_runner_local(num_workers=3, max_running_tasks=7, execution_mode="in_process")
+                    assert vane.set_runner_local() is None
                 else:
                     vane.set_runner_ray("ray://configured", max_task_backlog=11)
         monkeypatch.setenv("VANE_RUNNER", "invalid")
-        for kind in order * 2:
-            connections[kind].sql("SELECT 1 AS value").write_parquet(str(tmp_path / f"{kind}.parquet"))
+        for index, kind in enumerate(order * 2):
+            target = tmp_path / f"{kind}-{index}.parquet"
+            connections[kind].sql("SELECT 1 AS value").write_parquet(str(target))
             assert os.environ["VANE_RUNNER"] == "invalid"
-        assert {kind: runner.calls for kind, runner in created.items()} == {"local": 2, "ray": 2}
-        assert not list(tmp_path.iterdir())
+            if kind == "local":
+                assert pq.read_table(target).to_pylist() == [{"value": 1}]
+            else:
+                assert not target.exists()
+        assert len(created) == 1 and created[0].calls == 2
         if configured:
-            assert created["local"].options == {
-                "num_workers": 3,
-                "max_running_tasks": 7,
-                "execution_mode": "in_process",
-            }
-            assert created["ray"].options == ("ray://configured", 11)
+            assert created[0].options == ("ray://configured", 11)
         for kind in order:
             monkeypatch.setenv("VANE_RUNNER", kind)
-            assert vane.get_runner() is created[kind]
-            assert vane.get_or_create_runner() is created[kind]
             assert vane.get_or_infer_runner_type() == kind
+            assert vane.get_runner() is (created[0] if kind == "ray" else None)
         monkeypatch.setenv("VANE_RUNNER", "invalid")
         vane.teardown_runner()
-        assert all(runner.closed for runner in created.values())
-        for kind in order:
-            monkeypatch.setenv("VANE_RUNNER", kind)
-            assert vane.get_runner() is None
+        assert created[0].closed
     finally:
         for connection in connections.values():
             connection.close()
         vane.teardown_runner()
 
 
-def test_different_runner_types_initialize_concurrently():
+def test_selecting_local_does_not_wait_for_ray_initialization():
     script = r"""
 import threading
 import vane
-import vane.runners.local.runner as local_module
 import vane.runners.ray.runner as ray_module
 
-vane.teardown_runner()
-barrier = threading.Barrier(2)
-results = []
+entered = threading.Event()
+release = threading.Event()
 errors = []
-
-class LocalRunner:
-    name = "local"
-    def __init__(self, **kwargs):
-        barrier.wait(timeout=3)
-
 class RayRunner:
-    name = "ray"
-    def __init__(self, address, backlog):
-        barrier.wait(timeout=3)
-
-local_module.LocalRunner = LocalRunner
+    def __init__(self, *args):
+        entered.set()
+        assert release.wait(5)
 ray_module.RayRunner = RayRunner
 
-def initialize(factory):
+def initialize():
     try:
-        results.append(factory())
+        vane._native.set_runner_ray()
     except BaseException as error:
         errors.append(error)
-
-threads = [threading.Thread(target=initialize, args=(factory,), daemon=True)
-           for factory in (vane._native.set_runner_local, vane._native.set_runner_ray)]
-for thread in threads:
-    thread.start()
-for thread in threads:
-    thread.join(timeout=5)
-assert not any(thread.is_alive() for thread in threads)
+worker = threading.Thread(target=initialize, daemon=True)
+worker.start()
+try:
+    assert entered.wait(5)
+    assert vane.set_runner_local() is None
+    assert vane.get_runner() is None
+    with vane.connect() as connection:
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+finally:
+    release.set()
+    worker.join(5)
+assert not worker.is_alive()
 assert errors == [], errors
-assert {runner.name for runner in results} == {"local", "ray"}
 vane.teardown_runner()
 """
-    subprocess.run([sys.executable, "-c", script], check=True, timeout=12)
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=15)
 
 
 def test_set_runner_ray_rejects_removed_force_client_mode():

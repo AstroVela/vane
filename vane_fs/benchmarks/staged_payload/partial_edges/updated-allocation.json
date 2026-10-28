@@ -1,0 +1,49 @@
+{
+  "status": "PASS",
+  "samples": [
+    {
+      "mode": "aligned",
+      "logical_bytes": 33554432,
+      "live_payload_lengths": [
+        [
+          8,
+          8192
+        ]
+      ],
+      "wal_write_bytes": 4964600,
+      "database_write_bytes": 0,
+      "payload_write_bytes": 33554432,
+      "other_write_bytes": 8192,
+      "content_verified": true
+    },
+    {
+      "mode": "split",
+      "logical_bytes": 33554432,
+      "live_payload_lengths": [
+        [
+          8,
+          8160
+        ],
+        [
+          4096,
+          32
+        ]
+      ],
+      "wal_write_bytes": 5240640,
+      "database_write_bytes": 0,
+      "payload_write_bytes": 33554432,
+      "other_write_bytes": 8192,
+      "content_verified": true
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-updated-allocation-vqkhbnvl",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-updated-allocation-9h_gk49e",
+      "removed": true
+    }
+  ]
+}

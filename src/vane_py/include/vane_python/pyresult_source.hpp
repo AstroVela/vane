@@ -28,6 +28,8 @@ public:
 	virtual const DuckDBPyResultMetadata &Metadata() const = 0;
 	virtual unique_ptr<DataChunk> FetchChunk(bool raw = false) = 0;
 	virtual ArrowArrayStream TakeArrowStream(idx_t rows_per_batch) = 0;
+	//! Only live native streams drive the source connection while being fetched.
+	virtual bool RequiresConnectionLock() const = 0;
 	virtual optional_idx KnownRowCount() const = 0;
 	virtual bool IsClosed() const = 0;
 	virtual void Close() = 0;

@@ -3,7 +3,7 @@
 
 """Google Generative AI (Gemini) provider for Vane AI.
 
-Supports text embedding via ``embed_content`` and basic multimodal Prompt
+Supports text and multimodal embedding via ``embed_content`` and multimodal Prompt
 calls via ``generate_content``.
 
 Prompt calls must name a model, either per call (``model=...``) or through
@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
+from vane.ai._client_config import copy_client_options
+from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
@@ -41,6 +43,7 @@ from vane.ai.provider import (
     _ProviderResultError,
     _translate_missing_provider_dependency,
 )
+from vane.ai.providers._google_client_config import capture_google_client, create_google_client
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -57,7 +60,13 @@ def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from vane.ai.protocols import Prompter, TextEmbedder
+    from vane.ai.protocols import (
+        AudioEmbedderDescriptor,
+        ImageEmbedderDescriptor,
+        Prompter,
+        TextEmbedder,
+        VideoEmbedderDescriptor,
+    )
     from vane.ai.typing import Embedding, Options
 
 
@@ -170,13 +179,15 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
     "gemini-embedding-2": (128, 3072),
 }
 
-# Per-request input cap for Gemini embedding requests. The embeddings guide
+# Per-request input cap for Gemini Developer API embedding requests. The embeddings guide
 # does not publish a batch-size number, but the ``batchEmbedContents``
 # endpoint (which multi-input ``embed_content`` calls use) rejects larger
 # batches with "BatchEmbedContentsRequest.requests: at most 100 requests can
 # be in one batch", so 100 is the server-enforced limit.
 _EMBED_BATCH_LIMIT = 100
-_EMBED_REQUEST_OPTIONS = frozenset({"task_type", "title"})
+_EMBED_REQUEST_OPTIONS = frozenset(
+    {"task_type", "title", "input_type", "request_batch_size", "max_concurrency_per_actor"}
+)
 _PROMPT_REQUEST_OPTIONS = frozenset({"temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences"})
 
 # Request options rejected per model before dispatch. Gemini 3.6 Flash and
@@ -190,13 +201,21 @@ _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
 
 
 def _canonical_model_id(model_name: str) -> str:
-    """Strip the Gemini API ``models/`` resource prefix for local lookups.
+    """Resolve Google model resource names for local metadata lookups.
 
-    The Google Gen AI SDK accepts both ``gemini-3.6-flash`` and
-    ``models/gemini-3.6-flash``; local metadata and capability tables key on
-    the bare ID, while the caller-provided value is sent to the SDK verbatim.
+    Gemini and Vertex accept short names and Google publisher/project paths.
+    Custom resources and other publishers must not inherit Google's metadata
+    merely because their last path component matches a known model. The
+    caller-provided name is always sent to the SDK verbatim.
     """
-    return model_name.removeprefix("models/")
+    match model_name.split("/"):
+        case ["models", model] | ["google", model] | ["publishers", "google", "models", model] if model:
+            return model
+        case ["projects", project, "locations", location, "publishers", "google", "models", model] if (
+            project and location and model
+        ):
+            return model
+    return model_name
 
 
 def _validate_google_prompt_model_options(model_name: str, options: Mapping[str, Any]) -> None:
@@ -280,11 +299,25 @@ class GoogleProvider(Provider):
         prompt_model: str | None = None,
         embedding_model: str | None = None,
         embedding_dimensions: int | None = None,
+        api_key: str | None = None,
+        vertexai: bool | None = None,
+        credentials: Any = None,
+        project: str | None = None,
+        location: str | None = None,
+        base_url: str | None = None,
     ):
         self._name = name or "google"
         self._prompt_model = prompt_model
         self._embedding_model = embedding_model
         self._embedding_dimensions = embedding_dimensions
+        self._client_options = capture_google_client(
+            api_key=api_key,
+            vertexai=vertexai,
+            credentials=credentials,
+            project=project,
+            location=location,
+            base_url=base_url,
+        )
 
     @property
     def name(self) -> str:
@@ -321,7 +354,56 @@ class GoogleProvider(Provider):
             dimensions=dimensions,
             request_dimensions=request_dimensions,
             options=resolved_options,
+            client_options=self._client_options,
         )
+
+    def _media_embedder(
+        self, kind: str, model: str | None, dimensions: int | None, options: Mapping[str, Any] | None
+    ) -> Any:
+        from vane.ai.providers._google_multimodal import (
+            GoogleAudioEmbedderDescriptor,
+            GoogleImageEmbedderDescriptor,
+            GoogleMultimodalEmbedderDescriptor,
+            GoogleVideoEmbedderDescriptor,
+        )
+
+        text = cast(
+            GoogleTextEmbedderDescriptor, self.get_text_embedder(model=model, dimensions=dimensions, options=options)
+        )
+        descriptor = {
+            "audio": GoogleAudioEmbedderDescriptor,
+            "image": GoogleImageEmbedderDescriptor,
+            "video": GoogleVideoEmbedderDescriptor,
+            "multimodal": GoogleMultimodalEmbedderDescriptor,
+        }[kind]
+        return descriptor(
+            model_name=text.model_name,
+            provider_name=text.provider_name,
+            dimensions=text.get_dimensions(),
+            request_dimensions=text.request_dimensions,
+            options=text.options,
+            client_options=text.client_options,
+        )
+
+    def get_audio_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> AudioEmbedderDescriptor:
+        return cast("AudioEmbedderDescriptor", self._media_embedder("audio", model, dimensions, options))
+
+    def get_video_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> VideoEmbedderDescriptor:
+        return cast("VideoEmbedderDescriptor", self._media_embedder("video", model, dimensions, options))
+
+    def get_image_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> ImageEmbedderDescriptor:
+        return cast("ImageEmbedderDescriptor", self._media_embedder("image", model, dimensions, options))
+
+    def get_multimodal_embedder(
+        self, model: str | None = None, dimensions: int | None = None, *, options: Mapping[str, Any] | None = None
+    ) -> Any:
+        return self._media_embedder("multimodal", model, dimensions, options)
 
     def get_prompter(
         self,
@@ -358,6 +440,7 @@ class GoogleProvider(Provider):
             return_format=return_format,
             return_raw_response=return_raw_response,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
 
@@ -374,9 +457,9 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     provider supplies metadata for an otherwise unknown model, while
     ``request_dimensions`` records only an explicit public call override.
 
-    The default UDF ``batch_size`` matches the per-request input cap
-    (:data:`_EMBED_BATCH_LIMIT`); the embedder additionally chunks
-    oversized batches as defense in depth.
+    The default UDF ``batch_size`` retains the Gemini Developer API cap
+    (:data:`_EMBED_BATCH_LIMIT`); the embedder chunks requests using the
+    selected backend/model's limit after creating the client.
     """
 
     model_name: str
@@ -384,8 +467,10 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     dimensions: int | None = None
     request_dimensions: int | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_google_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google embedding model must be a non-empty string")
         unknown = sorted(set(self.options) - _EMBED_REQUEST_OPTIONS)
@@ -432,13 +517,14 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     def instantiate(self) -> TextEmbedder:
         return GoogleTextEmbedder(
             options=self.options,
+            client_options=self.client_options,
             model=self.model_name,
             dimensions=self.request_dimensions,
             provider_name=self.provider_name,
         )
 
 
-class GoogleTextEmbedder:
+class GoogleTextEmbedder(ManagedTextEmbedder):
     """Text embedder using Google Generative AI ``embed_content``."""
 
     def __init__(
@@ -447,76 +533,108 @@ class GoogleTextEmbedder:
         model: str,
         dimensions: int | None = None,
         provider_name: str = "google",
+        client_options: dict[str, Any] | None = None,
     ):
         with _translate_missing_provider_dependency("google", "google.genai"):
             import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
-        http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = genai.Client(http_options=http_options)
+        client_options = capture_google_client() if client_options is None else client_options
+        self._client = create_google_client(genai.Client, types, client_options)
         self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
         self._options = dict(options)
+        request_limit = _EMBED_BATCH_LIMIT
+        # Vertex Gemini embeddings accept one input per call: 001 uses predict,
+        # while 2/preview use embedContent and the SDK rejects multiple Content
+        # objects before dispatch. Resource-qualified model names share the cap.
+        if getattr(self._client, "vertexai", False) is True and _canonical_model_id(model).startswith(
+            "gemini-embedding-"
+        ):
+            request_limit = 1
+        self._request_batch_size = min(self._options.pop("request_batch_size", request_limit), request_limit)
+        self._request_concurrency = self._options.pop("max_concurrency_per_actor", 1)
 
     async def aclose(self) -> None:
         """Release the SDK client's async connection pool on the owning loop."""
         await self._client.aio.aclose()
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
-        """Embed *text*, chunking into per-request batches under the API cap.
+        maximum = getattr(self, "_request_batch_size", _EMBED_BATCH_LIMIT)
+        batches = (
+            (list(range(start, min(start + maximum, len(text)))), text[start : start + maximum])
+            for start in range(0, len(text), maximum)
+        )
+        return await self._run_requests(batches, self._embed_batch, [None] * len(text))
 
-        Each input is sent as its own ``types.Content``, so aggregating
-        models such as ``gemini-embedding-2`` still return one embedding
-        per input. Requests are capped at :data:`_EMBED_BATCH_LIMIT` inputs
-        and results are concatenated in input order, so an oversized arrow
-        batch can never produce a single oversized API call. The result
-        always contains exactly one embedding per input.
-        """
+    async def _embed_batch(self, text: list[str]) -> list[Embedding]:
         with _translate_missing_provider_dependency("google", "google.genai"):
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+        return await self._embed_contents([types.Content(parts=[types.Part.from_text(text=t)]) for t in text])
+
+    async def _embed_contents(self, contents: list[Any], *, reject_truncation: bool = False) -> list[Embedding]:
+        """One Content is one vector, including when it has multiple media parts."""
         config = dict(self._options)
         if self._dimensions is not None:
             config["output_dimensionality"] = self._dimensions
-
-        embeddings: list[Embedding] = []
-        for start in range(0, len(text), _EMBED_BATCH_LIMIT):
-            chunk = text[start : start + _EMBED_BATCH_LIMIT]
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in chunk],
-            }
-            if config:
-                kwargs["config"] = config
-            retry_error = None
-            capability_error: ProviderCapabilityError | None = None
-            try:
-                result = await self._client.aio.models.embed_content(**kwargs)
-            except Exception as exc:
-                retry_error = _retry_after_error_from_google_error(exc)
-                if retry_error is None and _is_embedding_capability_error(exc):
-                    capability_error = ProviderCapabilityError(
-                        getattr(self, "_provider_name", "google"),
-                        self._model,
-                        "embedding endpoint/model",
-                        original_error=exc,
-                    )
-                elif retry_error is None:
-                    raise
-            if retry_error is not None:
-                raise retry_error from None
-            if capability_error is not None:
-                raise capability_error from None
-            chunk_embeddings = result.embeddings or []
-            if len(chunk_embeddings) != len(chunk):
-                raise _ProviderResultError(
-                    f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(chunk)} inputs; "
-                    "embedding calls must preserve row count and order"
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "contents": contents,
+        }
+        if reject_truncation and self._client.vertexai:
+            config["auto_truncate"] = False
+        if config:
+            kwargs["config"] = config
+        retry_error = None
+        capability_error: ProviderCapabilityError | None = None
+        batch_error: _EmbeddingBatchError | None = None
+        try:
+            result = await self._client.aio.models.embed_content(**kwargs)
+        except Exception as exc:
+            # Classify the original fields before RetryAfterError sanitizes them.
+            if _is_request_wide_error(exc):
+                raise
+            retry_error = _retry_after_error_from_google_error(exc)
+            if retry_error is None and _is_embedding_capability_error(exc):
+                capability_error = ProviderCapabilityError(
+                    getattr(self, "_provider_name", "google"),
+                    self._model,
+                    "embedding endpoint/model",
+                    original_error=exc,
                 )
-            embeddings.extend(np.array(e.values, dtype=np.float32) for e in chunk_embeddings)
-        return embeddings
+            elif retry_error is None:
+                from vane.ai.functions import _provider_status_code
+
+                # Google raises ValueError for SDK input validation (including
+                # Pydantic response validation) and TypeError when deserializing
+                # malformed response fields, such as a non-array embeddings value.
+                # No vectors are available yet, so ignore mode must split the
+                # batch to recover neighboring rows. Do not retain SDK inputs
+                # or response values in the new exception or its context.
+                if isinstance(exc, (ValueError, TypeError)) and _provider_status_code(exc) is None:
+                    batch_error = _EmbeddingBatchError("Google embedding SDK could not validate the batch")
+                else:
+                    raise
+        if retry_error is not None:
+            raise retry_error from None
+        if capability_error is not None:
+            raise capability_error from None
+        if batch_error is not None:
+            raise batch_error from None
+        chunk_embeddings = result.embeddings or []
+        if len(chunk_embeddings) != len(contents):
+            raise _EmbeddingBatchError(
+                f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(contents)} inputs; "
+                "embedding calls must preserve row count and order"
+            )
+        if reject_truncation and any(
+            getattr(getattr(item, "statistics", None), "truncated", False) for item in chunk_embeddings
+        ):
+            raise _EmbeddingBatchError("Google truncated the embedding input; use smaller clips/text")
+        return self._decode_response_vectors(chunk_embeddings, lambda item: np.array(item.values, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -549,8 +667,10 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_google_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google prompt model must be a non-empty string")
         validated_options = _validate_google_prompt_options(self.options)
@@ -579,6 +699,7 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     def instantiate(self) -> Prompter:
         return GooglePrompter(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
@@ -598,14 +719,15 @@ class GooglePrompter:
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "google",
+        client_options: dict[str, Any] | None = None,
     ) -> None:
         with _translate_missing_provider_dependency("google", "google.genai"):
             import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
-        http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = genai.Client(http_options=http_options)
+        client_options = capture_google_client() if client_options is None else client_options
+        self._client = create_google_client(genai.Client, types, client_options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message

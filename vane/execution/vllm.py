@@ -19,6 +19,7 @@ from typing import Any, Callable
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
+from vane.ai._errors import DiagnosticError
 from vane.ai.provider import (
     _SafeProviderError,
     _translate_missing_provider_dependency,
@@ -253,6 +254,14 @@ class RayLocalVLLMExecutor(RayActorExecutorMixin, LocalVLLMExecutor):  # type: i
         )
 
 
+def _remote_failure(message: str, errors: list[Exception]) -> RuntimeError:
+    """Keep actual causes while retaining the private remote-control detail."""
+    failure = RuntimeError(message)
+    failure.primary_error = errors[0]  # type: ignore[attr-defined]
+    failure.cleanup_errors = tuple(errors[1:])  # type: ignore[attr-defined]
+    return failure
+
+
 class RemoteVLLMExecutor(VLLMExecutor):
     # Marks the short interval after reserving an actor's wait slot and before
     # its Ray ObjectRef is installed. This sentinel is shared by all instances.
@@ -289,6 +298,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         self._shutdown_called = False
         self._shutdown_complete = False
         self._error_message: str | None = None
+        self._error: DiagnosticError | None = None
         # Terminal cleanup is attempted at finish and retried once at shutdown.
         # Persistent failure warns without changing a successful query result.
         self._terminal_cleanup_warning_emitted = False
@@ -651,7 +661,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     control_rpc=control_rpc,
                 )
             except Exception as rollback_error:
-                exc = RuntimeError(f"{exc}; reservation rollback failed: {rollback_error}")
+                exc = _remote_failure(f"{exc}; reservation rollback failed: {rollback_error}", [exc, rollback_error])
             return exc
         return None
 
@@ -659,9 +669,10 @@ class RemoteVLLMExecutor(VLLMExecutor):
     def _submit_acknowledgement_error(errors: list[Exception]) -> Exception:
         if len(errors) == 1:
             return errors[0]
-        return RuntimeError(
+        return _remote_failure(
             "vllm remote submit acknowledgements failed: "
-            + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            + "; ".join(f"{type(error).__name__}: {error}" for error in errors),
+            errors,
         )
 
     def _drain_queued_submit_refs(self) -> None:
@@ -765,9 +776,9 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 _resolve_vllm_control_ref(method.remote(self._executor_id, wait_token))
                 self._aborted_actor_indices.add(actor_idx)
             except Exception as exc:
-                errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+                errors.append(exc)
         if errors:
-            raise RuntimeError("vllm remote abort failed: " + "; ".join(str(error) for error in errors))
+            raise _remote_failure("vllm remote abort failed: " + "; ".join(str(error) for error in errors), errors)
 
     def _release_actor_state(self) -> None:
         errors: list[Exception] = []
@@ -788,9 +799,11 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     raise RuntimeError("release_executor did not confirm release")
                 self._released_actor_indices.add(actor_idx)
             except Exception as exc:
-                errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+                errors.append(exc)
         if errors:
-            raise RuntimeError("vllm remote actor-state release failed: " + "; ".join(str(error) for error in errors))
+            raise _remote_failure(
+                "vllm remote actor-state release failed: " + "; ".join(str(error) for error in errors), errors
+            )
 
     def _report_router_completion(self) -> None:
         if self._router_completion_reported:
@@ -818,6 +831,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         with self._lifecycle_lock:
             if self._finished and self._error_message is not None:
                 return
+            primary_error = exc
             # A submit acknowledgement is the causal barrier before actor
             # terminal RPCs. Consume every outstanding acknowledgement with
             # its own control-RPC timeout, then perform one logical abort.
@@ -840,6 +854,15 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 cleanup_errors.append(cleanup_error)
             self._cancel_remote_refs()
             with self._result_cv:
+                # RayTaskError retains the real cause. Snapshot it before the
+                # private debug string loses type information, and preserve
+                # acknowledgement/cleanup exceptions as objects too.
+                self._error = DiagnosticError(
+                    "vllm remote task failed",
+                    _remote_failure(
+                        "remote execution failed", [primary_error, *pending_submit_errors, *cleanup_errors]
+                    ),
+                )
                 self._error_message = self._error_message or f"{type(exc).__name__}: {exc}"
                 if cleanup_errors:
                     self._error_message += "; cleanup failed: " + "; ".join(str(error) for error in cleanup_errors)
@@ -850,6 +873,11 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 self._ready_wait_refs.clear()
                 self._ready_submit_refs.clear()
             self._notify_state_change(force=True)
+
+    def _raise_recorded_error(self) -> None:
+        if self._error is not None:
+            # A fresh wrapper avoids sharing mutable tracebacks across callers.
+            raise DiagnosticError("vllm remote task failed", self._error) from None
 
     def _mark_finished(self) -> None:
         with self._lifecycle_lock:
@@ -887,10 +915,9 @@ class RemoteVLLMExecutor(VLLMExecutor):
 
     def submit(self, prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
         with self._lifecycle_lock:
+            self._raise_recorded_error()
             if self._shutdown_called or self._finished or self._finished_submitting_flag:
                 raise RuntimeError("vllm remote executor no longer accepts submissions")
-            if self._error_message is not None:
-                raise RuntimeError(f"vllm remote task failed: {self._error_message}")
             rows = _ensure_table(rows)
             count = len(prompts)
             if count != rows.num_rows:
@@ -955,8 +982,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
     def take_ready_result(self) -> tuple[list[str | None], pa.Table] | None:
         self._drain_queued_submit_refs()
         self._drain_queued_wait_refs()
-        if self._error_message is not None:
-            raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+        self._raise_recorded_error()
         try:
             result = self._result_buffer.popleft()
         except IndexError:
@@ -976,7 +1002,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
             if submit_errors:
                 submit_error = self._submit_acknowledgement_error(submit_errors)
                 self._record_error(submit_error)
-                raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+                self._raise_recorded_error()
             errors: list[Exception] = []
             for actor_idx, actor in enumerate(self.llm_actors):
                 if actor_idx in self._finished_actor_indices:
@@ -985,15 +1011,15 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     _resolve_vllm_control_ref(actor.finished_executor.remote(self._executor_id))
                     self._finished_actor_indices.add(actor_idx)
                 except Exception as exc:
-                    errors.append(RuntimeError(f"actor {actor_idx}: {exc}"))
+                    errors.append(exc)
             if not self._router_completion_reported:
                 try:
                     self._report_router_completion()
                 except Exception as exc:
-                    errors.append(RuntimeError(f"router: {exc}"))
+                    errors.append(exc)
             if errors:
-                raise RuntimeError(
-                    "vllm remote finished_submitting failed: " + "; ".join(str(error) for error in errors)
+                raise DiagnosticError(
+                    "vllm remote finished_submitting failed", _remote_failure("remote completion failed", errors)
                 )
             self._finished_submitting_flag = True
             self._notify_state_change(force=True)
@@ -1003,8 +1029,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         self._drain_queued_wait_refs()
         if self._result_buffer:
             return False
-        if self._error_message is not None:
-            raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+        self._raise_recorded_error()
         if not self._finished_submitting_flag:
             return False
         if sum(self._results_per_actor) >= sum(self._submit_per_actor):
@@ -1013,8 +1038,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
         return False
 
     def wait_for_result(self) -> None:
-        if self._error_message is not None:
-            raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+        self._raise_recorded_error()
         try:
             while not self._result_buffer and self._error_message is None and not self._finished:
                 self._drain_queued_submit_refs()
@@ -1048,8 +1072,7 @@ class RemoteVLLMExecutor(VLLMExecutor):
                     break
         except Exception as exc:
             self._record_error(exc)
-        if self._error_message is not None:
-            raise RuntimeError(f"vllm remote task failed: {self._error_message}")
+        self._raise_recorded_error()
 
     def shutdown(self) -> None:
         with self._lifecycle_lock:
@@ -1119,7 +1142,9 @@ class RemoteVLLMExecutor(VLLMExecutor):
                 self._warn_incomplete_terminal_cleanup(errors)
             self._notify_state_change(force=True)
             if errors and not completed_successfully:
-                raise RuntimeError("vllm remote shutdown incomplete: " + "; ".join(str(error) for error in errors))
+                raise DiagnosticError(
+                    "vllm remote shutdown incomplete", _remote_failure("remote shutdown failed", errors)
+                )
 
 
 class PrefixRouter:

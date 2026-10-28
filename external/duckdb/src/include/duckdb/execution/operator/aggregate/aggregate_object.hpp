@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -68,6 +74,7 @@ public:
 	                const vector<LogicalType> &payload_types);
 
 	AggregateFilterData &GetFilterData(idx_t aggr_idx);
+	void ResetInput();
 };
 
 } // namespace duckdb

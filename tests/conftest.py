@@ -17,7 +17,7 @@ from ray_test_profile import ray_test_object_store_options
 
 # Vane's import can create its default connection. Set the test policy before
 # that import; later environment changes do not change an existing connection.
-os.environ.setdefault("VANE_RUNNER", "local-fast")
+os.environ.setdefault("VANE_RUNNER", "local")
 vane = import_module("vane")
 
 try:
@@ -46,7 +46,7 @@ def default_vane_runner_for_tests(monkeypatch):
     """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
     # Record the current value even when it is already set. Runner-selection
     # APIs mutate the environment directly and must not leak to later tests.
-    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
+    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local"))
 
 
 def is_string_dtype(dtype):
@@ -251,6 +251,21 @@ def _alarm_handler(_signum, _frame):
 
 @pytest.fixture(autouse=True)
 def test_timeout():
+    if not hasattr(signal, "SIGALRM"):
+        if sys.platform == "win32":
+            from windows_test_timeout import windows_test_timeout
+
+            # CRT exit can run DLL cleanup without the GIL. Use an external
+            # watchdog to enforce the deadline without entering that cleanup.
+            with windows_test_timeout(TEST_TIMEOUT):
+                yield
+            return
+        faulthandler.dump_traceback_later(TEST_TIMEOUT, exit=True)
+        try:
+            yield
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        return
     prev_handler = signal.getsignal(signal.SIGALRM)
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(TEST_TIMEOUT)
@@ -410,3 +425,24 @@ def pytest_collection_finish(session):
 
 def pytest_unconfigure(config):
     _cancel_collection_watchdog(config)
+
+
+@pytest.fixture
+def application_provider_credentials(monkeypatch):
+    """These model-behavior tests use explicit application-side test credentials."""
+    for family in ("OPENAI", "GOOGLE", "ANTHROPIC"):
+        monkeypatch.setenv(f"{family}_API_KEY", "application-test-key")
+    for name in (
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT_ID",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)

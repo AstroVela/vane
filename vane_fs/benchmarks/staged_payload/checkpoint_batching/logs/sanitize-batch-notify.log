@@ -1,0 +1,1 @@
+notify PASS signals=1 hook_queries=0 passive=2 partial=1

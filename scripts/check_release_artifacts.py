@@ -94,16 +94,19 @@ WHEEL_DISTRIBUTION = re.sub(r"[-_.]+", "_", EXPECTED_NAME)
 EXPECTED_LIBRARY_ROOT = f"{WHEEL_DISTRIBUTION}.libs"
 
 
-def _expected_project_requires_dist() -> tuple[str, ...]:
-    requirements = [Requirement(str(value)) for value in PROJECT_METADATA.get("dependencies", [])]
-    for raw_extra, values in PROJECT_METADATA.get("optional-dependencies", {}).items():
+def _expected_project_requires_dist(project_metadata: dict = PROJECT_METADATA) -> tuple[str, ...]:
+    requirements = [Requirement(str(value)) for value in project_metadata.get("dependencies", [])]
+    for raw_extra, values in project_metadata.get("optional-dependencies", {}).items():
         extra = canonicalize_name(str(raw_extra))
         for value in values:
             requirement = Requirement(str(value))
             extra_marker = f'extra == "{extra}"'
-            requirement.marker = Marker(
-                extra_marker if requirement.marker is None else f"{requirement.marker} and {extra_marker}"
-            )
+            marker = requirement.marker
+            expression = str(marker) if marker is not None else ""
+            # Only a top-level disjunction needs grouping before the extra gate.
+            if marker is not None and "or" in marker._markers:
+                expression = f"({expression})"
+            requirement.marker = Marker(extra_marker if marker is None else f"{expression} and {extra_marker}")
             requirements.append(requirement)
     return tuple(str(requirement) for requirement in requirements)
 
@@ -114,13 +117,13 @@ EXPECTED_PROVIDES_EXTRA = tuple(
 )
 
 
-def _expected_project_entry_points() -> dict[str, dict[str, str]]:
+def _expected_project_entry_points(project_metadata: dict = PROJECT_METADATA) -> dict[str, dict[str, str]]:
     groups: dict[str, dict[str, str]] = {}
     for project_key, group in (("scripts", "console_scripts"), ("gui-scripts", "gui_scripts")):
-        values = PROJECT_METADATA.get(project_key, {})
+        values = project_metadata.get(project_key, {})
         if values:
             groups[group] = {str(name): str(reference) for name, reference in values.items()}
-    for group, values in PROJECT_METADATA.get("entry-points", {}).items():
+    for group, values in project_metadata.get("entry-points", {}).items():
         group_name = str(group)
         if group_name in groups:
             raise ValueError(f"project metadata declares entry-point group {group_name!r} more than once")
@@ -383,6 +386,17 @@ def _require_sdist_path(names: list[str], relative_path: str, artifact: Path) ->
     return matches[0]
 
 
+def _check_sdist_release_tests(artifact: Artifact) -> None:
+    """Require the test files referenced by the packaged release launcher."""
+    names = artifact.names()
+    launcher = _require_sdist_path(names, "scripts/run_release_tests.sh", artifact.path)
+    test_paths = re.findall(r'"\$project_root/(tests/[^"\r\n]+?\.py)(?:::|")', artifact.read(launcher).decode("utf-8"))
+    if not test_paths:
+        raise ValueError(f"{artifact.path}: release launcher must explicitly list its test files")
+    for relative_path in sorted(set(test_paths)):
+        _require_sdist_path(names, relative_path, artifact.path)
+
+
 def _check_paths(artifact: Artifact) -> None:
     names = artifact.path_names()
     canonical_paths: dict[str, str] = {}
@@ -623,14 +637,16 @@ def _check_no_official_duckdb_dependency(artifact: Artifact, metadata) -> None:
             raise ValueError(f"{artifact.path}: vane-ai must not depend on the official duckdb distribution")
 
 
-def _check_project_dependency_metadata(artifact: Artifact, metadata) -> None:
+def _check_project_dependency_metadata(artifact: Artifact, metadata, project_metadata: dict | None = None) -> None:
     raw_requirements = tuple(str(value) for value in metadata.get_all("Requires-Dist", []))
     try:
         requirements = tuple(str(Requirement(value)) for value in raw_requirements)
     except InvalidRequirement:
         raise ValueError(f"{artifact.path}: invalid Requires-Dist metadata") from None
     actual_requirements = Counter(requirements)
-    expected_requirements = Counter(EXPECTED_REQUIRES_DIST)
+    expected_requirements = Counter(
+        EXPECTED_REQUIRES_DIST if project_metadata is None else _expected_project_requires_dist(project_metadata)
+    )
     if actual_requirements != expected_requirements:
         missing = sorted((expected_requirements - actual_requirements).elements())
         unexpected = sorted((actual_requirements - expected_requirements).elements())
@@ -640,7 +656,11 @@ def _check_project_dependency_metadata(artifact: Artifact, metadata) -> None:
         )
 
     actual_extras = Counter(str(value) for value in metadata.get_all("Provides-Extra", []))
-    expected_extras = Counter(EXPECTED_PROVIDES_EXTRA)
+    expected_extras = Counter(
+        EXPECTED_PROVIDES_EXTRA
+        if project_metadata is None
+        else (canonicalize_name(str(extra)) for extra in project_metadata.get("optional-dependencies", {}))
+    )
     if actual_extras != expected_extras:
         missing = sorted((expected_extras - actual_extras).elements())
         unexpected = sorted((actual_extras - expected_extras).elements())
@@ -650,10 +670,15 @@ def _check_project_dependency_metadata(artifact: Artifact, metadata) -> None:
         )
 
 
-def _check_project_entry_points(artifact: WheelArtifact, layout: DistributionLayout) -> None:
+def _check_project_entry_points(
+    artifact: WheelArtifact, layout: DistributionLayout, project_metadata: dict | None = None
+) -> None:
+    expected_entry_points = (
+        EXPECTED_ENTRY_POINTS if project_metadata is None else _expected_project_entry_points(project_metadata)
+    )
     entry_points_path = f"{layout.dist_info_root}/entry_points.txt"
     matches = [name for name in artifact.names() if name.casefold() == entry_points_path.casefold()]
-    if not EXPECTED_ENTRY_POINTS:
+    if not expected_entry_points:
         if matches:
             raise ValueError(
                 f"{artifact.path}: wheel must not contain entry_points.txt because project metadata "
@@ -683,10 +708,10 @@ def _check_project_entry_points(artifact: WheelArtifact, layout: DistributionLay
     if parser.defaults():
         raise ValueError(f"{artifact.path}: entry_points.txt must not contain default entries")
     actual = {section: dict(parser.items(section, raw=True)) for section in parser.sections()}
-    if actual != EXPECTED_ENTRY_POINTS:
+    if actual != expected_entry_points:
         raise ValueError(
             f"{artifact.path}: entry_points.txt must match project metadata exactly: "
-            f"expected={EXPECTED_ENTRY_POINTS}, actual={actual}"
+            f"expected={expected_entry_points}, actual={actual}"
         )
 
 
@@ -767,6 +792,8 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
             raise ValueError(f"{artifact.path}: Vane sdist contains an unexpected archive root: {name!r}")
 
     required_paths = (
+        "native-media-release.toml",
+        "vane_fs/include/vane_fs/reader_abi.h",
         "DUCKDB_FORK_REVISION",
         "DUCKDB_SOURCE_ID",
         "DUCKDB_UPSTREAM_VERSION",
@@ -813,7 +840,17 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "scripts/validate_testpypi_candidate.py",
         "scripts/verify_duckdb_coexistence.py",
         "scripts/verify_extension_wheel.py",
+        "tests/__init__.py",
+        "tests/conftest.py",
+        "tests/datasink_test_helpers.py",
+        "tests/local_admission_helpers.py",
+        "tests/local_plan_helpers.py",
+        "tests/local_runtime_helpers.py",
+        "tests/local_gpu_helpers.py",
+        "tests/ray_diagnostic_helpers.py",
         "tests/ray_test_profile.py",
+        "tests/result_stream_helpers.py",
+        "tests/windows_test_timeout.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
         "vane/_native/__init__.pyi",
@@ -826,6 +863,8 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
 
+    _check_sdist_release_tests(artifact)
+
     # Optional codecs stay outside the base wheel, but their sources must be
     # available when a user builds the corresponding extension from an sdist.
     for relative_path in ("CMakeLists.txt", "native_media_extension.cpp", "include/native_media_extension.hpp"):
@@ -834,6 +873,18 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         _require_sdist_path(names, f"external/duckdb/extension/{domain}/{domain}_functions.cpp", artifact.path)
     for relative_path in ("extension.cmake", "media_reader.cpp", "image_convert.cpp", "include/media_reader.hpp"):
         _require_sdist_path(names, f"external/duckdb/extension/media_common/{relative_path}", artifact.path)
+    for relative_path in (
+        "CMakeLists.txt",
+        "gravitino_catalog.cpp",
+        "gravitino_client.cpp",
+        "gravitino_extension.cpp",
+        "gravitino_filesystem.cpp",
+        "gravitino_functions.cpp",
+        "include/gravitino_catalog.hpp",
+        "include/gravitino_client.hpp",
+        "include/gravitino_extension.hpp",
+    ):
+        _require_sdist_path(names, f"external/duckdb/extension/gravitino/{relative_path}", artifact.path)
 
     source_id_name = _require_sdist_path(names, "DUCKDB_SOURCE_ID", artifact.path)
     source_id = artifact.read(source_id_name).decode("ascii").strip()
@@ -926,7 +977,9 @@ def _check_wheel_record(artifact: WheelArtifact, layout: DistributionLayout) -> 
         raise ValueError(f"{artifact.path}: files missing from RECORD: {sorted(missing)}")
 
 
-def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
+def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout, project_metadata: dict | None = None) -> None:
+    if project_metadata is not None and project_metadata.get("name") != EXPECTED_NAME:
+        raise ValueError(f"{artifact.path}: base project metadata must describe {EXPECTED_NAME!r}")
     names = artifact.names()
     for name in names:
         parts = PurePosixPath(name).parts
@@ -969,8 +1022,8 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
         _require_exact_path(names, required_path, artifact.path)
     metadata = _check_metadata(artifact, f"{layout.dist_info_root}/METADATA", layout)
     _check_no_official_duckdb_dependency(artifact, metadata)
-    _check_project_dependency_metadata(artifact, metadata)
-    _check_project_entry_points(artifact, layout)
+    _check_project_dependency_metadata(artifact, metadata, project_metadata)
+    _check_project_entry_points(artifact, layout, project_metadata)
     _check_wheel_license_files(artifact, metadata, layout)
     _check_wheel_record(artifact, layout)
 
@@ -1024,10 +1077,11 @@ def check_artifact(
     archive_input: Path | ArchiveSnapshot,
     *,
     expected_version: Version | str,
+    project_metadata: dict | None = None,
     content_rules: tuple[ContentRule, ...] = (),
     text_content_rules: tuple[ContentRule, ...] = (),
 ) -> None:
-    """Validate one sdist or wheel."""
+    """Validate one artifact, optionally using the matching runtime's wheel metadata."""
     path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
     layout = distribution_layout(expected_version)
     artifact_version = _artifact_version(path)
@@ -1043,7 +1097,11 @@ def check_artifact(
         _check_internal_content(artifact, content_rules, text_content_rules)
         _check_raw_archive_content(path, artifact.raw_content_match)
         if isinstance(artifact, SdistArtifact):
+            if project_metadata is not None:
+                raise ValueError("explicit project metadata is supported only for wheel validation")
             _check_sdist(artifact, layout)
+        elif project_metadata is not None:
+            _check_wheel(artifact, layout, project_metadata)
         else:
             _check_wheel(artifact, layout)
     finally:

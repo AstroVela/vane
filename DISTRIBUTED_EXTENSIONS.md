@@ -131,10 +131,17 @@ providers. Each wheel contains exactly one self-contained artifact, its
 canonical descriptor, required license files, and one provider entry point,
 while declaring an exact dependency on the matching `vane-ai` version and on
 separately packaged dependency-extension wheels. Each extension-wheel package
-version contains the Vane release stage and the complete SHA-256 fingerprint of
-its immutable descriptor split across bounded numeric components. Those
-dependency-extension requirements therefore select the exact artifact identity
-instead of merely another build for the same Vane release. The provider module
+version appends an independent positive release number to the matching Vane
+release tuple: Vane `0.2.0` uses providers `0.2.0.1`, `0.2.0.2`, and so on.
+Vane prerelease/development suffixes are preserved after the fourth component.
+The counter continues across dev, rc, final and post stages of the same numeric
+Vane `X.Y.Z`: `0.2.0.2rc1` advances to `0.2.0.3`. Reset to one only for a new
+numeric base, such as the first `0.3.0.1` provider for Vane `0.3.0`.
+Dependencies pin the actual supplied wheel versions, while descriptors retain
+the exact artifact SHA-256 and dependency identities. Historical versions
+encoded from descriptor digests remain readable. Published files for a given
+version and wheel tag are immutable; changing their bytes requires a new release
+number. The provider module
 path is content-addressed too, so distinct artifacts do not overwrite each
 other's installed files. Each extension wheel is tagged for the active
 supported CPython minor, matching the native base wheel selected for that
@@ -160,6 +167,36 @@ from a trusted, hash-locked artifact set. Package version constraints alone do
 not identify wheel bytes; runtime admission also checks the exact DuckDB
 SourceID and descriptors. Build and clean verification commands are in
 [DEVELOPMENT.md](DEVELOPMENT.md#building-an-optional-extension-wheel).
+
+### Lazy batches across C++ extension boundaries
+
+Self-contained providers have a private copy of DuckDB's process-global state.
+An external block therefore carries its own process-local
+`shared_ptr<ExternalBlockBackendInterface>` in
+`ExternalBlockDescriptor::materializer`. A producer of new descriptors must
+bind a reader that understands their references. Copying, projecting, slicing
+or queueing a descriptor must preserve that binding alongside `object_ref` and
+`ownership_tokens`. The reader is a service capability; it must not retain the
+query or its input descriptors.
+
+The receiving native process binds Python ref-bundle results before passing
+them into the pipeline. The shared pointer is never part of a task's wire
+format. The backend registry remains available to producers during binding;
+consumers use only the reader already bound to the descriptor. Missing readers,
+mixed reader bindings and rejected descriptors fail before consuming rows.
+The existing `RAY_OBJECT_STORE` backend tag also covers local shared-memory
+ref bundles; its name does not select a runner or initialize Ray.
+
+Ordinary `SinkBatch` and `ExecuteBatch` adapters materialize through this
+capability, including adapters inside a provider and COPY operators created by
+that provider. A successful materialization replaces the input batch with its
+payload, which is reused across `BLOCKED` and `HAVE_MORE_OUTPUT` retries.
+Custom batch callbacks retain their existing dispatch and lazy behavior.
+
+This descriptor layout is part of the C++ extension ABI. Rebuild the base
+engine and every self-contained provider from the same matching source, then
+sign and package the resulting artifacts. An older provider cannot be reused
+by changing its manifest or relaxing source-identity checks.
 
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
@@ -195,12 +232,30 @@ The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
 This validation occurs before task admission and plan deserialization.
 
+The optional native VaneFS connector adds `vane_fs_workspaces` declarations to
+the same connection snapshot. Each declaration contains an absolute local
+database path, expected workspace ID, timeout, host name and bound snapshot
+IDs. Planning and worker connections reopen their own native providers;
+worker cache identities include the exact declarations. Same-host validation
+and workspace-ID checks precede file access. Driver plans retain binding pins,
+and query replay state owns worker pins across task attempts until cleanup.
+The optional `vane-fs` package must be installed in every participating process.
+This protocol qualifies same-host reads; remote services and multi-host storage
+require their own protocol.
+
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning
 DatabaseInstance, and attached catalogs are recreated only there. The
 declarations are removed when the coordinator produces a physical worker plan.
 Workers consume the immutable bind state serialized by the table function and
 never receive attachment SQL or repeat coordinator metadata binding.
+
+A catalog whose bound scans contain only self-contained metadata or physical
+storage paths can override `Catalog::RequiresAttachmentForPlanDeserialization()`
+to return false. Its attachment is then omitted from the logical-plan snapshot
+as well. Gravitino uses this contract: its token remains on the querying
+connection and planning does not repeat remote authentication. Other catalogs
+retain attachment replay by default.
 
 Connection snapshots do not transport DuckDB `CREATE SECRET` objects. A Ray
 worker disables host persistent-secret loading before a newly opened snapshot
@@ -334,11 +389,18 @@ occurrences of the same path. A zero-file MultiFile scan is represented by one
 explicit empty file split. The coordinator's original file list is never
 retained as a worker fallback.
 
-Vane's built-in CSV reader uses the extension-owned contract because a single
-seekable CSV file can be split below file granularity. A multi-file scan emits
-one split per bound file. A single uncompressed UTF-8 file may emit explicit
-byte ranges, with overlap used only to finish the record that starts inside a
-range. The worker bind serializes the bound schema, projection-facing column
+Vane's built-in CSV reader uses the extension-owned contract because seekable
+CSV files can be split below file granularity. Uncompressed UTF-8 files may emit
+explicit byte ranges in both single-file and multi-file scans, with overlap used
+only to finish the record that starts inside a range. Multi-file range planning
+requires either explicit reader options (`auto_detect=false`) or the per-file
+reader state bound by `union_by_name=true`. Ordinary multi-file auto detection
+keeps whole-file splits because its readers can still adapt each file's dialect
+and header. The granularity hint is shared proportionally among splittable file
+bytes, subject to each file's minimum safe range size; rounding and whole-file
+inputs can make the split count exceed the hint. Small, empty, and non-splittable
+files retain one whole-file split, and repeated paths retain distinct file
+ordinals. The worker bind serializes the bound schema, projection-facing column
 metadata, reader options, union-by-name per-file state, and complete
 `OpenFileInfo` options. It is detached until an assignment is applied, and an
 explicit empty assignment remains a zero-row scan. Compressed, non-seekable,
@@ -349,6 +411,42 @@ are rejected at every granularity because they cannot provide retryable tasks.
 Rejects-table scans are not distributed. CSV itself has no snapshot identifier,
 so referenced files must remain immutable for the lifetime of the query and its
 retries; a same-size replacement cannot be detected by this protocol.
+
+NDJSON scans (`read_ndjson`, `read_ndjson_auto`, `read_ndjson_objects`, and
+JSON readers with `format='newline_delimited'`) also use extension-owned splits.
+Seekable, uncompressed files can produce byte ranges, with a minimum nominal size of
+1 MiB. Planning divides the total bytes of eligible files by the target split
+count to choose a common range size, clamped between 1 MiB and 256 MiB by default.
+Each file is then divided into balanced ranges using its own size, so small
+files do not consume a large file's parallelism budget. The target split count
+is a hint, not an upper bound: a single 100 GiB input with four worker slots
+produces 400 nominal 256 MiB ranges.
+
+Set `VANE_NDJSON_MAX_SPLIT_BYTES` to an integer byte count of at least 2 MiB
+to override the maximum nominal size, or use
+`vane.configure(ndjson_max_split_bytes=128 * 1024 * 1024)`. The 2 MiB lower bound
+allows balanced ranges to retain the 1 MiB minimum without exceeding the cap.
+This setting is read only when planning new splits; replay preserves the
+already-assigned ranges. FTE may group multiple splits into a task, so this
+setting does not cap a task's input size or retry cost.
+
+Workers advance each boundary to the next line start and expose
+only that aligned interval to the JSON reader. Adjacent splits therefore read
+each record exactly once, including CRLF, UTF-8, and a final record without a
+newline. Schema inference remains on the coordinator; splits preserve the bound
+schema, reader options, filename and original file ordinal. Parsing errors in a
+range report line numbers relative to that range. Alignment can extend a range
+beyond its nominal size or make it empty. Boundary searches use fixed-size
+buffers and support cancellation; whitespace length is not treated as JSON
+object size.
+
+Auto-detected JSON format, array/unstructured JSON, compressed inputs, small
+files, and non-seekable replayable inputs retain whole-file splits. Pipes are
+rejected. Metadata lookup failures retain a whole-file split with unknown byte
+size. Split application rejects foreign files, mismatched identities and
+overlapping work; assignments can be replayed but not widened after assignment.
+Inputs must remain immutable throughout execution and retries, as JSON files
+have no snapshot identity.
 
 ## Distributed writes
 

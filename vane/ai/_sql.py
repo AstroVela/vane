@@ -6,16 +6,15 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal, cast
 
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
-    _EmbedTextBatch,
     _gpus_or_zero,
-    _prepare_embed_call,
+    _prepare_embedding_batch,
     _prepare_prompt_call,
     _PromptBatch,
     _resolve_ai_batch_size,
@@ -106,10 +105,6 @@ def _normalize_option_value(value: Any, name: str | None = None) -> Any:
     return value
 
 
-def _embedding_output_type(dimensions: int) -> str:
-    return f"FLOAT[{dimensions}]"
-
-
 def _normalize_sql_options(options: dict[str, Any] | None) -> dict[str, Any]:
     _reject_inline_credentials(options or {})
     # Preserve explicit NULL fields until the closed API validators see them.
@@ -126,7 +121,7 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    input_kind: str = "text",
+    input_kind: Literal["text", "blob", "blob_list", "file", "file_list"] = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:
@@ -246,31 +241,52 @@ def build_ai_prompt_sql_spec(
     }
 
 
+def _embedding_input_spec(input_spec: Any) -> tuple[tuple[Any, ...], bool]:
+    from vane.ai._embedding_content import EmbeddingPartSpec
+    from vane.ai.embedding import Modality, _validate_mime_type
+
+    structured = isinstance(input_spec, list)
+    values = input_spec if structured else [{"kind": "text"} if input_spec is None else input_spec]
+    if not values:
+        raise ValueError("ai_embed input_spec requires at least one part")
+    parts = []
+    for value in values:
+        if not isinstance(value, dict) or set(value) - {"kind", "mime_type"}:
+            raise ValueError("ai_embed input_spec parts must be STRUCTs with kind and optional mime_type")
+        kind = value.get("kind")
+        if not isinstance(kind, str) or kind not in {"text", "image", "video", "audio"}:
+            raise ValueError("ai_embed input_spec kind must be text, image, video or audio")
+        mime_type = value.get("mime_type")
+        part = EmbeddingPartSpec(cast(Modality, kind), mime_type)
+        _validate_mime_type(part.kind, part.mime_type)
+        parts.append(part)
+    return tuple(parts), structured
+
+
 def build_ai_embed_sql_spec(
     provider: str = "openai",
     model: str | None = None,
     dimensions: int | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
+    *,
+    input_spec: Any = None,
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
-    descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
+    parts, structured = _embedding_input_spec(input_spec)
+    multimodal = structured or parts[0].mime_type is not None
+    wrapper, udf_opts, _, resolved_dimensions, input_name = _prepare_embedding_batch(
         provider,
         model,
         dimensions,
         on_error,
         opts,
+        parts=parts,
+        multimodal=multimodal,
         relation=False,
     )
-    wrapper = _EmbedTextBatch(
-        descriptor,
-        "text",
-        "embedding",
-        resolved_dimensions,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-        normalize=normalize,
-    )
+    wrapper._selection_columns = (input_name,)
+    descriptor = wrapper._descriptor
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
         "function": actor_callable,
@@ -278,11 +294,50 @@ def build_ai_embed_sql_spec(
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,
-        "return_type": _embedding_output_type(resolved_dimensions),
-        "input_names": ["text"],
-        "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
+        "return_type": wrapper._output_spec.sql_type(),
+        "input_names": ["selected_input"],
+        "input_column": input_name,
+        "struct_input": structured,
+        "multimodal": multimodal,
+        "parts": [{"kind": part.kind, "mime_type": part.mime_type} for part in parts],
+        "schema": {"embedding": wrapper._output_spec.sql_type()},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),
+    }
+
+
+def build_ai_jev_sql_spec(
+    questions: str | dict[str, Any],
+    model: str = "jev-latest",
+    on_error: Literal["raise", "ignore"] = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build Jev's actor UDF with the same request contract as the Python API."""
+    from vane.ai._jev import _prepare_jev_call
+
+    opts = _normalize_sql_options(options)
+    if "execution_backend" in opts:
+        raise TypeError("Jev SQL uses the connection's actor backend; execution_backend is a Python-only option")
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except json.JSONDecodeError:
+            raise ValueError("ai_jev questions must be valid JSON") from None
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("ai_jev questions must be a non-empty JSON object or STRUCT")
+    wrapper, udf_opts = _prepare_jev_call(questions, model, on_error, opts)
+    return {
+        "function": _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True),
+        "name": "ai_jev",
+        "provider": "typesafe",
+        "model": model,
+        "return_type": "VARCHAR",
+        "input_names": ["state"],
+        "schema": {"response": "VARCHAR"},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
+        "row_preserving": True,
+        "actor_number": _actor_number_or_one(udf_opts),
+        "gpus": 0,
     }

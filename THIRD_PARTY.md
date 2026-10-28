@@ -18,9 +18,10 @@ source/relink delivery checks. Original upstream notices remain intact.
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
-The query-relation parameter binding changes under `external/duckdb` remain MIT
-licensed. Connection runner dispatch, interruption, and result ownership changes in the
-inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
+The query-relation parameter binding and pending-query progress snapshot changes
+under `external/duckdb` remain MIT licensed. Connection runner dispatch,
+interruption, and result ownership changes in the inherited Python client retain
+their `MIT AND Apache-2.0` file-level notices.
 
 ## Vendored native dependencies
 
@@ -52,6 +53,48 @@ pyelftools are installed separately by package managers and are not copied into
 the Vane source distribution. Optional provider clients are also installed
 separately. Their own distributions govern their licenses.
 
+The optional `mlx` extra installs [MLX](https://github.com/ml-explore/mlx)
+and [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) (MIT), Transformers and
+Hugging Face Hub (Apache-2.0), plus Pillow under its
+[PIL/Pillow license](https://github.com/python-pillow/Pillow/blob/main/LICENSE),
+separately on Apple Silicon. The image provider uses the installed SDK's
+NumPy/Pillow processor; no processor source or model assets are vendored.
+Its test shape images are generated locally by the tests. MLX-VLM also
+declares its own audio, image, tokenizer and HTTP dependencies; preserve the
+notices of the resolved wheels when distributing an environment. Vane does not
+vendor these SDKs. The EmbeddingGemma 2 checkpoint is obtained separately under
+the [Gemma terms](https://ai.google.dev/gemma/terms); no weights, tokenizer assets
+or Hugging Face cache are distributed with Vane.
+
+The optional `litert` extra installs [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
+(`litert-lm-api`, Apache-2.0) and Pillow under its PIL/Pillow license. Its native
+runtime, bundled libraries and their notices remain in the separately installed
+SDK wheel. Preserve that wheel's complete notices when redistributing an
+environment. The adapter requires separately provisioned EmbeddingGemma 2
+LiteRT-LM weights (Apache-2.0); Vane distributes no model assets, SDK source or
+third-party datasets. Test images and audio are authored in the tests.
+
+The optional `onnx` and alternative `onnx_cuda` extras install ONNX Runtime
+(MIT), ONNX and Transformers (Apache-2.0), PyTorch/torchvision (BSD-style), and
+Pillow (MIT-CMU for the qualified 12.3.0 wheel). Model inference uses ONNX
+Runtime; the official EmbeddingGemma 2 image/video processor uses CPU PyTorch.
+SDKs, their native
+libraries and notices remain in separately installed dependency wheels. The
+community EmbeddingGemma 2 ONNX export and its tokenizer/processor assets are
+provisioned separately under Apache-2.0. No upstream implementation, model
+weights or tokenizer data are vendored. Test media and small inference fixtures
+are authored locally. Preserve the exact wheels' complete notices when
+redistributing an environment, including NVIDIA notices for the CUDA variant.
+
+The optional `video_asr` extra installs faster-whisper (MIT) and its dependencies;
+`video_ocr` installs RapidOCR (Apache-2.0) and ONNX Runtime (MIT). These packages
+and model weights are not bundled. Local adapters require explicitly provisioned
+model assets; deployments must review their licenses separately. Preserve the
+exact dependency wheels' notices, including CTranslate2 and bundled native
+libraries, when redistributing an environment. PyAV/FFmpeg obligations are covered
+in [COPYLEFT.md](COPYLEFT.md). Cloud adapters use the Python standard library and
+do not include provider SDKs or model assets.
+
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.
@@ -66,3 +109,27 @@ These features do not enable FFmpeg's GPL, version3, or nonfree components.
 See [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md) for artifact
 packaging, notices, and corresponding-source/relinking requirements, and
 [FFmpeg's license documentation](https://ffmpeg.org/legal.html) for its terms.
+
+## Optional Cosmos video/text embedding
+
+The `cosmos` extra installs PyTorch and Torchvision (BSD-3-Clause),
+Transformers and einops (Apache-2.0), and Pillow under its
+[PIL/Pillow license](https://github.com/python-pillow/Pillow/blob/main/LICENSE)
+separately. Vane does not vendor these packages or NVIDIA's model implementation. Review bundled
+CUDA dependencies when redistributing a CUDA-enabled PyTorch installation.
+
+The optional [Cosmos-Embed1-224p model](https://huggingface.co/nvidia/Cosmos-Embed1-224p)
+is supplied under the NVIDIA Open Model License; its custom code includes
+Apache-2.0 and MIT notices. The adapter loads user-authorized, revision-pinned
+code through Hugging Face. No model code or weights are copied into Vane.
+The opt-in integration test uses the public video and target caption from the
+model card's inference example. Users obtain the video separately from
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Branko_Paukovic,_javelin_throw.webm)
+under that file's license. No media fixture is included in Vane distributions.
+
+## Optional CLAP audio/text embedding
+
+The `clap` extra installs PyTorch (BSD-3-Clause) and Transformers (Apache-2.0)
+separately. The [LAION CLAP HTSAT unfused checkpoint](https://huggingface.co/laion/clap-htsat-unfused)
+is distributed under Apache-2.0. Vane loads it through Transformers' built-in
+implementation; no remote model code, weights, or audio datasets are bundled.

@@ -25,6 +25,18 @@ _ALLOWED_OPTIONS = frozenset(
         "actor_dispatch_indices",
         "actor_pool_locator",
         "local_actor_pool",
+        "local_model_pool",
+        "local_task_admission",
+        "local_task_progress",
+        "local_query_admission",
+        "local_transport_input_target_bytes",
+        "local_data_scope",
+        "local_input_cleanup",
+        "local_executor_cleanup",
+        "local_request_cancellation",
+        "local_resource_unit",
+        "local_resource_activity",
+        "local_worker_metrics",
         "query_driver_handle",
         "query_generation_capability",
         "session_config",
@@ -87,11 +99,48 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
         )
 
     options = normalize_options(_options)
+    if options.get("local_model_pool") is not None and backend != "subprocess_actor":
+        raise ValueError("registered local models require the subprocess_actor backend")
+    if options.get("local_task_progress") is not None and backend != "subprocess_task":
+        raise ValueError("local task progress requires the subprocess_task backend")
+    if options.get("local_task_admission") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime task admission requires local subprocess UDFs")
+    if options.get("local_query_admission") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("query resource policy requires local subprocess UDFs")
+    if "local_transport_input_target_bytes" in options:
+        target = options["local_transport_input_target_bytes"]
+        if backend not in {"subprocess_actor", "subprocess_task"} or type(target) is not int or target <= 0:
+            raise ValueError("local transport input target requires positive integer bytes and a subprocess backend")
+    if options.get("local_data_scope") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime data accounting requires local subprocess UDFs")
+    if options.get("local_input_cleanup") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime input cleanup requires local subprocess UDFs")
+    if options.get("local_executor_cleanup") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime executor cleanup requires local subprocess UDFs")
+    if options.get("local_request_cancellation") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("request cancellation requires local subprocess UDFs")
+    if options.get("local_worker_metrics") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("local worker metrics require local subprocess UDFs")
+
+    if (
+        options.get("local_resource_unit") is not None or options.get("local_resource_activity") is not None
+    ) and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("local resource graphs require local subprocess UDFs")
 
     if backend in ("subprocess_task", "subprocess_actor"):
         gpus = float(payload.get("gpus") or 0.0)
         if gpus > 0:
-            raise ValueError("GPU resources require a Ray UDF backend")
+            from vane.execution.udf_local_model import RegisteredLocalModel
+
+            model = options.get("local_model_pool")
+            if backend != "subprocess_actor":
+                raise ValueError("GPU resources require a Ray UDF backend or a local actor pool")
+            if isinstance(model, RegisteredLocalModel):
+                model.validate_gpu_pool(payload, options.get("local_actor_pool"), options.get("session_config"))
+            else:
+                from vane.execution.udf_local_gpu import validate_query_gpu_pool
+
+                validate_query_gpu_pool(payload, options.get("local_actor_pool"), options.get("session_config"))
         from vane.execution.udf_subprocess import UDFExecutor
 
         return UDFExecutor(payload, options=options)
