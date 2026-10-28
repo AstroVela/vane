@@ -490,6 +490,47 @@ TEST_CASE("Materialized media failures keep the receipt and roll back uncommitte
 	REQUIRE_NO_FAIL(receiver.con.Query("SELECT 42"));
 }
 
+TEST_CASE("Materialized media shrinks a legal payload prefix to fit its pinned storage working set",
+          "[media-resource][media-materialization]") {
+	const auto batch = GENERATE(false, true);
+	auto image_type = ImageLogicalType::Create("RGB", 128, 128);
+	MaterializedMediaFixture receiver({LogicalType::BIGINT, image_type}, 1024 * 1024);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='512KiB'"));
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT, image_type}, 12);
+	for (idx_t row = 0; row < 12; row++) {
+		input.SetValue(0, row, Value::BIGINT(row));
+		vector<uint8_t> pixels(128 * 128 * 3, NumericCast<uint8_t>(row));
+		ImageVector::WritePixels(input.data[1], row, 128, 128, "RGB", pixels.data());
+	}
+	input.SetCardinality(12);
+	const auto bytes = EstimateMediaFlowInputBytes(input);
+	REQUIRE(bytes < 1024 * 1024);
+	REQUIRE(bytes > 512 * 1024);
+	MediaFlowWindow window(bytes);
+	auto ticket = TakeFlow(window, bytes);
+	input.AddMediaFlow(ticket);
+	REQUIRE(receiver.Accept(input, batch) == SinkResultType::NEED_MORE_INPUT);
+	CHECK_FALSE(ticket->IsActive());
+	auto &manager = BufferManager::GetBufferManager(*receiver.con.context);
+	CHECK(manager.GetUsedSwap() > 0);
+	CHECK(manager.GetUsedMemory() <= manager.GetMaxMemory());
+	auto result = receiver.Finish();
+	idx_t row = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++, row++) {
+			CHECK(chunk->GetValue(0, i) == Value::BIGINT(row));
+			auto pixels = ImageVector::Pixels(chunk->data[1], i);
+			for (idx_t pixel = 0; pixel < 128 * 128 * 3; pixel++) {
+				if (pixels[pixel] != row) {
+					FAIL("Shrinking the receiving prefix changed the image pixels");
+				}
+			}
+		}
+	}
+	CHECK(row == 12);
+}
+
 TEST_CASE("Materialized media releases production credit independently of retained pixels",
           "[media-resource][media-materialization]") {
 	MaterializedMediaFixture receiver({LogicalType::UTINYINT}, 8);

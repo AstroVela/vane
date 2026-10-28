@@ -100,19 +100,37 @@ SinkResultType PhysicalMediaMaterializedCollector::Sink(ExecutionContext &contex
 			                           static_cast<unsigned long long>(row_bytes),
 			                           static_cast<unsigned long long>(state.copy_limit));
 		}
-		const auto rows = MediaFlowRowsWithinByteLimit(chunk, offset, chunk.size() - offset, state.copy_limit);
+		auto rows = MediaFlowRowsWithinByteLimit(chunk, offset, chunk.size() - offset, state.copy_limit);
 		D_ASSERT(rows);
-		DataChunk selected;
-		selected.InitializeEmpty(types);
-		selected.Reference(chunk);
-		selected.Slice(offset, rows);
-		auto segment = CreateMediaCollection(context.client, types);
-		// Append obtains actual BufferManager blocks before writing. Its local
-		// append state releases every pin on return. Seal this prefix instead of
-		// retaining a partially filled 2048-row image chunk until the next input:
-		// already received pixels must be spillable before the source reaches EOF.
-		// Complex-vector flattening has at most copy_limit selected payload.
-		segment->Append(selected);
+		unique_ptr<ColumnDataCollection> segment;
+		while (true) {
+			if (context.client.interrupted) {
+				throw InterruptException();
+			}
+			try {
+				DataChunk selected;
+				selected.InitializeEmpty(types);
+				selected.Reference(chunk);
+				selected.Slice(offset, rows);
+				auto candidate = CreateMediaCollection(context.client, types);
+				// Append obtains actual BufferManager blocks before writing. Its local
+				// state releases every pin on return. Seal this prefix instead of
+				// retaining a partially filled 2048-row image chunk until the next input.
+				// Complex-vector flattening has at most copy_limit selected payload.
+				candidate->Append(selected);
+				segment = std::move(candidate);
+				break;
+			} catch (const OutOfMemoryException &) {
+				// Payload capacity and the pinned storage working set are different
+				// limits. Release the failed copy before retrying a smaller prefix.
+				// A single row that cannot fit is a permanent error, not a wait or
+				// a one-chunk capacity escape. Each retry strictly reduces rows.
+				if (rows == 1) {
+					throw;
+				}
+				rows = MaxValue<idx_t>(1, rows / 2);
+			}
+		}
 		pending->Combine(*segment);
 		offset += rows;
 	}

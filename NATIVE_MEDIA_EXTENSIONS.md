@@ -293,9 +293,11 @@ one prefix whose selected payload fits `streaming_buffer_size`. Each prefix gets
 independent storage: actual BufferManager allocation and copying finish, all
 append pins are released, and the complete input commits before the producer is
 acknowledged. Completed prefixes can spill before EOF under `memory_limit` and
-the normal temporary-directory settings. There is no one-chunk over-limit
-escape; an oversized row or a working set that cannot be allocated raises a
-resource error. Failed inputs do not acknowledge their producer. Prefix sealing
+the normal temporary-directory settings. If a payload-legal prefix cannot fit
+its pinned storage working set, the receiver discards that attempt and retries
+strictly fewer rows, down to one. A single row that still cannot fit raises a
+resource error; there is no one-chunk over-limit escape or indefinite retry.
+Failed inputs do not acknowledge their producer. Prefix sealing
 uses at least one storage block per prefix, trading storage efficiency and
 parallel throughput for bounded progress in this increment.
 
