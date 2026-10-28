@@ -232,6 +232,8 @@ from vane.execution.result_delivery import ResultDeliveryLimits
 
 faulthandler.dump_traceback_later(60, exit=True)
 artifact, path, ordered = sys.argv[1:]
+file_count = 1 if ordered == 'true' else 3
+expected_frames = list(range(12)) * file_count
 with (vane.connect() if not artifact else
       vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
     if artifact:
@@ -250,7 +252,8 @@ with (vane.connect() if not artifact else
     )
 
     def frames():
-        return vane.read_video_frames(path, 6, 8, connection=con,
+        return vane.read_video_frames([path] * file_count, 6, 8, connection=con,
+                                      read_task_count=file_count,
                                       max_partition_bytes=2048).project('frame_index, data')
 
     def pixels(batch):
@@ -291,14 +294,14 @@ with (vane.connect() if not artifact else
     assert pixels(first) == saved
 
     values, retained = collect(frames().filter('frame_index % 2 = 0'))
-    assert sorted(values) == list(range(0, 12, 2))
+    assert sorted(values) == sorted(list(range(0, 12, 2)) * file_count)
     values, limited = collect(frames().filter('frame_index % 2 = 0').limit(3))
     if ordered == 'true':
         assert values == [0, 2, 4], values
     else:
         assert len(values) == 3 and all(value % 2 == 0 for value in values), values
     values, repeated = collect(frames())
-    assert sorted(values) == list(range(12))
+    assert sorted(values) == sorted(expected_frames)
     assert pixels(first) == saved
     filtered_pixels = {batch['frame_index'].to_pylist()[0]: pixels(batch) for batch in retained}
     for batch in repeated:
@@ -330,7 +333,7 @@ with (vane.connect() if not artifact else
         raise AssertionError('an impossible receiving row must fail')
     con.execute("SET streaming_buffer_size='512B'")
     values, final = collect(frames())
-    assert sorted(values) == list(range(12))
+    assert sorted(values) == sorted(expected_frames)
     assert pixels(first) == saved
     del first, retained, limited, repeated, final, batch
     gc.collect()
