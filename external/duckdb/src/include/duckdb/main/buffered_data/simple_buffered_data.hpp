@@ -30,7 +30,9 @@ public:
 	static constexpr const BufferedData::Type TYPE = BufferedData::Type::SIMPLE;
 
 public:
-	explicit SimpleBufferedData(ClientContext &context, bool media_flow_receiver = false);
+	//! A custom result allocator must outlive every returned chunk and its views.
+	explicit SimpleBufferedData(ClientContext &context, bool media_flow_receiver = false,
+	                            Allocator &result_allocator = Allocator::DefaultAllocator());
 	~SimpleBufferedData() override;
 
 public:

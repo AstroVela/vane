@@ -80,7 +80,7 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 批次按实际选中行和剩余行计量拆分。队列放不下整批但能放下部分行时，保存输入偏移并返回 BLOCKED；队列有短批即可交付，不能为了填满容量等到 EOF。重试只接收尚未提交的行，每个输入状态只保留一份等待登记，整批全部提交后才在锁外确认原 flow。单行超过接收容量立即报资源错误；零 payload 的非空复制至少占用一个额度字节，避免零字节队列条目无限增长。
 - dequeue 将目标副本移交给调用者，再归还队列容量并在锁外唤醒 producer。关闭清除排队副本，撤销后续接收；进行中的复制保留 reservation 到其实际回滚。显式关闭或销毁媒体结果流会退役其仍活跃的 native 查询，清理阻塞的扫描和 flow scope；旧结果关闭不能取消同一连接后来的查询。
 - Arrow 导出当前以一行作为接收原子单位，即使 `rows_per_batch` 请求更大也不合并整段输入。该保守策略避免在 Python result delivery 获得容量前按行数预取大量媒体。按可用字节合并多个 Arrow 行属于后续优化。Python 关闭结果及 Arrow stream release 在等待 native worker 清理时释放 GIL。
-- 原始像素 lease 仍跟随原 allocation 的最后引用；队列拥有的是已经预留容量的新副本。调用者取走并长期保留的结果不再占用这个 C++ 队列额度，其数据由结果 owner 和已有 managed result delivery 契约持有。本批不约束任意客户端收集全部结果的内存，不把多个域额度解释为统一 RSS 上限。
+- 原始像素 lease 仍跟随原 allocation 的最后引用；队列拥有的是已经预留容量的新副本。生产路径使用进程生命周期的默认 allocator，取出的 chunk、slice 和 Arrow 数据可以晚于连接和数据库销毁。调用者取走并长期保留的结果不再占用这个 C++ 队列额度，其数据由结果 owner 和已有 managed result delivery 契约持有。本批不约束任意客户端收集全部结果的内存，不把多个域额度解释为统一 RSS 上限。
 
 核心 `[media-result-flow]` 测试不依赖 provider，覆盖偏斜字符串、嵌套字段、短批重试、复制前预留、重叠复制、复制失败与关闭竞态、单行超限、普通/ExecutionBatch pipeline、过滤与 LIMIT、保留 Arrow buffer 和结果提前关闭。真实 codec 的一帧/两帧窗口、慢消费、结果保留、错误后复用和超限接入现有 provider CI 文件 `test_native_media_admission.py`。最终构建身份、实测结果及跳过项随本批 PR 记录。
 

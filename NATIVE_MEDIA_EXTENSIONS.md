@@ -276,7 +276,9 @@ deliver one row per batch even when a larger preferred batch is requested, so
 the reader cannot prefetch an entire video before result-delivery admission.
 
 Taking a result chunk transfers its copy to the caller and returns queue capacity.
-Retained Arrow buffers stay valid through later reads and stream close. Managed
+Retained chunks, slices and Arrow buffers stay valid through later reads, stream
+close, and connection/database destruction. Receiving copies use the
+process-lifetime default allocator. Managed
 result delivery retains its existing byte accounting; arbitrary caller-retained
 results are outside this C++ queue limit. Closing a media stream retires its
 blocked native scan without waiting for those returned buffers to die.

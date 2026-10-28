@@ -131,10 +131,14 @@ unique_ptr<UDFExecutor> RefuseTasks(ClientContext &, const Value &, UDFConfig &,
 
 struct CopyProbe {
 	bool fail = false;
+	bool allocator_destroyed = false;
 	std::function<void()> before_allocate;
 };
 struct CopyAllocatorData : public PrivateAllocatorData {
 	explicit CopyAllocatorData(shared_ptr<CopyProbe> probe_p) : probe(std::move(probe_p)) {
+	}
+	~CopyAllocatorData() override {
+		probe->allocator_destroyed = true;
 	}
 	shared_ptr<CopyProbe> probe;
 };
@@ -289,7 +293,7 @@ struct ResultQueueFixture {
 	explicit ResultQueueFixture(idx_t bytes)
 	    : copy(make_shared_ptr<CopyProbe>()), db(nullptr, ConfigureCopyAllocator(config, copy)), con(db) {
 		ClientConfig::GetConfig(*con.context).streaming_buffer_size = bytes;
-		queue = make_shared_ptr<SimpleBufferedData>(*con.context, true);
+		queue = make_shared_ptr<SimpleBufferedData>(*con.context, true, Allocator::Get(*con.context));
 	}
 	shared_ptr<CopyProbe> copy;
 	DBConfig config;
@@ -538,6 +542,46 @@ TEST_CASE("A received result copy does not revoke the original pixels or borrow 
 	receiver.queue->Close();
 	copy.reset();
 	CHECK(static_cast<const uint8_t *>(arrow.children[0]->buffers[1])[0] == 42);
+	arrow.release(&arrow);
+}
+
+TEST_CASE("Returned media result copies outlive their database allocator", "[media-resource][media-result-flow]") {
+	auto probe = make_shared_ptr<CopyProbe>();
+	unique_ptr<DataChunk> retained;
+	unique_ptr<Vector> view;
+	ArrowArray arrow;
+	{
+		DBConfig config;
+		DuckDB db(nullptr, ConfigureCopyAllocator(config, probe));
+		Connection con(db);
+		ClientConfig::GetConfig(*con.context).streaming_buffer_size = 256;
+		auto queue = make_shared_ptr<SimpleBufferedData>(*con.context, true);
+		DataChunk input;
+		input.Initialize(
+		    Allocator::DefaultAllocator(),
+		    {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::STRUCT({{"s", LogicalType::VARCHAR}})}, 1);
+		input.SetValue(0, 0, Value::BIGINT(42));
+		input.SetValue(1, 0, Value(string(32, 'x')));
+		input.SetValue(2, 0, Value::STRUCT({{"s", Value(string(32, 'y'))}}));
+		input.SetCardinality(1);
+		idx_t offset = 0;
+		REQUIRE(queue->AppendMediaFlow(input, offset, InterruptState()) == SinkResultType::NEED_MORE_INPUT);
+		retained = queue->Scan();
+		REQUIRE(retained);
+		CHECK(retained->data[0].GetBuffer()->GetAllocator().get() == &Allocator::DefaultAllocator());
+		CHECK(retained->data[1].GetBuffer()->GetAllocator().get() == &Allocator::DefaultAllocator());
+		view = make_uniq<Vector>(retained->data[0], 0, 1);
+		ArrowConverter::ToArrowArray(*retained, &arrow, con.context->GetClientProperties(), {});
+		queue->Close();
+	}
+	CHECK(probe->allocator_destroyed);
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(42));
+	CHECK(retained->GetValue(1, 0) == Value(string(32, 'x')));
+	CHECK(retained->GetValue(2, 0) == Value::STRUCT({{"s", Value(string(32, 'y'))}}));
+	retained.reset();
+	CHECK(view->GetValue(0) == Value::BIGINT(42));
+	view.reset();
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 42);
 	arrow.release(&arrow);
 }
 

@@ -15,6 +15,9 @@
 namespace duckdb {
 
 struct SimpleBufferedData::MediaFlowState {
+	explicit MediaFlowState(Allocator &allocator_p) : allocator(allocator_p) {
+	}
+	Allocator &allocator;
 	struct Chunk {
 		unique_ptr<DataChunk> chunk;
 		idx_t bytes;
@@ -27,9 +30,9 @@ struct SimpleBufferedData::MediaFlowState {
 	bool closed = false;
 };
 
-SimpleBufferedData::SimpleBufferedData(ClientContext &context, bool media_flow_receiver_p)
+SimpleBufferedData::SimpleBufferedData(ClientContext &context, bool media_flow_receiver_p, Allocator &result_allocator)
     : BufferedData(BufferedData::Type::SIMPLE, context),
-      media_flow(media_flow_receiver_p ? make_uniq<MediaFlowState>() : nullptr) {
+      media_flow(media_flow_receiver_p ? make_uniq<MediaFlowState>(result_allocator) : nullptr) {
 	buffered_count = 0;
 	buffer_size = total_buffer_size;
 }
@@ -244,7 +247,9 @@ SinkResultType SimpleBufferedData::AppendMediaFlow(const DataChunk &input, idx_t
 		bool reserved = true;
 		try {
 			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(*cc, input.GetTypes(), rows);
+			// Returned copies can outlive the result, connection and database.
+			// The default allocator has process lifetime, unlike Allocator::Get(*cc).
+			chunk->Initialize(state.allocator, input.GetTypes(), rows);
 			SelectionVector selected(rows);
 			for (idx_t row = 0; row < rows; row++) {
 				selected.set_index(row, offset + row);
