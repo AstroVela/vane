@@ -652,6 +652,12 @@ static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &c
 OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                     GlobalOperatorState &gstate, OperatorState &state_p) const {
 	auto &state = state_p.Cast<CachingOperatorState>();
+	if (input.HasMediaFlow()) {
+		// Accumulating a preferred-size chunk can consume the entire upstream
+		// production window before a receiver sees any input. Keep this path
+		// incremental even for projections that discard the image column.
+		return ExecuteInternal(context, input, chunk, gstate, state);
+	}
 
 	if (state.initialized && state.must_return_continuation_chunk) {
 		chunk.Move(*state.cached_chunk);

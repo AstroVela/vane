@@ -7,6 +7,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parallel/interrupt.hpp"
 
 #include <limits>
@@ -310,6 +311,124 @@ shared_ptr<MediaResourcePool> GetNativeMediaOutputPool() {
 		return capacity ? make_shared_ptr<MediaResourcePool>(MediaResourceBudget(0, capacity)) : nullptr;
 	}();
 	return pool;
+}
+
+idx_t GetNativeMediaFlowCapacity() {
+	static const auto capacity = NativeMediaCapacity("VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES");
+	return capacity;
+}
+
+struct MediaFlowWindowState {
+	explicit MediaFlowWindowState(idx_t bytes) : pool({0, bytes}), scope(pool.CreateScope()) {
+	}
+	MediaResourcePool pool;
+	shared_ptr<MediaResourceScope> scope;
+	mutex lock;
+	bool closed = false;
+	idx_t next_id = 0;
+	unordered_map<idx_t, weak_ptr<MediaFlowTicket>> tickets;
+};
+
+struct MediaFlowTicket::State {
+	State(MediaResourceLease lease_p, weak_ptr<MediaFlowWindowState> window_p, idx_t id_p)
+	    : lease(std::move(lease_p)), window(std::move(window_p)), id(id_p) {
+	}
+	mutable mutex lock;
+	MediaResourceLease lease;
+	weak_ptr<MediaFlowWindowState> window;
+	idx_t id;
+};
+
+MediaFlowTicket::MediaFlowTicket(MediaResourceLease lease, weak_ptr<MediaFlowWindowState> window, idx_t id)
+    : state(make_uniq<State>(std::move(lease), std::move(window), id)) {
+}
+
+MediaFlowTicket::~MediaFlowTicket() {
+	Acknowledge();
+}
+
+void MediaFlowTicket::Acknowledge() noexcept {
+	MediaResourceLease returned;
+	{
+		lock_guard<mutex> guard(state->lock);
+		returned = std::move(state->lease);
+	}
+	auto window = state->window.lock();
+	if (window) {
+		lock_guard<mutex> guard(window->lock);
+		window->tickets.erase(state->id);
+	}
+	// Returning capacity may schedule a producer. Never invoke its callback
+	// while holding the ticket, window or receiving queue lock.
+	returned.Release();
+}
+
+bool MediaFlowTicket::IsActive() const {
+	lock_guard<mutex> guard(state->lock);
+	return bool(state->lease);
+}
+
+MediaFlowWindow::MediaFlowWindow(idx_t bytes) : state(make_shared_ptr<MediaFlowWindowState>(bytes)) {
+}
+
+MediaFlowWindow::~MediaFlowWindow() {
+	Close();
+}
+
+unique_ptr<MediaAdmissionRequest> MediaFlowWindow::Request(idx_t bytes) {
+	return state->scope->Request({0, bytes});
+}
+
+shared_ptr<MediaFlowTicket> MediaFlowWindow::TakeGrant(MediaAdmissionRequest &request) {
+	MediaResourceLease lease;
+	idx_t id;
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (state->closed) {
+			return nullptr;
+		}
+		// Serialize with Close marking the window closed before it cancels
+		// unclaimed grants. The request itself has one polling owner.
+		if (state->next_id == std::numeric_limits<idx_t>::max()) {
+			throw InternalException("Native media flow ticket identifier exhausted");
+		}
+		id = state->next_id++;
+		lease = request.TakeGrant();
+	}
+	auto ticket = shared_ptr<MediaFlowTicket>(new MediaFlowTicket(std::move(lease), state, id));
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (!state->closed) {
+			state->tickets.emplace(id, ticket);
+			return ticket;
+		}
+	}
+	// Close raced with taking a granted request. Do not export a live credit.
+	ticket->Acknowledge();
+	return nullptr;
+}
+
+MediaResourceSnapshot MediaFlowWindow::Snapshot() const {
+	return state->pool.Snapshot();
+}
+
+void MediaFlowWindow::Close() noexcept {
+	unordered_map<idx_t, weak_ptr<MediaFlowTicket>> tickets;
+	{
+		lock_guard<mutex> guard(state->lock);
+		if (state->closed) {
+			return;
+		}
+		state->closed = true;
+		tickets.swap(state->tickets);
+	}
+	state->scope->Close();
+	for (auto &entry : tickets) {
+		auto ticket = entry.second.lock();
+		if (ticket) {
+			ticket->Acknowledge();
+		}
+	}
 }
 
 } // namespace duckdb

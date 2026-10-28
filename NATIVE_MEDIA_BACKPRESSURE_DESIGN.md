@@ -53,6 +53,24 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 首轮发现现有 UDF collector 清理测试在 50 ms unregister 超时后立即检查异步交接事件的竞态；改为有超时的事件等待，保留 executor 最终释放和恰好关闭一次的断言，整组复测通过。
 - 完整 release gate 和 provider CI 的结果在[跟踪 issue #1093](https://github.com/AstroVela/vane/issues/1093)关联的本批 PR 中维护。
 
+### 第三批：原生扫描到 UDF 接收队列的独立生产窗口
+
+实现分支为 `feature/media-flow-window`，从集成分支合入 #1099 后的 `5d411f35f` 开始，目标仍为 `native-media-backpressure-dev`。
+
+- 新增默认关闭的 `VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES`。必须在 import Vane 前配置正整数；空值关闭，零、无效值和溢出均报错，首次创建数据库后固定。宿主保存配置，每个 scan edge 创建一个窗口供其并行 worker 共享；不同 scan 的 flow 窗口独立，原始像素物理额度仍是进程级共享。
+- 扫描在下一次 `Next()` 和像素 allocation 前非阻塞取得 flow credit，按 flow/物理额度的较小值缩批。单帧超过窗口立即报资源错误，`skip` 不吞掉此错误。先申请 flow，再申请原始像素 bytes；等待物理额度时持有 flow，但不新增像素分配。
+- `MediaFlowTicket` 与原始 allocation lease 分开。DataChunk 的引用、复制、选列、slice、append、move 保留票据；像素 owner 也保留票据，独立的 Vector/slice 不会因 chunk 重置而提前归还额度。普通 deep copy 或 Arrow 导出不会自动构成接收确认。
+- 普通和 materialized ExecutionBatch pipeline 的投影、过滤和 streaming LIMIT 保留输入票据。带票据输入绕过过滤算子的短批缓存，避免一帧窗口在缓存首选批次前耗尽。当前仅支持终点为 `PhysicalStreamingUDF` 的这类线性路径；开启窗口后，直接收集结果、先排序/聚合/物化再进入 UDF，以及其他中间算子明确报不支持。尚未对物化路径删除票据或无限等待。
+- UDF 接收队列在复制前预留 `pending_bytes + reserved_bytes + incoming_bytes <= task_input_max_bytes` 的 payload 容量，复制成功并提交队列后才在接收锁外确认 flow。对于此路径，单批大于接收容量会永久失败，不使用旧路径的空队列超额放行。接收前 BLOCKED、复制失败和已关闭接收端不会确认；已接收后 BLOCKED 的重试不会重复入队或重复归还。
+- 接收 payload 支持 primitive、固定 primitive ARRAY/IMAGE/TENSOR、STRUCT 和非内联字符串，并在复制前递归计算其新副本需求。动态 LIST/MAP、嵌套 ARRAY 或字符串 ARRAY 暂不支持；动态 IMAGE 应先 cast 成固定形状。此额度不包括 validity、allocator slack、metadata 对象、codec/scratch 和后续任务/SHM 副本，不是 RSS 限制。暂存输入保留已确认票据的 provenance，使短批重组和拒绝后的恢复继续使用相同 payload 口径。
+- 拆批按实际选中行和剩余行重新计量，并检查两者之和等于原待处理 payload；变长字符串不按行数比例扣减。被任务域拒收的 planned submit 与未拆分尾部同时计入 `pending_bytes`，重试期间不能借此腾出容量并确认新输入。
+- flow 接收确认只将源端生产窗口移交给已预留的 **C++ UDF ingress 队列**，不代表 Python task、SHM 或 Ray 对象存储已经接收。任务域仍执行现有 task/data admission。ingress 字节压力沿用现有短批提交机制，首选 compute batch 大于 flow 窗口仍能推进。
+- scan teardown 关闭窗口，取消等待者及未确认的生产票据；即使外部 view 存活，也无需等待它才能完成控制清理。这个操作不会撤销 view 的实际像素 lease。
+
+[核心测试](external/duckdb/test/api/test_media_flow.cpp) 不依赖 provider，覆盖接收提交/拒绝、两条 sink 路径、重试、复制分配失败和回滚、回调重入、取消/确认竞态、slice/Arrow 引用及一帧扫描经过过滤进入阻塞 UDF。真实视频的 1/2 帧窗口、慢 task/actor、短批、LIMIT、接收超额、错误后复用和不支持的物化路径接入现有 [provider CI 文件](tests/fast/test_native_media_admission.py)。实际执行结果在本批 PR 中记录。
+
+本批仍不是完整 M1/M2：`ORDER BY → fetchall` 的物化/溢写预算交接、重型 scalar 可恢复执行、相互依赖路径的最低推进资源、Python/native 权威统一及 Ray/FTE 全链路验证留在后续批次。
+
 ## 1 设计结论
 
 1. 在同一 Vane 核心 runtime 的 Worker 进程内共享媒体准入状态，向 DatabaseInstance、query、operator 分配子额度。不同查询不能各自拥有一个独立的全额媒体池。

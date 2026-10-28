@@ -21,6 +21,7 @@ class ExecutionContext;
 class VectorCache;
 class Serializer;
 class Deserializer;
+class MediaFlowTicket;
 
 //!  A Data Chunk represents a set of vectors.
 /*!
@@ -77,6 +78,13 @@ public:
 	DUCKDB_API void SetValue(idx_t col_idx, idx_t index, const Value &val);
 
 	idx_t GetAllocationSize() const;
+
+	//! Provenance through row-preserving pipeline operators and copies. A copy
+	//! alone is not a receipt from a bounded receiving domain.
+	DUCKDB_API void AddMediaFlow(shared_ptr<MediaFlowTicket> ticket);
+	DUCKDB_API void InheritMediaFlow(const DataChunk &other);
+	DUCKDB_API bool HasMediaFlow() const;
+	DUCKDB_API void AcknowledgeMediaFlow() const;
 
 	//! Returns true if all vectors in the DataChunk are constant
 	DUCKDB_API bool AllConstant() const;
@@ -173,5 +181,6 @@ private:
 	idx_t initial_capacity;
 	//! Vector caches, used to store data when ::Initialize is called
 	vector<VectorCache> vector_caches;
+	vector<shared_ptr<MediaFlowTicket>> media_flow;
 };
 } // namespace duckdb

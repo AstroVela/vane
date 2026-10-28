@@ -67,6 +67,9 @@ public:
 	DUCKDB_API shared_ptr<MediaResourcePool> GetMediaOutputPool() const {
 		return media_output_pool;
 	}
+	DUCKDB_API idx_t GetMediaFlowCapacity() const {
+		return media_flow_capacity;
+	}
 	DUCKDB_API TaskScheduler &GetScheduler();
 	DUCKDB_API ObjectCache &GetObjectCache();
 	DUCKDB_API ConnectionManager &GetConnectionManager();
@@ -117,6 +120,7 @@ private:
 	unique_ptr<ExecutionRuntime> execution_runtime;
 	shared_ptr<MediaResourcePool> media_decoder_pool;
 	shared_ptr<MediaResourcePool> media_output_pool;
+	idx_t media_flow_capacity;
 
 	duckdb_ext_api_v1 (*create_api_v1)();
 };

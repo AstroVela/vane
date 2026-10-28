@@ -211,7 +211,12 @@ jobs:
 
       - name: Build and run DuckDB unit tests
         if: matrix.python-version == '3.12'
-        run: scripts/run_native_tests.sh
+        run: |
+          scripts/run_native_tests.sh
+          VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES=1 \
+          VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES=64 \
+          VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES=64 \
+            build/native-cxx20/test/unittest '[media-resource]'
 
       - name: Sign the real-Ray dynamic extension fixture
         if: matrix.python-version == '3.12'

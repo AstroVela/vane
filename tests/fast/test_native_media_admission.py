@@ -47,7 +47,14 @@ def test_video_admission_retained_image_contract():
 
 
 @pytest.mark.parametrize("capacity", [None, "", "1", "4"])
-@pytest.mark.parametrize("variable", ["VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"])
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES",
+        "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES",
+        "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES",
+    ],
+)
 def test_native_decoder_admission_configuration(capacity, variable):
     env = {**os.environ, "VANE_RUNNER": "local-fast"}
     if capacity is None:
@@ -74,7 +81,14 @@ def test_native_decoder_admission_configuration(capacity, variable):
 
 
 @pytest.mark.parametrize("capacity", ["0", "-1", "1.5", " 2", "2x", str(2**64)])
-@pytest.mark.parametrize("variable", ["VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES"])
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES",
+        "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES",
+        "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES",
+    ],
+)
 def test_native_decoder_admission_rejects_invalid_capacity(capacity, variable):
     result = subprocess.run(
         [sys.executable, "-I", "-c", "import vane; vane.connect()"],
@@ -195,6 +209,164 @@ con.close()
     result = subprocess.run(
         [sys.executable, "-I", "-c", script, artifact, str(video_path)],
         env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "143"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_native_video_flow_window_to_slow_udf(video_path, tmp_path, window_bytes, backend):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    # This file is also in the explicit native_media provider CI test list.
+    # Keep the producer window smaller than the preferred UDF compute batch;
+    # its independent ingress byte window must flush a short batch to progress.
+    script = r"""
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import sys
+import threading
+import time
+import pyarrow as pa
+import vane
+
+artifact, path, directory, backend = sys.argv[1:]
+entered, proceed = (Path(directory) / name for name in ('entered', 'proceed'))
+
+def consume(batch):
+    entered.touch()
+    deadline = time.monotonic() + 30
+    while not proceed.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('slow consumer was never released')
+        time.sleep(0.01)
+    return pa.table({'frame_index': batch['frame_index']})
+
+class Consume:
+    def __call__(self, batch):
+        return consume(batch)
+
+def fail(batch):
+    raise ValueError('injected flow consumer failure')
+
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    if artifact:
+        con.load_extension(artifact)
+    else:
+        vane.load_installed_extension('native_media', connection=con)
+    con.execute("SET video_backend='native'")
+    con.execute('SET threads=4')
+    watchdog = threading.Timer(75, con.interrupt)
+    watchdog.daemon = True
+    watchdog.start()
+
+    def frames():
+        return vane.read_video_frames(path, 6, 8, connection=con,
+                                      max_partition_bytes=2048).project('frame_index, data')
+
+    def mapped(relation, *, fn=None, capacity=304):
+        options = {'actor_number': 1} if backend == 'subprocess_actor' and fn is None else {}
+        return relation.map_batches(
+            fn or (Consume if options else consume), schema={'frame_index': 'BIGINT'},
+            execution_backend=backend if fn is None else 'subprocess_task',
+            batch_size=4, min_task_batch_size=4, task_input_max_bytes=capacity,
+            output_batch_size=2, output_target_max_bytes=1024, **options)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(lambda: mapped(frames().filter('frame_index % 2 = 0')).to_arrow_table())
+            try:
+                deadline = time.monotonic() + 30
+                while not entered.exists():
+                    if future.done():
+                        future.result()  # expose a failure before the consumer starts
+                        raise AssertionError('query completed before the consumer gate')
+                    assert time.monotonic() < deadline, 'small native window failed to reach the UDF'
+                    time.sleep(0.01)
+                time.sleep(0.2)
+                assert not future.done(), 'consumer gate did not pause the query'
+            finally:
+                proceed.touch()
+            result = future.result(timeout=30)
+        assert sorted(result['frame_index'].to_pylist()) == list(range(0, 12, 2))
+
+        # LIMIT cancels the rest of the native/UDF chain. A new query must work
+        # even while the prior detached Arrow result remains alive.
+        assert len(mapped(frames()).limit(1).fetchall()) == 1
+        for relation, expected in (
+            (mapped(frames(), capacity=151), 'task_input_max_bytes receiving capacity'),
+            (mapped(frames(), fn=fail), 'injected flow consumer failure'),
+            (mapped(frames().project("CAST('bad' || frame_index::VARCHAR AS BIGINT) AS frame_index, data")),
+             'Conversion'),
+        ):
+            try:
+                relation.fetchall()
+            except vane.Error as error:
+                assert expected.lower() in str(error).lower(), str(error)
+            else:
+                raise AssertionError('expected rejection or downstream failure')
+        for relation in (frames(), mapped(frames().order('frame_index DESC'))):
+            try:
+                relation.fetchall()
+            except vane.NotImplementedException as error:
+                assert 'materialization budget handoff' in str(error), str(error)
+            else:
+                raise AssertionError('unsupported materialization must fail without waiting')
+        repeated = mapped(frames()).to_arrow_table()
+        assert sorted(repeated['frame_index'].to_pylist()) == list(range(12))
+        assert sorted(result['frame_index'].to_pylist()) == list(range(0, 12, 2))
+    finally:
+        proceed.touch()
+        watchdog.cancel()
+        vane.teardown_runner()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path), backend],
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+            "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "288",
+            "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_video_flow_window_rejects_an_oversized_frame(video_path):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    script = r"""
+import sys
+import vane
+artifact, path = sys.argv[1:]
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    if artifact:
+        con.load_extension(artifact)
+    else:
+        vane.load_installed_extension('native_media', connection=con)
+    con.execute("SET video_backend='native'")
+    for policy in ('raise', 'skip'):
+        try:
+            vane.read_video_frames(path, 6, 8, connection=con, on_error=policy).fetchall()
+        except vane.OutOfMemoryException as error:
+            assert 'VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES' in str(error), str(error)
+        else:
+            raise AssertionError('impossible flow reservation must fail without waiting')
+    assert vane.read_video_frames(path, 6, 8, connection=con, frame_limit=0).fetchall() == []
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path)],
+        env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": "143"},
         capture_output=True,
         text=True,
         timeout=30,

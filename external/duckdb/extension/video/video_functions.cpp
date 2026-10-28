@@ -235,6 +235,9 @@ static unique_ptr<FunctionData> BindPublicVideo(ClientContext &context, TableFun
 
 struct VideoGlobal : public GlobalTableFunctionState {
 	~VideoGlobal() override {
+		if (flow_window) {
+			flow_window->Close();
+		}
 		if (admission) {
 			admission->Close();
 		}
@@ -244,6 +247,7 @@ struct VideoGlobal : public GlobalTableFunctionState {
 	}
 	shared_ptr<MediaResourceScope> admission;
 	shared_ptr<MediaResourceScope> output_admission;
+	shared_ptr<MediaFlowWindow> flow_window;
 	idx_t output_rows = STANDARD_VECTOR_SIZE;
 	std::atomic<idx_t> next_task {0};
 	idx_t thread_count = 1;
@@ -255,6 +259,8 @@ struct VideoGlobal : public GlobalTableFunctionState {
 struct VideoLocal : public LocalTableFunctionState {
 	unique_ptr<MediaAdmissionRequest> admission_request;
 	unique_ptr<MediaAdmissionRequest> output_request;
+	unique_ptr<MediaAdmissionRequest> flow_request;
+	shared_ptr<MediaFlowTicket> output_flow;
 	// Reverse destruction order closes the actual codec before its reservation.
 	MediaResourceLease decoder_lease;
 	unique_ptr<VideoFrameCursor> cursor;
@@ -263,6 +269,8 @@ struct VideoLocal : public LocalTableFunctionState {
 	idx_t end_file = 0;
 
 	void CloseCursor() {
+		flow_request.reset();
+		output_flow.reset();
 		output_request.reset();
 		cursor.reset();
 		decoder_lease.Release();
@@ -289,6 +297,16 @@ static unique_ptr<GlobalTableFunctionState> InitVideo(ClientContext &context, Ta
 			throw OutOfMemoryException("Native video frame exceeds VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES");
 		}
 		result->output_admission = output_pool->CreateScope();
+	}
+	const auto flow_capacity = DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity();
+	if (flow_capacity) {
+		auto &p = bind.parameters;
+		const auto frame_bytes = p[0].GetValue<uint64_t>() * p[1].GetValue<uint64_t>() * 3;
+		result->output_rows = MinValue(result->output_rows, flow_capacity / frame_bytes);
+		if (result->output_rows == 0 && !bind.files.empty() && (p[10].IsNull() || p[10].GetValue<uint64_t>() != 0)) {
+			throw OutOfMemoryException("Native video frame exceeds VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES");
+		}
+		result->flow_window = make_shared_ptr<MediaFlowWindow>(flow_capacity);
 	}
 	result->thread_count = MaxValue<idx_t>(1, bind.TaskCount());
 	return std::move(result);
@@ -327,7 +345,7 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 				// A blocked poll must be empty. Deliver the previous file's tail
 				// before requesting another decoder, rather than retaining a
 				// partially filled output while waiting for admission.
-				if ((global.admission || global.output_admission) && row > 0) {
+				if ((global.admission || global.output_admission || global.flow_window) && row > 0) {
 					break;
 				}
 				if (output_allocated) {
@@ -380,28 +398,49 @@ static SourceResultType ScanVideo(ClientContext &context, TableFunctionInput &in
 				local.cursor = make_uniq<VideoFrameCursor>(context, bind.files[local.file_index], options,
 				                                           VideoFrameOperation::FRAMES, index);
 			}
-			if (global.output_admission && !output_allocated) {
-				if (!local.output_request) {
-					local.output_request = global.output_admission->Request({0, limit * frame_bytes});
+			if ((global.output_admission || global.flow_window) && !output_allocated) {
+				if (global.flow_window && !local.output_flow) {
+					if (!local.flow_request) {
+						local.flow_request = global.flow_window->Request(limit * frame_bytes);
+					}
+					auto status = local.flow_request->PollOrArm(interrupt);
+					if (status == MediaAdmissionStatus::WAITING) {
+						return SourceResultType::BLOCKED;
+					}
+					if (status == MediaAdmissionStatus::CANCELLED) {
+						local.CloseCursor();
+						return SourceResultType::FINISHED;
+					}
+					local.output_flow = global.flow_window->TakeGrant(*local.flow_request);
+					local.flow_request.reset();
+					if (!local.output_flow) {
+						local.CloseCursor();
+						return SourceResultType::FINISHED;
+					}
 				}
-				auto status = local.output_request->PollOrArm(interrupt);
-				if (status == MediaAdmissionStatus::WAITING) {
-					return SourceResultType::BLOCKED;
-				}
-				if (status == MediaAdmissionStatus::CANCELLED) {
-					local.CloseCursor();
-					return SourceResultType::FINISHED;
-				}
-				if (status != MediaAdmissionStatus::GRANTED) {
-					throw InternalException("Native video output admission did not produce a grant");
+				MediaResourceLease output_lease;
+				if (global.output_admission) {
+					if (!local.output_request) {
+						local.output_request = global.output_admission->Request({0, limit * frame_bytes});
+					}
+					auto status = local.output_request->PollOrArm(interrupt);
+					if (status == MediaAdmissionStatus::WAITING) {
+						return SourceResultType::BLOCKED;
+					}
+					if (status == MediaAdmissionStatus::CANCELLED) {
+						local.CloseCursor();
+						return SourceResultType::FINISHED;
+					}
+					output_lease = local.output_request->TakeGrant();
+					local.output_request.reset();
 				}
 				// A fresh IMAGE prevents VectorCache from pinning the pixel lease
 				// after consumption or mutating a downstream reference on reset.
 				Vector image(output.data[9].GetType(), limit);
 				auto &pixels = *StructVector::GetEntries(image)[ImageLogicalType::DATA];
-				AllocateMediaList(pixels, limit, limit * frame_bytes, local.output_request->TakeGrant());
+				AllocateMediaList(pixels, limit, limit * frame_bytes, std::move(output_lease), local.output_flow);
 				output.data[9].Reference(image);
-				local.output_request.reset();
+				output.AddMediaFlow(std::move(local.output_flow));
 				output_allocated = true;
 			}
 			if (!local.cursor->Next()) {
@@ -595,6 +634,7 @@ void RegisterMediaVideo(ExtensionLoader &loader) {
 	                        LogicalType::VARCHAR, LogicalType::BIGINT},
 	                       nullptr, BindVideo, InitVideo, InitVideoLocal);
 	function.poll_function = ScanVideo;
+	function.media_flow_source = true;
 	function.serialize = SerializeVideo;
 	function.deserialize = DeserializeVideo;
 	TableFunctionDistributedScanCallbacks callbacks;
