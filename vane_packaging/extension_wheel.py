@@ -277,6 +277,7 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
         "powrprof.dll",
         "psapi.dll",
         "rpcrt4.dll",
+        "rstrtmgr.dll",
         "secur32.dll",
         "setupapi.dll",
         "shell32.dll",
@@ -290,6 +291,7 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
         "winmm.dll",
         "wintrust.dll",
         "ws2_32.dll",
+        "wsock32.dll",
         "wtsapi32.dll",
     }
 )

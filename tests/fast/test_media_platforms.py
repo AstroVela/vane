@@ -21,6 +21,21 @@ from vane_packaging.media_binary import relocate_non_elf
 from vane_packaging.media_runtime import component_notice, stage_libraries, validate_library_graph
 
 
+@pytest.mark.parametrize("library", ["rstrtmgr.dll", "wsock32.dll"])
+def test_windows_engine_system_imports_do_not_allow_lookalike_dlls(library):
+    contents = _synthetic_pe(architecture="amd64", imports=(library,))
+    assert binary._validate_windows_pe_platform(
+        contents, "win_amd64", description="engine", interpreter_tag="cp312"
+    ) == (library,)
+    with pytest.raises(ValueError, match="non-policy Windows DLLs"):
+        binary._validate_windows_pe_platform(
+            _synthetic_pe(architecture="amd64", imports=("private_" + library,)),
+            "win_amd64",
+            description="engine",
+            interpreter_tag="cp312",
+        )
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_windows_binary_replacement_recovers_only_bounded_file_contention(tmp_path, monkeypatch, persistent):
     source, target = tmp_path / "new.dll", tmp_path / "old.dll"

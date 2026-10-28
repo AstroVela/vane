@@ -144,6 +144,23 @@ def _run(*command):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows DLL export decorations")
+def test_windows_static_engine_keeps_loadable_extension_entrypoints(tmp_path):
+    header = ROOT / "external/duckdb/src/include/duckdb/common/winapi.hpp"
+    (tmp_path / "probe.cpp").write_text(
+        f'#include "{header.as_posix()}"\nextern "C" DUCKDB_EXTENSION_API int media_answer() {{ return 42; }}\n'
+    )
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.29)\nproject(extension_export_probe CXX)\n"
+        "add_library(probe SHARED probe.cpp)\n"
+        "target_compile_definitions(probe PRIVATE DUCKDB_STATIC_BUILD DUCKDB_BUILD_LOADABLE_EXTENSION)\n"
+    )
+    build = tmp_path / "build"
+    _run("cmake", "-S", str(tmp_path), "-B", str(build), "-G", GENERATORS[0])
+    _run("cmake", "--build", str(build), "--config", "Release")
+    assert ctypes.CDLL(str(next(build.rglob("probe.dll")))).media_answer() == 42
+
+
 def test_dynamic_media_sdk_and_incremental_relocation(media_project):
     root = media_project
     build = root / "build"
