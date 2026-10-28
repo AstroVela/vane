@@ -803,6 +803,110 @@ def test_new_request_cannot_bypass_global_dispatch_waiting_to_start(admission, m
     assert capacity.reserved_slots == 0
 
 
+@pytest.mark.parametrize("release", [False, True])
+def test_completed_runtime_task_returns_its_quota_before_backend_capacity_notifications(
+    admission, monkeypatch, release
+):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    pool = h.pool(slots=2, execution_capacity=capacity)
+    backend = pool.create_authority()
+    ordinary = pool.create_authority()
+    physical_done, proceed = threading.Event(), threading.Event()
+    acquire = backend.try_acquire
+    first = True
+
+    def acquire_with_delayed_finalization(retained):
+        nonlocal first
+        base = acquire(retained)
+        if base is None or not first:
+            return base
+        first = False
+
+        def complete():
+            base.complete_execution()
+            physical_done.set()
+            assert proceed.wait(5), "backend finalization was not released"
+
+        return AdmissionLease(
+            request_id=base.request_id,
+            retained_input_bytes=retained,
+            lease=base.lease,
+            _release_callback=base.release,
+            _execution_finished_callback=complete,
+        )
+
+    monkeypatch.setattr(backend, "try_acquire", acquire_with_delayed_finalization)
+    limited = h.query().create_authority(backend)
+    limited.request(8)
+    held = h.take(limited)
+    ordinary.request(8)
+    limited.request(8)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            completion = threads.submit(held.release if release else held.complete_execution)
+            try:
+                assert physical_done.wait(5), "backend did not return execution capacity"
+                assert ordinary.state()["available"]
+                next_task = h.take(ordinary)
+                ordinary.request(8)
+                next_task.complete_execution()
+                assert limited.state()["available"], "backend completion bypassed the limited query's next turn"
+                assert ordinary.state()["state"] == "requested"
+                assert h.runtime.snapshot()["running_tasks"] == 0
+                assert h.runtime.snapshot()["ready_tasks"] == 1
+            finally:
+                proceed.set()
+                completion.result(timeout=5)
+    finally:
+        ordinary.close()
+
+
+def test_query_retains_cleanup_ownership_while_completed_backend_finalizes(admission, monkeypatch):
+    h = admission()
+    query = h.query()
+    backend = h.pool().create_authority()
+    physical_done, proceed = threading.Event(), threading.Event()
+    acquire = backend.try_acquire
+
+    def acquire_with_delayed_finalization(retained):
+        base = acquire(retained)
+        if base is None:
+            return None
+
+        def complete():
+            base.complete_execution()
+            physical_done.set()
+            assert proceed.wait(5), "backend finalization was not released"
+
+        return AdmissionLease(
+            request_id=base.request_id,
+            retained_input_bytes=retained,
+            lease=base.lease,
+            _release_callback=base.release,
+            _execution_finished_callback=complete,
+        )
+
+    monkeypatch.setattr(backend, "try_acquire", acquire_with_delayed_finalization)
+    owner = query.create_authority(backend)
+    owner.request(8)
+    held = h.take(owner)
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        completion = threads.submit(held.complete_execution)
+        try:
+            assert physical_done.wait(5), "backend did not return execution capacity"
+            assert h.runtime.snapshot()["running_tasks"] == 0
+            assert h.runtime.snapshot()["ready_tasks"] == 0
+            query.shutdown()
+            assert query.cleanup_pending()
+            with pytest.raises(TimeoutError, match="active queries or tasks"):
+                h.runtime.close()
+        finally:
+            proceed.set()
+            completion.result(timeout=5)
+    assert not query.cleanup_pending()
+
+
 def _wait_until(predicate):
     deadline = time.monotonic() + 5
     while not predicate():
