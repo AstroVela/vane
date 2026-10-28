@@ -234,25 +234,29 @@ faulthandler.dump_traceback_later(60, exit=True)
 artifact, path, ordered = sys.argv[1:]
 file_count = 1 if ordered == 'true' else 3
 expected_frames = list(range(12)) * file_count
-with (vane.connect() if not artifact else
-      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+
+def configure(connection, receiving_bytes):
     if artifact:
-        con.load_extension(artifact)
+        connection.load_extension(artifact)
     else:
-        vane.load_installed_extension('native_media', connection=con)
-    con.execute("SET video_backend='native'")
-    con.execute('SET threads=4')
-    con.execute('SET preserve_insertion_order=' + ordered)
+        vane.load_installed_extension('native_media', connection=connection)
+    connection.execute("SET video_backend='native'")
+    connection.execute('SET threads=4')
+    connection.execute('SET preserve_insertion_order=' + ordered)
     # Pixel bytes and receiving payload bytes are separate capacities. Each
     # selected row has 8 index bytes plus 144 fixed-image bytes.
-    con.execute("SET streaming_buffer_size='512B'")
+    connection.execute("SET streaming_buffer_size='" + str(receiving_bytes) + "B'")
+
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    configure(con, 512)
     runtime = con.configure_local_runtime(
         request_limit=RequestAdmissionLimits(1, 1),
         result_limit=ResultDeliveryLimits(2, 1048576),
     )
 
-    def frames():
-        return vane.read_video_frames([path] * file_count, 6, 8, connection=con,
+    def frames(connection=con):
+        return vane.read_video_frames([path] * file_count, 6, 8, connection=connection,
                                       read_task_count=file_count,
                                       max_partition_bytes=2048).project('frame_index, data')
 
@@ -324,14 +328,22 @@ with (vane.connect() if not artifact else
 
     # An indivisible row is a permanent resource failure, not an empty-queue
     # oversize escape or a wait that needs EOF to become ready.
-    con.execute("SET streaming_buffer_size='151B'")
-    try:
-        collect(frames())
-    except vane.OutOfMemoryException as error:
-        assert 'streaming_buffer_size receiving capacity' in str(error), str(error)
-    else:
-        raise AssertionError('an impossible receiving row must fail')
-    con.execute("SET streaming_buffer_size='512B'")
+    # Configured local runtimes accept read-only queries. Configure the small
+    # receiving queue before attaching its independent runtime.
+    with (vane.connect() if not artifact else
+          vane.connect(config={'allow_unsigned_extensions': 'true'})) as small:
+        configure(small, 151)
+        small_runtime = small.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            result_limit=ResultDeliveryLimits(2, 1048576),
+        )
+        try:
+            collect(frames(small))
+        except vane.OutOfMemoryException as error:
+            assert 'streaming_buffer_size receiving capacity' in str(error), str(error)
+        else:
+            raise AssertionError('an impossible receiving row must fail')
+        assert small_runtime.resource_snapshot()['request_admission']['active_requests'] == 0
     values, final = collect(frames())
     assert sorted(values) == sorted(expected_frames)
     assert pixels(first) == saved
