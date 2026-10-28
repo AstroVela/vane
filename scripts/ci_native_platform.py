@@ -43,6 +43,17 @@ def windows_build_settings(prefix: Path) -> list[str]:
     ]
 
 
+def media_build_settings() -> list[str]:
+    # Config settings are separate argv entries. CMAKE_ARGS is parsed by
+    # shlex, which strips unquoted Windows backslashes and splits spaces.
+    return [
+        "-Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON",
+        "-Ccmake.define.VANE_LOADABLE_EXTENSIONS=native_media;gravitino",
+        f"-Ccmake.define.VANE_MEDIA_RUNTIME_SDK={Path(os.environ['VANE_MEDIA_SDK']).as_posix()}",
+        f"-Ccmake.define.VANE_MEDIA_RUNTIME_DIRECTORY={Path(os.environ['VANE_MEDIA_RUNTIME']).as_posix()}",
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -71,6 +82,7 @@ def main() -> None:
                 "--no-isolation",
                 "--outdir",
                 "dist",
+                *media_build_settings(),
                 *windows_build_settings(Path("vcpkg_installed")),
             ],
             check=True,

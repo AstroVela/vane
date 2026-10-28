@@ -160,7 +160,7 @@ jobs:
           paths = json.loads(Path('build/media-fixture/paths.json').read_text())
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               for key, value in paths.items():
-                  stream.write(f'VANE_MEDIA_{key.upper()}={value}\n')
+                  stream.write(f'VANE_MEDIA_{key.upper()}={Path(value).as_posix()}\n')
           PYTHON
 
       - name: Build and run DuckDB unit tests
@@ -179,7 +179,6 @@ jobs:
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
-          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media;gravitino -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
         run: python scripts/ci_native_platform.py build-release
 
       - name: Validate release artifacts
@@ -322,6 +321,7 @@ jobs:
             --license-file "$RUNNER_TEMP/native-extension-notices.txt"
           python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
           scripts/run_installed_pytest.sh -m 'not real_ray' \
+            tests/fast/test_ci_native_platform.py \
             tests/fast/test_media_version.py \
             tests/fast/test_media_sources.py \
             tests/fast/test_media_release.py \
