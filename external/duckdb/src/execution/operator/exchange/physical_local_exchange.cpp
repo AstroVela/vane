@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/operator/exchange/physical_local_exchange.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
@@ -545,7 +546,8 @@ static idx_t LocalExchangeCoalesceRows() {
 	if (!resolved) {
 		resolved = true;
 		cached = 64; // default
-		auto *value = std::getenv("VANE_LOCAL_EXCHANGE_COALESCE_ROWS");
+		const duckdb::EnvironmentVariable value_env("VANE_LOCAL_EXCHANGE_COALESCE_ROWS");
+		const char *value = value_env.GetValue();
 		if (value && *value) {
 			char *endptr = nullptr;
 			auto parsed = std::strtoll(value, &endptr, 10);

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include "vane_python/native_resource_graph.hpp"
 #include "vane_python/vane_fs.hpp"
 #include <pybind11/pybind11.h>
@@ -59,7 +60,8 @@
 #include <utility>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
-	const char *val = std::getenv(name);
+	const duckdb::EnvironmentVariable val_env(name);
+	const char *val = val_env.GetValue();
 	if (!val || !*val) {
 		return 0;
 	}

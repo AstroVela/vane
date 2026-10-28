@@ -125,6 +125,18 @@ class inside a pybind11 lambda caused excessive MSVC frontend memory use.
 The Bash test launchers also support Git Bash with native Windows Python;
 building a wheel does not establish compatibility of every runtime backend.
 
+Native runner and UDF environment settings use owned process-environment
+snapshots. On Windows, read through `GetEnvironmentVariableW` so changes made
+by Python remain visible across statically linked CRTs, including Unicode
+values. Linux and macOS continue to read `getenv`. Keep the snapshot alive
+while using its value, and preserve the distinction between unset and empty
+variables. Exercise configuration changes after import with
+`tests/fast/test_vane_config.py` through the installed test launcher.
+Native FTE workers retain the POSIX `sysconf` capacity probe where available
+and fall back to psutil's physical-memory total on Windows or probe failure.
+The Python module also stops the process-local Flight service at interpreter
+exit, before Windows terminates the gRPC threads during DLL teardown.
+
 Windows local UDF workers use duplicated sockets and a job object to retain
 ownership of their descendants through shutdown. Shared memory follows Windows
 handle lifetime: keep a raw descriptor alive until its receiver has adopted it,

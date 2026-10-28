@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/process_id.hpp"
 
@@ -127,7 +128,8 @@ unsigned long long ParsePositiveByteCount(const char *name, const char *raw) {
 }
 
 idx_t ResolveShuffleCacheFlushThresholdBytes() {
-	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
+	const duckdb::EnvironmentVariable raw_env("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
+	const char *raw = raw_env.GetValue();
 	if (!raw || !*raw) {
 		return ShuffleCache::DEFAULT_FLUSH_THRESHOLD_BYTES;
 	}
@@ -140,7 +142,8 @@ idx_t ResolveShuffleCacheFlushThresholdBytes() {
 }
 
 optional_idx ResolveShuffleCacheMaxBufferedBytes() {
-	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES");
+	const duckdb::EnvironmentVariable raw_env("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES");
+	const char *raw = raw_env.GetValue();
 	if (!raw || !*raw) {
 		return optional_idx();
 	}

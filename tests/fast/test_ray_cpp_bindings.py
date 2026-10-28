@@ -28,6 +28,34 @@ from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
 
+@pytest.mark.parametrize("explicit_shutdown", [False, True])
+def test_local_flight_service_stops_before_process_exit(tmp_path, explicit_shutdown):
+    script = """
+import sys
+import vane
+
+vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(sys.argv[1])
+print("FLIGHT_COMPLETED", flush=True)
+if sys.argv[2] == "True":
+    vane.ray_cxx.shutdown_local_flight_service()
+"""
+    environ = {
+        **os.environ,
+        "VANE_FLIGHT_BIND_HOST": "127.0.0.1",
+        "VANE_FLIGHT_ADVERTISE_HOST": "127.0.0.1",
+        "VANE_FLIGHT_PORT": "0",
+    }
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path), str(explicit_shutdown)],
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=20,
+    )
+    assert "FLIGHT_COMPLETED" in result.stdout
+
+
 def _make_test_physical_plan(con=None):
     con = vane.connect() if con is None else con
     relation = con.sql("SELECT 1 AS i")
