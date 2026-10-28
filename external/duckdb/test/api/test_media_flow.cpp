@@ -6,6 +6,7 @@
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/column/column_data_allocator.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
@@ -859,6 +860,75 @@ TEST_CASE("Sorted media result copies remain valid after stream close and databa
 	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 23);
 	retained.reset();
 	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 23);
+	arrow.release(&arrow);
+}
+
+TEST_CASE("Arrow collector selection preserves native media receiving and exported lifetime",
+          "[media-resource][media-sort][media-arrow]") {
+	const auto sorted = GENERATE(false, true);
+	const auto streaming = GENERATE(false, true);
+	CAPTURE(sorted, streaming);
+	unique_ptr<DataChunk> retained;
+	ArrowArray arrow {};
+	const auto first = sorted ? 23 : 0;
+	{
+		DuckDB db(nullptr);
+		if (!db.instance->GetMediaFlowCapacity()) {
+			return;
+		}
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+		REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+		REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+		auto probe = RegisterFlow(db);
+		probe->images = true;
+		auto &config = ClientConfig::GetConfig(*con.context);
+		// Match relation Arrow table/capsule export, which installs its own factory.
+		config.get_result_collector = [](ClientContext &context, PreparedStatementData &data) {
+			return PhysicalArrowCollector::Create(context, data, 1000000);
+		};
+		{
+			auto ordinary = con.context->Query("SELECT 42", false);
+			REQUIRE_FALSE(ordinary->HasError());
+			CHECK(ordinary->type == QueryResultType::ARROW_RESULT);
+		}
+		auto result = con.context->Query(sorted ? "SELECT i, data FROM test_media_flow() ORDER BY i DESC"
+		                                        : "SELECT i, data FROM test_media_flow()",
+		                                 streaming);
+		INFO((result->HasError() ? result->GetError() : ""));
+		REQUIRE_FALSE(result->HasError());
+		CHECK(result->type == (streaming ? QueryResultType::STREAM_RESULT : QueryResultType::MATERIALIZED_RESULT));
+		if (sorted || !streaming) {
+			CHECK(BufferManager::GetBufferManager(*con.context).GetUsedSwap() > 0);
+		}
+		idx_t count = 0;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++, count++) {
+				const auto expected = sorted ? 23 - count : count;
+				CHECK(chunk->GetValue(0, row) == Value::BIGINT(expected));
+				auto pixels = ImageVector::Pixels(chunk->data[1], row);
+				for (idx_t pixel = 0; pixel < 128 * 128 * 3; pixel++) {
+					if (pixels[pixel] != expected) {
+						FAIL("Arrow receiving changed image pixels or sort association");
+					}
+				}
+			}
+			if (!retained) {
+				retained = std::move(chunk);
+				ArrowConverter::ToArrowArray(*retained, &arrow, con.context->GetClientProperties(), {});
+			}
+		}
+		CHECK(count == 24);
+		CHECK(probe->produced == 24);
+		CHECK(probe->window->Snapshot().reserved.bytes == 0);
+		result.reset();
+		config.get_result_collector = nullptr;
+		REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+	}
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(first));
+	CHECK(ImageVector::Pixels(retained->data[1], 0)[0] == first);
+	retained.reset();
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == first);
 	arrow.release(&arrow);
 }
 

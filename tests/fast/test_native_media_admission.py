@@ -217,7 +217,8 @@ con.close()
 
 
 @pytest.mark.parametrize("window_bytes", ["144", "288"])
-def test_native_video_flow_sort_spills_and_preserves_pixels(video_path, tmp_path, window_bytes):
+@pytest.mark.parametrize("arrow_export", ["table", "capsule"])
+def test_native_video_flow_sort_spills_and_preserves_pixels(video_path, tmp_path, window_bytes, arrow_export):
     providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
     artifact = "" if providers else str(media._artifact("video"))
     script = r"""
@@ -225,10 +226,11 @@ import faulthandler
 from pathlib import Path
 import sys
 import numpy as np
+import pyarrow as pa
 import vane
 
 faulthandler.dump_traceback_later(90, exit=True)
-artifact, path, spill_path = sys.argv[1:]
+artifact, path, spill_path, arrow_export = sys.argv[1:]
 with (vane.connect() if not artifact else
       vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
     if artifact:
@@ -306,7 +308,8 @@ with (vane.connect() if not artifact else
         np.testing.assert_array_equal(pixels, reference[index])
     for index, pixels, _ in mixed:
         np.testing.assert_array_equal(pixels, reference[index])
-    arrow = frames().order('frame_index DESC').to_arrow_table()
+    relation = frames().order('frame_index DESC')
+    arrow = relation.to_arrow_table() if arrow_export == 'table' else pa.table(relation)
     assert arrow['frame_index'].to_pylist() == list(range(11, -1, -1))
     arrow_pixels = arrow['data'].combine_chunks().storage.to_pylist()
     assert con.execute('SELECT 42').fetchone() == (42,)
@@ -317,7 +320,7 @@ assert arrow['data'].combine_chunks().storage.to_pylist() == arrow_pixels
 faulthandler.cancel_dump_traceback_later()
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path / "sort-spill")],
+        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path / "sort-spill"), arrow_export],
         env={
             **os.environ,
             "VANE_RUNNER": "local-fast",

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "duckdb/common/arrow/physical_arrow_batch_collector.hpp"
@@ -12,6 +18,11 @@ unique_ptr<PhysicalOperator> PhysicalArrowCollector::Create(ClientContext &conte
                                                             idx_t batch_size) {
 	auto &physical_plan = *data.physical_plan;
 	auto &root = physical_plan.Root();
+	if (PhysicalPlanGenerator::HasNativeMediaFlow(context, root)) {
+		// Finish the bounded receiving copy before acknowledging media input.
+		// The result is converted to Arrow when the caller exports it.
+		return PhysicalResultCollector::GetResultCollector(context, data);
+	}
 
 	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, root)) {
 		// Not an order-preserving plan: use the parallel materialized collector.
