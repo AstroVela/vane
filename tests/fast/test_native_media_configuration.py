@@ -3,6 +3,7 @@
 
 """Exercise the actual media CMake function with small stand-ins for DuckDB targets."""
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -76,7 +77,10 @@ def media_project(tmp_path, monkeypatch):
             "cmake_minimum_required(VERSION 3.29)\nproject(media_import_probe C)\n"
             "add_library(soxr SHARED ../library.c)\n"
             "set_target_properties(soxr PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)\n"
+            "add_library(z SHARED ../library-z.c)\n"
+            "set_target_properties(z PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)\n"
         )
+        (root / "library-z.c").write_text("int z_fixture(void) { return 43; }\n")
         _run("cmake", "-S", str(root / "library-probe"), "-B", str(root / "library-build"), "-G", GENERATORS[0])
         _run("cmake", "--build", str(root / "library-build"), "--config", "Release")
         library = next((root / "library-build").rglob("soxr.lib"))
@@ -100,8 +104,9 @@ def media_project(tmp_path, monkeypatch):
         "webpdemux",
     ):
         destination = sdk / "lib" / library_name.format(name)
-        if destination != library:
-            shutil.copyfile(library, destination)
+        source = next((root / "library-build").rglob("z.lib")) if sys.platform == "win32" and name == "z" else library
+        if destination != source:
+            shutil.copyfile(source, destination)
     runtime = root / "runtime"
     runtime.mkdir()
     (runtime / ".libs").mkdir()
@@ -173,6 +178,30 @@ def test_dynamic_media_sdk_and_incremental_relocation(media_project):
         assert len(runs.read_text().splitlines()) == count
         _run(*command)
         assert len(runs.read_text().splitlines()) == count
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="MSVC static-library/import-thunk collision")
+def test_dynamic_media_reuses_the_hosts_windows_zlib(media_project):
+    root = media_project
+    (root / "base-z.c").write_text("int z_fixture(void) { return 41; }\nint base_only(void) { return 1; }\n")
+    (root / "extension.c").write_text(
+        "int z_fixture(void);\nint base_only(void);\nint probe(void) { return z_fixture() + base_only(); }\n"
+    )
+    cmake = root / "CMakeLists.txt"
+    cmake.write_text(
+        cmake.read_text().replace(
+            "include(external/duckdb/extension/media_common/extension.cmake)",
+            "add_library(base_zlib STATIC base-z.c)\n"
+            "add_library(ZLIB::ZLIB ALIAS base_zlib)\n"
+            "target_link_libraries(file_extension INTERFACE base_zlib)\n"
+            "include(external/duckdb/extension/media_common/extension.cmake)",
+        )
+    )
+    build = root / "build"
+    _run("cmake", "-S", str(root), "-B", str(build), "-G", GENERATORS[0])
+    _run("cmake", "--build", str(build), "--config", "Release", "--target", "native_media_loadable_extension")
+    library = next(build.rglob("native_media_loadable_extension.dll"))
+    assert ctypes.CDLL(str(library)).probe() == 42
 
 
 def test_dynamic_media_rejects_sdk_without_boost_even_when_host_has_it(media_project):

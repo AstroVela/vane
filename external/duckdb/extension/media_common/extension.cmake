@@ -56,6 +56,13 @@ function(vane_build_native_media_extension)
                  PATHS "${boost_multiprecision_DIR}")
     include_directories("${VANE_MEDIA_RUNTIME_SDK}/include")
     foreach(library avformat avcodec avutil swscale swresample sndfile soxr tiff jpeg z webp webpdemux)
+      if(WIN32 AND library STREQUAL "z" AND TARGET ZLIB::ZLIB)
+        # The host's static Arrow dependencies already link zlib. Adding the
+        # SDK's import thunks gives duplicate symbols on MSVC. Codec DLLs keep
+        # their separate, namespaced zlib dependency in the runtime graph.
+        list(APPEND dependencies ZLIB::ZLIB)
+        continue()
+      endif()
       set(names "${library}" "lib${library}")
       if(WIN32 AND library STREQUAL "z")
         set(names z zlib)
