@@ -116,6 +116,22 @@ def test_memory_guard_rejects_reused_ancestor_pid():
     assert module.owned_process_tree(root) == [root, child]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process sessions")
+def test_memory_guard_ignores_inaccessible_sessions(monkeypatch):
+    spec = importlib.util.spec_from_file_location("vane_memory_guard", _GUARD)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    root = psutil.Process()
+    monkeypatch.setattr(module, "owned_process_tree", lambda _: [root])
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter([root]))
+
+    def deny_session_lookup(_pid):
+        raise PermissionError("session is not accessible")
+
+    monkeypatch.setattr(os, "getsid", deny_session_lookup)
+    assert module.owned_processes(root) == [root]
+
+
 @pytest.mark.parametrize("failure", ["memory", "timeout"])
 @pytest.mark.parametrize(
     "separate_process_group",

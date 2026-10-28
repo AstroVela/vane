@@ -122,7 +122,7 @@ def owned_processes(root: psutil.Process) -> list[psutil.Process]:
         try:
             if process.create_time() >= created and os.getsid(process.pid) == root.pid and process.is_running():
                 processes.add(process)
-        except (ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied):
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return list(processes)
 
