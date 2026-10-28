@@ -267,7 +267,11 @@ with (vane.connect() if not artifact else
     else:
         raise AssertionError('a full BufferManager with spill disabled must fail')
     con.execute("SET max_temp_directory_size='100MiB'")
-    assert len(frames(1).fetchall()) == 12
+    con.execute("SET memory_limit='10MiB'")
+    reference = {index: pixels for index, pixels in frames(1).fetchall()}
+    assert sorted(reference) == list(range(12))
+    for index, pixels in retained:
+        np.testing.assert_array_equal(pixels, reference[index])
     con.execute("SET streaming_buffer_size='151B'")
     try:
         frames(1).fetchall()
