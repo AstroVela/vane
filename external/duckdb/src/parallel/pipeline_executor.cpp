@@ -8,6 +8,7 @@
 
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -119,9 +120,12 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	if (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() &&
 	    pipeline.source->type == PhysicalOperatorType::TABLE_SCAN &&
 	    pipeline.source->Cast<PhysicalTableScan>().function.media_flow_source) {
-		if (!pipeline.sink || pipeline.sink->type != PhysicalOperatorType::STREAMING_UDF) {
-			throw NotImplementedException("Native media flow window currently requires a streaming UDF receiver; "
-			                              "materialization budget handoff is not implemented");
+		const bool bounded_result = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::RESULT_COLLECTOR &&
+		                            pipeline.sink->Cast<PhysicalResultCollector>().SupportsMediaFlowInput();
+		if (!pipeline.sink || (pipeline.sink->type != PhysicalOperatorType::STREAMING_UDF && !bounded_result)) {
+			throw NotImplementedException(
+			    "Native media flow window requires a streaming UDF or bounded result receiver; "
+			    "materialization budget handoff is not implemented");
 		}
 		for (auto &op : pipeline.operators) {
 			const auto type = op.get().type;

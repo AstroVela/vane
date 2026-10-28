@@ -1,9 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/stream_query_result.hpp"
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/common/box_renderer.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/buffered_data/simple_buffered_data.hpp"
 
 namespace duckdb {
 
@@ -20,6 +27,14 @@ StreamQueryResult::StreamQueryResult(ErrorData error) : QueryResult(QueryResultT
 }
 
 StreamQueryResult::~StreamQueryResult() {
+	if (IsMediaFlowResult()) {
+		try {
+			Close();
+		} catch (...) {
+			// Explicit Close reports errors. Destruction must still release the
+			// retained result buffers without throwing during stack unwinding.
+		}
+	}
 }
 
 string StreamQueryResult::ToString() {
@@ -195,8 +210,25 @@ bool StreamQueryResult::IsOpen() {
 }
 
 void StreamQueryResult::Close() {
-	buffered_data->Close();
+	// Query cleanup retires its receiver before another query can call into
+	// user code. Releasing that stale stream from a callback must not reacquire
+	// the context lock already held by the newer query.
+	const bool retired = IsMediaFlowResult() && buffered_data->Cast<SimpleBufferedData>().SnapshotMediaFlow().closed;
+	if (IsMediaFlowResult() && context && !retired) {
+		auto cc = context;
+		auto lock = cc->LockContext();
+		buffered_data->Close();
+		if (cc->IsActiveResult(*lock, *this)) {
+			cc->CleanupInternal(*lock, this);
+		}
+	} else if (buffered_data) {
+		buffered_data->Close();
+	}
 	context.reset();
+}
+
+bool StreamQueryResult::IsMediaFlowResult() const {
+	return buffered_data && buffered_data->IsMediaFlowReceiver();
 }
 
 bool StreamQueryResult::IsChunkReady(StreamExecutionResult result) {

@@ -28,6 +28,16 @@ namespace {
 
 class LocalQueryResultSource : public DuckDBPyResultSource {
 public:
+	~LocalQueryResultSource() override {
+		if (result && result->type == QueryResultType::STREAM_RESULT &&
+		    result->Cast<StreamQueryResult>().IsMediaFlowResult()) {
+			try {
+				Close();
+			} catch (...) {
+			}
+		}
+	}
+
 	explicit LocalQueryResultSource(unique_ptr<QueryResult> result_p) : result(std::move(result_p)) {
 		if (!result) {
 			throw InternalException("LocalQueryResultSource created without a result");
@@ -105,7 +115,15 @@ public:
 
 	void Close() override {
 		if (result && result->type == QueryResultType::STREAM_RESULT) {
-			result->Cast<StreamQueryResult>().Close();
+			auto &stream = result->Cast<StreamQueryResult>();
+			if (stream.IsMediaFlowResult() && py::gil_check()) {
+				// Closing this bounded receiver also drains its native query.
+				// Worker thread-state cleanup may need to acquire the GIL.
+				py::gil_scoped_release release;
+				stream.Close();
+			} else {
+				stream.Close();
+			}
 		}
 		result.reset();
 		closed = true;
@@ -190,6 +208,74 @@ struct ArrowQueryResultStreamOwner {
 	string last_error;
 };
 
+//! Arrow can release a stream while holding the GIL. This stream owns an
+//! unfinished native query, whose worker cleanup must be allowed to take it.
+struct MediaFlowArrowStreamOwner {
+	explicit MediaFlowArrowStreamOwner(ArrowArrayStream inner_p) : inner(inner_p), stream(inner_p) {
+		stream.private_data = this;
+		stream.get_schema = GetSchema;
+		stream.get_next = GetNext;
+		stream.get_last_error = GetLastError;
+		stream.release = Release;
+	}
+	~MediaFlowArrowStreamOwner() {
+		if (inner.release) {
+			inner.release(&inner);
+		}
+	}
+	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+		if (!stream || !stream->release) {
+			return -1;
+		}
+		auto &inner = reinterpret_cast<MediaFlowArrowStreamOwner *>(stream->private_data)->inner;
+		if (py::gil_check()) {
+			py::gil_scoped_release release;
+			return inner.get_schema(&inner, out);
+		}
+		return inner.get_schema(&inner, out);
+	}
+	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
+		if (!stream || !stream->release) {
+			return -1;
+		}
+		auto &inner = reinterpret_cast<MediaFlowArrowStreamOwner *>(stream->private_data)->inner;
+		if (py::gil_check()) {
+			py::gil_scoped_release release;
+			return inner.get_next(&inner, out);
+		}
+		return inner.get_next(&inner, out);
+	}
+	static const char *GetLastError(ArrowArrayStream *stream) {
+		if (!stream || !stream->release) {
+			return "stream was released";
+		}
+		auto &inner = reinterpret_cast<MediaFlowArrowStreamOwner *>(stream->private_data)->inner;
+		return inner.get_last_error(&inner);
+	}
+	static void Release(ArrowArrayStream *stream) {
+		if (!stream || !stream->release) {
+			return;
+		}
+		stream->release = nullptr;
+		auto owner = reinterpret_cast<MediaFlowArrowStreamOwner *>(stream->private_data);
+		if (py::gil_check()) {
+			py::gil_scoped_release release;
+			delete owner;
+		} else {
+			delete owner;
+		}
+	}
+	ArrowArrayStream inner;
+	ArrowArrayStream stream;
+};
+
+static ArrowArrayStream CreateMediaFlowArrowStream(unique_ptr<QueryResult> result, idx_t rows_per_batch) {
+	auto inner = make_uniq<ResultArrowArrayStreamWrapper>(std::move(result), rows_per_batch);
+	auto owner = new MediaFlowArrowStreamOwner(inner->stream);
+	inner.release(); // The exported inner release callback owns its wrapper.
+	return owner->stream;
+}
+
 ArrowArrayStream LocalQueryResultSource::TakeArrowStream(idx_t rows_per_batch) {
 	if (!result) {
 		throw InvalidInputException("result closed");
@@ -198,6 +284,16 @@ ArrowArrayStream LocalQueryResultSource::TakeArrowStream(idx_t rows_per_batch) {
 	if (result->type == QueryResultType::ARROW_RESULT) {
 		auto owner = new ArrowQueryResultStreamOwner(std::move(result));
 		return owner->stream;
+	}
+	const bool media_flow =
+	    result->type == QueryResultType::STREAM_RESULT && result->Cast<StreamQueryResult>().IsMediaFlowResult();
+	if (media_flow) {
+		if (py::gil_check()) {
+			// Failed wrapper allocation must also be able to retire the query.
+			py::gil_scoped_release release;
+			return CreateMediaFlowArrowStream(std::move(result), rows_per_batch);
+		}
+		return CreateMediaFlowArrowStream(std::move(result), rows_per_batch);
 	}
 	auto owner = new ResultArrowArrayStreamWrapper(std::move(result), rows_per_batch);
 	return owner->stream;

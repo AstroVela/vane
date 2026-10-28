@@ -5,13 +5,19 @@
 #include "test_helpers.hpp"
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
 #include <thread>
@@ -126,16 +132,26 @@ unique_ptr<UDFExecutor> RefuseTasks(ClientContext &, const Value &, UDFConfig &,
 
 struct CopyProbe {
 	bool fail = false;
+	bool allocator_destroyed = false;
+	std::function<void()> before_allocate;
 };
 struct CopyAllocatorData : public PrivateAllocatorData {
 	explicit CopyAllocatorData(shared_ptr<CopyProbe> probe_p) : probe(std::move(probe_p)) {
+	}
+	~CopyAllocatorData() override {
+		probe->allocator_destroyed = true;
 	}
 	shared_ptr<CopyProbe> probe;
 };
 DBConfig *ConfigureCopyAllocator(DBConfig &config, shared_ptr<CopyProbe> probe) {
 	config.allocator = make_uniq<Allocator>(
 	    [](PrivateAllocatorData *data, idx_t bytes) -> data_ptr_t {
-		    if (data->Cast<CopyAllocatorData>().probe->fail) {
+		    auto probe = data->Cast<CopyAllocatorData>().probe;
+		    auto before = std::move(probe->before_allocate);
+		    if (before) {
+			    before();
+		    }
+		    if (probe->fail) {
 			    throw OutOfMemoryException("injected ingress allocation failure");
 		    }
 		    return static_cast<data_ptr_t>(std::malloc(bytes));
@@ -273,7 +289,462 @@ shared_ptr<FlowProbe> RegisterFlow(DuckDB &db) {
 	loader.RegisterFunction(std::move(source));
 	return probe;
 }
+
+struct ResultQueueFixture {
+	explicit ResultQueueFixture(idx_t bytes)
+	    : copy(make_shared_ptr<CopyProbe>()), db(nullptr, ConfigureCopyAllocator(config, copy)), con(db) {
+		ClientConfig::GetConfig(*con.context).streaming_buffer_size = bytes;
+		queue = make_shared_ptr<SimpleBufferedData>(*con.context, true, Allocator::Get(*con.context));
+	}
+	shared_ptr<CopyProbe> copy;
+	DBConfig config;
+	DuckDB db;
+	Connection con;
+	shared_ptr<SimpleBufferedData> queue;
+};
+
+class ResultWakeTask : public Task {
+public:
+	TaskExecutionResult Execute(TaskExecutionMode) override {
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+	uint64_t CurrentInterruptEpoch() const override {
+		return 1;
+	}
+	void Reschedule(uint64_t epoch) override {
+		CHECK(epoch == 1);
+		wakes++;
+		if (on_wake) {
+			on_wake();
+		}
+	}
+	idx_t wakes = 0;
+	std::function<void()> on_wake;
+};
+
+class BatchMediaResultCollector : public PhysicalBufferedCollector {
+public:
+	BatchMediaResultCollector(PhysicalPlan &plan, PreparedStatementData &data)
+	    : PhysicalBufferedCollector(plan, data, false, true) {
+	}
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                          : ExecutionBatchRequirement::BATCH_OPTIONAL;
+	}
+};
+
+unique_ptr<PhysicalOperator> CollectFlowBatches(ClientContext &context, PreparedStatementData &data) {
+	if (data.output_type == QueryResultOutputType::ALLOW_STREAMING &&
+	    PhysicalPlanGenerator::HasNativeMediaFlow(context, data.physical_plan->Root())) {
+		return make_uniq<BatchMediaResultCollector>(*data.physical_plan, data);
+	}
+	return PhysicalResultCollector::GetResultCollector(context, data);
+}
 } // namespace
+
+TEST_CASE("Streaming media results split skewed payloads without acknowledging a partial receipt",
+          "[media-resource][media-result-flow]") {
+	const auto nested = GENERATE(false, true);
+	const auto large_first = GENERATE(false, true);
+	ResultQueueFixture receiver(1000);
+	const auto type = nested ? LogicalType::STRUCT({{"payload", LogicalType::VARCHAR}}) : LogicalType::VARCHAR;
+	auto value = [&](idx_t size) {
+		auto text = Value(string(size, 'x'));
+		return nested ? Value::STRUCT({{"payload", text}}) : text;
+	};
+	MediaFlowWindow initial_window(600), window(948);
+	DataChunk initial, input;
+	initial.Initialize(Allocator::DefaultAllocator(), {type}, 1);
+	initial.SetValue(0, 0, value(584));
+	initial.SetCardinality(1);
+	initial.AddMediaFlow(TakeFlow(initial_window, 600));
+	idx_t initial_offset = 0;
+	REQUIRE(receiver.queue->AppendMediaFlow(initial, initial_offset, InterruptState()) ==
+	        SinkResultType::NEED_MORE_INPUT);
+	input.Initialize(Allocator::DefaultAllocator(), {type}, 3);
+	for (idx_t row = 0; row < 3; row++) {
+		input.SetValue(0, row, value(row == (large_first ? 0 : 2) ? 900 : 0));
+	}
+	input.SetCardinality(3);
+	auto ticket = TakeFlow(window, 948);
+	input.AddMediaFlow(ticket);
+	idx_t offset = 0;
+	auto task = make_shared_ptr<ResultWakeTask>();
+	InterruptState interrupt {weak_ptr<Task>(task)};
+	for (idx_t retry = 0; retry < 3; retry++) {
+		REQUIRE(receiver.queue->AppendMediaFlow(input, offset, interrupt) == SinkResultType::BLOCKED);
+		CHECK(offset == (large_first ? 0 : 2));
+		CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == (large_first ? 600 : 632));
+		CHECK(receiver.queue->SnapshotMediaFlow().reserved_bytes == 0);
+		CHECK(receiver.queue->SnapshotMediaFlow().waiting_sinks == 1);
+		CHECK(ticket->IsActive());
+	}
+	task->on_wake = [&] {
+		CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == (large_first ? 0 : 32));
+	};
+	auto retained = receiver.queue->Scan();
+	REQUIRE(retained);
+	CHECK(retained->GetValue(0, 0) == value(584));
+	CHECK(task->wakes == 1);
+	REQUIRE(receiver.queue->AppendMediaFlow(input, offset, interrupt) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(offset == 0);
+	CHECK_FALSE(ticket->IsActive());
+	CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == 948);
+	CHECK(receiver.queue->SnapshotMediaFlow().peak_bytes <= 1000);
+	idx_t row = 0;
+	while (auto chunk = receiver.queue->Scan()) {
+		for (idx_t i = 0; i < chunk->size(); i++) {
+			CHECK(chunk->GetValue(0, i) == input.GetValue(0, row++));
+		}
+	}
+	CHECK(row == 3);
+	receiver.queue->Close();
+	CHECK(retained->GetValue(0, 0) == value(584));
+}
+
+TEST_CASE("Streaming result copy failure and close roll back reserved capacity without a receipt",
+          "[media-resource][media-result-flow]") {
+	const auto close_during_copy = GENERATE(false, true);
+	ResultQueueFixture receiver(8);
+	MediaFlowWindow window(8);
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT}, 1);
+	input.SetValue(0, 0, Value::BIGINT(42));
+	input.SetCardinality(1);
+	auto ticket = TakeFlow(window, 8);
+	input.AddMediaFlow(ticket);
+	idx_t offset = 0;
+	receiver.copy->before_allocate = [&] {
+		auto snapshot = receiver.queue->SnapshotMediaFlow();
+		CHECK(snapshot.reserved_bytes == 8);
+		CHECK(snapshot.queued_bytes == 0);
+		if (close_during_copy) {
+			receiver.queue->Close();
+			CHECK(receiver.queue->SnapshotMediaFlow().reserved_bytes == 8);
+		}
+	};
+	receiver.copy->fail = !close_during_copy;
+	CHECK_THROWS(receiver.queue->AppendMediaFlow(input, offset, InterruptState()));
+	CHECK(offset == 0);
+	CHECK(ticket->IsActive());
+	CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == 0);
+	CHECK(receiver.queue->SnapshotMediaFlow().reserved_bytes == 0);
+	if (!close_during_copy) {
+		receiver.copy->fail = false;
+		REQUIRE(receiver.queue->AppendMediaFlow(input, offset, InterruptState()) == SinkResultType::NEED_MORE_INPUT);
+		CHECK_FALSE(ticket->IsActive());
+		receiver.queue->Close();
+	}
+	CHECK_THROWS(receiver.queue->AppendMediaFlow(input, offset, InterruptState()));
+	window.Close();
+	CHECK(window.Snapshot().reserved.bytes == 0);
+}
+
+TEST_CASE("Overlapping result copies cannot spend another producer's reservation",
+          "[media-resource][media-result-flow]") {
+	ResultQueueFixture receiver(16);
+	MediaFlowWindow first_window(8), second_window(16);
+	DataChunk first, second;
+	first.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT}, 1);
+	first.SetValue(0, 0, Value::BIGINT(10));
+	first.SetCardinality(1);
+	first.AddMediaFlow(TakeFlow(first_window, 8));
+	second.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT}, 2);
+	second.SetValue(0, 0, Value::BIGINT(20));
+	second.SetValue(0, 1, Value::BIGINT(30));
+	second.SetCardinality(2);
+	auto ticket = TakeFlow(second_window, 16);
+	second.AddMediaFlow(ticket);
+	idx_t first_offset = 0, second_offset = 0;
+	auto task = make_shared_ptr<ResultWakeTask>();
+	InterruptState interrupt {weak_ptr<Task>(task)};
+	receiver.copy->before_allocate = [&] {
+		CHECK(receiver.queue->SnapshotMediaFlow().reserved_bytes == 8);
+		REQUIRE(receiver.queue->AppendMediaFlow(second, second_offset, interrupt) == SinkResultType::BLOCKED);
+		CHECK(second_offset == 1);
+		auto snapshot = receiver.queue->SnapshotMediaFlow();
+		CHECK(snapshot.queued_bytes == 8);
+		CHECK(snapshot.reserved_bytes == 8);
+		CHECK(snapshot.peak_bytes == 16);
+		CHECK(ticket->IsActive());
+	};
+	REQUIRE(receiver.queue->AppendMediaFlow(first, first_offset, interrupt) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == 16);
+	task->on_wake = [&] {
+		CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == 8);
+	};
+	auto next = receiver.queue->Scan();
+	REQUIRE(next);
+	CHECK(next->GetValue(0, 0) == Value::BIGINT(20));
+	CHECK(task->wakes == 1);
+	REQUIRE(receiver.queue->AppendMediaFlow(second, second_offset, interrupt) == SinkResultType::NEED_MORE_INPUT);
+	CHECK_FALSE(ticket->IsActive());
+	for (auto value : {10, 30}) {
+		next = receiver.queue->Scan();
+		REQUIRE(next);
+		CHECK(next->GetValue(0, 0) == Value::BIGINT(value));
+	}
+	CHECK(receiver.queue->SnapshotMediaFlow().queued_bytes == 0);
+	CHECK(receiver.queue->SnapshotMediaFlow().peak_bytes == 16);
+}
+
+TEST_CASE("A streaming result row larger than its receiving capacity fails before copying",
+          "[media-resource][media-result-flow]") {
+	ResultQueueFixture receiver(8);
+	MediaFlowWindow window(32);
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR}, 1);
+	input.SetValue(0, 0, Value(string(16, 'x')));
+	input.SetCardinality(1);
+	auto ticket = TakeFlow(window, 32);
+	input.AddMediaFlow(ticket);
+	idx_t offset = 0;
+	CHECK_THROWS_WITH(receiver.queue->AppendMediaFlow(input, offset, InterruptState()),
+	                  Catch::Matchers::Contains("streaming_buffer_size receiving capacity"));
+	CHECK(ticket->IsActive());
+	CHECK(receiver.queue->SnapshotMediaFlow().peak_bytes == 0);
+	CHECK(receiver.queue->SnapshotMediaFlow().waiting_sinks == 0);
+}
+
+TEST_CASE("A received result copy does not revoke the original pixels or borrow their allocation lease",
+          "[media-resource][media-result-flow]") {
+	ResultQueueFixture receiver(12);
+	MediaFlowWindow window(12);
+	MediaResourcePool pixels_pool({0, 12});
+	auto scope = pixels_pool.CreateScope();
+	auto request = scope->Request({0, 12});
+	REQUIRE(request->PollOrArm([] {}) == MediaAdmissionStatus::GRANTED);
+	auto ticket = TakeFlow(window, 12);
+	auto pixels = AllocateMediaVector(LogicalType::UTINYINT, 12, request->TakeGrant(),
+	                                  Allocator::DefaultAllocatorReference(), ticket);
+	for (idx_t row = 0; row < 12; row++) {
+		FlatVector::GetData<uint8_t>(*pixels)[row] = 42;
+	}
+	Vector view(*pixels, 0, 1);
+	DataChunk input;
+	input.InitializeEmpty({LogicalType::UTINYINT});
+	input.data[0].Reference(*pixels);
+	input.SetCardinality(12);
+	input.AddMediaFlow(ticket);
+	idx_t offset = 0;
+	REQUIRE(receiver.queue->AppendMediaFlow(input, offset, InterruptState()) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(window.Snapshot().reserved.bytes == 0);
+	CHECK(pixels_pool.Snapshot().reserved.bytes == 12);
+	auto copy = receiver.queue->Scan();
+	REQUIRE(copy);
+	ArrowArray arrow;
+	ArrowConverter::ToArrowArray(*copy, &arrow, receiver.con.context->GetClientProperties(), {});
+	input.Destroy();
+	pixels.reset();
+	CHECK(pixels_pool.Snapshot().reserved.bytes == 12);
+	Vector empty(LogicalType::UTINYINT);
+	view.Reference(empty);
+	CHECK(pixels_pool.Snapshot().reserved.bytes == 0);
+	receiver.queue->Close();
+	copy.reset();
+	CHECK(static_cast<const uint8_t *>(arrow.children[0]->buffers[1])[0] == 42);
+	arrow.release(&arrow);
+}
+
+TEST_CASE("Returned media result copies outlive their database allocator", "[media-resource][media-result-flow]") {
+	auto probe = make_shared_ptr<CopyProbe>();
+	unique_ptr<DataChunk> retained;
+	unique_ptr<Vector> view;
+	ArrowArray arrow;
+	{
+		DBConfig config;
+		DuckDB db(nullptr, ConfigureCopyAllocator(config, probe));
+		Connection con(db);
+		ClientConfig::GetConfig(*con.context).streaming_buffer_size = 256;
+		auto queue = make_shared_ptr<SimpleBufferedData>(*con.context, true);
+		DataChunk input;
+		input.Initialize(
+		    Allocator::DefaultAllocator(),
+		    {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::STRUCT({{"s", LogicalType::VARCHAR}})}, 1);
+		input.SetValue(0, 0, Value::BIGINT(42));
+		input.SetValue(1, 0, Value(string(32, 'x')));
+		input.SetValue(2, 0, Value::STRUCT({{"s", Value(string(32, 'y'))}}));
+		input.SetCardinality(1);
+		idx_t offset = 0;
+		REQUIRE(queue->AppendMediaFlow(input, offset, InterruptState()) == SinkResultType::NEED_MORE_INPUT);
+		retained = queue->Scan();
+		REQUIRE(retained);
+		CHECK(retained->data[0].GetBuffer()->GetAllocator().get() == &Allocator::DefaultAllocator());
+		CHECK(retained->data[1].GetBuffer()->GetAllocator().get() == &Allocator::DefaultAllocator());
+		view = make_uniq<Vector>(retained->data[0], 0, 1);
+		ArrowConverter::ToArrowArray(*retained, &arrow, con.context->GetClientProperties(), {});
+		queue->Close();
+	}
+	CHECK(probe->allocator_destroyed);
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(42));
+	CHECK(retained->GetValue(1, 0) == Value(string(32, 'x')));
+	CHECK(retained->GetValue(2, 0) == Value::STRUCT({{"s", Value(string(32, 'y'))}}));
+	retained.reset();
+	CHECK(view->GetValue(0) == Value::BIGINT(42));
+	view.reset();
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 42);
+	arrow.release(&arrow);
+}
+
+TEST_CASE("A one-frame native scan streams short result chunks through filters and limits",
+          "[media-resource][media-result-flow]") {
+	const auto batches = GENERATE(false, true);
+	const auto threads = GENERATE(1, 4);
+	const auto query = GENERATE(string("SELECT i * 2 + 1 FROM test_media_flow()"),
+	                            string("SELECT i * 2 + 1 FROM test_media_flow() WHERE i % 2 = 0"),
+	                            string("SELECT i * 2 + 1 FROM test_media_flow() WHERE i % 2 = 0 LIMIT 3"));
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=" + to_string(threads)));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='12B'"));
+	if (batches) {
+		ClientConfig::GetConfig(*con.context).get_result_collector = CollectFlowBatches;
+	}
+	auto probe = RegisterFlow(db);
+	auto result = con.SendQuery(query);
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->type == QueryResultType::STREAM_RESULT);
+	auto &stream = result->Cast<StreamQueryResult>();
+	CHECK(stream.IsMediaFlowResult());
+	auto retained = result->Fetch();
+	REQUIRE(retained);
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(1));
+	ArrowArray arrow;
+	ArrowConverter::ToArrowArray(*retained, &arrow, con.context->GetClientProperties(), {});
+	for (idx_t step = 0; step < 100; step++) {
+		if (StreamQueryResult::IsChunkReady(stream.ExecuteTask())) {
+			break;
+		}
+	}
+	const auto produced = probe->produced;
+	CHECK(produced < 24);
+	for (idx_t retry = 0; retry < 3; retry++) {
+		stream.ExecuteTask();
+		CHECK(probe->produced == produced);
+	}
+	vector<int64_t> values {1};
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			values.push_back(chunk->GetValue(0, row).GetValue<int64_t>());
+		}
+	}
+	REQUIRE_FALSE(result->HasError());
+	vector<int64_t> expected;
+	const auto filtered = query.find("WHERE") != string::npos;
+	const auto limited = query.find("LIMIT") != string::npos;
+	for (idx_t row = 0; row < (limited ? 6 : 24); row += filtered ? 2 : 1) {
+		expected.push_back(NumericCast<int64_t>(2 * row + 1));
+	}
+	CHECK(values == expected);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(1));
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 1);
+	arrow.release(&arrow);
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Closing a buffered media result retires its blocked scan while a returned chunk survives",
+          "[media-resource][media-result-flow]") {
+	const auto explicit_close = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='8B'"));
+	auto probe = RegisterFlow(db);
+	auto result = con.SendQuery("SELECT i FROM test_media_flow()");
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->type == QueryResultType::STREAM_RESULT);
+	auto retained = result->Fetch();
+	REQUIRE(retained);
+	result->Cast<StreamQueryResult>().ExecuteTask();
+	if (explicit_close) {
+		result->Cast<StreamQueryResult>().Close();
+	}
+	result.reset();
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Media Arrow export bounds prefetch and does not retire a newer query on release",
+          "[media-resource][media-result-flow]") {
+	const auto replace_query = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='12B'"));
+	auto probe = RegisterFlow(db);
+	auto result = con.SendQuery("SELECT i FROM test_media_flow()");
+	REQUIRE_FALSE(result->HasError());
+	auto wrapper = new ResultArrowArrayStreamWrapper(std::move(result), 1000000);
+	CHECK(wrapper->batch_size == 1);
+	auto stream = wrapper->stream;
+	ArrowArray retained;
+	REQUIRE(stream.get_next(&stream, &retained) == 0);
+	REQUIRE(retained.release);
+	CHECK(retained.length == 1);
+	CHECK(probe->produced < 24);
+	unique_ptr<QueryResult> next;
+	if (replace_query) {
+		next = con.SendQuery("SELECT 42");
+		REQUIRE_FALSE(next->HasError());
+	}
+	stream.release(&stream);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(static_cast<const int64_t *>(retained.children[0]->buffers[1])[0] == 0);
+	if (next) {
+		auto chunk = next->Fetch();
+		REQUIRE(chunk);
+		CHECK(chunk->GetValue(0, 0) == Value::BIGINT(42));
+	}
+	retained.release(&retained);
+	REQUIRE_NO_FAIL(con.Query("SELECT 43"));
+}
+
+TEST_CASE("A newer query callback can release its retired media Arrow stream", "[media-resource][media-result-flow]") {
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='8B'"));
+	auto probe = RegisterFlow(db);
+	ArrowArrayStream stream {};
+	bool released = false;
+	ExtensionLoader loader(*db.instance, "media_result_release_test");
+	loader.RegisterFunction(ScalarFunction("release_old_media_stream", {LogicalType::BIGINT}, LogicalType::BIGINT,
+	                                       [&](DataChunk &, ExpressionState &, Vector &output) {
+		                                       stream.release(&stream);
+		                                       released = true;
+		                                       output.Reference(Value::BIGINT(42));
+	                                       }));
+	auto result = con.SendQuery("SELECT i FROM test_media_flow()");
+	REQUIRE_FALSE(result->HasError());
+	auto wrapper = new ResultArrowArrayStreamWrapper(std::move(result), 1000000);
+	stream = wrapper->stream;
+	ArrowArray retained;
+	REQUIRE(stream.get_next(&stream, &retained) == 0);
+	REQUIRE(retained.release);
+	auto next = con.Query("SELECT release_old_media_stream(i) FROM range(1) t(i)");
+	REQUIRE_FALSE(next->HasError());
+	CHECK(released);
+	CHECK(next->GetValue(0, 0) == Value::BIGINT(42));
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(static_cast<const int64_t *>(retained.children[0]->buffers[1])[0] == 0);
+	retained.release(&retained);
+	REQUIRE_NO_FAIL(con.Query("SELECT 43"));
+}
 
 TEST_CASE("Media flow receipt does not revoke retained physical storage", "[media-resource][media-flow]") {
 	MediaFlowWindow window(12);

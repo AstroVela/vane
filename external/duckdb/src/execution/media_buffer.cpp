@@ -34,14 +34,14 @@ private:
 
 idx_t AddInputBytes(idx_t left, idx_t right) {
 	if (right > std::numeric_limits<idx_t>::max() - left) {
-		throw OutOfMemoryException("Native media UDF input payload size overflow");
+		throw OutOfMemoryException("Native media receiver payload size overflow");
 	}
 	return left + right;
 }
 
 idx_t MultiplyInputBytes(idx_t count, idx_t width) {
 	if (width && count > std::numeric_limits<idx_t>::max() / width) {
-		throw OutOfMemoryException("Native media UDF input payload size overflow");
+		throw OutOfMemoryException("Native media receiver payload size overflow");
 	}
 	return count * width;
 }
@@ -59,7 +59,7 @@ idx_t MediaFlowVectorInputBytes(const Vector &vector, idx_t rows) {
 	}
 	if (physical == PhysicalType::LIST) {
 		throw NotImplementedException("Native media flow receiver does not support variable-sized nested input; "
-		                              "cast images to IMAGE(mode, height, width) before the UDF");
+		                              "cast images to IMAGE(mode, height, width) before the receiver");
 	}
 	if (physical == PhysicalType::STRUCT) {
 		idx_t bytes = 0;
@@ -128,5 +128,41 @@ idx_t EstimateMediaFlowInputBytes(const DataChunk &chunk) {
 		bytes = AddInputBytes(bytes, MediaFlowVectorInputBytes(column, chunk.size()));
 	}
 	return bytes;
+}
+
+idx_t EstimateMediaFlowInputBytes(const DataChunk &chunk, idx_t offset, idx_t rows) {
+	D_ASSERT(offset <= chunk.size() && rows <= chunk.size() - offset);
+	if (!rows) {
+		return 0;
+	}
+	if (!offset && rows == chunk.size()) {
+		return EstimateMediaFlowInputBytes(chunk);
+	}
+	DataChunk slice;
+	slice.InitializeEmpty(chunk.GetTypes());
+	slice.SetCapacity(chunk);
+	SelectionVector selection(rows);
+	for (idx_t row = 0; row < rows; row++) {
+		selection.set_index(row, offset + row);
+	}
+	slice.Slice(chunk, selection, rows);
+	return EstimateMediaFlowInputBytes(slice);
+}
+
+idx_t MediaFlowRowsWithinByteLimit(const DataChunk &chunk, idx_t offset, idx_t rows, idx_t bytes) {
+	if (EstimateMediaFlowInputBytes(chunk, offset, rows) <= bytes) {
+		return rows;
+	}
+	idx_t lower = 0;
+	idx_t upper = rows;
+	while (lower < upper) {
+		auto middle = lower + (upper - lower + 1) / 2;
+		if (EstimateMediaFlowInputBytes(chunk, offset, middle) <= bytes) {
+			lower = middle;
+		} else {
+			upper = middle - 1;
+		}
+	}
+	return lower;
 }
 } // namespace duckdb

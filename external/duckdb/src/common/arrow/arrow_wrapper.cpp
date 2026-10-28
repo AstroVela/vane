@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/arrow_util.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -177,7 +183,12 @@ ResultArrowArrayStreamWrapper::ResultArrowArrayStreamWrapper(unique_ptr<QueryRes
 	if (batch_size_p == 0) {
 		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
 	}
-	batch_size = batch_size_p;
+	// A preferred row count must not prefetch an entire media scan before
+	// downstream result-delivery admission. Each row already fits the bounded
+	// receiver; packing several rows by bytes is a separate optimization.
+	batch_size = result->type == QueryResultType::STREAM_RESULT && result->Cast<StreamQueryResult>().IsMediaFlowResult()
+	                 ? idx_t(1)
+	                 : batch_size_p;
 	//! We initialize the stream functions
 	stream.get_schema = ResultArrowArrayStreamWrapper::MyStreamGetSchema;
 	stream.get_next = ResultArrowArrayStreamWrapper::MyStreamGetNext;

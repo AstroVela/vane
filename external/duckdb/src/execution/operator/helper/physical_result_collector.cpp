@@ -32,6 +32,13 @@ unique_ptr<PhysicalOperator> PhysicalResultCollector::GetResultCollector(ClientC
                                                                          PreparedStatementData &data) {
 	auto &physical_plan = *data.physical_plan;
 	auto &root = physical_plan.Root();
+	if (data.output_type == QueryResultOutputType::ALLOW_STREAMING &&
+	    PhysicalPlanGenerator::HasNativeMediaFlow(context, root)) {
+		// Ordered partitions need their own minimum-progress reservation before
+		// they can use the batched collector. Preserve order on one worker here.
+		const bool parallel = !PhysicalPlanGenerator::PreserveInsertionOrder(context, root);
+		return make_uniq<PhysicalBufferedCollector>(physical_plan, data, parallel, true);
+	}
 
 	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, root)) {
 		// Not an order-preserving plan: use the parallel materialized collector.

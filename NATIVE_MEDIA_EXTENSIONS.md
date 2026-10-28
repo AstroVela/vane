@@ -250,8 +250,9 @@ The scan reserves production credit before reading and allocating each batch;
 both limits can reduce the batch size, and an impossible single frame fails
 without waiting.
 
-This window currently supports a linear native video scan through projections,
-filters and streaming LIMIT into a streaming UDF. Its C++ ingress queue reserves
+This window supports a linear native video scan through projections,
+filters and streaming LIMIT into a streaming UDF or an explicit streaming result
+(`relation.execute_result(stream=True)`). The UDF's C++ ingress queue reserves
 `task_input_max_bytes` payload capacity before copying, commits the independent
 copy, then acknowledges the producer outside its lock. A rejected or failed
 copy retains the producer credit. An accepted but blocked sink acknowledges
@@ -265,8 +266,28 @@ collections and non-primitive arrays require a later copy-capacity contract.
 A source batch larger than the UDF ingress capacity raises a resource error;
 reduce the producer window/batch or increase `task_input_max_bytes`.
 
-With this window enabled, direct result collection and materialization before
-the UDF (including sorting and aggregation) raise a clear unsupported-path error.
+The streaming result queue reserves `streaming_buffer_size` payload bytes before
+copying, including every selected column. It splits input batches using actual
+row payloads, retains its input offset on a blocked retry, and acknowledges the
+producer after every row in the input has committed. A single row larger than
+the receiving capacity raises a resource error. Ordered media result paths use
+one pipeline worker; unordered paths can run in parallel. Arrow exports currently
+deliver one row per batch even when a larger preferred batch is requested, so
+the reader cannot prefetch an entire video before result-delivery admission.
+
+Taking a result chunk transfers its copy to the caller and returns queue capacity.
+Retained chunks, slices and Arrow buffers stay valid through later reads, stream
+close, and connection/database destruction. Receiving copies use the
+process-lifetime default allocator. Managed
+result delivery retains its existing byte accounting; arbitrary caller-retained
+results are outside this C++ queue limit. Closing a media stream retires its
+blocked native scan without waiting for those returned buffers to die.
+Query retirement also closes its receiver, so an old Arrow stream can be
+released inside a newer query callback without reacquiring that query's context
+lock or cancelling its execution.
+
+With this window enabled, materialized results and materialization before
+the UDF (including sorting and aggregation) still raise an unsupported-path error.
 Their materialization/spill budget handoff is a separate increment. Scan cleanup
 cancels flow waiters and returns production credits even if detached views
 remain alive; physical pixel reservations on those views remain valid. The

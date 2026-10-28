@@ -217,6 +217,161 @@ con.close()
 
 
 @pytest.mark.parametrize("window_bytes", ["144", "288"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_native_video_flow_streaming_result_handoff(video_path, window_bytes, ordered):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    script = r"""
+import faulthandler
+import gc
+import sys
+import time
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.result_delivery import ResultDeliveryLimits
+
+faulthandler.dump_traceback_later(60, exit=True)
+artifact, path, ordered = sys.argv[1:]
+file_count = 1 if ordered == 'true' else 3
+expected_frames = list(range(12)) * file_count
+
+def configure(connection, receiving_bytes):
+    if artifact:
+        connection.load_extension(artifact)
+    else:
+        vane.load_installed_extension('native_media', connection=connection)
+    connection.execute("SET video_backend='native'")
+    connection.execute('SET threads=4')
+    connection.execute('SET preserve_insertion_order=' + ordered)
+    # Pixel bytes and receiving payload bytes are separate capacities. Each
+    # selected row has 8 index bytes plus 144 fixed-image bytes.
+    connection.execute("SET streaming_buffer_size='" + str(receiving_bytes) + "B'")
+
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    configure(con, 512)
+    runtime = con.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(1, 1),
+        result_limit=ResultDeliveryLimits(2, 1048576),
+    )
+
+    def frames(connection=con):
+        return vane.read_video_frames([path] * file_count, 6, 8, connection=connection,
+                                      read_task_count=file_count,
+                                      max_partition_bytes=2048).project('frame_index, data')
+
+    def pixels(batch):
+        column = batch['data']
+        array = column.combine_chunks() if hasattr(column, 'combine_chunks') else column
+        return array.storage.to_pylist()
+
+    def collect(relation):
+        result = relation.execute_result(stream=True, rows_per_batch=1000000)
+        values = []
+        retained = []
+        try:
+            while True:
+                try:
+                    batch = result.take()
+                except StopIteration:
+                    break
+                # A large preferred Arrow batch cannot prefetch the full scan.
+                assert batch.num_rows == 1, batch.num_rows
+                values.extend(batch['frame_index'].to_pylist())
+                retained.append(batch)
+        finally:
+            result.close()
+        return values, retained
+
+    stream = frames().execute_result(stream=True, rows_per_batch=1000000)
+    first = stream.take()
+    assert first.num_rows == 1
+    first_index = first['frame_index'].to_pylist()[0]
+    assert 0 <= first_index < 12
+    if ordered == 'true':
+        assert first_index == 0
+    saved = pixels(first)
+    time.sleep(0.1)  # Leave the real decoder behind a non-consuming receiver.
+    assert runtime.resource_snapshot()['request_admission']['active_requests'] == 1
+    stream.close()
+    assert runtime.resource_snapshot()['request_admission']['active_requests'] == 0
+    assert pixels(first) == saved
+
+    values, retained = collect(frames().filter('frame_index % 2 = 0'))
+    assert sorted(values) == sorted(list(range(0, 12, 2)) * file_count)
+    values, limited = collect(frames().filter('frame_index % 2 = 0').limit(3))
+    if ordered == 'true':
+        assert values == [0, 2, 4], values
+    else:
+        assert len(values) == 3 and all(value % 2 == 0 for value in values), values
+    values, repeated = collect(frames())
+    assert sorted(values) == sorted(expected_frames)
+    assert pixels(first) == saved
+    filtered_pixels = {batch['frame_index'].to_pylist()[0]: pixels(batch) for batch in retained}
+    for batch in repeated:
+        index = batch['frame_index'].to_pylist()[0]
+        if index in filtered_pixels:
+            assert pixels(batch) == filtered_pixels[index]
+
+    # A failure after some accepted frames must retire the source and leave
+    # the same connection usable while earlier Arrow buffers remain alive.
+    bad = frames().project("CAST('bad' || frame_index::VARCHAR AS BIGINT) AS frame_index, data")
+    try:
+        collect(bad)
+    except vane.Error:
+        pass
+    else:
+        raise AssertionError('expected a conversion failure')
+    assert runtime.resource_snapshot()['request_admission']['active_requests'] == 0
+    assert con.execute('SELECT 42').fetchall() == [(42,)]
+    assert pixels(first) == saved
+
+    # An indivisible row is a permanent resource failure, not an empty-queue
+    # oversize escape or a wait that needs EOF to become ready.
+    # Configured local runtimes accept read-only queries. Configure the small
+    # receiving queue before attaching its independent runtime.
+    with (vane.connect() if not artifact else
+          vane.connect(config={'allow_unsigned_extensions': 'true'})) as small:
+        configure(small, 151)
+        small_runtime = small.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            result_limit=ResultDeliveryLimits(2, 1048576),
+        )
+        try:
+            collect(frames(small))
+        except vane.OutOfMemoryException as error:
+            assert 'streaming_buffer_size receiving capacity' in str(error), str(error)
+        else:
+            raise AssertionError('an impossible receiving row must fail')
+        assert small_runtime.resource_snapshot()['request_admission']['active_requests'] == 0
+    values, final = collect(frames())
+    assert sorted(values) == sorted(expected_frames)
+    assert pixels(first) == saved
+    del first, retained, limited, repeated, final, batch
+    gc.collect()
+    assert runtime.resource_snapshot()['request_admission']['active_requests'] == 0
+    delivery = runtime.resource_snapshot()['result_delivery']
+    assert delivery['active_results'] == delivery['usage_bytes'] == 0, delivery
+faulthandler.cancel_dump_traceback_later()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(ordered).lower()],
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+            "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "288",
+            "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 def test_native_video_flow_window_to_slow_udf(video_path, tmp_path, window_bytes, backend):
     providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"

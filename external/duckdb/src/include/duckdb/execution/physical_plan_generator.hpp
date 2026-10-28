@@ -126,6 +126,8 @@ public:
 	static bool UseBatchIndex(ClientContext &context, PhysicalOperator &plan);
 	//! Whether or not we should preserve insertion order for executing the given sink
 	static bool PreserveInsertionOrder(ClientContext &context, PhysicalOperator &plan);
+	//! Enabled native scan with only row-preserving flow-aware intermediates.
+	static bool HasNativeMediaFlow(ClientContext &context, const PhysicalOperator &plan);
 	//! The order preservation type of the given operator decided by recursively looking at its children
 	static OrderPreservationType OrderPreservationRecursive(PhysicalOperator &op);
 

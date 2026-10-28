@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
@@ -76,7 +82,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalLimit &op) {
 		}
 
 		// maintaining insertion order is important
-		if (UseBatchIndex(plan) && UseBatchLimit(plan, op.limit_val, op.offset_val)) {
+		if (UseBatchIndex(plan) && UseBatchLimit(plan, op.limit_val, op.offset_val) &&
+		    !HasNativeMediaFlow(context, plan)) {
 			// source supports batch index: use parallel batch limit
 			auto &limit = Make<PhysicalLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
 			                                  op.estimated_cardinality);
