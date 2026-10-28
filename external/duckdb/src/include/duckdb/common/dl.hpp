@@ -27,7 +27,7 @@ inline void *dlopen(const char *file, int mode) {
 	if (!file) {
 		return (void *)GetModuleHandle(nullptr);
 	}
-	auto fpath = WindowsUtil::UTF8ToUnicode(file);
+	auto fpath = WindowsUtil::UTF8ToUnicodePath(file);
 	return (void *)LoadLibraryW(fpath.c_str());
 }
 
@@ -58,7 +58,7 @@ inline std::string GetDLError(void) {
 //! default DLL search policy or the behavior of unrelated extensions.
 inline void *dlopen_with_runtime(const char *file, int mode) {
 #ifdef _WIN32
-	auto path = WindowsUtil::UTF8ToUnicode(file);
+	auto path = WindowsUtil::UTF8ToUnicodePath(file);
 	auto required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
 	if (!required) {
 		return nullptr;

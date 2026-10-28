@@ -89,15 +89,42 @@ def owned_process_tree(root: psutil.Process) -> list[psutil.Process]:
 
 
 def stop_processes(root: psutil.Process, known: set[psutil.Process]) -> None:
-    processes = known | set(owned_process_tree(root))
-    # Stop the launcher before its workers can schedule more work. Process
-    # objects verify creation times before kill(), protecting against PID reuse.
-    for process in [root, *(processes - {root})]:
+    deadline = time.monotonic() + 5
+    while True:
+        known.update(owned_processes(root))
+        alive = []
+        # Kill the launcher before its workers can schedule more work. Keep its
+        # zombie unreaped until cleanup finishes, reserving the session ID and
+        # leaving Popen.wait() responsible for the command's actual exit code.
+        for process in [root, *(known - {root})]:
+            try:
+                if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    alive.append(process)
+                    process.kill()
+            except psutil.NoSuchProcess:
+                pass
+        if not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("memory guard still has live command processes")
+        time.sleep(0.01)
+
+
+def owned_processes(root: psutil.Process) -> list[psutil.Process]:
+    processes = set(owned_process_tree(root))
+    if os.name == "nt" or not root.is_running():
+        return list(processes)
+    # POSIX commands own a new session. Its membership survives reparenting
+    # and shell job-control process groups, unlike a sampled parent/child tree.
+    # The leader is not reaped until cleanup, so this session cannot be reused.
+    created = root.create_time()
+    for process in psutil.process_iter():
         try:
-            process.kill()
-        except psutil.NoSuchProcess:
-            pass
-    psutil.wait_procs(list(processes | {root}), timeout=5)
+            if process.create_time() >= created and os.getsid(process.pid) == root.pid and process.is_running():
+                processes.add(process)
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return list(processes)
 
 
 def main() -> int:
@@ -125,6 +152,7 @@ def main() -> int:
     reason = None
     code = 1
     child = None
+    root = None
     job = None
     ready_directory = None
     known: set[psutil.Process] = set()
@@ -148,14 +176,20 @@ def main() -> int:
             job = windows_job(child.pid)
             ready.touch()
         else:
-            child = subprocess.Popen(command)
+            child = subprocess.Popen(command, start_new_session=True)
         try:
             root = psutil.Process(child.pid)
         except psutil.NoSuchProcess:
             code = child.wait()
             return code
-        while child.poll() is None:
-            processes = job_processes(job) if job is not None else owned_process_tree(root)
+        while True:
+            if os.name == "nt":
+                if child.poll() is not None:
+                    break
+            elif root.status() == psutil.STATUS_ZOMBIE:
+                # Popen.poll() would reap the POSIX session leader too early.
+                break
+            processes = job_processes(job) if job is not None else owned_processes(root)
             known.update(processes)
             known = {process for process in known if process.is_running()}
             for process in known:
@@ -183,22 +217,23 @@ def main() -> int:
                 reason, code = "guard interrupted", 130
             if reason is not None:
                 print(f"Memory guard stopped command: {reason}", file=sys.stderr, flush=True)
-                if job is not None:
-                    job.close(timeout=5)
-                else:
-                    stop_processes(root, known)
                 break
             interrupted.wait(0.25)
-        child_code = child.wait()
-        if reason is None:
-            code = child_code
     finally:
         if job is not None:
             job.close(timeout=5)
-        elif child is not None and child.poll() is None:
-            stop_processes(psutil.Process(child.pid), known)
+        elif child is not None:
+            if root is None:
+                try:
+                    root = psutil.Process(child.pid)
+                except psutil.NoSuchProcess:
+                    pass
+            if root is not None:
+                stop_processes(root, known)
         if child is not None:
-            child.wait()
+            child_code = child.wait()
+            if reason is None:
+                code = child_code
         if ready_directory is not None:
             ready_directory.cleanup()
         args.report.write_text(

@@ -20,15 +20,16 @@ if(ENABLE_UNITTEST_CPP_TESTS AND EXTENSION_STATIC_BUILD)
     ${PARAMETERS}
     loadable_extension_batch_demo.cpp)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(loadable_extension_batch_demo_loadable_extension PRIVATE
-                        -Wl,-Bsymbolic -Wl,-z,defs)
+    target_link_options(loadable_extension_batch_demo_loadable_extension
+                        PRIVATE -Wl,-Bsymbolic -Wl,-z,defs)
   elseif(APPLE)
-    # Mach-O's two-level namespace already keeps the private engine local.
-    # The extension builder exports only its entry point unless asked for the
-    # two additional test factories used by the native adapter regression.
-    target_link_options(loadable_extension_batch_demo_loadable_extension PRIVATE
-                        -Wl,-exported_symbol,_batch_demo_has_private_reader
-                        -Wl,-exported_symbol,_batch_demo_make_operator)
+    # Mach-O's two-level namespace already keeps the private engine local. The
+    # extension builder exports only its entry point unless asked for the two
+    # additional test factories used by the native adapter regression.
+    target_link_options(
+      loadable_extension_batch_demo_loadable_extension PRIVATE
+      -Wl,-exported_symbol,_batch_demo_has_private_reader
+      -Wl,-exported_symbol,_batch_demo_make_operator)
   endif()
   target_compile_definitions(
     test_execution

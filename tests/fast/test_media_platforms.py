@@ -15,6 +15,7 @@ from packaging.tags import sys_tags
 
 import vane
 from tests.fast.test_extension_wheel import _synthetic_macho, _synthetic_pe
+from vane._native_runtime_format import filesystem_path
 from vane_packaging import extension_wheel as binary
 from vane_packaging import media_binary
 from vane_packaging.media_binary import relocate_non_elf
@@ -117,7 +118,8 @@ def test_native_media_macos_bundling_does_not_allow_foreign_dependency_paths(dep
 
 
 @pytest.mark.skipif(sys.platform not in {"win32", "darwin"}, reason="native Mach-O/PE loader regression")
-def test_namespaced_media_libraries_load_after_relocation(tmp_path):
+@pytest.mark.parametrize("long_path", [False, True])
+def test_namespaced_media_libraries_load_after_relocation(tmp_path, long_path):
     if shutil.which("cmake") is None:
         pytest.skip("requires CMake and a native C compiler")
     if sys.platform == "win32":
@@ -164,10 +166,18 @@ def test_namespaced_media_libraries_load_after_relocation(tmp_path):
     relocate_non_elf(extension, mapping, platform)
     shutil.rmtree(prefix)
     shutil.rmtree(build)
+    if long_path:
+        directory = tmp_path
+        while len(str(directory)) < 280:
+            directory /= "long-media-path-component"
+        filesystem_path(directory).mkdir(parents=True)
+        relocated.rename(filesystem_path(directory / relocated.name))
+        relocated = directory / relocated.name
+        extension = relocated / extension.name
     if sys.platform == "win32":
         with pytest.raises(OSError):
             ctypes.CDLL(str(extension), winmode=0)
     assert vane.ray_cxx.load_media_probe_for_test(str(extension)) == 42
     consumer = mapping[consumer_name]
-    library = ctypes.CDLL(str(relocated / ".libs" / consumer))
+    library = ctypes.CDLL(str(filesystem_path(relocated / ".libs" / consumer)))
     assert library.media_decode() == 42

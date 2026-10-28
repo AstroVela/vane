@@ -10,8 +10,18 @@ import json
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from xml.etree.ElementTree import Element, SubElement, tostring
+
+
+class GravitinoHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves a reverse hostname here, which can block on the
+        # macOS runner's resolver. This fixture only serves numeric loopback
+        # addresses and does not need a DNS name to announce its ready port.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
 
 
 def serve_gravitino(state, ready):
@@ -346,7 +356,7 @@ def serve_gravitino(state, ready):
 
         do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = handle_request
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = GravitinoHTTPServer(("127.0.0.1", 0), Handler)
     ready.send(server.server_port)
     ready.close()
     try:

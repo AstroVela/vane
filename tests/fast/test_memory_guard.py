@@ -116,13 +116,17 @@ def test_memory_guard_rejects_reused_ancestor_pid():
     assert module.owned_process_tree(root) == [root, child]
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows jobs retain orphaned descendants")
 @pytest.mark.parametrize("failure", ["memory", "timeout"])
-def test_memory_guard_retains_children_after_their_parent_exits(tmp_path, failure):
+@pytest.mark.parametrize(
+    "separate_process_group",
+    [False, pytest.param(True, marks=pytest.mark.skipif(os.name == "nt", reason="POSIX process groups"))],
+)
+def test_memory_guard_retains_children_after_their_parent_exits(tmp_path, failure, separate_process_group):
     pid_file = tmp_path / "orphan.pid"
     worker = (
         "import os, time; from pathlib import Path; "
-        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        + ("os.setpgid(0, 0); " if separate_process_group else "")
+        + f"Path({str(pid_file)!r}).write_text(str(os.getpid())); "
         "time.sleep(0.75); " + ("data = bytearray(128 * 1024**2); " if failure == "memory" else "") + "time.sleep(60)"
     )
     middle = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {worker!r}])"
@@ -142,7 +146,6 @@ def test_memory_guard_retains_children_after_their_parent_exits(tmp_path, failur
         unrelated.wait(timeout=5)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows command bootstrap")
 def test_memory_guard_preserves_stdin_and_virtual_environment(tmp_path):
     report = tmp_path / "memory.json"
     script = "import os, sys; print(sys.prefix); print(sys.stdin.read()); print(os.environ['VANE_GUARD_TEST'])"
@@ -166,3 +169,23 @@ def test_memory_guard_preserves_stdin_and_virtual_environment(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [sys.prefix, "stdin remains available", "inherited"]
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_memory_guard_cleans_orphans_after_the_command_exits(tmp_path, code):
+    pid_file = tmp_path / "orphan.pid"
+    worker = (
+        "import os, time; from pathlib import Path; "
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    script = (
+        "import subprocess, sys, time; from pathlib import Path; "
+        f"subprocess.Popen([sys.executable, '-c', {worker!r}]); "
+        f"path = Path({str(pid_file)!r})\n"
+        "while not path.is_file(): time.sleep(0.01)\n"
+        f"sys.exit({code})"
+    )
+    result, report = _run_guard(tmp_path, script)
+    assert result.returncode == report["exit_code"] == code
+    assert report["stopped_reason"] is None
+    assert not _active_process(int(pid_file.read_text()))

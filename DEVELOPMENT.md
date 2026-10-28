@@ -177,6 +177,12 @@ The Windows guard assigns the command to a Job Object before it starts work,
 retaining ownership when an intermediate Git Bash process exits. Its process
 list includes nested worker jobs; the guard never changes CPU or process-count
 limits.
+POSIX commands start in an owned session, so the guard also tracks descendants
+after an intermediate launcher exits or creates a separate process group.
+The session leader remains unreaped until cleanup completes. Successful commands
+also release their remaining descendants before the guard returns their exit code.
+Linux Python 3.12 has the same six-hour job budget as macOS and Windows, including
+the additional native/provider gates; individual step deadlines stay bounded.
 
 Windows CI installs into a short virtual-environment path, `build/py`, so the
 namespaced codec DLLs in media provider wheels also install with the default
@@ -190,6 +196,8 @@ Windows local shuffle storage uses bounded, case-safe node names and Win32
 extended paths for filesystem and Arrow I/O beyond `MAX_PATH`; it does not
 require changing the machine's `LongPathsEnabled` registry setting. Object-store
 keys retain the same layout across platforms.
+Both ordinary extension loads and media runtime loads apply this path conversion,
+including verified cache paths beneath a long user temporary directory.
 
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below

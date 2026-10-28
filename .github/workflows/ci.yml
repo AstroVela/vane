@@ -122,6 +122,9 @@ jobs:
     with:
       runner: ubuntu-24.04
       python-version: ${{ matrix.python-version }}
+      # Python 3.12 also builds native tests and qualifies signed providers,
+      # VaneFS and wheel coexistence before the three isolated release phases.
+      timeout-minutes: ${{ matrix.python-version == '3.12' && 360 || 180 }}
     secrets: inherit
 
   native-macos:
