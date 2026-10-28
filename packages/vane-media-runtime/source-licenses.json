@@ -302,5 +302,16 @@
       "vorbis-1.3.7/debian/copyright": "1f6c6b6397d86d20968d7856d6945591b89e4cb64e5fc1ec8b992811f6a65ed8"
     },
     "sha512": "bfb6f5dbfd49ed38b2b08b3667c06d02e68f649068a050f21a3cc7e1e56b27afd546aaa3199c4f6448f03f6e66a82f9a9dc2241c826d3d1d4acbd38339b9e9fb"
+  },
+  "yasm-yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823.tar.gz": {
+    "license": "BSD-2-Clause AND BSD-3-Clause AND (Artistic-1.0 OR GPL-2.0-only OR LGPL-2.0-only)",
+    "notices": {
+      "yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823/Artistic.txt": "b7fd9b73ea99602016a326e0b62e6646060d18febdd065ceca8bb482208c3d88",
+      "yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823/BSD.txt": "a84b45f23040624681ca6974ff48d8ef6b477a1cb51e4a1c842e49d00c231e0d",
+      "yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823/COPYING": "795f8d76eade6130129b680ac72ea81cb3e143467a65ea1f5f64946151d7fa20",
+      "yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823/GNU_GPL-2.0": "e6d6a009505e345fe949e1310334fcb0747f28dae2856759de102ab66b722cb4",
+      "yasm-009450c7ad4d425fa5a10ac4bd6efbd25248d823/GNU_LGPL-2.0": "1faefae1fe8838a2e48864df7d1376e421a50c551c5ae2f60c9f2093206e18a9"
+    },
+    "sha512": "a542577558676d11b52981925ea6219bffe699faa1682c033b33b7534f5a0dfe9f29c56b32076b68c48f65e0aef7c451be3a3af804c52caa4d4357de4caad83c"
   }
 }

@@ -160,14 +160,24 @@ parent remaps a grown result before handling cancellation; a reused worker's
 next small result must not be read from the old, unlinked mapping. Linux keeps
 its in-place growth and Windows keeps its named-mapping handoff.
 
-The macOS and Windows CI jobs also build and install the Vane Python wheel,
-then run the non-Ray, shared-Ray and owner-Ray release phases in separate
-processes. `scripts/run_with_memory_guard.py` preserves build concurrency,
+The native CI jobs share `.github/workflows/native-python.yml`. macOS arm64
+and Windows x64 use Python 3.12 and the same test steps as Linux Python 3.12:
+native unit tests, signed extension callbacks and wheel verification,
+Gravitino, dynamic native media and replacement runtimes, VaneFS, Quickstart,
+the three release phases, and coexistence with the official DuckDB package.
+The remaining Linux Python versions and Linux fast-test shards are unchanged.
+`scripts/run_ci_step.py` runs each build/test step through
+`scripts/run_with_memory_guard.py`, which preserves build concurrency,
 stops only its owned process tree on a memory limit or deadline, and records
 usage in a JSON report. The per-process limit is 4 GiB (Windows private bytes,
 POSIX resident bytes). Windows reserves 4 GiB of available physical memory;
-the smaller macOS runner reserves 1.5 GiB. The local Windows build retains
+the Linux and macOS runners reserve 1.5 GiB. The local Windows build retains
 default MSBuild `/m` concurrency and its 4 GiB physical-memory reserve.
+
+Windows local shuffle storage uses bounded, case-safe node names and Win32
+extended paths for filesystem and Arrow I/O beyond `MAX_PATH`; it does not
+require changing the machine's `LongPathsEnabled` registry setting. Object-store
+keys retain the same layout across platforms.
 
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
@@ -527,9 +537,8 @@ scripts/run_native_tests.sh "test name" -s
 scripts/run_native_tests.sh
 ```
 
-The build uses two parallel compile jobs by default to stay within standard CI
-runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
-machine has more capacity.
+The build uses the selected generator's default parallelism. Set
+`VANE_NATIVE_BUILD_JOBS` to request an explicit worker count when needed.
 
 The launcher uses Ninja's single Release configuration by default. Windows CI
 disables Git's automatic CRLF conversion before checkout so source-license

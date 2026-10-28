@@ -1559,13 +1559,27 @@ def _core_metadata_lines(contents: bytes) -> Iterable[bytes]:
         yield contents[line_start:]
 
 
+def _bundled_library_names(libraries: Iterable[str]) -> frozenset[str]:
+    names = frozenset(libraries)
+    if len(names) > 128 or any(
+        not isinstance(name, str) or name in {".", ".."} or re.fullmatch(r"[A-Za-z0-9_+.-]{1,255}", name) is None
+        for name in names
+    ):
+        raise ValueError("bundled libraries require bounded, plain filenames")
+    return names
+
+
 def _runtime_linkage_options(libraries):
     if libraries is None:
         return {}
     from vane_packaging.media_runtime import exported_versions
 
     return {
-        "bundled_versions": {name: exported_versions(contents) for name, contents in libraries.items()},
+        "bundled_versions": {
+            name: exported_versions(contents) if contents.startswith(_ELF_MAGIC) else frozenset()
+            for name, contents in libraries.items()
+        },
+        "bundled_libraries": frozenset(libraries),
         "allowed_runpath": "$ORIGIN/.libs",
     }
 
@@ -1579,6 +1593,7 @@ def _validate_native_binary_platform(
     interpreter_tag: str,
     bundled_versions: dict[str, frozenset[str]] | None = None,
     allowed_runpath: str | None = None,
+    bundled_libraries: Iterable[str] = (),
 ) -> None:
     if platform_build_details.platform_tag != platform_tag:
         raise ValueError(
@@ -1597,13 +1612,16 @@ def _validate_native_binary_platform(
             allowed_runpath=allowed_runpath,
         )
     elif policy.family == "macosx":
-        _validate_macos_binary_platform(contents, platform_tag, description=description)
+        _validate_macos_binary_platform(
+            contents, platform_tag, description=description, bundled_libraries=bundled_libraries
+        )
     elif policy.family == "windows":
         _validate_windows_pe_platform(
             contents,
             platform_tag,
             description=description,
             interpreter_tag=interpreter_tag,
+            bundled_libraries=bundled_libraries,
         )
 
 
@@ -1613,6 +1631,7 @@ def _validate_windows_pe_platform(
     *,
     description: str,
     interpreter_tag: str,
+    bundled_libraries: Iterable[str] = (),
 ) -> tuple[str, ...]:
     policy = _wheel_platform_policy(platform_tag)
     if policy.family != "windows":
@@ -1742,7 +1761,9 @@ def _validate_windows_pe_platform(
         description=description,
     )
     dependencies = tuple(dict.fromkeys((*imports, *delay_imports)))
-    allowed_libraries = _windows_policy_external_libraries(interpreter_tag)
+    allowed_libraries = _windows_policy_external_libraries(interpreter_tag) | frozenset(
+        name.casefold() for name in _bundled_library_names(bundled_libraries)
+    )
     unsupported_libraries = tuple(sorted(set(dependencies).difference(allowed_libraries)))
     if unsupported_libraries:
         raise ValueError(f"{description} requires non-policy Windows DLLs: {unsupported_libraries}")
@@ -2690,6 +2711,7 @@ def _validate_macos_binary_platform(
     platform_tag: str,
     *,
     description: str,
+    bundled_libraries: Iterable[str] = (),
 ) -> tuple[int, int, int]:
     policy = _wheel_platform_policy(platform_tag)
     if policy.family != "macosx":
@@ -2786,8 +2808,14 @@ def _validate_macos_binary_platform(
         raise ValueError(f"{description} Mach-O load-command sizes do not match their declared total")
     if len(set(dynamic_library_dependencies)) != len(dynamic_library_dependencies):
         raise ValueError(f"{description} contains duplicate Mach-O dynamic-library dependencies")
+    bundled_names = _bundled_library_names(bundled_libraries)
+    bundled_paths = {f"{prefix}/{name}" for prefix in ("@loader_path", "@loader_path/.libs") for name in bundled_names}
     non_system_dependencies = tuple(
-        sorted(path for path in dynamic_library_dependencies if not _is_macos_system_library_path(path))
+        sorted(
+            path
+            for path in dynamic_library_dependencies
+            if not _is_macos_system_library_path(path) and path not in bundled_paths
+        )
     )
     if non_system_dependencies:
         raise ValueError(f"{description} requires non-system Mach-O dynamic libraries: {non_system_dependencies}")
@@ -3683,7 +3711,11 @@ def _license_entries(
     entries: dict[str, bytes] = {}
     casefolded_paths: dict[str, str] = {}
     for license_file in license_files:
-        path = Path(license_file).expanduser().resolve(strict=True)
+        path = Path(license_file).expanduser()
+        # Reject invalid archive basenames before touching the filesystem;
+        # Windows cannot even create some names that other hosts can reject.
+        _license_member_path(Path(path.name), windows_paths=windows_paths)
+        path = path.resolve(strict=True)
         if not path.is_file():
             raise ValueError(f"license file is not a regular file: {path}")
         relative_path = _license_member_path(path, windows_paths=windows_paths)

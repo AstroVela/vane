@@ -56,9 +56,9 @@ function(vane_build_native_media_extension)
                  PATHS "${boost_multiprecision_DIR}")
     include_directories("${VANE_MEDIA_RUNTIME_SDK}/include")
     foreach(library avformat avcodec avutil swscale swresample sndfile soxr tiff jpeg z webp webpdemux)
-      set(names "${library}")
+      set(names "${library}" "lib${library}")
       if(WIN32 AND library STREQUAL "z")
-        set(names zlib)
+        set(names z zlib)
       endif()
       unset(shared_library)
       unset(shared_library CACHE)
@@ -87,9 +87,10 @@ function(vane_build_native_media_extension)
     set_property(TARGET native_media_loadable_extension PROPERTY
                  VANE_LOADABLE_RUNTIME_DIRECTORY "${VANE_MEDIA_RUNTIME_DIRECTORY}/.libs")
     get_filename_component(vane_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../.." ABSOLUTE)
-    set_property(TARGET native_media_loadable_extension APPEND PROPERTY LINK_DEPENDS
+    set(runtime_link_dependencies
                  "${VANE_MEDIA_RUNTIME_DIRECTORY}/runtime-manifest.json"
                  "${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                 "${vane_root}/cmake/prepare_dynamic_media_extension.cmake"
                  "${vane_root}/vane/_native_runtime_format.py"
                  "${vane_root}/vane_packaging/media_runtime.py"
                  "${vane_root}/vane_packaging/media_binary.py"
@@ -99,10 +100,31 @@ function(vane_build_native_media_extension)
                  "${vane_root}/vane_packaging/extension_materials.py"
                  "${vane_root}/vane_packaging/manylinux_policy.py"
                  "${vane_root}/vane_packaging/_vendor/auditwheel/manylinux-policy.json")
-    add_custom_command(TARGET native_media_loadable_extension POST_BUILD
-      COMMAND "${Python3_EXECUTABLE}" "${vane_root}/scripts/prepare_dynamic_media_extension.py"
-              --artifact "$<TARGET_FILE:native_media_loadable_extension>"
-              --runtime "${VANE_MEDIA_RUNTIME_DIRECTORY}"
+    set_property(TARGET native_media_loadable_extension APPEND PROPERTY LINK_DEPENDS ${runtime_link_dependencies})
+    # Visual Studio does not implement LINK_DEPENDS. A generated translation
+    # unit makes SDK/relocator changes trigger one relink on every generator.
+    set(runtime_stamp "${CMAKE_CURRENT_BINARY_DIR}/native_media_runtime_stamp.cpp")
+    add_custom_command(OUTPUT "${runtime_stamp}"
+      COMMAND "${CMAKE_COMMAND}" -E touch "${runtime_stamp}"
+      DEPENDS ${runtime_link_dependencies}
       VERBATIM)
+    target_sources(native_media_loadable_extension PRIVATE "${runtime_stamp}")
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+      add_custom_command(TARGET native_media_loadable_extension POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" "-DPYTHON=${Python3_EXECUTABLE}"
+                "-DPREPARE=${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                "-DARTIFACT=$<TARGET_FILE:native_media_loadable_extension>"
+                "-DRUNTIME=${VANE_MEDIA_RUNTIME_DIRECTORY}"
+                "-DSTAMP=${CMAKE_CURRENT_BINARY_DIR}/native_media_prepared_$<CONFIG>.stamp"
+                "-DINPUTS=$<TARGET_FILE:native_media_loadable_extension>;${runtime_link_dependencies}"
+                -P "${vane_root}/cmake/prepare_dynamic_media_extension.cmake"
+        VERBATIM)
+    else()
+      add_custom_command(TARGET native_media_loadable_extension POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                --artifact "$<TARGET_FILE:native_media_loadable_extension>"
+                --runtime "${VANE_MEDIA_RUNTIME_DIRECTORY}"
+        VERBATIM)
+    endif()
   endif()
 endfunction()

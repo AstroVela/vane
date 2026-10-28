@@ -17,7 +17,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from vane_packaging.extension_wheel import _parse_elf_dynamic_linkage, _validate_linux_elf_platform
+from vane_packaging.extension_wheel import (
+    _parse_elf_dynamic_linkage,
+    _validate_linux_elf_platform,
+    _validate_macos_binary_platform,
+    _validate_windows_pe_platform,
+)
+from vane_packaging.media_binary import macho_linkage, relocate_non_elf
 from vane_packaging.media_runtime import exported_versions, validate_library_graph
 
 
@@ -45,6 +51,34 @@ def prepare(artifact: Path, runtime: Path, patchelf: str = "patchelf") -> None:
     with tempfile.TemporaryDirectory(prefix="vane-media-relocate-", dir=artifact.parent) as temporary:
         target = Path(temporary) / artifact.name
         target.write_bytes(payload)
+        if manifest["platform"].startswith(("win_", "macosx_")):
+            mapping = {name[len(prefix) :]: name for name in libraries}
+            relocate_non_elf(target, mapping, manifest["platform"])
+            payload = target.read_bytes()
+            if manifest["platform"].startswith("win_"):
+                needed = _validate_windows_pe_platform(
+                    payload,
+                    manifest["platform"],
+                    description=artifact.name,
+                    interpreter_tag=f"cp{sys.version_info.major}{sys.version_info.minor}",
+                    bundled_libraries=libraries,
+                )
+            else:
+                _validate_macos_binary_platform(
+                    payload,
+                    manifest["platform"],
+                    description=artifact.name,
+                    bundled_libraries=libraries,
+                )
+                needed = tuple(Path(name).name for name in macho_linkage(payload)[1])
+            if not set(needed) & libraries.keys():
+                raise ValueError("media extension does not dynamically link the selected runtime")
+            target.write_bytes(
+                fmt.attach_trailer(payload + contents[-512:], fmt.reference(document)["manifest_sha256"])
+            )
+            shutil.copymode(artifact, target)
+            target.replace(artifact)
+            return
         arguments = [patchelf, "--set-rpath", "$ORIGIN/.libs"]
         for name in libraries:
             arguments.extend(("--replace-needed", name[len(prefix) :], name))

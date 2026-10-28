@@ -22,9 +22,7 @@ std::wstring WindowsUtil::UTF8ToUnicode(const char *input) {
 
 std::wstring WindowsUtil::UTF8ToUnicodePath(const char *input) {
 	auto path = UTF8ToUnicode(input);
-	// CreateDirectory reserves twelve characters below MAX_PATH. Explicit
-	// extended paths work without a machine-wide LongPathsEnabled setting.
-	if (path.size() < MAX_PATH - 12 || path.compare(0, 4, L"\\\\?\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0) {
+	if (!*input || path.compare(0, 4, L"\\\\?\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0) {
 		return path;
 	}
 	auto required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
@@ -42,6 +40,11 @@ std::wstring WindowsUtil::UTF8ToUnicodePath(const char *input) {
 			continue;
 		}
 		std::wstring absolute(buffer.data(), length);
+		// The limit applies to the absolute path, including the working
+		// directory. CreateDirectory also reserves twelve characters.
+		if (absolute.size() < MAX_PATH - 12) {
+			return path;
+		}
 		std::replace(absolute.begin(), absolute.end(), L'/', L'\\');
 		if (absolute.compare(0, 2, L"\\\\") == 0) {
 			return L"\\\\?\\UNC\\" + absolute.substr(2);

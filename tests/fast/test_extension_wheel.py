@@ -1263,7 +1263,10 @@ def test_platform_wheel_rejects_names_that_cannot_form_normalized_wheel_names(
 
 def test_platform_wheel_rejects_names_that_exceed_generated_component_limits(tmp_path, monkeypatch):
     extension_name = "a" * 191
-    artifact_path = _write_artifact(tmp_path / f"{extension_name}.duckdb_extension")
+    artifact_path = tmp_path / f"{extension_name}.duckdb_extension"
+    if sys.platform == "win32":
+        artifact_path = Path("\\\\?\\" + str(artifact_path))
+    artifact_path = _write_artifact(artifact_path)
 
     def create_descriptor(path, *, name, trust_identity, dependencies):
         return _descriptor(
@@ -1359,7 +1362,6 @@ def test_platform_wheel_rejects_an_invalid_license_expression(tmp_path):
 def test_platform_wheel_rejects_an_unsafe_license_file_path(tmp_path, synthetic_descriptor_factory):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
     license_path = tmp_path / "license\ninjected.txt"
-    license_path.write_text("license", encoding="utf-8")
 
     with pytest.raises(ValueError, match="safe ASCII relative path"):
         build_extension_wheel(
@@ -1390,6 +1392,7 @@ def test_platform_wheel_rejects_windows_unsafe_license_paths(member_name):
 def test_platform_wheel_rejects_case_insensitive_license_path_collisions(
     tmp_path,
     synthetic_descriptor_factory,
+    monkeypatch,
 ):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
     first_license = tmp_path / "licenses" / "Foo.txt"
@@ -1397,6 +1400,15 @@ def test_platform_wheel_rejects_case_insensitive_license_path_collisions(
     first_license.parent.mkdir()
     first_license.write_text("first", encoding="utf-8")
     second_license.write_text("second", encoding="utf-8")
+    resolve = Path.resolve
+
+    def preserve_archive_case(path, *args, **kwargs):
+        # Model the two archive names even on a filesystem that aliases them.
+        if path in (first_license, second_license):
+            return path
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", preserve_archive_case)
 
     with pytest.raises(ValueError, match="case-insensitive wheel path collisions"):
         build_extension_wheel(
@@ -1635,7 +1647,7 @@ def test_extension_distribution_version_preserves_vane_version_order(tmp_path):
 
 def test_platform_wheel_escapes_license_paths_in_record_csv(tmp_path, synthetic_descriptor_factory):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
-    license_path = tmp_path / 'license,"quoted".txt'
+    license_path = tmp_path / "license,quoted.txt"
     license_path.write_text("license", encoding="utf-8")
     built = build_extension_wheel(
         artifact=artifact_path,
@@ -1652,8 +1664,18 @@ def test_platform_wheel_escapes_license_paths_in_record_csv(tmp_path, synthetic_
         record_name = f"{distribution_root}-{built.distribution_version}.dist-info/RECORD"
         record_rows = list(csv.reader(io.StringIO(wheel.read(record_name).decode("utf-8"))))
 
-    assert any(row[0].endswith('licenses/license,"quoted".txt') for row in record_rows)
+    assert any(row[0].endswith("licenses/license,quoted.txt") for row in record_rows)
     assert all(len(row) == 3 for row in record_rows)
+
+
+def test_wheel_record_escapes_embedded_quotes_without_host_filename_constraints():
+    name = 'licenses/license,"quoted".txt'
+    record = extension_wheel_module._record({name: b"license"}, "package.dist-info/RECORD")
+    rows = list(csv.reader(io.StringIO(record)))
+    assert rows[0][0] == name
+    assert rows[0][1].startswith("sha256=")
+    assert rows[0][2] == "7"
+    assert rows[1] == ["package.dist-info/RECORD", "", ""]
 
 
 def test_platform_wheel_rejects_a_tag_for_a_different_artifact_platform(

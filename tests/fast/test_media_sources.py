@@ -470,7 +470,9 @@ def test_sdk_build_uses_archived_recipes_and_disables_external_overlays(source_s
         assert kwargs["cwd"] == project
 
     monkeypatch.setattr(backend.subprocess, "run", run)
-    assert backend._build_sdk(project) == project / "build/installed/x64-linux-vane-media"
+    from vane_packaging.media_runtime import runtime_triplet
+
+    assert backend._build_sdk(project) == project / "build/installed" / runtime_triplet()
     assert len(calls) == 2
     assert f"--overlay-ports={project / 'sdk/ports'}" in calls[-1]
     assert f"--overlay-triplets={project / 'triplets'}" in calls[-1]
