@@ -124,6 +124,20 @@ def _refresh_file_inventory(files):
     files["source-inventory.json"] = json.dumps(inventory).encode()
 
 
+def test_failed_source_rebuild_cleans_deep_paths_without_masking_the_error(source_sdk):
+    _, _, _, backend = source_sdk
+    with pytest.raises(ValueError, match="original build failure"):
+        with backend._source_build_project() as project:
+            deep = project
+            while len(str(deep)) < 350:
+                deep /= "nested-source-component"
+            directory = backend._format().filesystem_path(deep)
+            directory.mkdir(parents=True)
+            (directory / "source.cpp").write_bytes(b"// source fixture\n")
+            raise ValueError("original build failure")
+    assert not project.exists()
+
+
 def test_source_archive_declares_its_project_component_and_build_notices(source_sdk):
     _, files, archive, _ = source_sdk
     read_source_archive(_archive(archive, files), archive.name)

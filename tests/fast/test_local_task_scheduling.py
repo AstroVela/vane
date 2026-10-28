@@ -231,6 +231,7 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
     import vane.execution.udf_subprocess as subprocess_exec
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_UDF_WORKER_SLOT_DEBUG", "1")
     subprocess_exec._shutdown_global_task_runtime()
     # Ray's default protected shares reserve downstream progress too. Four
     # CPUs leave room for two upstream calls with a second task operator.
@@ -252,7 +253,10 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
         deadline = time.monotonic() + 10
         while len(list(directory.iterdir())) < 2:
             if time.monotonic() > deadline:
-                raise RuntimeError("single-row-group UDF did not admit a second batch worker")
+                raise RuntimeError(
+                    "single-row-group UDF did not admit a second batch worker: "
+                    f"batch_rows={table.num_rows}, worker_pids={sorted(path.name for path in directory.iterdir())}"
+                )
             time.sleep(0.01)
         return pa.table({"x": table.column("x"), "pid": [os.getpid()] * table.num_rows})
 

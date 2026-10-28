@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
@@ -51,6 +52,22 @@ def _format():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@contextmanager
+def _source_build_project():
+    from vane_packaging.media_version import runtime_format
+
+    parent = Path(tempfile.gettempdir()).resolve()
+    project = Path(tempfile.mkdtemp(prefix="vane-media-source-", dir=parent))
+    try:
+        yield project
+    finally:
+        if project.resolve().parent != parent:
+            raise ValueError("media build cleanup must remain inside its temporary parent")
+        # Build tools need ordinary paths, but recursive Python cleanup must
+        # handle deep Boost source paths on Windows without a registry change.
+        shutil.rmtree(runtime_format().filesystem_path(project))
 
 
 def _build_sdk(project):
@@ -145,8 +162,7 @@ def _build_verified_wheel(wheel_directory, settings):
         local = PROJECT / name
         if local.is_symlink() or not local.is_file() or local.read_bytes() != contents:
             raise ValueError(f"runtime build source differs from its published archive: {name}")
-    with tempfile.TemporaryDirectory(prefix="vane-media-source-") as temporary:
-        project = Path(temporary)
+    with _source_build_project() as project:
         for name, contents in files.items():
             destination = project / name
             destination.parent.mkdir(parents=True, exist_ok=True)
