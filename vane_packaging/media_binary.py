@@ -9,8 +9,23 @@ import shutil
 import struct
 import subprocess
 from pathlib import Path
+from time import sleep
 
 from vane_packaging import extension_wheel as binary
+
+
+def _replace_windows_binary(source: Path, target: Path) -> None:
+    # Windows can briefly deny replacement while another process inspects a
+    # newly written DLL. Keep publication atomic and bound the retry interval.
+    for attempt, delay in enumerate((0, 0.05, 0.1, 0.2, 0.4, 0.8)):
+        if delay:
+            sleep(delay)
+        try:
+            source.replace(target)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                raise
 
 
 def macho_linkage(contents: bytes) -> tuple[str | None, tuple[str, ...], tuple[str, ...]]:
@@ -152,7 +167,7 @@ def relocate_non_elf(target: Path, mapping: dict[str, str], platform: str, *, li
         output = target.with_name(target.name + ".relocated")
         try:
             image.write(str(output), config)
-            output.replace(target)
+            _replace_windows_binary(output, target)
         finally:
             output.unlink(missing_ok=True)
     elif family == "macosx":

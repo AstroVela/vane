@@ -8,6 +8,7 @@ import hashlib
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from packaging.tags import sys_tags
@@ -15,8 +16,39 @@ from packaging.tags import sys_tags
 import vane
 from tests.fast.test_extension_wheel import _synthetic_macho, _synthetic_pe
 from vane_packaging import extension_wheel as binary
+from vane_packaging import media_binary
 from vane_packaging.media_binary import relocate_non_elf
 from vane_packaging.media_runtime import component_notice, stage_libraries, validate_library_graph
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_windows_binary_replacement_recovers_only_bounded_file_contention(tmp_path, monkeypatch, persistent):
+    source, target = tmp_path / "new.dll", tmp_path / "old.dll"
+    source.write_bytes(b"new binary")
+    target.write_bytes(b"original binary")
+    replace = Path.replace
+    attempts = []
+
+    def contend(path, destination):
+        attempts.append(path)
+        if persistent or len(attempts) <= 2:
+            error = PermissionError("file is being inspected")
+            error.winerror = 5
+            raise error
+        return replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", contend)
+    monkeypatch.setattr(media_binary, "sleep", lambda _: None)
+    if persistent:
+        with pytest.raises(PermissionError, match="being inspected"):
+            media_binary._replace_windows_binary(source, target)
+        assert 2 < len(attempts) < 10
+        assert source.read_bytes() == b"new binary"
+        assert target.read_bytes() == b"original binary"
+    else:
+        media_binary._replace_windows_binary(source, target)
+        assert target.read_bytes() == b"new binary"
+        assert not source.exists()
 
 
 def test_component_notices_allow_only_reviewed_line_ending_variants(tmp_path):
