@@ -9,6 +9,7 @@
 #include "duckdb/execution/operator/helper/physical_batch_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_batch_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_materialized_collector.hpp"
+#include "duckdb/execution/operator/helper/physical_media_materialized_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
@@ -32,8 +33,10 @@ unique_ptr<PhysicalOperator> PhysicalResultCollector::GetResultCollector(ClientC
                                                                          PreparedStatementData &data) {
 	auto &physical_plan = *data.physical_plan;
 	auto &root = physical_plan.Root();
-	if (data.output_type == QueryResultOutputType::ALLOW_STREAMING &&
-	    PhysicalPlanGenerator::HasNativeMediaFlow(context, root)) {
+	if (PhysicalPlanGenerator::HasNativeMediaFlow(context, root)) {
+		if (data.output_type != QueryResultOutputType::ALLOW_STREAMING) {
+			return make_uniq<PhysicalMediaMaterializedCollector>(physical_plan, data);
+		}
 		// Ordered partitions need their own minimum-progress reservation before
 		// they can use the batched collector. Preserve order on one worker here.
 		const bool parallel = !PhysicalPlanGenerator::PreserveInsertionOrder(context, root);

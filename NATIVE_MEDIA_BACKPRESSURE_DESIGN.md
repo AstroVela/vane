@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：前三批 decoder、原始像素 buffer 和 UDF ingress flow 已合入集成分支；第四批实现有界流式结果接收。更新日期：2026-10-28。
+状态：前三批 decoder、原始像素 buffer 和 UDF ingress flow 已合入集成分支；第四批实现有界流式结果接收；第五批实现普通物化结果的 BufferManager 交接。更新日期：2026-10-28。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -83,6 +83,19 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 原始像素 lease 仍跟随原 allocation 的最后引用；队列拥有的是已经预留容量的新副本。生产路径使用进程生命周期的默认 allocator，取出的 chunk、slice 和 Arrow 数据可以晚于连接和数据库销毁。调用者取走并长期保留的结果不再占用这个 C++ 队列额度，其数据由结果 owner 和已有 managed result delivery 契约持有。本批不约束任意客户端收集全部结果的内存，不把多个域额度解释为统一 RSS 上限。
 
 核心 `[media-result-flow]` 测试不依赖 provider，覆盖偏斜字符串、嵌套字段、短批重试、复制前预留、重叠复制、复制失败与关闭竞态、单行超限、普通/ExecutionBatch pipeline、过滤与 LIMIT、保留 Arrow buffer 和结果提前关闭。真实 codec 的一帧/两帧窗口、慢消费、结果保留、错误后复用和超限接入现有 provider CI 文件 `test_native_media_admission.py`。最终构建身份、实测结果及跳过项随本批 PR 记录。
+
+### 第五批：普通物化结果与实际溢写交接
+
+实现分支为 `feature/media-materialization`，叠加第四批 #1105 的 `ece9b94b8`，最终目标仍为基于 main 的 `native-media-backpressure-dev`。本批支持 native scan 经投影、过滤、streaming LIMIT 到普通物化结果及 `fetchall()`；排序、聚合、join 和物化后再进入 UDF 继续拒绝，不借用它们尚未建立的接收协议。
+
+- 新增专用物化 collector。仅在开启 native flow 且线性路径受支持时选择；普通查询和默认关闭行为不变。首版统一使用单个 collector worker，在保序的同时把 staging 工作集限制为一个字节段，避免并行 partition 的最低推进资源依赖。
+- 使用 query 的 `streaming_buffer_size` 限制单次接收 staging 的选中 payload，沿用第三、四批的 primitive、固定 primitive ARRAY/IMAGE/TENSOR、STRUCT 和字符串口径。按实际选中行计算可接收前缀；单行超过容量在 flatten 和目标复制之前失败。staging payload、实际 BufferManager 存储块、原始像素 lease 是独立记账域，不合并解释为 RSS 硬上限。validity、vector/allocator slack 和控制 metadata 不属于 payload 计量。
+- 每个前缀创建独立的 BufferManager column collection。实际分配受 `memory_limit` 和既有临时目录/磁盘容量约束，Append 的临时状态在复制结束时释放全部 pin。完成的前缀不再继续填充默认 2048 行列块，因而在后续输入和 EOF 之前即可被驱逐、溢写。该保守方案每段至少占用一个存储块，先保证推进和记账正确，后续再优化块合并和并行度。
+- 一个输入的所有前缀先提交到临时 collection，再整体发布到结果存储；分配、复制、spill 或中断失败不确认上游。全部提交且解除 pin 后，才在存储锁外确认输入的 flow ticket。源像素 allocation 仍等最后一个原始 view 释放，不能因为 receiving copy 成功而撤销。
+- 合并 collection 时，先分配所有可能失败的控制结构，再移动 segment 和发布行数；使用 vector 的几何扩容，避免大量独立前缀造成二次方的目录复制。异常后的未提交前缀随 query state 清理，释放存储块、临时文件占用和等待票据；后续查询可复用连接。
+- 未读物化结果持有 context，确保其 spillable storage 在原连接关闭后仍可读取。fetch 返回使用进程生命周期默认 allocator 的独立副本；chunk 和 Arrow 可以晚于结果、连接和数据库销毁。`fetchall()` 已收集到 Python 的副本由调用者持有，不计入此 collector 的受管存储，不承诺任意客户端保留所有结果的总内存上限。
+
+核心 `[media-materialization]` 测试不依赖 provider，覆盖偏斜字符串与嵌套/选中行、两条 sink 路径、实际 BufferManager spill、小容量 EOF、过滤和 LIMIT、永久超额、禁止 spill、失败/中断清理、原始像素 lease 与接收确认分离，以及连接销毁后的未读结果和 Arrow。真实视频的一帧/两帧窗口、物化 spill、失败后复用和结果保留加入现有 provider CI 文件 `test_native_media_admission.py`。具体构建身份和实测结果随本批 PR 记录。
 
 ## 1 设计结论
 

@@ -4,11 +4,13 @@
 #include "catch.hpp"
 #include "test_helpers.hpp"
 #include "duckdb/common/types/image.hpp"
+#include "duckdb/common/types/column/column_data_allocator.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
+#include "duckdb/execution/operator/helper/physical_media_materialized_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
@@ -17,8 +19,10 @@
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include <thread>
 #include <cstdlib>
@@ -217,6 +221,7 @@ struct FlowProbe {
 	shared_ptr<MediaFlowWindow> window;
 	shared_ptr<MediaFlowTicket> initial_view;
 	bool hold_initial_view = false;
+	bool images = false;
 	idx_t produced = 0;
 };
 struct FlowInfo : public TableFunctionInfo {
@@ -256,6 +261,10 @@ unique_ptr<FunctionData> BindFlow(ClientContext &, TableFunctionBindInput &input
                                   vector<string> &names) {
 	types.push_back(LogicalType::BIGINT);
 	names.push_back("i");
+	if (input.info->Cast<FlowInfo>().probe->images) {
+		types.push_back(ImageLogicalType::Create("RGB", 128, 128));
+		names.push_back("data");
+	}
 	return make_uniq<FlowBind>(input.info->Cast<FlowInfo>().probe);
 }
 unique_ptr<GlobalTableFunctionState> InitFlow(ClientContext &, TableFunctionInitInput &input) {
@@ -275,7 +284,12 @@ SourceResultType PollFlow(ClientContext &, TableFunctionInput &input, DataChunk 
 	}
 	output.AddMediaFlow(state.window->TakeGrant(*state.request));
 	state.request.reset();
-	output.SetValue(0, 0, Value::BIGINT(state.probe->produced++));
+	const auto row = state.probe->produced++;
+	output.SetValue(0, 0, Value::BIGINT(row));
+	if (state.probe->images) {
+		vector<uint8_t> pixels(128 * 128 * 3, NumericCast<uint8_t>(row));
+		ImageVector::WritePixels(output.data[1], 0, 128, 128, "RGB", pixels.data());
+	}
 	output.SetCardinality(1);
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
@@ -340,7 +354,324 @@ unique_ptr<PhysicalOperator> CollectFlowBatches(ClientContext &context, Prepared
 	}
 	return PhysicalResultCollector::GetResultCollector(context, data);
 }
+
+struct MaterializedMediaFixture {
+	MaterializedMediaFixture(const vector<LogicalType> &types, idx_t copy_limit)
+	    : copy(make_shared_ptr<CopyProbe>()), db(nullptr, ConfigureCopyAllocator(config, copy)), con(db),
+	      thread(*con.context), context(*con.context, thread, nullptr) {
+		ClientConfig::GetConfig(*con.context).streaming_buffer_size = copy_limit;
+		prepared = con.Prepare("SELECT 1");
+		REQUIRE_FALSE(prepared->HasError());
+		auto &data = *prepared->data;
+		data.types = types;
+		data.names = vector<string>(types.size(), "value");
+		sink = make_uniq<PhysicalMediaMaterializedCollector>(*data.physical_plan, data);
+		global = sink->GetGlobalSinkState(*con.context);
+		local = sink->GetLocalSinkState(context);
+	}
+	SinkResultType Accept(DataChunk &chunk, bool batch = false) {
+		InterruptState interrupt;
+		OperatorSinkInput input {*global, *local, interrupt};
+		if (batch) {
+			ExecutionBatch envelope;
+			envelope.materialized = make_uniq<DataChunk>();
+			envelope.materialized->InitializeEmpty(chunk.GetTypes());
+			envelope.materialized->Reference(chunk);
+			return sink->SinkBatch(context, envelope, input);
+		}
+		return sink->Sink(context, chunk, input);
+	}
+	unique_ptr<QueryResult> Finish() {
+		return sink->GetResult(*global);
+	}
+	shared_ptr<CopyProbe> copy;
+	DBConfig config;
+	DuckDB db;
+	Connection con;
+	ThreadContext thread;
+	ExecutionContext context;
+	unique_ptr<PreparedStatement> prepared;
+	unique_ptr<PhysicalMediaMaterializedCollector> sink;
+	unique_ptr<GlobalSinkState> global;
+	unique_ptr<LocalSinkState> local;
+};
+
+class BatchMediaMaterializedCollector : public PhysicalMediaMaterializedCollector {
+public:
+	BatchMediaMaterializedCollector(PhysicalPlan &plan, PreparedStatementData &data)
+	    : PhysicalMediaMaterializedCollector(plan, data) {
+	}
+	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
+		return role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                          : ExecutionBatchRequirement::BATCH_OPTIONAL;
+	}
+};
+
+unique_ptr<PhysicalOperator> MaterializeFlowBatches(ClientContext &context, PreparedStatementData &data) {
+	if (PhysicalPlanGenerator::HasNativeMediaFlow(context, data.physical_plan->Root())) {
+		return make_uniq<BatchMediaMaterializedCollector>(*data.physical_plan, data);
+	}
+	return PhysicalResultCollector::GetResultCollector(context, data);
+}
 } // namespace
+
+TEST_CASE("Materialized media commits every selected prefix before acknowledging the input",
+          "[media-resource][media-materialization]") {
+	const auto nested = GENERATE(false, true);
+	const auto batch = GENERATE(false, true);
+	const auto type = nested ? LogicalType::STRUCT({{"s", LogicalType::VARCHAR}}) : LogicalType::VARCHAR;
+	MaterializedMediaFixture receiver({type}, 916);
+	DataChunk source, input;
+	source.Initialize(Allocator::DefaultAllocator(), {type}, 4);
+	for (idx_t row = 0; row < 4; row++) {
+		auto value = Value(string(row == 0 ? 900 : (row == 3 ? 2000 : 0), 'x'));
+		source.SetValue(0, row, nested ? Value::STRUCT({{"s", value}}) : value);
+	}
+	source.SetCardinality(4);
+	SelectionVector selected(3);
+	selected.set_index(0, 2);
+	selected.set_index(1, 0);
+	selected.set_index(2, 1);
+	input.InitializeEmpty({type});
+	input.Slice(source, selected, 3);
+	CHECK(EstimateMediaFlowInputBytes(input) == 948);
+	MediaFlowWindow window(948);
+	auto ticket = TakeFlow(window, 948);
+	input.AddMediaFlow(ticket);
+	auto waiting = window.Request(948);
+	unique_ptr<QueryResult> result;
+	REQUIRE(waiting->PollOrArm([&] {
+		// A receipt can re-enter the collector. Its entire input must already
+		// be visible, with every prefix unpinned and owned by BufferManager.
+		result = receiver.Finish();
+		CHECK(result->Cast<MaterializedQueryResult>().RowCount() == 3);
+		CHECK(BufferManager::GetBufferManager(*receiver.con.context).GetUsedMemory() > 0);
+	}) == MediaAdmissionStatus::WAITING);
+	REQUIRE(receiver.Accept(input, batch) == SinkResultType::NEED_MORE_INPUT);
+	REQUIRE(result);
+	CHECK_FALSE(ticket->IsActive());
+	CHECK(input.data[0].GetVectorType() == VectorType::DICTIONARY_VECTOR);
+	idx_t row = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++, row++) {
+			CHECK(chunk->GetValue(0, i) == source.GetValue(0, selected.get_index(row)));
+		}
+	}
+	CHECK(row == 3);
+}
+
+TEST_CASE("Materialized media failures keep the receipt and roll back uncommitted prefixes",
+          "[media-resource][media-materialization]") {
+	const auto batch = GENERATE(false, true);
+	const auto failure = GENERATE(0, 1, 2);
+	MaterializedMediaFixture receiver({LogicalType::VARCHAR}, 616);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='768KiB'"));
+	REQUIRE_NO_FAIL(receiver.con.Query("SET max_temp_directory_size='0B'"));
+	if (failure == 1) {
+		REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='1B'"));
+	}
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR}, 8);
+	for (idx_t row = 0; row < 8; row++) {
+		// Oversized row follows a legal prefix. Neither may be published.
+		input.SetValue(0, row, Value(string(failure == 0 && row == 1 ? 700 : 600, 'x')));
+	}
+	input.SetCardinality(8);
+	MediaFlowWindow window(6000);
+	auto ticket = TakeFlow(window, 6000);
+	input.AddMediaFlow(ticket);
+	auto &manager = BufferManager::GetBufferManager(*receiver.con.context);
+	const auto baseline = manager.GetUsedMemory();
+	REQUIRE_THROWS_AS(receiver.Accept(input, batch), OutOfMemoryException);
+	CHECK(ticket->IsActive());
+	CHECK(manager.GetUsedMemory() == baseline);
+	CHECK(receiver.Finish()->Cast<MaterializedQueryResult>().RowCount() == 0);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='10MiB'"));
+	REQUIRE_NO_FAIL(receiver.con.Query("SELECT 42"));
+}
+
+TEST_CASE("Materialized media releases production credit independently of retained pixels",
+          "[media-resource][media-materialization]") {
+	MaterializedMediaFixture receiver({LogicalType::UTINYINT}, 8);
+	MediaFlowWindow window(12);
+	MediaResourcePool pool({0, 12});
+	auto scope = pool.CreateScope();
+	auto request = scope->Request({0, 12});
+	REQUIRE(request->PollOrArm([] {}) == MediaAdmissionStatus::GRANTED);
+	auto ticket = TakeFlow(window, 12);
+	auto pixels = AllocateMediaVector(LogicalType::UTINYINT, 12, request->TakeGrant(),
+	                                  Allocator::DefaultAllocatorReference(), ticket);
+	for (idx_t row = 0; row < 12; row++) {
+		FlatVector::GetData<uint8_t>(*pixels)[row] = NumericCast<uint8_t>(row);
+	}
+	Vector retained(*pixels, 0, 1);
+	DataChunk input;
+	input.InitializeEmpty({LogicalType::UTINYINT});
+	input.data[0].Reference(*pixels);
+	input.SetCardinality(12);
+	input.AddMediaFlow(ticket);
+	REQUIRE(receiver.Accept(input) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(window.Snapshot().reserved.bytes == 0);
+	CHECK(pool.Snapshot().reserved.bytes == 12);
+	input.Destroy();
+	pixels.reset();
+	CHECK(pool.Snapshot().reserved.bytes == 12);
+	retained.Reference(Value::UTINYINT(0));
+	CHECK(pool.Snapshot().reserved.bytes == 0);
+	auto result = receiver.Finish();
+	CHECK(result->Cast<MaterializedQueryResult>().GetValue(0, 11) == Value::UTINYINT(11));
+}
+
+TEST_CASE("Native materialization reaches EOF and spills sealed images within a small memory limit",
+          "[media-resource][media-materialization]") {
+	const auto batch = GENERATE(false, true);
+	const auto filtered = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='768KiB'"));
+	if (batch) {
+		ClientConfig::GetConfig(*con.context).get_result_collector = MaterializeFlowBatches;
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	auto result = con.Query(filtered ? "SELECT i * 2 AS n, data FROM test_media_flow() WHERE i % 2 = 0"
+	                                 : "SELECT i AS n, data FROM test_media_flow()");
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	CHECK(probe->produced == 24);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	CHECK(manager.GetUsedSwap() > 0);
+	CHECK(manager.GetUsedMemory() <= manager.GetMaxMemory());
+	CHECK(result->Collection().GetAllocatorType() == ColumnDataAllocatorType::BUFFER_MANAGER_ALLOCATOR);
+	idx_t row = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++, row++) {
+			const auto original = row * (filtered ? 2 : 1);
+			CHECK(chunk->GetValue(0, i) == Value::BIGINT(original * (filtered ? 2 : 1)));
+			auto pixels = ImageVector::Pixels(chunk->data[1], i);
+			for (idx_t pixel = 0; pixel < 128 * 128 * 3; pixel++) {
+				if (pixels[pixel] != original) {
+					FAIL("Spilled image pixels were not preserved");
+				}
+			}
+		}
+	}
+	CHECK(row == (filtered ? 12 : 24));
+	result.reset();
+	CHECK(manager.GetUsedSwap() == 0);
+	auto limited = con.Query("SELECT i, data FROM test_media_flow() WHERE i % 2 = 0 LIMIT 2");
+	REQUIRE_FALSE(limited->HasError());
+	CHECK(limited->RowCount() == 2);
+	CHECK(probe->produced < 24);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Unread native materialization and fetched copies survive connection and database destruction",
+          "[media-resource][media-materialization]") {
+	unique_ptr<QueryResult> result;
+	shared_ptr<CopyProbe> allocator_probe;
+	{
+		MaterializedMediaFixture receiver({LogicalType::VARCHAR}, 1200);
+		allocator_probe = receiver.copy;
+		DataChunk input;
+		input.Initialize(Allocator::DefaultAllocator(), {LogicalType::VARCHAR}, 4);
+		for (idx_t row = 0; row < 4; row++) {
+			input.SetValue(0, row, Value(string(1000, 'a' + row)));
+		}
+		input.SetCardinality(4);
+		REQUIRE(receiver.Accept(input) == SinkResultType::NEED_MORE_INPUT);
+		result = receiver.Finish();
+	}
+	CHECK_FALSE(allocator_probe->allocator_destroyed);
+	// GetValue caches an additional scan state in the materialized base class.
+	// Its pins must also be released before the retained database is destroyed.
+	CHECK(result->Cast<MaterializedQueryResult>().GetValue(0, 3) == Value(string(1000, 'd')));
+	auto first = result->Fetch();
+	REQUIRE(first);
+	ArrowArray arrow;
+	ArrowConverter::ToArrowArray(*first, &arrow, ClientProperties(), {});
+	idx_t rows = first->size();
+	while (auto chunk = result->Fetch()) {
+		rows += chunk->size();
+	}
+	CHECK(rows == 4);
+	result.reset();
+	CHECK(allocator_probe->allocator_destroyed);
+	CHECK(first->GetValue(0, 0) == Value(string(1000, 'a')));
+	CHECK(static_cast<const char *>(arrow.children[0]->buffers[2])[0] == 'a');
+	first.reset();
+	arrow.release(&arrow);
+}
+
+TEST_CASE("Native materialization cleans received storage and flow after failure or cancellation",
+          "[media-resource][media-materialization]") {
+	const auto failure = GENERATE(0, 1, 2, 3);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='768KiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	if (failure == 0) {
+		REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='0B'"));
+	}
+	if (failure == 3) {
+		REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='49159B'"));
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	ExtensionLoader loader(*db.instance, "media_materialization_cancel_test");
+	loader.RegisterFunction(ScalarFunction("interrupt_media_materialization", {LogicalType::BIGINT},
+	                                       LogicalType::BIGINT,
+	                                       [&](DataChunk &input, ExpressionState &, Vector &output) {
+		                                       output.Reference(input.data[0]);
+		                                       if (input.GetValue(0, 0) == Value::BIGINT(3)) {
+			                                       con.Interrupt();
+		                                       }
+	                                       }));
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	const auto baseline = manager.GetUsedMemory();
+	auto query = failure == 1 ? "SELECT CASE WHEN i=3 THEN CAST('bad' || i::VARCHAR AS BIGINT) ELSE i END, data "
+	                            "FROM test_media_flow()"
+	             : failure == 2 ? "SELECT interrupt_media_materialization(i), data FROM test_media_flow()"
+	                            : "SELECT i, data FROM test_media_flow()";
+	auto result = con.Query(query);
+	REQUIRE(result->HasError());
+	CHECK(probe->produced > 0);
+	CHECK(probe->produced < 24);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(manager.GetUsedMemory() == baseline);
+	CHECK(manager.GetUsedSwap() == 0);
+	REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='10MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	REQUIRE_NO_FAIL(con.Query("SELECT i, data FROM test_media_flow() LIMIT 1"));
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("A reset materialization allocator preserves its managed database lifetime",
+          "[media-resource][media-materialization]") {
+	unique_ptr<ColumnDataAllocator> replacement;
+	{
+		DuckDB db(nullptr);
+		ColumnDataAllocator original(BufferManager::GetBufferManager(*db.instance),
+		                             ColumnDataCollectionLifetime::THROW_ERROR_AFTER_DATABASE_CLOSES);
+		// Combining/resetting sealed collections creates a fresh allocator. It
+		// must inherit the lifetime guard and unregister itself on destruction.
+		replacement = make_uniq<ColumnDataAllocator>(original);
+		CHECK(replacement->GetDatabase() == db.instance);
+	}
+	CHECK_THROWS_AS(replacement->GetDatabase(), ConnectionException);
+	replacement.reset();
+}
 
 TEST_CASE("Streaming media results split skewed payloads without acknowledging a partial receipt",
           "[media-resource][media-result-flow]") {
@@ -893,8 +1224,7 @@ TEST_CASE("Enabled native flow rejects unsupported materialization before produc
 	}
 	Connection con(db);
 	auto probe = RegisterFlow(db);
-	for (auto query : {"SELECT i FROM test_media_flow()", "SELECT i FROM test_media_flow() ORDER BY i",
-	                   "SELECT sum(i) FROM test_media_flow()"}) {
+	for (auto query : {"SELECT i FROM test_media_flow() ORDER BY i", "SELECT sum(i) FROM test_media_flow()"}) {
 		auto result = con.Query(query);
 		REQUIRE(result->HasError());
 		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("materialization budget handoff"));

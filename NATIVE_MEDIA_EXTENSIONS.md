@@ -251,8 +251,9 @@ both limits can reduce the batch size, and an impossible single frame fails
 without waiting.
 
 This window supports a linear native video scan through projections,
-filters and streaming LIMIT into a streaming UDF or an explicit streaming result
-(`relation.execute_result(stream=True)`). The UDF's C++ ingress queue reserves
+filters and streaming LIMIT into a streaming UDF, an explicit streaming result
+(`relation.execute_result(stream=True)`), or an ordinary materialized result
+(`relation.fetchall()`). The UDF's C++ ingress queue reserves
 `task_input_max_bytes` payload capacity before copying, commits the independent
 copy, then acknowledges the producer outside its lock. A rejected or failed
 copy retains the producer credit. An accepted but blocked sink acknowledges
@@ -286,9 +287,28 @@ Query retirement also closes its receiver, so an old Arrow stream can be
 released inside a newer query callback without reacquiring that query's context
 lock or cancelling its execution.
 
-With this window enabled, materialized results and materialization before
-the UDF (including sorting and aggregation) still raise an unsupported-path error.
-Their materialization/spill budget handoff is a separate increment. Scan cleanup
+Ordinary native materialized results use BufferManager storage even when the
+caller requests in-memory results. A single collector worker limits staging to
+one prefix whose selected payload fits `streaming_buffer_size`. Each prefix gets
+independent storage: actual BufferManager allocation and copying finish, all
+append pins are released, and the complete input commits before the producer is
+acknowledged. Completed prefixes can spill before EOF under `memory_limit` and
+the normal temporary-directory settings. There is no one-chunk over-limit
+escape; an oversized row or a working set that cannot be allocated raises a
+resource error. Failed inputs do not acknowledge their producer. Prefix sealing
+uses at least one storage block per prefix, trading storage efficiency and
+parallel throughput for bounded progress in this increment.
+
+The staging limit covers the same supported payload types as UDF ingress;
+validity, vector/allocator slack and control metadata are additional overhead.
+BufferManager separately charges the actual retained storage blocks. Unread
+materialized results keep their database alive; fetched copies use the default
+allocator and can outlive it. Copies collected by `fetchall()` belong to the
+caller and are outside the collector's storage budget.
+
+With this window enabled, sorting, aggregation and materialization before the
+UDF still raise an unsupported-path error. Those operators need their own
+materialization/spill handoff. Scan cleanup
 cancels flow waiters and returns production credits even if detached views
 remain alive; physical pixel reservations on those views remain valid. The
 receipt covers C++ ingress, while subsequent Python task/SHM/Ray admission keeps

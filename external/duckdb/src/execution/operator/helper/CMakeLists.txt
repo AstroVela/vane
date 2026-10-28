@@ -13,6 +13,7 @@ add_library_unity(
   physical_limit_percent.cpp
   physical_load.cpp
   physical_materialized_collector.cpp
+  physical_media_materialized_collector.cpp
   physical_pragma.cpp
   physical_prepare.cpp
   physical_reservoir_sample.cpp
