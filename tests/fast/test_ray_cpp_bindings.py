@@ -186,9 +186,11 @@ def test_flight_shuffle_cleanup_resolves_bootstrap_storage_config():
         source_con.close()
 
 
-def test_execute_native_keeps_result_collector_query_local():
+@pytest.mark.parametrize("progress_bar", [False, True])
+def test_execute_native_keeps_result_collector_query_local(progress_bar):
     con = vane.connect()
     cursor = con.cursor()
+    cursor.execute(f"SET enable_progress_bar = {str(progress_bar).lower()}")
     local_sql = "SELECT sum(i)::BIGINT FROM range(32) tbl(i)"
     plan = _make_test_physical_plan(cursor)
     vane.ray_cxx._install_counting_result_collector_for_test(cursor)
@@ -5046,3 +5048,48 @@ def test_execute_native_roundtrip_hash_join_plan_no_crash():
     assert "rows 1" in proc.stdout
     assert "status ok" in proc.stdout
     assert "ok" in proc.stdout
+
+
+def test_snapshot_capture_does_not_use_connection_result_collector():
+    with vane.connect() as con, con.cursor() as cursor:
+        vane.ray_cxx._install_counting_result_collector_for_test(cursor)
+        plan = _make_test_physical_plan(cursor)
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 0
+
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan)
+        assert result.completion_status == "ok"
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 0
+        assert vane.ray_cxx._execute_materialized_int64_for_test(cursor, "SELECT 7::BIGINT") == 7
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 1
+
+
+def test_snapshot_cleanup_does_not_use_connection_result_collector():
+    with vane.connect() as con, con.cursor() as cursor:
+        plan = _make_test_physical_plan(cursor)
+        cursor.execute("SELECT i FROM range(16) tbl(i)")
+        assert cursor.fetchone() == (0,)
+        vane.ray_cxx._install_counting_result_collector_for_test(cursor)
+
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan)
+        assert result.completion_status == "ok"
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 0
+        assert vane.ray_cxx._execute_materialized_int64_for_test(cursor, "SELECT 7::BIGINT") == 7
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 1
+
+
+@pytest.mark.parametrize("input_type", ["VARCHAR", "INTEGER"])
+def test_snapshot_query_failure_preserves_connection_result_collector_and_redacts_values(input_type):
+    with vane.connect() as con, con.cursor() as cursor:
+        plan = _make_test_physical_plan(cursor)
+        sensitive_value = "collector-sensitive-test-value)"
+        plan.__getstate__()[6]["settings"].append(
+            {"name": "__vane_missing_collector_setting", "value": sensitive_value, "input_type": input_type}
+        )
+        vane.ray_cxx._install_counting_result_collector_for_test(cursor)
+
+        with pytest.raises(vane.InvalidInputException, match="Connection snapshot query failed") as error:
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan)
+        assert sensitive_value not in str(error.value)
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 0
+        assert vane.ray_cxx._execute_materialized_int64_for_test(cursor, "SELECT 7::BIGINT") == 7
+        assert vane.ray_cxx._connection_result_collector_calls_for_test(cursor) == 1
