@@ -19,6 +19,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/operator/order/physical_order.hpp"
 
 namespace duckdb {
 
@@ -28,8 +29,12 @@ bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const Phy
 	}
 	auto current = &plan;
 	while (current->type != PhysicalOperatorType::TABLE_SCAN) {
-		if (current->type != PhysicalOperatorType::PROJECTION && current->type != PhysicalOperatorType::FILTER &&
-		    current->type != PhysicalOperatorType::STREAMING_LIMIT) {
+		if (current->type == PhysicalOperatorType::ORDER_BY) {
+			if (!current->Cast<PhysicalOrder>().media_flow_receiver) {
+				return false;
+			}
+		} else if (current->type != PhysicalOperatorType::PROJECTION && current->type != PhysicalOperatorType::FILTER &&
+		           current->type != PhysicalOperatorType::STREAMING_LIMIT) {
 			return false;
 		}
 		auto children = current->GetInputChildren();

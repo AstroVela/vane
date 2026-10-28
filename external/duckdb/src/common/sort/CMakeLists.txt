@@ -3,6 +3,7 @@ add_library_unity(
   OBJECT
   full_sort.cpp
   hashed_sort.cpp
+  media_sort.cpp
   natural_sort.cpp
   sort.cpp
   sort_strategy.cpp

@@ -823,6 +823,7 @@ TEST_CASE("PhysicalLimitPercent serialization roundtrip (expression)", "[seriali
 }
 
 TEST_CASE("PhysicalOrder serialization roundtrip", "[serialization][physical_plan]") {
+	const auto media_flow_receiver = GENERATE(false, true);
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
 
@@ -831,7 +832,8 @@ TEST_CASE("PhysicalOrder serialization roundtrip", "[serialization][physical_pla
 	auto expr = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
 	orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(expr));
 
-	auto &order_by = plan.Make<PhysicalOrder>(types, std::move(orders), vector<idx_t>(), 10, false);
+	auto &order_by =
+	    plan.Make<PhysicalOrder>(types, std::move(orders), vector<idx_t>(), 10, false, media_flow_receiver);
 
 	MemoryStream stream(allocator);
 	SerializationOptions options;
@@ -855,6 +857,9 @@ TEST_CASE("PhysicalOrder serialization roundtrip", "[serialization][physical_pla
 	auto *order_ptr = dynamic_cast<PhysicalOrder *>(deserialized_op.get());
 	REQUIRE(order_ptr != nullptr);
 	REQUIRE(order_ptr->type == PhysicalOperatorType::ORDER_BY);
+	REQUIRE(order_ptr->media_flow_receiver == media_flow_receiver);
+	REQUIRE(order_ptr->ParallelSink() == !media_flow_receiver);
+	REQUIRE(order_ptr->ParallelSource() == !media_flow_receiver);
 	REQUIRE(order_ptr->orders.size() == 1);
 	REQUIRE(order_ptr->orders[0].type == OrderType::ASCENDING);
 	REQUIRE(order_ptr->orders[0].null_order == OrderByNullType::NULLS_LAST);

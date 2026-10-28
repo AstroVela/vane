@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/sorting/sorted_run_merger.hpp"
 
 #include "duckdb/common/sorting/sort.hpp"
@@ -893,12 +899,15 @@ ProgressData SortedRunMerger::GetProgress(ClientContext &, GlobalSourceState &gs
 //===--------------------------------------------------------------------===//
 // Non-Standard Interface
 //===--------------------------------------------------------------------===//
-SourceResultType SortedRunMerger::MaterializeSortedRun(ExecutionContext &, OperatorSourceInput &input) const {
+SourceResultType SortedRunMerger::MaterializeSortedRun(ExecutionContext &context, OperatorSourceInput &input) const {
 	auto &gstate = input.global_state.Cast<SortedRunMergerGlobalState>();
 	auto &lstate = input.local_state.Cast<SortedRunMergerLocalState>();
 
 	SourceResultType res = SourceResultType::HAVE_MORE_OUTPUT;
 	while (true) {
+		if (context.client.interrupted) {
+			throw InterruptException();
+		}
 		if (!lstate.TaskFinished() || gstate.AssignTask(lstate)) {
 			res = lstate.ExecuteTask(gstate, nullptr);
 		} else {

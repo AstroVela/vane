@@ -308,8 +308,30 @@ materialized results keep their database alive; fetched copies use the default
 allocator and can outlive it. Copies collected by `fetchall()` belong to the
 caller and are outside the collector's storage budget.
 
-With this window enabled, sorting, aggregation and materialization before the
-UDF still raise an unsupported-path error. Those operators need their own
+Full `ORDER BY` over the supported native scan/projection/filter path also has
+a receiving contract. The initial implementation accepts projected fixed-width
+primitive sort keys, including multiple keys, ASC/DESC and NULL ordering. Media
+payload stays in sealed BufferManager column segments; native sort runs contain
+only encoded keys and row ids. `streaming_buffer_size` bounds each receiving
+prefix's selected input payload, a conservative encoded-key size and row ids.
+Both stores complete copying, sealing and unpinning before the complete input
+is acknowledged. The original pixel lease remains independent.
+
+Two-way key-run merge passes bound the fan-in. Pixels can spill before EOF and
+are looked up by row id after sorting. The final id sequence is stored under
+BufferManager and all key/merge pins retire before pixel lookup. One worker receives input and one worker
+produces the ordered output, one row at a time; the reader caches at most one
+bounded input prefix. Storage blocks and merge buffers use actual BufferManager
+capacity and the usual spill settings. A receiving prefix can shrink on memory
+pressure; a row or minimum sort working set that cannot fit fails explicitly.
+Per-prefix storage blocks and serial execution are conservative correctness
+choices in this increment, with directory and allocator overhead additional to
+the payload budget.
+
+With this window enabled, variable-sized/nested sort keys, TopN, aggregation,
+joins/windows and sorting before the UDF still raise an unsupported-path error.
+In particular, the optimizer commonly uses TopN for `ORDER BY ... LIMIT`, which
+requires separate qualification. These operators need their own
 materialization/spill handoff. Scan cleanup
 cancels flow waiters and returns production credits even if detached views
 remain alive; physical pixel reservations on those views remain valid. The

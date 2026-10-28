@@ -11,6 +11,8 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_media_materialized_collector.hpp"
+#include "duckdb/execution/operator/order/physical_order.hpp"
+#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
@@ -22,6 +24,8 @@
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/parallel/event.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 
 #include <thread>
@@ -413,7 +417,450 @@ unique_ptr<PhysicalOperator> MaterializeFlowBatches(ClientContext &context, Prep
 	}
 	return PhysicalResultCollector::GetResultCollector(context, data);
 }
+
+class MediaSortTestEvent : public Event {
+public:
+	explicit MediaSortTestEvent(Executor &executor) : Event(executor) {
+	}
+	void Schedule() override {
+	}
+};
+
+struct MediaSortFixture {
+	MediaSortFixture(vector<LogicalType> types, idx_t copy_limit)
+	    : db(nullptr), con(db), thread(*con.context), context(*con.context, thread, nullptr),
+	      plan(Allocator::DefaultAllocator()), executor(*con.context), pipeline(executor), event(executor) {
+		REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+		ClientConfig::GetConfig(*con.context).streaming_buffer_size = copy_limit;
+		vector<BoundOrderByNode> orders;
+		orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+		                    make_uniq<BoundReferenceExpression>(types[0], 0));
+		vector<idx_t> projections;
+		for (idx_t i = 0; i < types.size(); i++) {
+			projections.push_back(i);
+		}
+		sink = make_uniq<PhysicalOrder>(plan, types, std::move(orders), std::move(projections), 0, false, true);
+		sink->children.push_back(plan.Make<PhysicalDummyScan>(types, 0));
+		sink->sink_state = sink->GetGlobalSinkState(*con.context);
+		local = sink->GetLocalSinkState(context);
+	}
+	SinkResultType Accept(DataChunk &chunk, bool batch = false) {
+		InterruptState interrupt;
+		OperatorSinkInput input {*sink->sink_state, *local, interrupt};
+		if (batch) {
+			ExecutionBatch envelope;
+			envelope.materialized = make_uniq<DataChunk>();
+			envelope.materialized->InitializeEmpty(chunk.GetTypes());
+			envelope.materialized->Reference(chunk);
+			return sink->SinkBatch(context, envelope, input);
+		}
+		return sink->Sink(context, chunk, input);
+	}
+	SinkFinalizeType Finish() {
+		InterruptState interrupt;
+		OperatorSinkFinalizeInput input {*sink->sink_state, interrupt};
+		auto result = sink->Finalize(pipeline, event, *con.context, input);
+		source = sink->GetGlobalSourceState(*con.context);
+		source_local = sink->GetLocalSourceState(context, *source);
+		return result;
+	}
+	unique_ptr<DataChunk> Fetch() {
+		auto chunk = make_uniq<DataChunk>();
+		chunk->Initialize(Allocator::DefaultAllocator(), sink->types);
+		InterruptState interrupt;
+		OperatorSourceInput input {*source, *source_local, interrupt};
+		sink->GetDataInternal(context, *chunk, input);
+		return chunk->size() ? std::move(chunk) : nullptr;
+	}
+	DuckDB db;
+	Connection con;
+	ThreadContext thread;
+	ExecutionContext context;
+	PhysicalPlan plan;
+	Executor executor;
+	Pipeline pipeline;
+	MediaSortTestEvent event;
+	unique_ptr<PhysicalOrder> sink;
+	unique_ptr<LocalSinkState> local;
+	unique_ptr<GlobalSourceState> source;
+	unique_ptr<LocalSourceState> source_local;
+};
 } // namespace
+
+TEST_CASE("Media sort commits selected skewed payload and key storage before a receipt",
+          "[media-resource][media-sort]") {
+	const auto batch = GENERATE(false, true);
+	const auto nested = GENERATE(false, true);
+	const auto payload_type = nested ? LogicalType::STRUCT({{"s", LogicalType::VARCHAR}}) : LogicalType::VARCHAR;
+	MediaSortFixture receiver({LogicalType::BIGINT, payload_type}, 1000);
+	DataChunk original, input;
+	original.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT, payload_type}, 4);
+	for (idx_t i = 0; i < 4; i++) {
+		original.SetValue(0, i, Value::BIGINT(4 - i));
+		auto text = Value(string(i == 0 ? 900 : (i == 3 ? 2000 : 0), 'a' + i));
+		original.SetValue(1, i, nested ? Value::STRUCT({{"s", text}}) : text);
+	}
+	original.SetCardinality(4);
+	SelectionVector selected(3);
+	selected.set_index(0, 2);
+	selected.set_index(1, 0);
+	selected.set_index(2, 1);
+	input.InitializeEmpty(original.GetTypes());
+	input.Slice(original, selected, 3);
+	MediaFlowWindow window(1000);
+	auto ticket = TakeFlow(window, 1000);
+	input.AddMediaFlow(ticket);
+	auto waiting = window.Request(1000);
+	idx_t receipts = 0;
+	REQUIRE(waiting->PollOrArm([&] {
+		// The callback can finalize and scan both domains immediately.
+		CHECK(receiver.Finish() == SinkFinalizeType::READY);
+		receipts++;
+	}) == MediaAdmissionStatus::WAITING);
+	REQUIRE(receiver.Accept(input, batch) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(receipts == 1);
+	CHECK_FALSE(ticket->IsActive());
+	idx_t row = 0;
+	while (auto output = receiver.Fetch()) {
+		REQUIRE(output->size() == 1);
+		const auto original_row = 2 - row;
+		CHECK(output->GetValue(0, 0) == original.GetValue(0, original_row));
+		CHECK(output->GetValue(1, 0) == original.GetValue(1, original_row));
+		row++;
+	}
+	CHECK(row == 3);
+	CHECK(input.data[1].GetVectorType() == VectorType::DICTIONARY_VECTOR);
+}
+
+TEST_CASE("Native media sort spills images and reaches EOF with one frame of production credit",
+          "[media-resource][media-sort]") {
+	const auto batch = GENERATE(false, true);
+	const auto filtered = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	if (batch) {
+		ClientConfig::GetConfig(*con.context).get_result_collector = MaterializeFlowBatches;
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	auto result = con.Query(filtered ? "SELECT i, data FROM test_media_flow() WHERE i % 2 = 0 ORDER BY i DESC"
+	                                 : "SELECT i, data FROM test_media_flow() ORDER BY i DESC");
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	CHECK(probe->produced == 24);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	CHECK(manager.GetUsedSwap() > 0);
+	CHECK(manager.GetUsedMemory() <= manager.GetMaxMemory());
+	idx_t count = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++, count++) {
+			const auto expected = filtered ? 22 - 2 * count : 23 - count;
+			CHECK(chunk->GetValue(0, row) == Value::BIGINT(expected));
+			auto pixels = ImageVector::Pixels(chunk->data[1], row);
+			for (idx_t pixel = 0; pixel < 128 * 128 * 3; pixel++) {
+				if (pixels[pixel] != expected) {
+					FAIL("Sorting changed the correspondence between keys and image pixels");
+				}
+			}
+		}
+	}
+	CHECK(count == (filtered ? 12 : 24));
+	result.reset();
+	CHECK(manager.GetUsedSwap() == 0);
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Media sort merges across native key chunks without retaining pixels in the merge",
+          "[media-resource][media-sort]") {
+	const auto batch = GENERATE(false, true);
+	MediaSortFixture receiver({LogicalType::BIGINT, LogicalType::BIGINT}, 1024 * 1024);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='2MiB'"));
+	const idx_t total = 2 * STANDARD_VECTOR_SIZE + 3;
+	for (idx_t offset = 0; offset < total;) {
+		const auto rows = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - offset);
+		DataChunk input;
+		input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT, LogicalType::BIGINT}, rows);
+		for (idx_t row = 0; row < rows; row++) {
+			input.SetValue(0, row, Value::BIGINT((total - offset - row) * 17));
+			input.SetValue(1, row, Value::BIGINT(offset + row));
+		}
+		input.SetCardinality(rows);
+		MediaFlowWindow window(rows * 16);
+		auto ticket = TakeFlow(window, rows * 16);
+		input.AddMediaFlow(ticket);
+		REQUIRE(receiver.Accept(input, batch) == SinkResultType::NEED_MORE_INPUT);
+		CHECK_FALSE(ticket->IsActive());
+		offset += rows;
+	}
+	REQUIRE(receiver.Finish() == SinkFinalizeType::READY);
+	idx_t row = 0;
+	while (auto output = receiver.Fetch()) {
+		CHECK(output->GetValue(0, 0) == Value::BIGINT((row + 1) * 17));
+		CHECK(output->GetValue(1, 0) == Value::BIGINT(total - row - 1));
+		row++;
+	}
+	CHECK(row == total);
+}
+
+TEST_CASE("Media sort failed inputs retain receipts and release every uncommitted storage domain",
+          "[media-resource][media-sort]") {
+	const auto batch = GENERATE(false, true);
+	const auto failure = GENERATE(0, 1, 2);
+	MediaSortFixture receiver({LogicalType::BIGINT, LogicalType::VARCHAR}, 648);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='2MiB'"));
+	if (failure == 1) {
+		REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='512KiB'"));
+	}
+	if (failure == 2) {
+		REQUIRE_NO_FAIL(receiver.con.Query("SET max_temp_directory_size='0B'"));
+	}
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT, LogicalType::VARCHAR}, 8);
+	for (idx_t row = 0; row < 8; row++) {
+		input.SetValue(0, row, Value::BIGINT(row));
+		input.SetValue(1, row, Value(string(failure == 0 && row == 1 ? 700 : 600, 'x')));
+	}
+	input.SetCardinality(8);
+	MediaFlowWindow window(6000);
+	auto ticket = TakeFlow(window, 6000);
+	input.AddMediaFlow(ticket);
+	auto &manager = BufferManager::GetBufferManager(*receiver.con.context);
+	const auto baseline = manager.GetUsedMemory();
+	REQUIRE_THROWS_AS(receiver.Accept(input, batch), OutOfMemoryException);
+	CHECK(ticket->IsActive());
+	CHECK(manager.GetUsedMemory() == baseline);
+	CHECK(manager.GetUsedSwap() == 0);
+	CHECK(receiver.Finish() == SinkFinalizeType::NO_OUTPUT_POSSIBLE);
+	CHECK_FALSE(receiver.Fetch());
+}
+
+TEST_CASE("Media sort shrinks pixel prefixes and retires key pins before reading large stored images",
+          "[media-resource][media-sort]") {
+	const auto batch = GENERATE(false, true);
+	auto image_type = ImageLogicalType::Create("RGB", 128, 128);
+	MediaSortFixture receiver({LogicalType::BIGINT, image_type}, 3 * 1024 * 1024);
+	REQUIRE_NO_FAIL(receiver.con.Query("SET memory_limit='2MiB'"));
+	const idx_t rows = 60;
+	DataChunk input;
+	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT, image_type}, rows);
+	for (idx_t row = 0; row < rows; row++) {
+		input.SetValue(0, row, Value::BIGINT(rows - row - 1));
+		vector<uint8_t> pixels(128 * 128 * 3, NumericCast<uint8_t>(rows - row - 1));
+		ImageVector::WritePixels(input.data[1], row, 128, 128, "RGB", pixels.data());
+	}
+	input.SetCardinality(rows);
+	const auto bytes = EstimateMediaFlowInputBytes(input);
+	REQUIRE(bytes > 2 * 1024 * 1024);
+	MediaFlowWindow window(bytes);
+	auto ticket = TakeFlow(window, bytes);
+	input.AddMediaFlow(ticket);
+	REQUIRE(receiver.Accept(input, batch) == SinkResultType::NEED_MORE_INPUT);
+	CHECK_FALSE(ticket->IsActive());
+	REQUIRE(receiver.Finish() == SinkFinalizeType::READY);
+	auto &manager = BufferManager::GetBufferManager(*receiver.con.context);
+	CHECK(manager.GetUsedSwap() > 0);
+	CHECK(manager.GetUsedMemory() <= manager.GetMaxMemory());
+	idx_t row = 0;
+	while (auto output = receiver.Fetch()) {
+		CHECK(output->GetValue(0, 0) == Value::BIGINT(row));
+		// Physical sources may return dictionary vectors. ImageVector pixel
+		// access requires flat input, as QueryResult::Fetch supplies publicly.
+		output->Flatten();
+		CHECK(ImageVector::Pixels(output->data[1], 0)[0] == row);
+		row++;
+	}
+	CHECK(row == rows);
+}
+
+TEST_CASE("Native media sorting rejects unsupported key types before producing any rows",
+          "[media-resource][media-sort]") {
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	auto probe = RegisterFlow(db);
+	for (auto query : {"SELECT i::VARCHAR AS k FROM test_media_flow() ORDER BY k",
+	                   "SELECT [i] AS k FROM test_media_flow() ORDER BY k"}) {
+		auto result = con.Query(query);
+		REQUIRE(result->HasError());
+		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("fixed-width primitive sort keys"));
+		CHECK(probe->produced == 0);
+	}
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Native media sort preserves multiple keys NULL ordering and projected images",
+          "[media-resource][media-sort]") {
+	const auto nulls_first = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	auto result = con.Query("SELECT i, data, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 3 END AS k "
+	                        "FROM test_media_flow() ORDER BY k DESC NULLS " +
+	                        string(nulls_first ? "FIRST" : "LAST") + ", i ASC");
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	vector<idx_t> expected;
+	for (idx_t i = 0; i < 24; i++) {
+		expected.push_back(i);
+	}
+	std::sort(expected.begin(), expected.end(), [&](idx_t a, idx_t b) {
+		const bool a_null = a % 5 == 0;
+		const bool b_null = b % 5 == 0;
+		if (a_null != b_null) {
+			return nulls_first ? a_null : !a_null;
+		}
+		if (!a_null && a % 3 != b % 3) {
+			return a % 3 > b % 3;
+		}
+		return a < b;
+	});
+	idx_t row = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++, row++) {
+			CHECK(chunk->GetValue(0, i) == Value::BIGINT(expected[row]));
+			CHECK(ImageVector::Pixels(chunk->data[1], i)[0] == expected[row]);
+			CHECK(chunk->GetValue(2, i).IsNull() == (expected[row] % 5 == 0));
+		}
+	}
+	CHECK(row == 24);
+	result.reset();
+	auto images_only = con.Query("SELECT data FROM test_media_flow() ORDER BY i DESC");
+	REQUIRE_FALSE(images_only->HasError());
+	row = 0;
+	while (auto chunk = images_only->Fetch()) {
+		for (idx_t i = 0; i < chunk->size(); i++, row++) {
+			CHECK(ImageVector::Pixels(chunk->data[0], i)[0] == 23 - row);
+		}
+	}
+	CHECK(row == 24);
+}
+
+TEST_CASE("Media sort receipts preserve independently retained physical pixel leases", "[media-resource][media-sort]") {
+	MediaSortFixture receiver({LogicalType::UTINYINT}, 64);
+	MediaFlowWindow window(12);
+	MediaResourcePool pool({0, 12});
+	auto scope = pool.CreateScope();
+	auto request = scope->Request({0, 12});
+	REQUIRE(request->PollOrArm([] {}) == MediaAdmissionStatus::GRANTED);
+	auto ticket = TakeFlow(window, 12);
+	auto pixels = AllocateMediaVector(LogicalType::UTINYINT, 12, request->TakeGrant(),
+	                                  Allocator::DefaultAllocatorReference(), ticket);
+	for (idx_t row = 0; row < 12; row++) {
+		FlatVector::GetData<uint8_t>(*pixels)[row] = NumericCast<uint8_t>(11 - row);
+	}
+	Vector retained(*pixels, 0, 1);
+	DataChunk input;
+	input.InitializeEmpty({LogicalType::UTINYINT});
+	input.data[0].Reference(*pixels);
+	input.SetCardinality(12);
+	input.AddMediaFlow(ticket);
+	REQUIRE(receiver.Accept(input) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(window.Snapshot().reserved.bytes == 0);
+	CHECK(pool.Snapshot().reserved.bytes == 12);
+	input.Destroy();
+	pixels.reset();
+	CHECK(pool.Snapshot().reserved.bytes == 12);
+	retained.Reference(Value::UTINYINT(0));
+	CHECK(pool.Snapshot().reserved.bytes == 0);
+	REQUIRE(receiver.Finish() == SinkFinalizeType::READY);
+	idx_t row = 0;
+	while (auto chunk = receiver.Fetch()) {
+		CHECK(chunk->GetValue(0, 0) == Value::UTINYINT(row++));
+	}
+	CHECK(row == 12);
+}
+
+TEST_CASE("Native media sorting cleans storage and credits on spill failure expression failure and cancellation",
+          "[media-resource][media-sort]") {
+	const auto failure = GENERATE(0, 1, 2);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	if (failure == 0) {
+		REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='0B'"));
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	ExtensionLoader loader(*db.instance, "media_sort_cancel_test");
+	loader.RegisterFunction(ScalarFunction("interrupt_media_sort", {LogicalType::BIGINT}, LogicalType::BIGINT,
+	                                       [&](DataChunk &input, ExpressionState &, Vector &output) {
+		                                       output.Reference(input.data[0]);
+		                                       if (input.GetValue(0, 0) == Value::BIGINT(3)) {
+			                                       con.Interrupt();
+		                                       }
+	                                       }));
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	const auto baseline = manager.GetUsedMemory();
+	auto query = failure == 1 ? "SELECT CASE WHEN i=3 THEN CAST('bad' || i::VARCHAR AS BIGINT) ELSE i END AS k, data "
+	                            "FROM test_media_flow() ORDER BY k"
+	             : failure == 2 ? "SELECT interrupt_media_sort(i) AS k, data FROM test_media_flow() ORDER BY k"
+	                            : "SELECT i, data FROM test_media_flow() ORDER BY i";
+	auto result = con.Query(query);
+	REQUIRE(result->HasError());
+	CHECK(probe->produced > 0);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(manager.GetUsedMemory() == baseline);
+	CHECK(manager.GetUsedSwap() == 0);
+	REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='10MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC"));
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Sorted media result copies remain valid after stream close and database destruction",
+          "[media-resource][media-sort]") {
+	unique_ptr<DataChunk> retained;
+	ArrowArray arrow;
+	{
+		DuckDB db(nullptr);
+		if (!db.instance->GetMediaFlowCapacity()) {
+			return;
+		}
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+		REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+		auto probe = RegisterFlow(db);
+		probe->images = true;
+		auto result = con.SendQuery("SELECT i, data FROM test_media_flow() ORDER BY i DESC");
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(result->type == QueryResultType::STREAM_RESULT);
+		retained = result->Fetch();
+		REQUIRE(retained);
+		CHECK(retained->size() == 1);
+		CHECK(retained->GetValue(0, 0) == Value::BIGINT(23));
+		ArrowConverter::ToArrowArray(*retained, &arrow, con.context->GetClientProperties(), {});
+		result->Cast<StreamQueryResult>().Close();
+		CHECK(probe->produced == 24);
+		CHECK(probe->window->Snapshot().reserved.bytes == 0);
+		REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+	}
+	CHECK(retained->GetValue(0, 0) == Value::BIGINT(23));
+	CHECK(ImageVector::Pixels(retained->data[1], 0)[0] == 23);
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 23);
+	retained.reset();
+	CHECK(static_cast<const int64_t *>(arrow.children[0]->buffers[1])[0] == 23);
+	arrow.release(&arrow);
+}
 
 TEST_CASE("Materialized media commits every selected prefix before acknowledging the input",
           "[media-resource][media-materialization]") {
@@ -1265,7 +1712,7 @@ TEST_CASE("Enabled native flow rejects unsupported materialization before produc
 	}
 	Connection con(db);
 	auto probe = RegisterFlow(db);
-	for (auto query : {"SELECT i FROM test_media_flow() ORDER BY i", "SELECT sum(i) FROM test_media_flow()"}) {
+	for (auto query : {"SELECT i FROM test_media_flow() ORDER BY i LIMIT 3", "SELECT sum(i) FROM test_media_flow()"}) {
 		auto result = con.Query(query);
 		REQUIRE(result->HasError());
 		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("materialization budget handoff"));

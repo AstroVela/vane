@@ -919,8 +919,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto orders = deserializer.ReadProperty<vector<BoundOrderByNode>>(103, "orders");
 		auto projections = deserializer.ReadProperty<vector<idx_t>>(104, "projections");
 		auto is_index_sort = deserializer.ReadProperty<bool>(105, "is_index_sort");
+		auto media_flow_receiver = deserializer.ReadPropertyWithDefault<bool>(106, "media_flow_receiver");
 		return make_uniq<PhysicalOrder>(physical_plan, std::move(types), std::move(orders), std::move(projections),
-		                                estimated_cardinality, is_index_sort);
+		                                estimated_cardinality, is_index_sort, media_flow_receiver);
 	}
 	case PhysicalOperatorType::TOP_N: {
 		auto orders = deserializer.ReadProperty<vector<BoundOrderByNode>>(103, "orders");

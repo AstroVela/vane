@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：前三批 decoder、原始像素 buffer 和 UDF ingress flow 已合入集成分支；第四批实现有界流式结果接收；第五批实现普通物化结果的 BufferManager 交接。更新日期：2026-10-28。
+状态：前五批 decoder、原始像素 buffer、UDF ingress flow、流式结果和普通物化结果已合入集成分支；第六批实现完整排序的预算交接。更新日期：2026-10-29。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -86,7 +86,7 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 
 ### 第五批：普通物化结果与实际溢写交接
 
-实现分支为 `feature/media-materialization`，叠加第四批 #1105 的 `ece9b94b8`，最终目标仍为基于 main 的 `native-media-backpressure-dev`。本批支持 native scan 经投影、过滤、streaming LIMIT 到普通物化结果及 `fetchall()`；排序、聚合、join 和物化后再进入 UDF 继续拒绝，不借用它们尚未建立的接收协议。
+实现分支为 `feature/media-materialization`，第四批合入后重放到集成基线，现已通过 #1108 合入 `native-media-backpressure-dev`。本批支持 native scan 经投影、过滤、streaming LIMIT 到普通物化结果及 `fetchall()`；本批交付时排序、聚合、join 和物化后再进入 UDF 继续拒绝，不借用它们尚未建立的接收协议。
 
 - 新增专用物化 collector。仅在开启 native flow 且线性路径受支持时选择；普通查询和默认关闭行为不变。首版统一使用单个 collector worker，在保序的同时把 staging 工作集限制为一个字节段，避免并行 partition 的最低推进资源依赖。
 - 使用 query 的 `streaming_buffer_size` 限制单次接收 staging 的选中 payload，沿用第三、四批的 primitive、固定 primitive ARRAY/IMAGE/TENSOR、STRUCT 和字符串口径。按实际选中行计算可接收前缀；单行超过容量在 flatten 和目标复制之前失败。staging payload、实际 BufferManager 存储块、原始像素 lease 是独立记账域，不合并解释为 RSS 硬上限。validity、vector/allocator slack 和控制 metadata 不属于 payload 计量。
@@ -96,6 +96,19 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 未读物化结果持有 context，确保其 spillable storage 在原连接关闭后仍可读取。fetch 返回使用进程生命周期默认 allocator 的独立副本；chunk 和 Arrow 可以晚于结果、连接和数据库销毁。`fetchall()` 已收集到 Python 的副本由调用者持有，不计入此 collector 的受管存储，不承诺任意客户端保留所有结果的总内存上限。
 
 核心 `[media-materialization]` 测试不依赖 provider，覆盖偏斜字符串与嵌套/选中行、两条 sink 路径、实际 BufferManager spill、小容量 EOF、过滤和 LIMIT、永久超额、禁止 spill、失败/中断清理、原始像素 lease 与接收确认分离，以及连接销毁后的未读结果和 Arrow。真实视频的一帧/两帧窗口、物化 spill、失败后复用和结果保留加入现有 provider CI 文件 `test_native_media_admission.py`。具体构建身份和实测结果随本批 PR 记录。
+
+### 第六批：完整排序的像素存储与 key/行号交接
+
+实现分支为 `feature/media-sort-handoff`，从 #1108 已合入的集成提交 `ce33c20d8` 开始，目标为基于 main 的 `native-media-backpressure-dev`。首版覆盖 native scan 经投影、过滤到完整 `ORDER BY`，以及排序后到有界流式/普通物化结果。排序键限于投影后的固定宽度 primitive，支持多键、ASC/DESC、NULLS FIRST/LAST；变长/嵌套键、TopN、排序后进入 UDF、join、aggregate 和 window 继续明确拒绝。
+
+- 像素和其他输入 payload 按实际选中行存入独立 BufferManager column collection，排序只接收原生编码 key 与独立行号。排序不把图片放进 key run 的 payload，避免 merge 分区同时固定一整组图片。首版接收和输出各使用一个 worker，保留确定的有序读取与最低工作集；普通查询的排序选择与并行度不变。
+- `streaming_buffer_size` 同时约束一个接收前缀的输入 payload、编码 key 的保守上界和行号。所有输入列计费，包括只用于排序而最终不输出的列；validity、vector/allocator slack、目录 metadata 和原始像素 allocation 仍分属既有开销/记账域。key 上界在编码之前由固定键类型计算。单行超过容量立即失败；BufferManager 固定工作集放不下时丢弃候选副本，严格减少行数重试，单行仍无法分配则返回资源错误。
+- 每个前缀的 column storage 完成实际分配和复制后解除 append pin；独立 key/行号 run 排序、封存并解除 pin。一个输入的所有前缀、存储目录和行号 run 整体发布后，才在锁外确认原 flow。任何编码、分配、复制或 spill 失败都不确认未提交输入。原始像素 lease 继续跟随原 allocation 的最后引用。
+- EOF 后对 key/行号 run 做两路合并，限制 merge fan-in；沿用原生 sort 的类型编码、比较和外部存储，不以 TMM 的估算 reservation 作为硬容量。实际存储块和 merge buffer 受 BufferManager 限制，已封存的像素与 key 均可溢写。每次合并同步退役旧 run；最终顺序写入独立的受管行号列存储后，退役全部 key/merge pin，再开始读取图片，避免排序工作集挤占已经合法接收的像素段。长合并循环检查中断，失败和取消时释放存储及临时文件占用。
+- 输出按排序后的行号二分查找封存的输入段。一次只向下游交付一行；本地最多缓存一个受接收上限约束的输入段，避免在结果接收前生成一整个向量的图片。结果接收继续使用第四/第五批的有界流式队列或可溢写物化 collector，不能退回普通无限物化路径。结果 chunk 和 Arrow 的独立副本仍由默认 allocator 持有，允许晚于连接/数据库销毁。
+- 序列化保存媒体排序接收标记；旧计划默认 false。启用 flow 的 pipeline 只允许已声明预算交接的排序和结果终点，未覆盖的排序后执行域在执行前明确报错。`ORDER BY ... LIMIT` 通常由优化器改写为 TopN，属于下一独立增量；不借完整排序的测试宣称其已覆盖。
+
+核心 `[media-sort]` 覆盖两条 sink 路径、偏斜字符串 payload、选中行/嵌套字段、超过标准 key chunk 的行号合并、小内存真实 spill、一帧窗口 EOF、多键与 NULL、隐藏排序列、单行超限、失败回滚、取消、原始像素引用和关闭后保留的结果/Arrow。真实视频窗口 144/288 bytes 的排序、三文件输入、spill/恢复和逐像素对照进入现有 provider CI 文件 `test_native_media_admission.py`。构建身份和实际执行结果随本批 PR 记录。
 
 ## 1 设计结论
 
