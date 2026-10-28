@@ -1488,7 +1488,7 @@ def test_shuffle_cache_windows_node_names_do_not_alias(tmp_path):
 @pytest.mark.parametrize("storage", ["duckdb", "local"])
 def test_shuffle_cache_roundtrip_with_a_long_base_directory(tmp_path, storage):
     directory = tmp_path
-    while len(str(directory)) < 180:
+    while len(str(directory)) < 200:
         directory /= "nested-component-0123456789"
     directory.mkdir(parents=True)
     if storage == "duckdb":
