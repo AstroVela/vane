@@ -3,6 +3,7 @@
 
 #include "ray_binding_internal.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/dl.hpp"
 
 namespace duckdb {
 namespace ray_bindings {
@@ -28,6 +29,20 @@ private:
 };
 
 void RegisterRayMiscTestsBindings(py::module_ &m) {
+	m.def("load_media_probe_for_test", [](const std::string &path) {
+		auto handle = dlopen_with_runtime(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			throw std::runtime_error("could not load media probe: " + GetDLError());
+		}
+		auto function = reinterpret_cast<int (*)()>(dlsym(handle, "media_decode"));
+		if (!function) {
+			dlclose(handle);
+			throw std::runtime_error("media probe is missing media_decode");
+		}
+		auto result = function();
+		dlclose(handle);
+		return result;
+	});
 	m.def("create_local_directory_for_test", [](const std::string &path, bool inject_race) {
 		DirectoryCreationRaceFileSystem fs(inject_race);
 		fs.CreateDirectory(path);

@@ -8759,8 +8759,10 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     assert Path(result["copy_output_lifecycle_path"]).is_file()
     assert Path(result["copy_output_manifest_path"]).is_file()
     assert Path(result["copy_output_committed_marker_path"]).is_file()
-    assert result["copy_output_manifest_path"].endswith(
-        f"{dst.name}.duckdb_commit/{result['copy_output_run_id']}/manifest.txt"
+    assert Path(result["copy_output_manifest_path"]).parts[-3:] == (
+        f"{dst.name}.duckdb_commit",
+        result["copy_output_run_id"],
+        "manifest.txt",
     )
     committed = vane.ray_cxx.read_committed_copy_direct_write_result(
         result["copy_output_base_path"],

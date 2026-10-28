@@ -1461,8 +1461,9 @@ def test_shuffle_cache_does_not_recover_uncommitted_files(tmp_path):
     assert result["recovered_row_count"] == 0
 
 
-def test_shuffle_cache_duckdb_filesystem_storage_roundtrip(tmp_path):
-    result = vane.ray_cxx.shuffle_cache_duckdb_filesystem_storage_roundtrip_for_test(str(tmp_path))
+@pytest.mark.parametrize("node_id", ["node-a", "worker:ray:0", "worker*ray?0", "NODE-A", "worker.", "~worker"])
+def test_shuffle_cache_duckdb_filesystem_storage_roundtrip(tmp_path, node_id):
+    result = vane.ray_cxx.shuffle_cache_duckdb_filesystem_storage_roundtrip_for_test(str(tmp_path), node_id)
 
     assert result["committed_manifest"] is True
     assert result["manifest_file_count"] == 1
@@ -1471,6 +1472,17 @@ def test_shuffle_cache_duckdb_filesystem_storage_roundtrip(tmp_path):
     assert result["values"] == [71, 72, 73, 74]
     assert result["manifest_tmp_exists"] is False
     assert result["marker_tmp_exists"] is False
+    assert Path(result["manifest_path"]).is_relative_to(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows filename and case-folding aliases")
+def test_shuffle_cache_windows_node_names_do_not_alias(tmp_path):
+    nodes = ["worker:ray:0", "worker_ray_0", "NODE-A", "node-a", "worker.", "worker", "~worker"]
+    paths = [
+        vane.ray_cxx.shuffle_cache_duckdb_filesystem_storage_roundtrip_for_test(str(tmp_path), node)["manifest_path"]
+        for node in nodes
+    ]
+    assert len({str(Path(path)).casefold() for path in paths}) == len(nodes)
 
 
 def _minio_test_config():

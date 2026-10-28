@@ -20,6 +20,9 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/storage/temporary_memory_manager.hpp"
+#ifdef _WIN32
+#include "mbedtls_wrapper.hpp"
+#endif
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
@@ -42,6 +45,19 @@ namespace distributed {
 namespace {
 
 std::string ShuffleCacheSanitizePathComponent(const std::string &value) {
+#ifdef _WIN32
+	// Ray worker IDs contain colons. Keep ordinary lowercase identifiers for
+	// existing local layouts, and map unsafe/long identifiers to bounded names.
+	// The reserved prefix and SHA-256 also avoid case-folding and escape aliases.
+	if (value.size() > 120 || value.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-.") != std::string::npos ||
+	    (!value.empty() && value.back() == '.')) {
+		duckdb_mbedtls::MbedTlsWrapper::SHA256State hash;
+		hash.AddString(value);
+		std::string digest(duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT, '\0');
+		hash.FinishHex(&digest[0]);
+		return "~" + digest;
+	}
+#endif
 	std::string out = value;
 	for (auto &ch : out) {
 		if (ch == '/' || ch == '\\') {
