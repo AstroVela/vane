@@ -154,7 +154,10 @@ def test_namespaced_media_libraries_load_after_relocation(tmp_path, long_path):
         shutil.copyfile(path, library_dir / path.name)
     platform = next(tag.platform for tag in sys_tags() if tag.platform.startswith(("win_", "macosx_")))
     staged = tmp_path / "staged"
-    mapping = stage_libraries(prefix, staged, namespace="vane_media_probe", platform=platform)
+    # ctypes keeps loaded libraries alive across parameter cases on Windows.
+    # Give each probe its own names so a previous load cannot hide missing DLLs.
+    namespace = "vane_media_probe_long" if long_path else "vane_media_probe"
+    mapping = stage_libraries(prefix, staged, namespace=namespace, platform=platform)
     assert len(mapping) == 2
     validate_library_graph({path.name: path.read_bytes() for path in staged.iterdir()}, platform)
     relocated = tmp_path / "relocated"
