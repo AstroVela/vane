@@ -217,6 +217,99 @@ con.close()
 
 
 @pytest.mark.parametrize("window_bytes", ["144", "288"])
+def test_native_video_flow_materialized_result_spills_and_cleans_up(video_path, tmp_path, window_bytes):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    script = r"""
+import faulthandler
+from pathlib import Path
+import sys
+import numpy as np
+import vane
+
+faulthandler.dump_traceback_later(60, exit=True)
+artifact, path, spill_path = sys.argv[1:]
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    if artifact:
+        con.load_extension(artifact)
+    else:
+        vane.load_installed_extension('native_media', connection=con)
+    con.execute("SET video_backend='native'")
+    con.execute('SET threads=4')
+    con.execute("SET temp_directory='" + spill_path.replace("'", "''") + "'")
+    con.execute("SET memory_limit='2MiB'")
+    con.execute("SET streaming_buffer_size='512B'")
+
+    def frames(files=3):
+        return vane.read_video_frames([path] * files, 6, 8, connection=con,
+                                      read_task_count=files,
+                                      max_partition_bytes=2048).project('frame_index, data')
+
+    # Execute materializes before returning. The producer must reach EOF even
+    # though its window is only one/two frames and the collector has to spill.
+    materialized = frames().execute()
+    assert any(p.is_file() and p.stat().st_size for p in Path(spill_path).rglob('*'))
+    retained = materialized.fetchall()
+    assert sorted(row[0] for row in retained) == sorted(list(range(12)) * 3)
+    assert all(pixels.shape == (6, 8, 3) and pixels.dtype == np.uint8 for _, pixels in retained)
+    snapshots = [pixels.copy() for _, pixels in retained]
+    filtered = frames(1).filter('frame_index % 2 = 0').limit(3).fetchall()
+    assert [row[0] for row in filtered] == [0, 2, 4]
+
+    # A receiving failure must not turn into an unbounded in-memory result or
+    # leave the flow/pixel pools stuck for the next query.
+    con.execute("SET max_temp_directory_size='0B'")
+    try:
+        frames().fetchall()
+    except vane.OutOfMemoryException:
+        pass
+    else:
+        raise AssertionError('a full BufferManager with spill disabled must fail')
+    con.execute("SET max_temp_directory_size='100MiB'")
+    con.execute("SET memory_limit='10MiB'")
+    reference = {index: pixels for index, pixels in frames(1).fetchall()}
+    assert sorted(reference) == list(range(12))
+    for index, pixels in retained:
+        np.testing.assert_array_equal(pixels, reference[index])
+    con.execute("SET streaming_buffer_size='151B'")
+    try:
+        frames(1).fetchall()
+    except vane.OutOfMemoryException as error:
+        assert 'streaming_buffer_size receiving capacity' in str(error), str(error)
+    else:
+        raise AssertionError('an impossible materialized receiving row must fail')
+    con.execute("SET streaming_buffer_size='512B'")
+    try:
+        frames(1).project("CAST('bad' || frame_index::VARCHAR AS BIGINT), data").fetchall()
+    except vane.ConversionException:
+        pass
+    else:
+        raise AssertionError('expected a downstream expression failure')
+    assert len(frames(1).fetchall()) == 12
+    assert con.execute('SELECT 42').fetchone() == (42,)
+for (_, pixels), snapshot in zip(retained, snapshots):
+    np.testing.assert_array_equal(pixels, snapshot)
+faulthandler.cancel_dump_traceback_later()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path / "spill")],
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+            "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "288",
+            "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
 @pytest.mark.parametrize("ordered", [False, True])
 def test_native_video_flow_streaming_result_handoff(video_path, window_bytes, ordered):
     providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
@@ -464,7 +557,8 @@ with (vane.connect() if not artifact else
                 assert expected.lower() in str(error).lower(), str(error)
             else:
                 raise AssertionError('expected rejection or downstream failure')
-        for relation in (frames(), mapped(frames().order('frame_index DESC'))):
+        assert len(frames().fetchall()) == 12
+        for relation in (frames().order('frame_index DESC'), mapped(frames().order('frame_index DESC'))):
             try:
                 relation.fetchall()
             except vane.NotImplementedException as error:

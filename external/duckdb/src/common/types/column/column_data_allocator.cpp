@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/column/column_data_allocator.hpp"
 
 #include "duckdb/common/radix_partitioning.hpp"
@@ -48,7 +54,7 @@ ColumnDataAllocator::ColumnDataAllocator(ColumnDataAllocator &other) {
 	case ColumnDataAllocatorType::HYBRID:
 		alloc.buffer_manager = other.alloc.buffer_manager;
 		if (other.managed_result_set.IsValid()) {
-			ResultSetManager::Get(alloc.buffer_manager->GetDatabase()).Add(*this);
+			managed_result_set = ResultSetManager::Get(alloc.buffer_manager->GetDatabase()).Add(*this);
 		}
 		break;
 	case ColumnDataAllocatorType::IN_MEMORY_ALLOCATOR:

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/column/column_data_collection.hpp"
 
 #include "duckdb/common/printer.hpp"
@@ -10,6 +16,8 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+
+#include <iterator>
 
 namespace duckdb {
 
@@ -1218,12 +1226,16 @@ void ColumnDataCollection::Combine(ColumnDataCollection &other) {
 	if (types != other.types) {
 		throw InternalException("Attempting to combine ColumnDataCollections with mismatching types");
 	}
-	this->count += other.count;
-	this->segments.reserve(segments.size() + other.segments.size());
-	for (auto &other_seg : other.segments) {
-		segments.push_back(std::move(other_seg));
-	}
-	other.Reset();
+	// Allocate before publishing any rows. Reset() also allocates an allocator,
+	// so invoking it after moving segments would make a failed combine partial.
+	auto replacement_allocator = make_shared_ptr<ColumnDataAllocator>(*other.allocator);
+	// Range insertion preserves vector's geometric growth for sealed prefixes.
+	segments.insert(segments.end(), std::make_move_iterator(other.segments.begin()),
+	                std::make_move_iterator(other.segments.end()));
+	count += other.count;
+	other.count = 0;
+	other.segments.clear();
+	other.allocator = std::move(replacement_allocator);
 	Verify();
 }
 
