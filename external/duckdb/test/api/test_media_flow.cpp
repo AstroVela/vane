@@ -12,6 +12,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -706,6 +707,41 @@ TEST_CASE("Media Arrow export bounds prefetch and does not retire a newer query 
 		REQUIRE(chunk);
 		CHECK(chunk->GetValue(0, 0) == Value::BIGINT(42));
 	}
+	retained.release(&retained);
+	REQUIRE_NO_FAIL(con.Query("SELECT 43"));
+}
+
+TEST_CASE("A newer query callback can release its retired media Arrow stream", "[media-resource][media-result-flow]") {
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='8B'"));
+	auto probe = RegisterFlow(db);
+	ArrowArrayStream stream {};
+	bool released = false;
+	ExtensionLoader loader(*db.instance, "media_result_release_test");
+	loader.RegisterFunction(ScalarFunction("release_old_media_stream", {LogicalType::BIGINT}, LogicalType::BIGINT,
+	                                       [&](DataChunk &, ExpressionState &, Vector &output) {
+		                                       stream.release(&stream);
+		                                       released = true;
+		                                       output.Reference(Value::BIGINT(42));
+	                                       }));
+	auto result = con.SendQuery("SELECT i FROM test_media_flow()");
+	REQUIRE_FALSE(result->HasError());
+	auto wrapper = new ResultArrowArrayStreamWrapper(std::move(result), 1000000);
+	stream = wrapper->stream;
+	ArrowArray retained;
+	REQUIRE(stream.get_next(&stream, &retained) == 0);
+	REQUIRE(retained.release);
+	auto next = con.Query("SELECT release_old_media_stream(i) FROM range(1) t(i)");
+	REQUIRE_FALSE(next->HasError());
+	CHECK(released);
+	CHECK(next->GetValue(0, 0) == Value::BIGINT(42));
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(static_cast<const int64_t *>(retained.children[0]->buffers[1])[0] == 0);
 	retained.release(&retained);
 	REQUIRE_NO_FAIL(con.Query("SELECT 43"));
 }

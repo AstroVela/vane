@@ -22,8 +22,21 @@ struct SimpleBufferedData::MediaFlowState {
 		unique_ptr<DataChunk> chunk;
 		idx_t bytes;
 	};
-	queue<Chunk> chunks;
-	unordered_map<const void *, InterruptState> blocked_sinks;
+	using Chunks = queue<Chunk>;
+	using Waiters = unordered_map<const void *, InterruptState>;
+	// Moving these owners out during Close allocates no empty containers, even
+	// on platforms where a default-constructed queue/map allocates a sentinel.
+	unique_ptr<Chunks> chunks = make_uniq<Chunks>();
+	unique_ptr<Waiters> blocked_sinks = make_uniq<Waiters>();
+	static void WakeSinks(Waiters &ready) {
+		for (auto &entry : ready) {
+			try {
+				entry.second.Callback();
+			} catch (...) {
+				// One failing notification must not strand the other receivers.
+			}
+		}
+	}
 	idx_t queued_bytes = 0;
 	idx_t reserved_bytes = 0;
 	idx_t peak_bytes = 0;
@@ -60,27 +73,24 @@ bool SimpleBufferedData::ChunkReady() {
 	lock_guard<mutex> lock(glock);
 	// A short prefix can fill all usable capacity even below the byte limit.
 	// Return it now instead of waiting for the producer to reach EOF.
-	return !media_flow->chunks.empty();
+	return media_flow->chunks && !media_flow->chunks->empty();
 }
 
 void SimpleBufferedData::UnblockSinks() {
 	if (media_flow) {
-		unordered_map<const void *, InterruptState> ready;
+		unique_ptr<MediaFlowState::Waiters> ready;
 		{
 			lock_guard<mutex> lock(glock);
 			auto &state = *media_flow;
-			if (!state.closed && state.queued_bytes + state.reserved_bytes >= BufferSize()) {
+			if (state.closed || state.blocked_sinks->empty() ||
+			    state.queued_bytes + state.reserved_bytes >= BufferSize()) {
 				return;
 			}
-			ready.swap(state.blocked_sinks);
+			auto replacement = make_uniq<MediaFlowState::Waiters>();
+			ready = std::move(state.blocked_sinks);
+			state.blocked_sinks = std::move(replacement);
 		}
-		for (auto &entry : ready) {
-			try {
-				entry.second.Callback();
-			} catch (...) {
-				// One failing notification must not strand the other receivers.
-			}
-		}
+		MediaFlowState::WakeSinks(*ready);
 		return;
 	}
 	auto cc = context.lock();
@@ -156,13 +166,13 @@ unique_ptr<DataChunk> SimpleBufferedData::Scan() {
 		{
 			lock_guard<mutex> lock(glock);
 			auto &state = *media_flow;
-			if (state.closed || state.chunks.empty()) {
+			if (state.closed || state.chunks->empty()) {
 				return nullptr;
 			}
-			auto &entry = state.chunks.front();
+			auto &entry = state.chunks->front();
 			state.queued_bytes -= entry.bytes;
 			chunk = std::move(entry.chunk);
-			state.chunks.pop();
+			state.chunks->pop();
 		}
 		// Queue -> client handoff. Retained results keep their vector storage,
 		// while the bounded queue can accept the next copy.
@@ -208,10 +218,10 @@ SinkResultType SimpleBufferedData::AppendMediaFlow(const DataChunk &input, idx_t
 	auto &state = *media_flow;
 	if (offset == input.size()) {
 		lock_guard<mutex> lock(glock);
-		state.blocked_sinks.erase(&offset);
 		if (state.closed || context.expired()) {
 			throw InterruptException();
 		}
+		state.blocked_sinks->erase(&offset);
 	}
 	while (offset < input.size()) {
 		idx_t rows;
@@ -219,11 +229,11 @@ SinkResultType SimpleBufferedData::AppendMediaFlow(const DataChunk &input, idx_t
 		shared_ptr<ClientContext> cc;
 		{
 			lock_guard<mutex> lock(glock);
-			state.blocked_sinks.erase(&offset);
 			cc = state.closed ? nullptr : context.lock();
 			if (!cc) {
 				throw InterruptException();
 			}
+			state.blocked_sinks->erase(&offset);
 			const auto row_bytes = MaxValue<idx_t>(1, EstimateMediaFlowInputBytes(input, offset, 1));
 			if (row_bytes > BufferSize()) {
 				throw OutOfMemoryException("Native media streaming result row requires %llu payload bytes, exceeding "
@@ -237,7 +247,7 @@ SinkResultType SimpleBufferedData::AppendMediaFlow(const DataChunk &input, idx_t
 			rows = available ? MediaFlowRowsWithinByteLimit(input, offset, input.size() - offset, available) : 0;
 			if (!rows) {
 				// Inspect capacity and arm the retry under the same lock as Scan.
-				state.blocked_sinks.emplace(&offset, interrupt);
+				state.blocked_sinks->emplace(&offset, interrupt);
 				return SinkResultType::BLOCKED;
 			}
 			bytes = MaxValue<idx_t>(1, EstimateMediaFlowInputBytes(input, offset, rows));
@@ -259,7 +269,7 @@ SinkResultType SimpleBufferedData::AppendMediaFlow(const DataChunk &input, idx_t
 			if (state.closed) {
 				throw InterruptException();
 			}
-			state.chunks.push(MediaFlowState::Chunk {std::move(chunk), bytes});
+			state.chunks->push(MediaFlowState::Chunk {std::move(chunk), bytes});
 			state.reserved_bytes -= bytes;
 			reserved = false;
 			state.queued_bytes += bytes;
@@ -285,20 +295,22 @@ void SimpleBufferedData::Close() {
 		BufferedData::Close();
 		return;
 	}
-	queue<MediaFlowState::Chunk> retired;
+	unique_ptr<MediaFlowState::Chunks> retired;
+	unique_ptr<MediaFlowState::Waiters> waiters;
 	{
 		lock_guard<mutex> lock(glock);
 		media_flow->closed = true;
 		context.reset();
-		retired.swap(media_flow->chunks);
+		retired = std::move(media_flow->chunks);
+		waiters = std::move(media_flow->blocked_sinks);
 		media_flow->queued_bytes = 0;
 	}
 	// Reservations for copies in progress remain charged until their rollback.
 	// Free chunks and notify tasks outside the queue lock.
-	while (!retired.empty()) {
-		retired.pop();
+	retired.reset();
+	if (waiters) {
+		MediaFlowState::WakeSinks(*waiters);
 	}
-	UnblockSinks();
 }
 
 SimpleBufferedData::MediaFlowSnapshot SimpleBufferedData::SnapshotMediaFlow() {
@@ -307,8 +319,12 @@ SimpleBufferedData::MediaFlowSnapshot SimpleBufferedData::SnapshotMediaFlow() {
 		throw InvalidInputException("Not a native media result queue");
 	}
 	auto &state = *media_flow;
-	return {BufferSize(),     state.queued_bytes,         state.reserved_bytes,
-	        state.peak_bytes, state.blocked_sinks.size(), state.closed};
+	return {BufferSize(),
+	        state.queued_bytes,
+	        state.reserved_bytes,
+	        state.peak_bytes,
+	        state.blocked_sinks ? state.blocked_sinks->size() : 0,
+	        state.closed};
 }
 
 } // namespace duckdb

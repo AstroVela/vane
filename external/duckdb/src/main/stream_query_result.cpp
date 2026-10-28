@@ -10,6 +10,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/common/box_renderer.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/buffered_data/simple_buffered_data.hpp"
 
 namespace duckdb {
 
@@ -209,7 +210,11 @@ bool StreamQueryResult::IsOpen() {
 }
 
 void StreamQueryResult::Close() {
-	if (IsMediaFlowResult() && context) {
+	// Query cleanup retires its receiver before another query can call into
+	// user code. Releasing that stale stream from a callback must not reacquire
+	// the context lock already held by the newer query.
+	const bool retired = IsMediaFlowResult() && buffered_data->Cast<SimpleBufferedData>().SnapshotMediaFlow().closed;
+	if (IsMediaFlowResult() && context && !retired) {
 		auto cc = context;
 		auto lock = cc->LockContext();
 		buffered_data->Close();

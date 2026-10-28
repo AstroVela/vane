@@ -282,6 +282,9 @@ process-lifetime default allocator. Managed
 result delivery retains its existing byte accounting; arbitrary caller-retained
 results are outside this C++ queue limit. Closing a media stream retires its
 blocked native scan without waiting for those returned buffers to die.
+Query retirement also closes its receiver, so an old Arrow stream can be
+released inside a newer query callback without reacquiring that query's context
+lock or cancelling its execution.
 
 With this window enabled, materialized results and materialization before
 the UDF (including sorting and aggregation) still raise an unsupported-path error.

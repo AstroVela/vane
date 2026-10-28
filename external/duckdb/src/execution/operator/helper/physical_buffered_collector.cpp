@@ -20,6 +20,13 @@ PhysicalBufferedCollector::PhysicalBufferedCollector(PhysicalPlan &physical_plan
 //===--------------------------------------------------------------------===//
 class BufferedCollectorGlobalState : public GlobalSinkState {
 public:
+	~BufferedCollectorGlobalState() override {
+		if (buffered_data && buffered_data->IsMediaFlowReceiver()) {
+			// Retire the receiver while query cleanup already owns the context
+			// lock. A stale result may later die inside a newer query callback.
+			buffered_data->Close();
+		}
+	}
 	mutex glock;
 	//! This is weak to avoid creating a cyclical reference
 	weak_ptr<ClientContext> context;

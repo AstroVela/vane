@@ -78,7 +78,7 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 开启 flow 后，显式流式结果使用具备接收确认协议的 `PhysicalBufferedCollector`。保序路径使用单个 pipeline worker，避免后续 partition 占满容量而阻止最小 partition 推进；无序路径可并行。过滤后的 LIMIT 使用 streaming limit，不引入需要等待物化的 batch limit。普通查询的 collector 和 LIMIT 选择不受影响。
 - 接收容量使用 query 的 `streaming_buffer_size`，计量沿用 UDF ingress 的受支持 payload 类型和口径。所有选中列都计费，不只计算原始像素。任何接收复制之前，原子预留 `queued_bytes + reserved_bytes + copy_bytes <= streaming_buffer_size`；复制在队列锁外进行，提交成功后把预留转为已入队字节。复制失败或关闭期间未提交的复制回滚，不能确认上游。
 - 批次按实际选中行和剩余行计量拆分。队列放不下整批但能放下部分行时，保存输入偏移并返回 BLOCKED；队列有短批即可交付，不能为了填满容量等到 EOF。重试只接收尚未提交的行，每个输入状态只保留一份等待登记，整批全部提交后才在锁外确认原 flow。单行超过接收容量立即报资源错误；零 payload 的非空复制至少占用一个额度字节，避免零字节队列条目无限增长。
-- dequeue 将目标副本移交给调用者，再归还队列容量并在锁外唤醒 producer。关闭清除排队副本，撤销后续接收；进行中的复制保留 reservation 到其实际回滚。显式关闭或销毁媒体结果流会退役其仍活跃的 native 查询，清理阻塞的扫描和 flow scope；旧结果关闭不能取消同一连接后来的查询。
+- dequeue 将目标副本移交给调用者，再归还队列容量并在锁外唤醒 producer。关闭清除排队副本，撤销后续接收；进行中的复制保留 reservation 到其实际回滚。显式关闭或销毁媒体结果流会退役其仍活跃的 native 查询，清理阻塞的扫描和 flow scope。查询结束时也会关闭其 receiver；之后旧结果从新查询的回调中释放时直接完成释放，不重入新查询已持有的 context 锁，也不能取消该查询。关闭通过移动预先创建的队列和等待表，在锁外释放副本并唤醒任务，避免在 query-state 析构时分配空容器。
 - Arrow 导出当前以一行作为接收原子单位，即使 `rows_per_batch` 请求更大也不合并整段输入。该保守策略避免在 Python result delivery 获得容量前按行数预取大量媒体。按可用字节合并多个 Arrow 行属于后续优化。Python 关闭结果及 Arrow stream release 在等待 native worker 清理时释放 GIL。
 - 原始像素 lease 仍跟随原 allocation 的最后引用；队列拥有的是已经预留容量的新副本。生产路径使用进程生命周期的默认 allocator，取出的 chunk、slice 和 Arrow 数据可以晚于连接和数据库销毁。调用者取走并长期保留的结果不再占用这个 C++ 队列额度，其数据由结果 owner 和已有 managed result delivery 契约持有。本批不约束任意客户端收集全部结果的内存，不把多个域额度解释为统一 RSS 上限。
 
