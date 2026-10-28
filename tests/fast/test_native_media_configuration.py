@@ -32,6 +32,9 @@ def media_project(tmp_path, monkeypatch):
     cmake_path.parent.mkdir(parents=True)
     shutil.copyfile(ROOT / cmake_path.relative_to(root), cmake_path)
     (root / "cmake").mkdir()
+    (root / "cmake/FindZLIB.cmake").write_text(
+        "if(NOT TARGET ZLIB::ZLIB)\nadd_library(ZLIB::ZLIB INTERFACE IMPORTED)\nendif()\nset(ZLIB_FOUND TRUE)\n"
+    )
     shutil.copyfile(
         ROOT / "cmake/prepare_dynamic_media_extension.cmake", root / "cmake/prepare_dynamic_media_extension.cmake"
     )
@@ -118,6 +121,7 @@ def media_project(tmp_path, monkeypatch):
     (root / "CMakeLists.txt").write_text("""
 cmake_minimum_required(VERSION 3.29)
 project(media_probe LANGUAGES C CXX)
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(EXTENSION_STATIC_BUILD ON)
 set(VANE_MEDIA_RUNTIME_SDK "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
 set(VANE_MEDIA_RUNTIME_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
@@ -181,20 +185,36 @@ def test_dynamic_media_sdk_and_incremental_relocation(media_project):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="MSVC static-library/import-thunk collision")
-def test_dynamic_media_reuses_the_hosts_windows_zlib(media_project):
+@pytest.mark.parametrize("host_scope", ["before", "after", "sibling"])
+def test_dynamic_media_reuses_the_hosts_windows_zlib(media_project, host_scope):
     root = media_project
     (root / "base-z.c").write_text("int z_fixture(void) { return 41; }\nint base_only(void) { return 1; }\n")
     (root / "extension.c").write_text(
         "int z_fixture(void);\nint base_only(void);\nint probe(void) { return z_fixture() + base_only(); }\n"
     )
     cmake = root / "CMakeLists.txt"
+    host = (
+        "add_library(base_zlib STATIC base-z.c)\n"
+        "if(NOT TARGET ZLIB::ZLIB)\nadd_library(ZLIB::ZLIB ALIAS base_zlib)\nendif()\n"
+        "target_link_libraries(file_extension INTERFACE base_zlib)\n"
+    )
+    source = cmake.read_text()
+    if host_scope == "sibling":
+        sibling = root / "host-zlib"
+        sibling.mkdir()
+        (sibling / "CMakeLists.txt").write_text(
+            "add_library(base_zlib STATIC ../base-z.c)\n"
+            "add_library(ZLIB::ZLIB INTERFACE IMPORTED)\n"
+            "target_link_libraries(ZLIB::ZLIB INTERFACE base_zlib)\n"
+            "target_link_libraries(file_extension INTERFACE ZLIB::ZLIB)\n"
+        )
+        host = "add_subdirectory(host-zlib)\n"
     cmake.write_text(
-        cmake.read_text().replace(
+        source + host
+        if host_scope == "after"
+        else source.replace(
             "include(external/duckdb/extension/media_common/extension.cmake)",
-            "add_library(base_zlib STATIC base-z.c)\n"
-            "add_library(ZLIB::ZLIB ALIAS base_zlib)\n"
-            "target_link_libraries(file_extension INTERFACE base_zlib)\n"
-            "include(external/duckdb/extension/media_common/extension.cmake)",
+            host + "include(external/duckdb/extension/media_common/extension.cmake)",
         )
     )
     build = root / "build"

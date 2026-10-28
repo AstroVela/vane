@@ -45,6 +45,11 @@ function(vane_build_native_media_extension)
     if(NOT EXISTS "${boost_multiprecision_DIR}/boost_multiprecision-config.cmake")
       message(FATAL_ERROR "Missing Boost.Multiprecision in VANE_MEDIA_RUNTIME_SDK")
     endif()
+    if(WIN32 AND NOT TARGET ZLIB::ZLIB)
+      # Resolve the host dependency before adding the SDK to the search path.
+      # Arrow may have created a directory-local target in a sibling scope.
+      find_package(ZLIB REQUIRED)
+    endif()
     list(PREPEND CMAKE_PREFIX_PATH "${VANE_MEDIA_RUNTIME_SDK}")
     file(GLOB boost_configs "${VANE_MEDIA_RUNTIME_SDK}/share/boost_*/*-config.cmake")
     foreach(config IN LISTS boost_configs)
@@ -56,13 +61,6 @@ function(vane_build_native_media_extension)
                  PATHS "${boost_multiprecision_DIR}")
     include_directories("${VANE_MEDIA_RUNTIME_SDK}/include")
     foreach(library avformat avcodec avutil swscale swresample sndfile soxr tiff jpeg z webp webpdemux)
-      if(WIN32 AND library STREQUAL "z" AND TARGET ZLIB::ZLIB)
-        # The host's static Arrow dependencies already link zlib. Adding the
-        # SDK's import thunks gives duplicate symbols on MSVC. Codec DLLs keep
-        # their separate, namespaced zlib dependency in the runtime graph.
-        list(APPEND dependencies ZLIB::ZLIB)
-        continue()
-      endif()
       set(names "${library}" "lib${library}")
       if(WIN32 AND library STREQUAL "z")
         set(names z zlib)
@@ -75,7 +73,13 @@ function(vane_build_native_media_extension)
       if(NOT shared_library)
         message(FATAL_ERROR "Missing native media SDK library: ${library}")
       endif()
-      list(APPEND dependencies "${shared_library}")
+      if(WIN32 AND library STREQUAL "z")
+        # Do not mix the host's static definitions with SDK import thunks.
+        # Codec DLLs retain their separate, namespaced runtime zlib.
+        list(APPEND dependencies ZLIB::ZLIB)
+      else()
+        list(APPEND dependencies "${shared_library}")
+      endif()
     endforeach()
   endif()
 
