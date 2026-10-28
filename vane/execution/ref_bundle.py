@@ -57,6 +57,8 @@ _RAY_LIKE_SHM_MEMORY_FRACTION = 0.95
 _RAY_LIKE_OBJECT_STORE_MAX_BYTES = 200 * _GIB
 _deferred_shm_close_lock = threading.Lock()
 _deferred_shm_closes: list[tuple[shared_memory.SharedMemory, ForkableOutputLease | None]] = []
+_descriptor_shm_lock = threading.Lock()
+_descriptor_shm_owners: weakref.WeakValueDictionary[str, shared_memory.SharedMemory] = weakref.WeakValueDictionary()
 _shm_debug_lock = threading.Lock()
 _shm_debug_seq = 0
 _local_shm_budget_cond = threading.Condition()
@@ -170,7 +172,7 @@ def _parse_byte_size(value: str) -> int:
 
 
 def _available_system_memory_bytes() -> int:
-    if sys.platform == "darwin":
+    if sys.platform in {"darwin", "win32"}:
         import psutil
 
         return int(psutil.virtual_memory().available)
@@ -189,8 +191,8 @@ def _available_system_memory_bytes() -> int:
 
 
 def _available_local_shm_bytes() -> int:
-    if sys.platform == "darwin":
-        # Darwin POSIX shared memory draws from VM; it has no /dev/shm mount.
+    if sys.platform in {"darwin", "win32"}:
+        # Darwin and Windows shared memory draw from VM, without /dev/shm.
         return _available_system_memory_bytes()
     stat = os.statvfs("/dev/shm")
     return int(stat.f_frsize) * int(stat.f_bavail)
@@ -1485,9 +1487,44 @@ def _arrow_table_from_local_shm_zero_copy(
         raise
 
 
+def _close_descriptor_shm(name: str, shm: shared_memory.SharedMemory) -> None:
+    with _descriptor_shm_lock:
+        if _descriptor_shm_owners.get(name) is shm:
+            del _descriptor_shm_owners[name]
+    shm.close()
+
+
+def _release_descriptor_shm(name: str) -> None:
+    if os.name != "nt":
+        return
+    with _descriptor_shm_lock:
+        shm = _descriptor_shm_owners.pop(name, None)
+    if shm is not None:
+        shm.close()
+
+
+class _WindowsShmDescriptor(dict[str, Any]):
+    """Keep the publisher's mapping open until adoption or descriptor release.
+
+    Raw Windows descriptors require the publisher to retain this owner through
+    handoff. Subprocess output uses parent-owned arena grants instead.
+    """
+
+    def __init__(self, descriptor: dict[str, Any], shm: shared_memory.SharedMemory) -> None:
+        super().__init__(descriptor)
+        with _descriptor_shm_lock:
+            _descriptor_shm_owners[shm.name] = shm
+        weakref.finalize(self, _close_descriptor_shm, shm.name, shm)
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        # The mapping handle belongs to the publisher, outside the wire data.
+        return dict, (dict(self),)
+
+
 def _unlink_shared_memory_name(name: str) -> None:
     if not name:
         return
+    _release_descriptor_shm(name)
     try:
         shm = _open_existing_shm(name, track=False)
     except FileNotFoundError:
@@ -1518,6 +1555,9 @@ def _posix_shm_name(shm: shared_memory.SharedMemory) -> str:
 
 
 def _untrack_shm(shm: shared_memory.SharedMemory) -> shared_memory.SharedMemory:
+    if os.name == "nt":
+        # Windows mappings are owned by open handles, never resource_tracker.
+        return shm
     try:
         name = _posix_shm_name(shm)
     except Exception:
@@ -1538,7 +1578,8 @@ def _open_existing_shm(name: str, *, track: bool) -> shared_memory.SharedMemory:
 
 
 def _unlink_shm(shm: shared_memory.SharedMemory, *, track: bool) -> None:
-    if track:
+    if track or os.name == "nt":
+        # On Windows unlink is a no-op; the last close destroys the mapping.
         shm.unlink()
         return
     posix_shmem = getattr(shared_memory, "_posixshmem", None)
@@ -2029,6 +2070,7 @@ def make_local_shm_descriptor_from_block(
     """Publish a block only after writing its admitted IPC bytes."""
     required = block.ipc_size_bytes
     shm = _create_shm(required, track=False)
+    descriptor_owns_shm = False
     try:
         region = _require_shm_buffer(shm)[:required]
         try:
@@ -2056,6 +2098,9 @@ def make_local_shm_descriptor_from_block(
         if grant_id is not None:
             descriptor["grant_id"] = int(grant_id)
         _shm_debug_log("create_descriptor", name=shm.name, size=required, rows=block.num_rows, nbytes=block.size_bytes)
+        if os.name == "nt":
+            descriptor = _WindowsShmDescriptor(descriptor, shm)
+            descriptor_owns_shm = True
         return descriptor
     except Exception:
         try:
@@ -2064,7 +2109,8 @@ def make_local_shm_descriptor_from_block(
             pass
         raise
     finally:
-        shm.close()
+        if not descriptor_owns_shm:
+            shm.close()
 
 
 def make_pooled_shm_descriptor(
@@ -2212,16 +2258,19 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     cancel_event: _CancellationFlag | None = None,
     on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
-    descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
-    local_descs = descriptor["block_refs"]
-    metadata_in = descriptor["metadata"]
-    grant_id = descriptor["grant_id"]
-    consuming_input = local_shm_budget_manager().output_grant_input(grant_id)
-    output_owner = local_shm_budget_manager().output_grant_owner(grant_id)
+    # Normalized wire fields do not retain the publisher's Windows handles.
+    # Keep the original descriptor alive until adoption or rollback finishes.
+    normalized_descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
     refs = []
     metadata = []
     grant_budget_remaining: int | None = None
+    output_owner: _OutputGrant | None = None
     try:
+        local_descs = normalized_descriptor["block_refs"]
+        metadata_in = normalized_descriptor["metadata"]
+        grant_id = normalized_descriptor["grant_id"]
+        consuming_input = local_shm_budget_manager().output_grant_input(grant_id)
+        output_owner = local_shm_budget_manager().output_grant_owner(grant_id)
         for local_desc, meta in zip(local_descs, metadata_in, strict=False):
             name = str(local_desc["shm_name"])
             size = int(local_desc["ipc_size_bytes"])
@@ -2300,6 +2349,10 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                         output_owner=output_owner,
                     )
                 )
+                if shm is not None:
+                    # The adopted ref now owns a live handle independently of
+                    # the publisher, so a raw Windows descriptor can retire.
+                    _release_descriptor_shm(name)
             except Exception as adoption_error:
                 try:
                     if pooled_budget is not None:
@@ -2342,6 +2395,10 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         except Exception as cleanup_error:
             raise adoption_error from cleanup_error
         raise
+    finally:
+        # A retained exception traceback must not keep the publisher alive
+        # after the receiver has adopted its handles or rolled back.
+        del descriptor
 
     if grant_budget_remaining is not None and grant_budget_remaining > 0:
         _release_local_shm_ref_budget(
@@ -2352,7 +2409,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         REF_BUNDLE_RESULT_MARKER,
         refs,
         metadata,
-        descriptor["names"],
+        normalized_descriptor["names"],
     )
 
 

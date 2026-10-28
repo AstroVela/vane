@@ -8,17 +8,22 @@ from __future__ import annotations
 import os
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import psutil
+
+if TYPE_CHECKING:
+    from vane.execution._windows_job import WindowsWorkerJob
 
 
 class WorkerProcessGroup:
     """Retain process identities until the worker's process group is gone.
 
-    Workers start a new session before importing user code. Group discovery
+    Windows job objects retain descendants after their worker exits. POSIX
+    workers start a new session before importing user code; group discovery
     still works after the worker exits and its children are reparented. Saved
     psutil identities also retain descendants that create their own sessions.
-    Signals use psutil's PID-reuse checks, never an unverified numeric PID.
+    POSIX signals use psutil's PID-reuse checks, never an unverified numeric PID.
     """
 
     def __init__(self, pid: int) -> None:
@@ -32,6 +37,12 @@ class WorkerProcessGroup:
             self._root.create_time()
         except psutil.NoSuchProcess:
             self._root = None
+        self._windows_job: WindowsWorkerJob | None = None
+        if os.name == "nt":
+            from vane.execution._windows_job import WindowsWorkerJob
+
+            # The worker is still blocked on its socket-bootstrap pipe.
+            self._windows_job = WindowsWorkerJob(pid)
 
     def capture(self) -> None:
         if self.owner_pid != os.getpid():
@@ -40,6 +51,9 @@ class WorkerProcessGroup:
             self._capture()
 
     def _capture(self) -> None:
+        if self._windows_job is not None:
+            # Job membership survives root exit and cannot race PID reuse.
+            return
         if self._root is not None and self._root.is_running():
             try:
                 self._members.update(self._root.children(recursive=True))
@@ -68,6 +82,9 @@ class WorkerProcessGroup:
             self._close(timeout)
 
     def _close(self, timeout: float) -> None:
+        if self._windows_job is not None:
+            self._windows_job.close(timeout)
+            return
         deadline = time.monotonic() + timeout
         while True:
             self._capture()

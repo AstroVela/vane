@@ -838,6 +838,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "tests/ray_diagnostic_helpers.py",
         "tests/ray_test_profile.py",
         "tests/result_stream_helpers.py",
+        "tests/windows_test_timeout.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
         "vane/_native/__init__.pyi",

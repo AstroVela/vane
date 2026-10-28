@@ -60,6 +60,7 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # Optional provider, benchmark, compatibility, and external-service suites run
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
+  "$project_root/tests/fast/test_windows_udf_transport.py"
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_mlx_provider.py"
   "$project_root/tests/fast/test_mlx_image_provider.py"
@@ -106,6 +107,8 @@ release_tests=(
 # use real native plans/subprocesses and small shared-memory budgets, without
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_monkeypatch"
   "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
   "$project_root/tests/fast/test_local_query_models.py::test_model_releases_output_before_completion_callback_returns"
   "$project_root/tests/fast/test_local_task_scheduling.py"

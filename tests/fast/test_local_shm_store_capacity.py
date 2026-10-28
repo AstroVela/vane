@@ -17,7 +17,8 @@ from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCa
 from vane.execution.udf_shm_store import LocalShmStore, LocalShmStoreCapacityError
 
 
-def test_darwin_auto_capacity_uses_available_vm_without_linux_paths(monkeypatch):
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_darwin_auto_capacity_uses_available_vm_without_linux_paths(monkeypatch, platform):
     from types import SimpleNamespace
 
     import psutil
@@ -25,23 +26,24 @@ def test_darwin_auto_capacity_uses_available_vm_without_linux_paths(monkeypatch)
     from vane.execution import ref_bundle
 
     def no_linux_path(*args, **kwargs):
-        pytest.fail("Darwin shared-memory capacity must not probe Linux paths")
+        pytest.fail("VM-backed shared-memory capacity must not probe Linux paths")
 
-    monkeypatch.setattr(ref_bundle.sys, "platform", "darwin")
+    monkeypatch.setattr(ref_bundle.sys, "platform", platform)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=10 * 1024**3))
     monkeypatch.setattr("builtins.open", no_linux_path)
-    monkeypatch.setattr(os, "statvfs", no_linux_path)
+    monkeypatch.setattr(os, "statvfs", no_linux_path, raising=False)
     assert ref_bundle._auto_local_shm_store_capacity_bytes() == 3 * 1024**3
 
 
-def test_darwin_auto_capacity_rejects_exhausted_vm(monkeypatch):
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_darwin_auto_capacity_rejects_exhausted_vm(monkeypatch, platform):
     from types import SimpleNamespace
 
     import psutil
 
     from vane.execution import ref_bundle
 
-    monkeypatch.setattr(ref_bundle.sys, "platform", "darwin")
+    monkeypatch.setattr(ref_bundle.sys, "platform", platform)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=0))
     with pytest.raises(RuntimeError, match="no available memory"):
         ref_bundle._auto_local_shm_store_capacity_bytes()

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import math
 import os
 import queue
@@ -146,6 +147,7 @@ _MSG_OUTPUT_GRANT_FAILED = 0x12
 _MSG_STREAM_NEXT = 0x13
 _MSG_STREAM_CONTINUE = 0x14
 _MSG_INPUT_RETAINED = 0x15
+_MSG_IPC_RESULT = 0x16
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -505,17 +507,34 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             )
             env.update(self._worker_env)
             env["PYTHONUNBUFFERED"] = "1"
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NO_WINDOW
+            else:
+                creationflags = 0
             self._proc = subprocess.Popen(
                 cmd,
-                pass_fds=(child_fd, shm_fd),
+                pass_fds=() if sys.platform == "win32" else (child_fd, shm_fd),
                 close_fds=True,
-                start_new_session=True,
+                start_new_session=sys.platform != "win32",
+                creationflags=creationflags,
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if sys.platform == "win32" else subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=None if _subprocess_debug_enabled() else subprocess.DEVNULL,
             )
             self._process_group = WorkerProcessGroup(self._proc.pid)
+            if sys.platform == "win32":
+                # The child waits on stdin until job ownership is established.
+                # WSADuplicateSocket transfers only these sockets to that PID.
+                bootstrap = json.dumps(
+                    [child_sock.share(self._proc.pid).hex(), self._shm_peer.child_sock.share(self._proc.pid).hex()]
+                ).encode("ascii")
+                assert self._proc.stdin is not None
+                try:
+                    self._proc.stdin.write(bootstrap + b"\n")
+                    self._proc.stdin.flush()
+                finally:
+                    self._proc.stdin.close()
             child_sock.close()
             self._startup_child_sock = None
             self._shm_peer.child_sock.close()
@@ -1089,6 +1108,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         except Exception as exc:
             self._raise_result_decoding_error(exc, descriptor)
 
+    def _adopt_ipc_result_mapping(self, shm_name: str) -> None:
+        try:
+            data_shm = self._require_data_shm()
+            if shm_name == data_shm.name:
+                return
+            replacement = _open_existing_shm(shm_name, track=False)
+            try:
+                data_shm.close()
+            except BaseException:
+                replacement.close()
+                raise
+            self._data_shm = replacement
+        except Exception as exc:
+            self._raise_result_decoding_error(exc)
+
     def _decode_ipc_result(self, result_size: int) -> pa.Table:
         try:
             data_shm = self._require_data_shm()
@@ -1273,6 +1307,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             msg_type, payload = self._recv_expected(
                 (
                     _MSG_OK,
+                    _MSG_IPC_RESULT,
                     _MSG_REF_BUNDLE_RESULT,
                     _MSG_REF_BUNDLE_CHUNK,
                     _MSG_ERROR,
@@ -1304,7 +1339,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     self._send_worker_message(self._require_socket(), _MSG_STREAM_CONTINUE)
                 msg_type = None
                 continue
-            if msg_type in (_MSG_OK, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
+            if msg_type in (_MSG_OK, _MSG_IPC_RESULT, _MSG_REF_BUNDLE_RESULT, _MSG_ERROR, _MSG_TASK_CANCELLED):
                 self._awaiting_submit_terminal = False
             try:
                 if self._handle_submit_control_message(msg_type, payload):
@@ -1408,11 +1443,27 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     msg_type = None
                     continue
                 return result
+            shm_name = None
+            if msg_type == _MSG_IPC_RESULT:
+                try:
+                    if os.name != "nt" or not 8 < len(payload) <= 264:
+                        raise ValueError("invalid named mapping response size")
+                    shm_name = payload[8:].decode("ascii")
+                    if not shm_name.startswith("wnsm_") or not shm_name[5:].isalnum():
+                        raise ValueError("invalid named mapping response name")
+                except ValueError as error:
+                    self._mark_broken("UDF subprocess returned malformed IPC response", actor_lost=True)
+                    raise RuntimeError(self._broken_error) from error
+                payload = payload[:8]
             if len(payload) != 8:
                 self._mark_broken("UDF subprocess returned malformed OK response", actor_lost=True)
                 raise RuntimeError(self._broken_error)
 
             result_size = struct.unpack("<Q", payload)[0]
+            if shm_name is not None:
+                # A terminal response leaves the worker reusable. Synchronize
+                # mapping ownership even when cancellation discards its data.
+                self._adopt_ipc_result_mapping(shm_name)
             scope = self._current_execution_scope()
             scope.raise_if_cancelled("UDF subprocess task")
             if result_size == 0:
@@ -1424,7 +1475,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     actor_lost=True,
                 )
                 raise RuntimeError(self._broken_error)
-            return self._wrap_output(self._decode_ipc_result(result_size))
+            result = self._decode_ipc_result(result_size)
+            return self._wrap_output(result)
         raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:

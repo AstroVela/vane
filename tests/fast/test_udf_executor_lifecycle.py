@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -3548,23 +3549,104 @@ def test_subprocess_close_is_idempotent():
     assert proc is None or proc.poll() is not None
 
 
-def test_subprocess_resizes_shared_memory_for_large_output():
-    from vane.execution.udf_subprocess import UDFExecutor
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_subprocess_resizes_shared_memory_for_large_output(backend):
+    from vane.execution.udf_subprocess import UDFExecutor, _SingleSubprocessExecutor
 
     large_value = "x" * (2 * 1024 * 1024)
 
     def expand(table):
         return pa.table({"out": [large_value for _ in range(table.num_rows)]})
 
-    executor = UDFExecutor(_subprocess_map_payload(expand))
-    try:
-        _submit_with_admission(executor, pa.table({"x": [1, 2]}))
-        output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
+    class Expand:
+        def __call__(self, table):
+            return expand(table)
 
-        assert output is not None
-        assert output.column("out").to_pylist() == [large_value, large_value]
+    executor = (
+        _SingleSubprocessExecutor(_subprocess_map_payload(Expand, execution_backend=backend, actor_number=1))
+        if backend == "subprocess_actor"
+        else UDFExecutor(_subprocess_map_payload(expand))
+    )
+    try:
+        # Reuse the executor across growth, a small result, and another growth.
+        for rows in [2, 1, 5]:
+            table = pa.table({"x": list(range(rows))})
+            if backend == "subprocess_actor":
+                executor.submit(table)
+            else:
+                _submit_with_admission(executor, table)
+            output = _wait_for_results(executor, 1, timeout_s=10.0)[0]
+
+            assert output is not None
+            assert output.column("out").to_pylist() == [large_value] * rows
     finally:
         executor.close()
+
+
+@pytest.mark.parametrize("mapping_failure", [None, "open", "close"])
+def test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker(monkeypatch, mapping_failure):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class Mapping:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def close(self):
+            if mapping_failure == "close" and self.name == "wnsm_original":
+                raise BufferError("original mapping is still exported")
+            self.closed = True
+
+    original = Mapping("wnsm_original")
+    replacement = Mapping("wnsm_replacement")
+    scope = subprocess_exec.ExecutionCancellationScope("cancelled-ipc", 1)
+    scope.cancel("result no longer needed")
+    worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._data_shm = original
+    worker._shm_peer = None
+    worker._broken_error = None
+    worker._current_execution_scope = lambda: scope
+    worker._recv_expected = lambda _expected: (
+        subprocess_exec._MSG_IPC_RESULT,
+        struct.pack("<Q", 128) + replacement.name.encode("ascii"),
+    )
+    protocol_errors = []
+    worker._record_worker_protocol_failure = protocol_errors.append
+
+    def mark_broken(error, **_kwargs):
+        worker._broken_error = error
+
+    def open_mapping(name, *, track):
+        assert name == replacement.name
+        assert track is False
+        if mapping_failure == "open":
+            raise FileNotFoundError("replacement mapping disappeared")
+        return replacement
+
+    def decode_result(*_args, **_kwargs):
+        pytest.fail("cancelled IPC results must not be decoded")
+
+    worker._mark_broken = mark_broken
+    worker._decode_ipc_result = decode_result
+    # Exercise Windows message handling on Linux/macOS CI without changing os globally.
+    monkeypatch.setattr(subprocess_exec, "os", types.SimpleNamespace(name="nt"))
+    monkeypatch.setattr(subprocess_exec, "_open_existing_shm", open_mapping)
+    if mapping_failure is None:
+        with pytest.raises(subprocess_exec.ExecutionCancelledError, match="result no longer needed"):
+            worker._recv_submit_result()
+        assert worker._data_shm is replacement
+        assert original.closed
+        assert not replacement.closed
+        assert worker._broken_error is None
+        assert protocol_errors == []
+    else:
+        with pytest.raises(RuntimeError, match="result decoding failed"):
+            worker._recv_submit_result()
+        assert worker._data_shm is original
+        assert worker._broken_error is not None
+        assert len(protocol_errors) == 1
+        assert replacement.closed is (mapping_failure == "close")
+    assert not worker._awaiting_submit_terminal
 
 
 def test_subprocess_map_batches_none_output_returns_empty_table():
@@ -4015,7 +4097,9 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
-    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", str(required + 1))
+    # Retained Arrow results from other tests must not consume this test's budget.
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: required + 1)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
 
     wait_started = threading.Event()
     original_log = ref_bundle._shm_debug_log
@@ -4028,6 +4112,7 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
     monkeypatch.setattr(ref_bundle, "_shm_debug_log", record_budget_wait)
 
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(table)
+    assert manager.snapshot()["allocated_bytes"] == required
     done = threading.Event()
     holder = {}
 
@@ -4051,9 +4136,7 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
             holder["result"][1][0].release()
         thread.join(timeout=5.0)
 
-    with ref_bundle._local_shm_budget_cond:
-        assert ref_bundle._local_shm_budget_reserved_bytes == 0
-        assert ref_bundle._local_shm_budget_pending_output_bytes == 0
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
 def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monkeypatch):
@@ -4061,10 +4144,12 @@ def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monke
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
-    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", str(required + 1))
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: required + 1)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
 
     descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(table)
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(table)
+    assert manager.snapshot()["allocated_bytes"] == required
 
     wait_events = []
     original_log = ref_bundle._shm_debug_log
@@ -4091,15 +4176,14 @@ def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monke
         thread.start()
         assert done.wait(5.0)
         assert not wait_events
+        assert manager.snapshot()["allocated_bytes"] == 2 * required
     finally:
         refs[0].release()
         if "result" in holder:
             holder["result"][1][0].release()
         thread.join(timeout=5.0)
 
-    with ref_bundle._local_shm_budget_cond:
-        assert ref_bundle._local_shm_budget_reserved_bytes == 0
-        assert ref_bundle._local_shm_budget_pending_output_bytes == 0
+    assert manager.snapshot()["usage_bytes"] == 0
 
 
 def test_subprocess_ref_bundle_output_materializes():
@@ -8634,6 +8718,69 @@ def test_local_ref_bundle_worker_payload_carries_input_lease_id():
             ref.release()
 
 
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_temporary_descriptor_survives_normalization_and_releases_after_adoption(monkeypatch, fail_open):
+    from vane.execution import ref_bundle
+
+    class OwningDescriptor(dict):
+        def __init__(self, publisher):
+            super().__init__(publisher)
+            self.publisher = publisher
+
+    publishers = []
+    finalized = []
+    names = []
+    opened = False
+    original_open = ref_bundle._open_existing_shm
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+
+    def temporary_descriptor():
+        publisher = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [1, 2, 3]}))
+        names.append(publisher["block_refs"][0]["shm_name"])
+        descriptor = OwningDescriptor(publisher)
+        publishers.append(weakref.ref(descriptor))
+        weakref.finalize(descriptor, finalized.append, "released")
+        return descriptor
+
+    def inspect_open(name, *, track):
+        nonlocal opened
+        if not opened:
+            opened = True
+            assert publishers[0]() is not None, "publisher finalized before mapping adoption"
+            if fail_open:
+                raise MemoryError("receiver mapping failed")
+        return original_open(name, track=track)
+
+    monkeypatch.setattr(ref_bundle, "_open_existing_shm", inspect_open)
+    result = None
+    try:
+        if fail_open:
+            # Keep the exception traceback alive: it must not retain a failed
+            # temporary publisher after adoption rollback finishes.
+            with pytest.raises(MemoryError, match="receiver mapping failed") as caught:
+                ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+                    temporary_descriptor(), block_on_budget=False
+                )
+            assert caught.value.__traceback__ is not None
+        else:
+            result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(
+                temporary_descriptor(), block_on_budget=False
+            )
+        gc.collect()
+        assert opened
+        assert publishers[0]() is None
+        assert finalized == ["released"]
+        if result is not None:
+            assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).to_pydict() == {"x": [1, 2, 3]}
+    finally:
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        for name in names:
+            ref_bundle._unlink_shared_memory_name(name)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
 def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_monkeypatch(monkeypatch):
     from vane.execution import ref_bundle
 
@@ -8664,7 +8811,11 @@ def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_mon
         for ref in refs:
             ref.release()
 
-    assert shared_registers
+    if sys.platform == "win32":
+        assert not shared_registers
+        assert not shared_unregisters
+    else:
+        assert shared_registers
     assert sorted(shared_registers) == sorted(shared_unregisters)
 
 
