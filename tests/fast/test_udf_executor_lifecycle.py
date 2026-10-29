@@ -9519,7 +9519,10 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pool
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
 
 
-def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(monkeypatch):
+@pytest.mark.parametrize("collect_unrelated_worker", [False, True])
+def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(
+    monkeypatch, collect_unrelated_worker
+):
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -9537,8 +9540,20 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
         4: stale_scope,
     }
 
+    pending_workers = []
+    unrelated_worker_ref = None
+    if collect_unrelated_worker:
+        unrelated_worker = _bare_shutdown_executor(subprocess_exec, _FakeControlSocket(), None)
+        unrelated_worker._test_cycle = unrelated_worker
+        unrelated_worker_ref = weakref.ref(unrelated_worker)
+        pending_workers.append(unrelated_worker)
+        del unrelated_worker
+
     def cancel_input_lease(lease_id, *, name):
         events.append(f"lease:{lease_id}:{name}")
+        if pending_workers:
+            pending_workers.clear()
+            gc.collect()
         if lease_id == 1 and "lease" not in failed_once:
             failed_once.add("lease")
             raise RuntimeError("planned input lease failure")
@@ -9557,9 +9572,25 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
             failed_once.add("wake")
             raise RuntimeError("planned budget wakeup failure")
 
-    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
-    monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_output_grant)
-    monkeypatch.setattr(subprocess_exec, "wake_local_shm_ref_budget_waiters", wake_budget)
+    # Keep the real cleanup methods, but inject failures only for this worker.
+    # Module-wide mocks can also be reached by unrelated workers' __del__.
+    cleanup_globals = dict(
+        vars(subprocess_exec),
+        cancel_local_shm_input_lease=cancel_input_lease,
+        release_local_shm_output_grant=release_output_grant,
+        wake_local_shm_ref_budget_waiters=wake_budget,
+    )
+    for method_name in ("_cancel_active_input_leases", "_release_active_output_grants", "_cancel_scope_resources"):
+        method = getattr(type(executor), method_name)
+        isolated_method = types.FunctionType(
+            method.__code__,
+            cleanup_globals,
+            method.__name__,
+            method.__defaults__,
+            method.__closure__,
+        )
+        isolated_method.__kwdefaults__ = method.__kwdefaults__
+        monkeypatch.setattr(executor, method_name, types.MethodType(isolated_method, executor))
 
     with pytest.raises(
         RuntimeError,
@@ -9582,6 +9613,8 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
     assert sock.closed
     assert executor._sock is None
     assert executor._proc is None
+    if unrelated_worker_ref is not None:
+        assert unrelated_worker_ref() is None
 
     executor.close(kill=True)
 
