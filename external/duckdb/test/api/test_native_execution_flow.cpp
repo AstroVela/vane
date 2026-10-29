@@ -318,6 +318,16 @@ TEST_CASE("Bounded native results become ready before upstream flow pipelines fi
 	result->Cast<StreamQueryResult>().Close();
 	CHECK(first->GetValue(0, 0) == Value::BIGINT(0));
 	REQUIRE_NO_FAIL(con.Query("SELECT 7"));
+	auto streamed = con.SendQuery(sql);
+	REQUIRE_NO_FAIL(*streamed);
+	idx_t rows = 0;
+	while (auto chunk = streamed->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			CHECK(chunk->GetValue(0, row) == Value::BIGINT(rows++ * 49));
+		}
+	}
+	REQUIRE_NO_FAIL(*streamed);
+	CHECK(rows == 64);
 	auto repeated = con.Query(sql);
 	REQUIRE_NO_FAIL(*repeated);
 	CHECK(repeated->RowCount() == 64);

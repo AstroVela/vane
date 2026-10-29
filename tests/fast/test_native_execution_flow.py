@@ -198,6 +198,19 @@ def test_native_flow_crosses_real_udf_boundary_and_reuses_after_close(backend):
             assert query().explain().count('NATIVE_PROJECT') >= 2
             for _ in range(2):
                 assert sorted(query().fetchall()) == expected
+            stream = query().execute_result(stream=True, rows_per_batch=1000000)
+            streamed = []
+            try:
+                while True:
+                    try:
+                        batch = stream.take()
+                    except StopIteration:
+                        break
+                    streamed.extend(zip(batch['value'].to_pylist(), batch['payload'].to_pylist(),
+                                        batch['next'].to_pylist()))
+            finally:
+                stream.close()
+            assert sorted(streamed) == expected
             result = query().execute_result(stream=True, rows_per_batch=1000000)
             retained = result.take()
             before = retained.to_pylist()

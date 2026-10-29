@@ -30,7 +30,10 @@ PipelineTask::PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p)
 bool PipelineTask::TaskBlockedOnResult() const {
 	// If this returns true, it means the pipeline this task belongs to has a cached chunk
 	// that was the result of the Sink method returning BLOCKED
-	return pipeline_executor->RemainingSinkChunk();
+	// Resumable upstream sinks may also block while the result pipeline is live.
+	// Only a result receiver can be unblocked by the caller fetching a result.
+	return pipeline.sink && pipeline.sink->type == PhysicalOperatorType::RESULT_COLLECTOR &&
+	       pipeline_executor->RemainingSinkChunk();
 }
 
 const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
