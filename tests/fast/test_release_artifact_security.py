@@ -506,14 +506,10 @@ def test_release_metadata_rejects_invalid_requirements():
         ),
     ],
 )
-def test_optional_dependency_markers_preserve_grouping_and_extra_gate(monkeypatch, condition, expected):
+def test_optional_dependency_markers_preserve_grouping_and_extra_gate(condition, expected):
     dependency = "accelerator>=1" + (f"; {condition}" if condition else "")
-    monkeypatch.setattr(
-        check_release_artifacts,
-        "PROJECT_METADATA",
-        {"optional-dependencies": {"test_extra": [dependency]}},
-    )
-    assert check_release_artifacts._expected_project_requires_dist() == (f"accelerator>=1; {expected}",)
+    project_metadata = {"optional-dependencies": {"test_extra": [dependency]}}
+    assert check_release_artifacts._expected_project_requires_dist(project_metadata) == (f"accelerator>=1; {expected}",)
 
 
 @pytest.mark.parametrize("platform", ["Linux", "Windows", "Darwin"])

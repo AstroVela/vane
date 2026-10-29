@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,10 +18,24 @@ GENERATORS = ["Visual Studio 17 2022"] if sys.platform == "win32" else ["Ninja",
 
 
 @pytest.fixture
-def media_project(tmp_path, monkeypatch):
+def media_project_directory(tmp_path):
+    if sys.platform != "win32":
+        yield tmp_path
+        return
+    # MSBuild excludes all of AppData from dependency tracking, including
+    # pytest's default temporary directory even when TEMP/TMP are overridden.
+    # Keep incremental-build inputs and outputs in the checkout's build tree.
+    directory = ROOT / "build" / "media-configuration-tests"
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory) as temporary:
+        yield Path(temporary)
+
+
+@pytest.fixture
+def media_project(media_project_directory, monkeypatch):
     if sys.platform != "win32" and (not shutil.which("cc") or not shutil.which("ninja")):
         pytest.skip("CMake linkage test requires a C compiler and Ninja")
-    root = tmp_path / "project"
+    root = media_project_directory / "project"
     if sys.platform == "win32":
         # MSBuild excludes files below TEMP from dependency tracking. Keep
         # compiler scratch files separate from the fixture's source/builds.
