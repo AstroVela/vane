@@ -253,6 +253,9 @@ shared_ptr<MediaProjectState> PhysicalMediaProject::GetState(ClientContext &cont
 }
 
 void PhysicalMediaProject::ResetExecutionState() {
+	// Pipeline initialization reuses an existing physical sink state. Retire it
+	// with the rendezvous so prepared executions connect both sides to one epoch.
+	sink_state.reset();
 	shared_ptr<MediaProjectState> previous;
 	{
 		std::lock_guard<std::mutex> guard(state_lock);
