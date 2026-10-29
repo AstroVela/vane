@@ -16,7 +16,8 @@ struct ManagedImageResize {
 		const auto &input = expression.children[0]->return_type;
 		const auto &output = expression.return_type;
 		if (!ImageLogicalType::IsFixedShape(input) || !ImageLogicalType::IsFixedShape(output)) {
-			throw NotImplementedException("Managed native_resize requires fixed-shape IMAGE input and constant dimensions");
+			throw NotImplementedException(
+			    "Managed native_resize requires fixed-shape IMAGE input and constant dimensions");
 		}
 		auto mode = ImageLogicalType::GetMode(input);
 		if (ImageLogicalType::StorageType(input) != ImageLogicalType::PixelType(mode)) {
@@ -31,7 +32,7 @@ struct ManagedImageResize {
 		const auto height = ImageLogicalType::GetHeight(output);
 		const auto channels = ImageLogicalType::ChannelsForMode(mode);
 		auto bytes = ImageOperatorContract::CheckSize(width, height, channels, ImageOperatorContract::MAX_BYTES,
-		                                             ImageLogicalType::ElementSize(mode));
+		                                              ImageLogicalType::ElementSize(mode));
 		bool antialias = false;
 		if (expression.children.size() == 4) {
 			auto option = ExpressionExecutor::EvaluateScalar(context, *expression.children[3]);
@@ -42,14 +43,15 @@ struct ManagedImageResize {
 		const auto input_height = ImageLogicalType::GetHeight(input);
 		if (antialias && (width < input_width || height < input_height)) {
 			const bool horizontal = uint64_t(width) * input_height <= uint64_t(input_width) * height;
-			scratch = ImageOperatorContract::CheckSize(horizontal ? width : input_width, horizontal ? input_height : height,
-			                                           channels, ImageOperatorContract::MAX_BYTES, sizeof(double));
+			scratch =
+			    ImageOperatorContract::CheckSize(horizontal ? width : input_width, horizontal ? input_height : height,
+			                                     channels, ImageOperatorContract::MAX_BYTES, sizeof(double));
 		}
 		return {bytes, scratch};
 	}
-	
+
 	static void Execute(ClientContext &context, DataChunk &args, Vector &result, MediaResourceLease lease,
-	                                  shared_ptr<void> lifetime) {
+	                    shared_ptr<void> lifetime) {
 		D_ASSERT(args.size() == 1);
 		AllocateMediaArray(result, 1, std::move(lease), std::move(lifetime));
 		ImageOperatorInput images(args.data[0], 1, &context);
@@ -71,9 +73,9 @@ struct ManagedImageResize {
 		layout.width = ImageLogicalType::GetWidth(result.GetType());
 		layout.height = ImageLogicalType::GetHeight(result.GetType());
 		auto target = FlatVector::GetData(ArrayVector::GetEntry(result));
-		ResizeImagePixels(image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); }, antialias);
+		ResizeImagePixels(
+		    image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); }, antialias);
 	}
-
 };
 
 } // namespace duckdb

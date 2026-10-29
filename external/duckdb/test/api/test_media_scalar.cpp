@@ -34,7 +34,7 @@ struct ScalarProbe {
 	bool fail = false;
 };
 
-ScalarFunction ManagedFunction(shared_ptr<ScalarProbe> probe) {
+ScalarFunction ManagedFunction(shared_ptr<ScalarProbe> probe, idx_t scratch = 17) {
 	auto input = ImageLogicalType::Create("RGB", 2, 2);
 	auto output = ImageLogicalType::Create("RGB", 1, 1);
 	ScalarFunction function("test_managed_resize", {input, LogicalType::BIGINT, LogicalType::BIGINT}, output,
@@ -44,7 +44,9 @@ ScalarFunction ManagedFunction(shared_ptr<ScalarProbe> probe) {
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetExtraFunctionInfo(make_shared_ptr<ManagedMediaScalarFunctionInfo>(
-	    [](ClientContext &, const BoundFunctionExpression &) { return ManagedMediaWorkingSet {3, 17}; },
+	    [scratch](ClientContext &, const BoundFunctionExpression &) {
+		    return ManagedMediaWorkingSet {3, scratch};
+	    },
 	    [probe](ClientContext &, DataChunk &args, Vector &output, MediaResourceLease lease, shared_ptr<void> lifetime) {
 		    AllocateMediaArray(output, 1, std::move(lease), std::move(lifetime));
 		    if (probe->fail) {
@@ -65,12 +67,12 @@ ScalarFunction ManagedFunction(shared_ptr<ScalarProbe> probe) {
 }
 
 struct ScalarFixture {
-	explicit ScalarFixture(idx_t copy_limit = 40, bool real_resize = false, bool antialias = false)
+	explicit ScalarFixture(idx_t copy_limit = 40, bool real_resize = false, bool antialias = false, idx_t scratch = 17)
 	    : db(nullptr), con(db), thread(*con.context), context(*con.context, thread, nullptr),
 	      plan(Allocator::DefaultAllocator()), probe(make_shared_ptr<ScalarProbe>()) {
 		ClientConfig::GetConfig(*con.context).streaming_buffer_size = copy_limit;
 		input_types = {LogicalType::BIGINT, ImageLogicalType::Create("RGB", 2, 2)};
-		auto function = ManagedFunction(probe);
+		auto function = ManagedFunction(probe, scratch);
 		if (real_resize) {
 			function.SetExtraFunctionInfo(make_shared_ptr<ManagedMediaScalarFunctionInfo>(
 			    ManagedImageResize::WorkingSet, ManagedImageResize::Execute));
@@ -85,9 +87,10 @@ struct ScalarFixture {
 		}
 		vector<unique_ptr<Expression>> expressions;
 		expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
-		expressions.push_back(make_uniq<BoundFunctionExpression>(function.return_type, function, std::move(args), nullptr));
+		expressions.push_back(
+		    make_uniq<BoundFunctionExpression>(function.return_type, function, std::move(args), nullptr));
 		op = make_uniq<PhysicalMediaProject>(plan, vector<LogicalType> {LogicalType::BIGINT, function.return_type},
-		                                    std::move(expressions), 5);
+		                                     std::move(expressions), 5);
 		op->children.push_back(plan.Make<PhysicalDummyScan>(input_types, 5));
 		sink_global = op->GetGlobalSinkState(*con.context);
 		sink_local = op->GetLocalSinkState(context);
@@ -314,10 +317,9 @@ TEST_CASE("Managed scalar SQL plans stream with one thread and reject unsupporte
 		CHECK(FlatVector::GetData<uint8_t>(ArrayVector::GetEntry(chunk->data[1]))[0] == 65 + row);
 	}
 	CHECK(probe->executed == 9);
-	for (auto sql : {
-	         "SELECT CASE WHEN i=0 THEN test_managed_resize(data,1,1) ELSE NULL END FROM scalar_input",
-	         "SELECT i FROM scalar_input WHERE test_managed_resize(data,1,1) IS NOT NULL",
-	         "SELECT test_managed_resize(data,1,1),test_managed_resize(data,2,1) FROM scalar_input"}) {
+	for (auto sql : {"SELECT CASE WHEN i=0 THEN test_managed_resize(data,1,1) ELSE NULL END FROM scalar_input",
+	                 "SELECT i FROM scalar_input WHERE test_managed_resize(data,1,1) IS NOT NULL",
+	                 "SELECT test_managed_resize(data,1,1),test_managed_resize(data,2,1) FROM scalar_input"}) {
 		auto rejected = con.Query(sql);
 		REQUIRE(rejected->HasError());
 		CHECK(rejected->GetError().find("Managed media") != string::npos);
@@ -330,7 +332,30 @@ TEST_CASE("Managed scalar rejects a receiving capacity smaller than one row", "[
 		return;
 	}
 	REQUIRE_THROWS_WITH(ScalarFixture(19), Catch::Matchers::Contains("streaming_buffer_size receiving capacity"));
+	REQUIRE_THROWS_WITH(ScalarFixture(40, false, false, GetNativeMediaOutputPool()->Snapshot().capacity.bytes),
+	                    Catch::Matchers::Contains("minimum working set"));
 	CHECK(GetNativeMediaOutputPool()->Snapshot().reserved.bytes == 0);
+}
+
+TEST_CASE("Managed scalar copy failure leaves input unacknowledged and retryable", "[media-scalar]") {
+	if (!ScalarAdmissionEnabled()) {
+		return;
+	}
+	ScalarFixture fixture;
+	auto input = fixture.Input();
+	MediaFlowWindow window(1);
+	input->AddMediaFlow(window.TakeGrant(*window.Request(1)));
+	REQUIRE_NO_FAIL(fixture.con.Query("SET memory_limit='1B'"));
+	REQUIRE_THROWS_AS(fixture.Accept(*input), OutOfMemoryException);
+	CHECK(window.Snapshot().reserved.bytes == 1);
+	CHECK(fixture.Pool()->Snapshot().reserved.bytes == 0);
+	CHECK(fixture.Pool()->Snapshot().waiting_requests == 0);
+	REQUIRE_NO_FAIL(fixture.con.Query("SET memory_limit='10MiB'"));
+	REQUIRE(fixture.Accept(*input) == SinkResultType::NEED_MORE_INPUT);
+	CHECK(window.Snapshot().reserved.bytes == 0);
+	DataChunk output;
+	REQUIRE(fixture.Next(output) == SourceResultType::HAVE_MORE_OUTPUT);
+	CHECK(output.GetValue(0, 0) == Value::BIGINT(0));
 }
 
 TEST_CASE("Managed native resize kernel reserves antialias scratch and preserves NULLs", "[media-scalar]") {

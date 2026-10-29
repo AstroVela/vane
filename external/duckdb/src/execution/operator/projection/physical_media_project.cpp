@@ -56,7 +56,8 @@ idx_t ManagedColumn(const vector<unique_ptr<Expression>> &expressions) {
 		} else if (expression.GetExpressionClass() != ExpressionClass::BOUND_REF &&
 		           (expression.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
 		            expression.return_type.IsNested())) {
-			throw NotImplementedException("Managed media projection fields must be column references or primitive constants");
+			throw NotImplementedException(
+			    "Managed media projection fields must be column references or primitive constants");
 		}
 		if (!GetManagedMediaScalar(expression)) {
 			FixedBytes(expression.return_type);
@@ -108,8 +109,7 @@ void Wake(vector<InterruptState> tasks) {
 
 struct MediaProjectState : public StateWithBlockableTasks {
 	MediaProjectState(ClientContext &context_p, const PhysicalMediaProject &op)
-	    : input_types(op.children[0].get().GetTypes()),
-	      scalar_column(ManagedColumn(op.select_list)),
+	    : input_types(op.children[0].get().GetTypes()), scalar_column(ManagedColumn(op.select_list)),
 	      function(op.select_list[scalar_column]->Cast<BoundFunctionExpression>()),
 	      info(*GetManagedMediaScalar(function)) {
 		auto &db = DatabaseInstance::GetDatabase(context_p);
@@ -215,7 +215,7 @@ struct MediaProjectLocalState : public LocalSourceState {
 };
 
 void CopyOwnedRow(MediaProjectState &state, MediaProjectLocalState &local, DataChunk &owned,
-	              MediaResourceLease row_lease) {
+                  MediaResourceLease row_lease) {
 	auto lifetime = make_shared_ptr<MediaProjectRowLifetime>(local.lifetime, std::move(row_lease));
 	MediaResourcePool columns({0, state.row_bytes});
 	auto scope = columns.CreateScope();
@@ -226,8 +226,8 @@ void CopyOwnedRow(MediaProjectState &state, MediaProjectLocalState &local, DataC
 		if (type.InternalType() == PhysicalType::ARRAY) {
 			AllocateMediaArray(owned.data[column], 1, std::move(lease), lifetime);
 		} else {
-			auto vector = AllocateMediaVector(type, 1, std::move(lease), Allocator::DefaultAllocatorReference(), nullptr,
-			                                  lifetime);
+			auto vector = AllocateMediaVector(type, 1, std::move(lease), Allocator::DefaultAllocatorReference(),
+			                                  nullptr, lifetime);
 			owned.data[column].Reference(*vector);
 		}
 		VectorOperations::Copy(local.cache.data[column], owned.data[column], local.row + 1, local.row, 0);
@@ -237,8 +237,8 @@ void CopyOwnedRow(MediaProjectState &state, MediaProjectLocalState &local, DataC
 } // namespace
 
 PhysicalMediaProject::PhysicalMediaProject(PhysicalPlan &plan, vector<LogicalType> types,
-	                                       vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality)
-	    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), select_list(std::move(expressions)) {
+                                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality)
+    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), select_list(std::move(expressions)) {
 }
 
 shared_ptr<MediaProjectState> PhysicalMediaProject::GetState(ClientContext &context) const {
@@ -328,7 +328,7 @@ SinkResultType PhysicalMediaProject::Sink(ExecutionContext &context, DataChunk &
 }
 
 SinkFinalizeType PhysicalMediaProject::Finalize(Pipeline &, Event &, ClientContext &,
-	                                            OperatorSinkFinalizeInput &input) const {
+                                                OperatorSinkFinalizeInput &input) const {
 	auto &state = *input.global_state.Cast<MediaProjectSinkState>().state;
 	vector<InterruptState> wakeups;
 	{
@@ -349,7 +349,7 @@ unique_ptr<LocalSourceState> PhysicalMediaProject::GetLocalSourceState(Execution
 }
 
 SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                                   OperatorSourceInput &input) const {
+                                                       OperatorSourceInput &input) const {
 	auto &state = *input.global_state.Cast<MediaProjectSourceState>().state;
 	auto &local = input.local_state.Cast<MediaProjectLocalState>();
 	chunk.Destroy(); // Empty-schema Reset would keep the preceding borrowed buffers alive.
@@ -383,8 +383,8 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 			if (status == MediaAdmissionStatus::CANCELLED) {
 				return SourceResultType::FINISHED;
 			}
-			local.lifetime = make_shared_ptr<MediaProjectBatchLifetime>(local.batch->request->TakeGrant(), state.row_bytes,
-			                                               state.working_set.output_bytes);
+			local.lifetime = make_shared_ptr<MediaProjectBatchLifetime>(
+			    local.batch->request->TakeGrant(), state.row_bytes, state.working_set.output_bytes);
 			local.batch->request.reset();
 			bool closed;
 			{
@@ -515,7 +515,8 @@ void ValidateManagedMediaPlan(ClientContext &context, LogicalOperator &root) {
 					}
 					info->working_set(context, expression.Cast<BoundFunctionExpression>());
 				}
-				ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) { check(child, false); });
+				ExpressionIterator::EnumerateChildren(expression,
+				                                      [&](const Expression &child) { check(child, false); });
 			};
 			check(**root_expression, true);
 		});
