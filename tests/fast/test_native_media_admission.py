@@ -279,8 +279,9 @@ with (vane.connect() if not artifact else
         raise AssertionError('the sort must reserve encoded keys as well as pixels')
     con.execute("SET streaming_buffer_size='512B'")
     for relation, message in (
-        (frames().order('frame_index').limit(3), 'materialization budget handoff'),
         (frames().project('frame_index, data, frame_index::VARCHAR AS k').order('k'),
+         'fixed-width primitive sort keys'),
+        (frames().project('frame_index, data, [frame_index] AS k').order('k'),
          'fixed-width primitive sort keys'),
     ):
         try:
@@ -321,6 +322,135 @@ faulthandler.cancel_dump_traceback_later()
 """
     result = subprocess.run(
         [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path / "sort-spill"), arrow_export],
+        env={
+            **os.environ,
+            "VANE_RUNNER": "local-fast",
+            "VANE_PROGRESS": "0",
+            "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+            "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "288",
+            "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
+@pytest.mark.parametrize("arrow_export", ["table", "capsule"])
+def test_native_video_flow_topn_spills_and_preserves_pixels(video_path, tmp_path, window_bytes, arrow_export):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifact = "" if providers else str(media._artifact("video"))
+    script = r"""
+import faulthandler
+from pathlib import Path
+import sys
+import numpy as np
+import pyarrow as pa
+import vane
+
+faulthandler.dump_traceback_later(90, exit=True)
+artifact, path, spill_path, arrow_export = sys.argv[1:]
+with (vane.connect() if not artifact else
+      vane.connect(config={'allow_unsigned_extensions': 'true'})) as con:
+    if artifact:
+        con.load_extension(artifact)
+    else:
+        vane.load_installed_extension('native_media', connection=con)
+    con.execute("SET video_backend='native'")
+    con.execute('SET threads=4')
+    con.execute("SET temp_directory='" + spill_path.replace("'", "''") + "'")
+    con.execute("SET memory_limit='2MiB'")
+    con.execute("SET streaming_buffer_size='512B'")
+
+    def frames(files=1):
+        return vane.read_video_frames([path] * files, 6, 8, connection=con,
+                                      read_task_count=files,
+                                      max_partition_bytes=2048).project('frame_index, data')
+
+    ordered = frames(3).order('frame_index DESC').limit(9, 2).execute()
+    assert any(p.is_file() and p.stat().st_size for p in Path(spill_path).rglob('*'))
+    retained = ordered.fetchall()
+    expected = sorted(list(range(12)) * 3, reverse=True)[2:11]
+    assert [row[0] for row in retained] == expected
+    snapshots = [pixels.copy() for _, pixels in retained]
+    filtered = frames().filter('frame_index % 2 = 0').order('frame_index DESC').limit(3, 1).fetchall()
+    assert [row[0] for row in filtered] == [8, 6, 4]
+    mixed = frames().project(
+        'frame_index, data, CASE WHEN frame_index % 5 = 0 THEN NULL '
+        'ELSE frame_index % 3 END AS k'
+    ).order('k DESC NULLS FIRST, frame_index ASC').limit(5, 2).project('frame_index, data').fetchall()
+    mixed_expected = sorted(range(12), key=lambda i: (i % 5 != 0, -(i % 3) if i % 5 else 0, i))[2:7]
+    assert [row[0] for row in mixed] == mixed_expected
+    hidden = frames().order('frame_index DESC').limit(2, 3).project('data').fetchall()
+    assert frames().order('frame_index').limit(0).fetchall() == []
+    assert frames().order('frame_index').limit(3, 100).fetchall() == []
+    assert frames().filter('frame_index < 0').order('frame_index').limit(3).fetchall() == []
+
+    # LIMIT 1 still receives the complete sort; it cannot bypass spill capacity.
+    con.execute("SET max_temp_directory_size='0B'")
+    try:
+        frames(3).order('frame_index DESC').limit(1).fetchall()
+    except vane.OutOfMemoryException:
+        pass
+    else:
+        raise AssertionError('TopN with spill disabled must fail before releasing uncommitted input')
+    con.execute("SET max_temp_directory_size='100MiB'")
+    con.execute("SET streaming_buffer_size='175B'")
+    try:
+        frames().order('frame_index').limit(1).fetchall()
+    except vane.OutOfMemoryException as error:
+        assert 'streaming_buffer_size receiving capacity' in str(error), str(error)
+    else:
+        raise AssertionError('TopN must reserve encoded keys as well as pixels')
+    con.execute("SET streaming_buffer_size='512B'")
+    for key in ('frame_index::VARCHAR', '[frame_index]'):
+        try:
+            frames().project('frame_index, data, ' + key + ' AS k').order('k').limit(3).fetchall()
+        except vane.NotImplementedException as error:
+            assert 'fixed-width primitive sort keys' in str(error), str(error)
+        else:
+            raise AssertionError('an unsupported TopN key must fail explicitly')
+    try:
+        frames().project("CAST('bad' || frame_index::VARCHAR AS BIGINT) AS frame_index, data").order(
+            'frame_index'
+        ).limit(1).fetchall()
+    except vane.ConversionException:
+        pass
+    else:
+        raise AssertionError('LIMIT must preserve downstream expression failures')
+
+    reader = frames().order('frame_index DESC').limit(4, 2).to_arrow_reader(batch_size=1000000)
+    first = reader.read_next_batch()
+    assert first.num_rows == 1, first.num_rows
+    assert first['frame_index'].to_pylist() == [9]
+    first_pixels = first['data'].storage.to_pylist()
+    reader.close()
+    assert con.execute('SELECT 42').fetchone() == (42,)
+
+    con.execute("SET memory_limit='10MiB'")
+    reference = dict(frames().fetchall())
+    assert sorted(reference) == list(range(12))
+    for rows in (retained, filtered, mixed):
+        for index, pixels in rows:
+            np.testing.assert_array_equal(pixels, reference[index])
+    for (pixels,), index in zip(hidden, (8, 7)):
+        np.testing.assert_array_equal(pixels, reference[index])
+    relation = frames().order('frame_index DESC').limit(5, 2)
+    arrow = relation.to_arrow_table() if arrow_export == 'table' else pa.table(relation)
+    assert arrow['frame_index'].to_pylist() == [9, 8, 7, 6, 5]
+    arrow_pixels = arrow['data'].combine_chunks().storage.to_pylist()
+    assert con.execute('SELECT 42').fetchone() == (42,)
+for (index, pixels), snapshot in zip(retained, snapshots):
+    np.testing.assert_array_equal(pixels, snapshot)
+    np.testing.assert_array_equal(pixels, reference[index])
+assert first['data'].storage.to_pylist() == first_pixels
+assert arrow['data'].combine_chunks().storage.to_pylist() == arrow_pixels
+faulthandler.cancel_dump_traceback_later()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, artifact, str(video_path), str(tmp_path / "topn-spill"), arrow_export],
         env={
             **os.environ,
             "VANE_RUNNER": "local-fast",
@@ -680,7 +810,8 @@ with (vane.connect() if not artifact else
         assert len(frames().fetchall()) == 12
         ordered_frames = frames().order('frame_index DESC').fetchall()
         assert [row[0] for row in ordered_frames] == list(range(11, -1, -1))
-        for relation in (mapped(frames().order('frame_index DESC')),):
+        for relation in (mapped(frames().order('frame_index DESC')),
+                         mapped(frames().order('frame_index DESC').limit(3))):
             try:
                 relation.fetchall()
             except vane.NotImplementedException as error:

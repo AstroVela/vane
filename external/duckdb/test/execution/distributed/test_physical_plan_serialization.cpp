@@ -992,6 +992,50 @@ TEST_CASE("PhysicalPlan tree: Limit -> OrderBy -> ColumnDataScan", "[serializati
 	std::cerr << "[test] PhysicalPlan tree Limit->OrderBy roundtrip PASSED" << std::endl;
 }
 
+TEST_CASE("PhysicalPlan tree: Media TopN fallback -> ColumnDataScan", "[serialization][physical_plan][media-topn]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	auto &scan = MakeColumnDataScan(plan, types);
+	vector<BoundOrderByNode> orders;
+	orders.emplace_back(OrderType::DESCENDING, OrderByNullType::NULLS_FIRST,
+	                    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	auto &order = plan.Make<PhysicalOrder>(types, std::move(orders), vector<idx_t> {0}, 24, false, true);
+	order.children.push_back(scan);
+	auto &limit = plan.Make<PhysicalStreamingLimit>(types, BoundLimitNode::ConstantValue(5),
+	                                                BoundLimitNode::ConstantValue(2), 5, false);
+	limit.children.push_back(order);
+	plan.SetRoot(limit);
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	plan.Serialize(serializer);
+	serializer.End();
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	PhysicalPlan decoded_plan(allocator);
+	deserializer.Begin();
+	auto root = decoded_plan.Deserialize(deserializer);
+	deserializer.End();
+	REQUIRE(root);
+	REQUIRE(root->type == PhysicalOperatorType::STREAMING_LIMIT);
+	auto &decoded_limit = root->Cast<PhysicalStreamingLimit>();
+	CHECK(decoded_limit.limit_val.GetConstantValue() == 5);
+	CHECK(decoded_limit.offset_val.GetConstantValue() == 2);
+	CHECK_FALSE(decoded_limit.parallel);
+	REQUIRE(root->children.size() == 1);
+	auto &decoded_order = root->children[0].get().Cast<PhysicalOrder>();
+	CHECK(decoded_order.media_flow_receiver);
+	CHECK_FALSE(decoded_order.ParallelSink());
+	CHECK_FALSE(decoded_order.ParallelSource());
+	REQUIRE(decoded_order.orders.size() == 1);
+	CHECK(decoded_order.orders[0].type == OrderType::DESCENDING);
+	CHECK(decoded_order.orders[0].null_order == OrderByNullType::NULLS_FIRST);
+	REQUIRE(decoded_order.children.size() == 1);
+	CHECK(decoded_order.children[0].get().type == PhysicalOperatorType::COLUMN_DATA_SCAN);
+}
+
 TEST_CASE("PhysicalPlan tree: StreamingLimit -> ColumnDataScan", "[serialization][physical_plan]") {
 	Allocator allocator;
 	PhysicalPlan plan(allocator);

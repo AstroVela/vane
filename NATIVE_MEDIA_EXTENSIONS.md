@@ -328,11 +328,19 @@ Per-prefix storage blocks and serial execution are conservative correctness
 choices in this increment, with directory and allocator overhead additional to
 the payload budget.
 
-With this window enabled, variable-sized/nested sort keys, TopN, aggregation,
+`ORDER BY ... LIMIT n OFFSET m` with integer bounds, including plans optimized
+to logical TopN, uses the same spillable full sort followed by a serial streaming limit when native
+flow is enabled. Fixed-width keys, hidden ordering columns, multiple keys and
+NULL ordering follow the full-sort contract. The first implementation receives
+and sorts the complete input before applying LIMIT/OFFSET, so LIMIT 1 can still
+require spill and does not bound memory by one row. Candidate-heap optimization
+and dynamic boundary pruning remain future work. Ordinary queries retain the
+existing TopN implementation. Arrow table and capsule export use the existing
+bounded or spillable media receiver before converting the result to Arrow.
+
+With this window enabled, variable-sized/nested sort keys, aggregation,
 joins/windows and sorting before the UDF still raise an unsupported-path error.
-In particular, the optimizer commonly uses TopN for `ORDER BY ... LIMIT`, which
-requires separate qualification. These operators need their own
-materialization/spill handoff. Scan cleanup
+These operators need their own materialization/spill handoff. Scan cleanup
 cancels flow waiters and returns production credits even if detached views
 remain alive; physical pixel reservations on those views remain valid. The
 receipt covers C++ ingress, while subsequent Python task/SHM/Ray admission keeps

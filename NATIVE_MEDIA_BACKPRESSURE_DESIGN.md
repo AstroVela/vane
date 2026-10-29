@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：前五批 decoder、原始像素 buffer、UDF ingress flow、流式结果和普通物化结果已合入集成分支；第六批实现完整排序的预算交接。更新日期：2026-10-29。
+状态：前六批 decoder、原始像素 buffer、UDF ingress flow、流式结果、普通物化结果和完整排序已合入集成分支；第七批实现 TopN 语义的预算交接。更新日期：2026-10-29。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -108,7 +108,19 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 输出按排序后的行号二分查找封存的输入段。一次只向下游交付一行；本地最多缓存一个受接收上限约束的输入段，避免在结果接收前生成一整个向量的图片。结果接收继续使用第四/第五批的有界流式队列或可溢写物化 collector，不能退回普通无限物化路径。结果 chunk 和 Arrow 的独立副本仍由默认 allocator 持有，允许晚于连接/数据库销毁。
 - 序列化保存媒体排序接收标记；旧计划默认 false。启用 flow 的 pipeline 只允许已声明预算交接的排序和结果终点，未覆盖的排序后执行域在执行前明确报错。`ORDER BY ... LIMIT` 通常由优化器改写为 TopN，属于下一独立增量；不借完整排序的测试宣称其已覆盖。
 
-核心 `[media-sort]` 覆盖两条 sink 路径、偏斜字符串 payload、选中行/嵌套字段、超过标准 key chunk 的行号合并、小内存真实 spill、一帧窗口 EOF、多键与 NULL、隐藏排序列、单行超限、失败回滚、取消、原始像素引用和关闭后保留的结果/Arrow。真实视频窗口 144/288 bytes 的排序、三文件输入、spill/恢复和逐像素对照进入现有 provider CI 文件 `test_native_media_admission.py`。构建身份和实际执行结果随本批 PR 记录。
+核心 `[media-sort]` 覆盖两条 sink 路径、偏斜字符串 payload、选中行/嵌套字段、超过标准 key chunk 的行号合并、小内存真实 spill、一帧窗口 EOF、多键与 NULL、隐藏排序列、单行超限、失败回滚、取消、原始像素引用和关闭后保留的结果/Arrow。真实视频窗口 144/288 bytes 的排序、三文件输入、spill/恢复和逐像素对照进入现有 provider CI 文件 `test_native_media_admission.py`。构建身份和实际执行结果随本批 PR 记录。第六批通过 #1110 合入为 `f8e5b9479`；Arrow table/capsule 工厂会选择既有媒体接收器，再从受管结果导出 Arrow。
+
+### 第七批：TopN 语义复用可溢写排序接收
+
+实现分支为 `feature/media-topn-handoff`，基于 #1110 已合入的集成提交 `f8e5b9479`，目标为 `native-media-backpressure-dev`。首版覆盖 native scan 经投影、过滤到 `ORDER BY ... LIMIT/OFFSET`，以及普通结果、流式结果、Arrow table/capsule 导出。
+
+- 物理规划阶段识别受支持的 native flow 输入，将逻辑 TopN 转成带接收标记的 `PhysicalOrder`，再接串行 `PhysicalStreamingLimit`。排序使用完整输入的列和基数估计，包括最终投影隐藏的排序列；继续复用第六批的 payload、编码 key 和行号容量检查、封存、spill 和整批确认。
+- 本批执行完整输入排序，EOF 后才应用 LIMIT/OFFSET。即使 LIMIT 为 1，也可能需要 spill；关闭 spill 或最低工作集无法容纳时返回明确资源错误。候选数量和 LIMIT/OFFSET 不作为字节容量。候选堆和动态边界剪枝属于后续性能优化；本路径将可选 TopN 动态过滤状态保持为未初始化，不发布候选边界。
+- 串行 LIMIT 保持排序后的行次序，继续由已有流式/物化媒体 collector 接收输出。接收原子单位、源像素 lease 的最后引用寿命、Arrow 独立副本和取消契约均沿用既有实现。LIMIT 0 可由优化器直接消除扫描；空输入、OFFSET 超过 EOF、预编译 LIMIT/OFFSET 和隐藏排序列遵循现有 SQL 语义。
+- 转换仅在实验 flow 已启用且输入链路符合接收契约时生效。默认关闭时及普通数据源仍使用原有 `PhysicalTopN`。变长/嵌套键、排序后进入 UDF、aggregate/join/window 和其他未声明交接的执行边界继续明确拒绝；本批不扩大 Ray/FTE 支持声明，不默认启用实验额度。
+- 计划复用已有 ORDER_BY 标记和 STREAMING_LIMIT 序列化字段，无新增物理算子或 ABI 字段。序列化回归检查 LIMIT/OFFSET、串行属性、排序方向、NULL 顺序和接收标记均保留。
+
+核心 `[media-topn]` 不依赖 provider，覆盖规划选择、普通 TopN 保持原行为、一帧窗口下完整接收并 spill、两条 sink 路径、流式/物化结果、隐藏键与 NULL/重复键、预编译参数、空结果、失败清理、缺少源 credit 时取消、Arrow 提前关闭和数据库销毁后的数组寿命。真实视频在现有 provider CI 文件加入 144/288 bytes 窗口、三文件 TopN、spill/恢复、参考像素对照和 table/capsule 四种组合；本机缺少匹配 provider 时的跳过不计为真实解码通过。
 
 ## 1 设计结论
 
