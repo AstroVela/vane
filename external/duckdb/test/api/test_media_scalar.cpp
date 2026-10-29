@@ -347,7 +347,7 @@ TEST_CASE("Managed scalar SQL plans stream with one thread and reject unsupporte
 		CHECK(db.instance->GetMediaOutputPool()->Snapshot().reserved.bytes == 0);
 	}
 	CHECK(probe->executed == 22);
-	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='constant_folding'"));
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='expression_rewriter'"));
 	auto constant_dimensions = con.Query("SELECT i,test_managed_resize(data,1+0,1) FROM scalar_input LIMIT 1");
 	REQUIRE_NO_FAIL(*constant_dimensions);
 	idx_t constant_rows = 0;
