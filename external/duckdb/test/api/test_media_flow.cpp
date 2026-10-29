@@ -2070,6 +2070,7 @@ TEST_CASE("Flow ingress copy cost follows selected values and fixed image payloa
 	CHECK(EstimateMediaFlowInputBytes(repeated_copy) == EstimateMediaFlowInputBytes(repeated));
 	DataChunk dynamic;
 	dynamic.Initialize(Allocator::DefaultAllocator(), {LogicalType::LIST(LogicalType::UTINYINT)}, 1);
+	dynamic.SetValue(0, 0, Value::LIST(LogicalType::UTINYINT, {}));
 	dynamic.SetCardinality(1);
-	REQUIRE_THROWS_AS(EstimateMediaFlowInputBytes(dynamic), NotImplementedException);
+	CHECK(EstimateMediaFlowInputBytes(dynamic) == sizeof(list_entry_t));
 }

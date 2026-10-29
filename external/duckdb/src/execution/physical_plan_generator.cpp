@@ -20,15 +20,16 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
+#include "duckdb/execution/operator/projection/physical_media_project.hpp"
 
 namespace duckdb {
 
 bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const PhysicalOperator &plan) {
-	if (!DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity()) {
-		return false;
-	}
 	auto current = &plan;
 	while (current->type != PhysicalOperatorType::TABLE_SCAN) {
+		if (current->type == PhysicalOperatorType::MEDIA_PROJECT) {
+			return true;
+		}
 		if (current->type == PhysicalOperatorType::ORDER_BY) {
 			if (!current->Cast<PhysicalOrder>().media_flow_receiver) {
 				return false;
@@ -43,7 +44,8 @@ bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const Phy
 		}
 		current = &children[0].get();
 	}
-	return current->Cast<PhysicalTableScan>().function.media_flow_source;
+	return DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity() &&
+	       current->Cast<PhysicalTableScan>().function.media_flow_source;
 }
 
 PhysicalPlanGenerator::PhysicalPlanGenerator(ClientContext &context) : context(context) {
@@ -64,6 +66,7 @@ PhysicalOperator &PhysicalPlanGenerator::ResolveAndPlan(unique_ptr<LogicalOperat
 	// Resolve the types of each operator.
 	profiler.StartPhase(MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
 	op->ResolveOperatorTypes();
+	ValidateManagedMediaPlan(context, *op);
 	profiler.EndPhase();
 
 	// Resolve the column references.

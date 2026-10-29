@@ -9,6 +9,7 @@
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/projection/physical_media_project.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -576,6 +577,8 @@ void Executor::CancelTasks() {
 		std::function<void(PhysicalOperator &)> reset_udfs = [&](PhysicalOperator &op) {
 			if (op.type == PhysicalOperatorType::STREAMING_UDF) {
 				op.Cast<PhysicalStreamingUDF>().ResetStreamingState(true);
+			} else if (op.type == PhysicalOperatorType::MEDIA_PROJECT) {
+				op.Cast<PhysicalMediaProject>().ResetExecutionState();
 			}
 			// Include owned plans under result collectors and EXECUTE, which
 			// are deliberately absent from GetInputChildren().
@@ -649,8 +652,11 @@ bool Executor::ResultCollectorIsBlocked() {
 	if (!HasStreamingResultCollector()) {
 		return false;
 	}
-	if (completed_pipelines + 1 != total_pipelines) {
-		// The result collector is always in the last pipeline
+	if (!physical_plan->Cast<PhysicalResultCollector>().SupportsMediaFlowInput() &&
+	    completed_pipelines + 1 != total_pipelines) {
+		// Ordinary blocking plans finish their upstream pipelines first. A
+		// bounded flow receiver can fill while resumable upstream pipelines
+		// are still active. Let Fetch drain it or none of those tasks can finish.
 		return false;
 	}
 	if (to_be_rescheduled_tasks.empty()) {

@@ -22,6 +22,7 @@
 #include "duckdb/execution/operator/aggregate/physical_streaming_window.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_media_project.hpp"
 #include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
 #include "duckdb/execution/operator/projection/physical_vllm.hpp"
 
@@ -352,7 +353,7 @@ SourceResultType PhysicalOperator::GetData(ExecutionContext &context, DataChunk 
 SourceResultType PhysicalOperator::GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
                                                 OperatorSourceInput &input) const {
 	auto chunk = make_uniq<DataChunk>();
-	if (type == PhysicalOperatorType::EMPTY_RESULT) {
+	if (type == PhysicalOperatorType::EMPTY_RESULT || type == PhysicalOperatorType::MEDIA_PROJECT) {
 		chunk->InitializeEmpty(types);
 	} else {
 		chunk->Initialize(BufferAllocator::Get(context.client), types);
@@ -804,6 +805,12 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
 		return make_uniq<PhysicalProjection>(physical_plan, std::move(types), std::move(select_list),
 		                                     estimated_cardinality);
+	}
+	case PhysicalOperatorType::MEDIA_PROJECT: {
+		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
+		auto resource_admission = deserializer.ReadPropertyWithExplicitDefault<bool>(104, "resource_admission", true);
+		return make_uniq<PhysicalMediaProject>(physical_plan, std::move(types), std::move(select_list),
+		                                       estimated_cardinality, resource_admission);
 	}
 	case PhysicalOperatorType::VLLM_PROJECT: {
 		unique_ptr<Expression> prompt_expr;

@@ -1,4 +1,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_media_project.hpp"
+#include "duckdb/execution/managed_media_scalar.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -36,6 +39,21 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalProjection &op) {
 		}
 	}
 
+	if (NativeExecutionFlowEnabled(context)) {
+		auto &flow = Make<PhysicalMediaProject>(op.types, std::move(op.expressions), op.estimated_cardinality, false);
+		flow.children.push_back(plan);
+		return flow;
+	}
+	if (NativeMediaScalarAdmissionEnabled(context)) {
+		for (auto &expression : op.expressions) {
+			if (GetManagedMediaScalar(*expression)) {
+				auto &managed =
+				    Make<PhysicalMediaProject>(op.types, std::move(op.expressions), op.estimated_cardinality);
+				managed.children.push_back(plan);
+				return managed;
+			}
+		}
+	}
 	auto &proj = Make<PhysicalProjection>(op.types, std::move(op.expressions), op.estimated_cardinality);
 	proj.children.push_back(plan);
 	return proj;

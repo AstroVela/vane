@@ -35,6 +35,8 @@ set(TEST_API_OBJECTS
     test_media_resource.cpp
     test_media_buffer.cpp
     test_media_flow.cpp
+    test_media_scalar.cpp
+    test_native_execution_flow.cpp
     test_insertion_order_preserving_map.cpp
     test_bignum.cpp
     test_threads.cpp
@@ -59,6 +61,12 @@ if(DUCKDB_EXTENSION_TPCH_SHOULD_LINK)
 endif()
 
 add_library(test_api OBJECT ${TEST_API_OBJECTS})
+set_property(
+  SOURCE test_media_scalar.cpp
+  APPEND
+  PROPERTY INCLUDE_DIRECTORIES
+           "${CMAKE_CURRENT_SOURCE_DIR}/../../extension/image/include"
+           "${CMAKE_CURRENT_SOURCE_DIR}/../../extension/file/include")
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_api>
     PARENT_SCOPE)

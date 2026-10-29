@@ -122,15 +122,17 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	                               pipeline.source->Cast<PhysicalTableScan>().function.media_flow_source;
 	const bool native_media_sort = pipeline.source->type == PhysicalOperatorType::ORDER_BY &&
 	                               pipeline.source->Cast<PhysicalOrder>().media_flow_receiver;
-	if (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() &&
-	    (native_media_scan || native_media_sort)) {
+	const bool managed_media = pipeline.source->type == PhysicalOperatorType::MEDIA_PROJECT;
+	if (managed_media || native_media_sort ||
+	    (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() && native_media_scan)) {
 		const bool bounded_result = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::RESULT_COLLECTOR &&
 		                            pipeline.sink->Cast<PhysicalResultCollector>().SupportsMediaFlowInput();
 		const bool bounded_sort = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::ORDER_BY &&
 		                          pipeline.sink->Cast<PhysicalOrder>().media_flow_receiver;
-		const bool bounded_udf =
-		    pipeline.sink && native_media_scan && pipeline.sink->type == PhysicalOperatorType::STREAMING_UDF;
-		if (!bounded_udf && !bounded_result && !bounded_sort) {
+		const bool bounded_udf = pipeline.sink && (native_media_scan || managed_media) &&
+		                         pipeline.sink->type == PhysicalOperatorType::STREAMING_UDF;
+		const bool bounded_scalar = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::MEDIA_PROJECT;
+		if (!bounded_udf && !bounded_result && !bounded_sort && !bounded_scalar) {
 			throw NotImplementedException(
 			    "Native media flow window requires a supported streaming UDF, bounded sort or result receiver; "
 			    "materialization budget handoff is not implemented");
@@ -170,7 +172,11 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 		if (execution_mode == PipelineExecutionMode::DATA_CHUNK) {
 			auto &prev_operator = i == 0 ? *pipeline.source : pipeline.operators[i - 1].get();
 			auto chunk = make_uniq<DataChunk>();
-			chunk->Initialize(BufferAllocator::Get(context.client), prev_operator.GetTypes());
+			if (prev_operator.type == PhysicalOperatorType::MEDIA_PROJECT) {
+				chunk->InitializeEmpty(prev_operator.GetTypes());
+			} else {
+				chunk->Initialize(BufferAllocator::Get(context.client), prev_operator.GetTypes());
+			}
 			intermediate_chunks.push_back(std::move(chunk));
 		} else {
 			intermediate_batches.push_back(make_uniq<ExecutionBatch>());
@@ -1210,7 +1216,8 @@ void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
 	// EMPTY_RESULT emits no rows; a result collector returns its own buffered
 	// result instead of writing this root pipeline's output chunk. Neither
 	// needs a dense ARRAY buffer merely to carry its schema.
-	if (last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR) {
+	if (last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR ||
+	    last_op.type == PhysicalOperatorType::MEDIA_PROJECT) {
 		chunk.InitializeEmpty(last_op.GetTypes());
 		return;
 	}

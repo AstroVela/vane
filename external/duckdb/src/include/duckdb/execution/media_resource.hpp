@@ -11,6 +11,7 @@
 namespace duckdb {
 
 class InterruptState;
+class ClientContext;
 struct MediaResourcePoolState;
 struct MediaResourceRequestState;
 
@@ -150,5 +151,15 @@ private:
 //! Host constructor only. Extensions read DatabaseInstance's installed value.
 //! Zero means disabled. Like the allocation pools, fixed on first database use.
 DUCKDB_API idx_t GetNativeMediaFlowCapacity();
+
+//! Host constructor only. Experimental flag, frozen on first database use.
+DUCKDB_API bool GetNativeMediaScalarAdmission();
+//! Read the installed host runtime even when called by a self-contained extension.
+DUCKDB_API bool NativeMediaScalarAdmissionEnabled(ClientContext &context);
+
+//! Host-captured, function-independent projection flow. Its receiving/storage
+//! and output windows are separate from optional exact allocation admission.
+DUCKDB_API bool GetNativeExecutionFlow();
+DUCKDB_API bool NativeExecutionFlowEnabled(ClientContext &context);
 
 } // namespace duckdb
