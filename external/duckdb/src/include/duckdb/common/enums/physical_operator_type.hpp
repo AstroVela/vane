@@ -145,6 +145,7 @@ enum class PhysicalOperatorType : uint8_t {
 	DISTRIBUTED_RESERVOIR_SAMPLE,
 	DISTRIBUTED_EXTENSION_WRITE,
 	DATA_SINK,
+	MEDIA_PROJECT,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

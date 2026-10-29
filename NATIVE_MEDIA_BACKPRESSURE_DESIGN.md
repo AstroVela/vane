@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：前五批 decoder、原始像素 buffer、UDF ingress flow、流式结果和普通物化结果已合入集成分支；第六批实现完整排序的预算交接。更新日期：2026-10-29。
+状态：前六批 decoder、原始像素 buffer、UDF ingress flow、流式结果、普通物化结果和完整排序已合入集成分支；第七批 TopN 为 Draft PR #1111；第八批开始 M3 的固定尺寸 resize 实验。更新日期：2026-10-29。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -109,6 +109,20 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 - 序列化保存媒体排序接收标记；旧计划默认 false。启用 flow 的 pipeline 只允许已声明预算交接的排序和结果终点，未覆盖的排序后执行域在执行前明确报错。`ORDER BY ... LIMIT` 通常由优化器改写为 TopN，属于下一独立增量；不借完整排序的测试宣称其已覆盖。
 
 核心 `[media-sort]` 覆盖两条 sink 路径、偏斜字符串 payload、选中行/嵌套字段、超过标准 key chunk 的行号合并、小内存真实 spill、一帧窗口 EOF、多键与 NULL、隐藏排序列、单行超限、失败回滚、取消、原始像素引用和关闭后保留的结果/Arrow。真实视频窗口 144/288 bytes 的排序、三文件输入、spill/恢复和逐像素对照进入现有 provider CI 文件 `test_native_media_admission.py`。构建身份和实际执行结果随本批 PR 记录。
+
+### 第八批：固定尺寸 resize 的流式接收和整行准入
+
+实现分支为 `feature/media-scalar-execution`，直接基于集成分支合入 #1110 后的 `f8e5b9479`，不包含尚未合入的 #1111。它是 M3 的首个实验切片，不代表图片/音频/视频 scalar、一般表达式程序或 M3 整体已完成。
+
+- 在导入 Vane 前设置 `VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION=1`，并同时配置正数 `VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES` 和 `VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES`。开关在首次宿主数据库创建时固定；未设置、空串或 `0` 保持旧路径，其他值报错。此开关仅接管显式注册 capability 的 native resize，不接管 Python resize 或未注册的其他 native scalar。
+- 新物理节点 `MEDIA_PROJECT` 将输入接收和求值拆成可并发推进的 sink/source pipeline，二者都串行执行。一个输入批次尚未执行完时，下一批输入返回拒收 `BLOCKED`，保持其 receipt 有效。接收方按字节拆成独立的 BufferManager 前缀，完成所有副本并释放 append pins 后，先排入整组工作集请求，再发布并 ACK 原输入。复制失败不发布也不 ACK；等待不持有原始像素引用。
+- 最低推进预留为 `输入前缀扫描副本 + 一行独立输入 + 一行输出像素 + kernel 临时空间`。前缀行数同时受 `streaming_buffer_size` 和宿主池剩余工作集容量约束。连一个输入行都放不下时明确报资源错误，不作“一行例外”。原输入的生产窗口和像素 lease 仍按原协议释放；接收存储由 BufferManager 管理并可溢写，其磁盘/存储预算不重复计入媒体池。
+- 整组 lease 在一个输入批次的全部行执行期间保留，给输入行和输出分配建立独立子额度，避免上游抢占后续行必需的推进空间。扫描缓存按前缀大小创建，只保留一个前缀。每行先取得输入与输出子额度，再执行一次 kernel，成功后提交行位置；下游拒收重试已有输出，不重算已完成行。等待请求使用 `PollOrArm` 和调度器唤醒，不在工作线程中等待容量。
+- 输入行和 resize 输出都是独立、已准入的 primitive/ARRAY 分配。每个子 buffer 额外保留整组 lease 的祖先 lifetime，最后一个切片/Arrow owner 释放实际存储后才归还额度。关闭 scope 只取消等待请求，不撤销 detached buffer；consumer 提前结束还会关闭子 scope 并唤醒拒收的上游。prepared statement 的执行状态在任务清理后退役，不随物理计划留到下一次执行。
+- `native_resize` 的 descriptor 从函数 catalog 恢复，不通过名称猜测受管函数。只接受 canonical fixed-shape IMAGE 列引用和绑定常量尺寸/antialias；保留原来的 bilinear/antialias kernel 与 NULL 语义。antialias 下采样的 `double` 中间平面按实际两阶段过滤方向完整预留。实验模式将 resize 保留到物理规划阶段，禁止优化器在常量折叠中调用普通分配回调。
+- 首版每个查询只允许一个受管调用，且必须是投影根字段。其他输出字段和输入 schema 限固定数字、boolean、primitive ARRAY；其他输出字段只能列引用或 primitive 常量。嵌套调用、CASE/短路内部、filter predicate、动态尺寸/模式、变长输入、多个受管节点和 distributed translation 都明确拒绝。支持接到已有有界结果接收与完整排序；TopN 覆盖仍依赖第七批。受管 source 后的 UDF handoff、decode/crop/convert/encode、音频和视频 scalar 留给后续增量。
+
+CI 增加独立开启开关的 `[media-scalar]` 进程，覆盖满池交接、拒收不 ACK、短前缀恢复、保留像素导致的暂停、批次 envelope、NULL、异常/取消、连接销毁后祖先 lease 和不含运行时状态的序列化。该进程还直接执行与 provider 共用的 resize adapter 和真实 kernel，验证 bilinear/antialias 像素及 scratch 额度。实际 native 视频扫描 → resize → 物化/两种 Arrow 接口，以及一帧/两帧窗口与未受管执行的逐像素对照，加入已由 provider CI 显式运行的 `tests/fast/test_native_media_admission.py`。这些 provider 用例在本地没有匹配扩展时仍会跳过，验收结果须单独记录。
 
 ## 1 设计结论
 

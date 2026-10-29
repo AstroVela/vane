@@ -17,7 +17,12 @@ class DataChunk;
 DUCKDB_API unique_ptr<Vector>
 AllocateMediaVector(const LogicalType &type, idx_t count, MediaResourceLease lease,
                     shared_ptr<Allocator> allocator = Allocator::DefaultAllocatorReference(),
-                    shared_ptr<MediaFlowTicket> flow = nullptr);
+                    shared_ptr<MediaFlowTicket> flow = nullptr, shared_ptr<void> lifetime = nullptr);
+
+//! Fixed arrays whose primitive child owns both its local lease and the parent
+//! working-set lifetime. No dense default-capacity pixel cache is allocated.
+DUCKDB_API void AllocateMediaArray(Vector &array, idx_t rows, MediaResourceLease lease,
+                                   shared_ptr<void> lifetime = nullptr);
 
 //! Install a fresh list child without retaining it in a reusable VectorCache.
 //! The caller must not append beyond count or treat this as admission for copies.

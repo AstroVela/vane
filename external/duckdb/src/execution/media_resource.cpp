@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/execution/media_resource.hpp"
+#include "duckdb/execution/execution_runtime.hpp"
+#include "duckdb/main/database.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -316,6 +318,24 @@ shared_ptr<MediaResourcePool> GetNativeMediaOutputPool() {
 idx_t GetNativeMediaFlowCapacity() {
 	static const auto capacity = NativeMediaCapacity("VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES");
 	return capacity;
+}
+
+bool GetNativeMediaScalarAdmission() {
+	static const bool enabled = [] {
+		const auto value = FileSystem::GetEnvVariable("VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION");
+		if (value.empty() || value == "0") {
+			return false;
+		}
+		if (value != "1") {
+			throw InvalidInputException("VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION must be 0 or 1");
+		}
+		return true;
+	}();
+	return enabled;
+}
+
+bool NativeMediaScalarAdmissionEnabled(ClientContext &context) {
+	return DatabaseInstance::GetDatabase(context).GetExecutionRuntime().native_media_scalar_admission;
 }
 
 struct MediaFlowWindowState {

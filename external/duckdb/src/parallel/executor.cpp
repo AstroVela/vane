@@ -9,6 +9,7 @@
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/projection/physical_media_project.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -576,6 +577,8 @@ void Executor::CancelTasks() {
 		std::function<void(PhysicalOperator &)> reset_udfs = [&](PhysicalOperator &op) {
 			if (op.type == PhysicalOperatorType::STREAMING_UDF) {
 				op.Cast<PhysicalStreamingUDF>().ResetStreamingState(true);
+			} else if (op.type == PhysicalOperatorType::MEDIA_PROJECT) {
+				op.Cast<PhysicalMediaProject>().ResetExecutionState();
 			}
 			// Include owned plans under result collectors and EXECUTE, which
 			// are deliberately absent from GetInputChildren().

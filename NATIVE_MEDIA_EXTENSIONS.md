@@ -242,6 +242,25 @@ progress reservations for interdependent media operators are still pending.
 The complete target, implementation status and remaining validation are in
 [Native media backpressure design](NATIVE_MEDIA_BACKPRESSURE_DESIGN.md).
 
+An additional opt-in experiment, `VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION=1`,
+adds fixed-shape `native_resize` to the host output pool. Set it before importing
+Vane together with both positive output-byte and in-flight-byte capacities. It
+defaults to disabled; only `0` and `1` are accepted. A `MEDIA_PROJECT` node copies
+one receiving batch to spillable BufferManager storage, acknowledges the input,
+and resumes one row at a time after reserving its input cache, owned input row,
+output pixels and antialias scratch. Retained output views keep the ancestor
+reservation alive through connection teardown. This reserves managed payload;
+it does not measure process RSS or charge BufferManager storage twice.
+
+The first scalar experiment accepts one resize call per query as a projection
+field, with a canonical fixed-shape IMAGE column and constant dimensions/options.
+Its input schema and other fields must have fixed numeric/boolean/primitive-array
+storage; the other fields must be column references or primitive constants.
+Nested calls, conditional/filter contexts, dynamic shapes, multiple managed
+nodes and distributed translation raise explicit unsupported errors. Python
+resize and other native media functions retain their existing contracts. This
+is the first M3 slice; it does not enable the full scalar roadmap by default.
+
 `VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES` enables an additional experimental
 **per-scan production window**, shared by that scan's parallel workers. Configure
 it before importing Vane with the same positive-integer and fixed-at-first-use

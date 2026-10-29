@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -13,6 +14,96 @@ import pytest
 from tests.fast import test_native_media_extensions as media
 
 video_path = media.video_path
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
+@pytest.mark.parametrize("antialias", [False, True])
+def test_native_video_fixed_resize_admission_matches_unmanaged_execution(video_path, window_bytes, antialias):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifacts = [] if providers else [str(media._artifact("video"))]
+    script = r"""
+import faulthandler
+import json
+import os
+import sys
+import numpy as np
+import pyarrow as pa
+import vane
+
+faulthandler.dump_traceback_later(60, exit=True)
+path, antialias, managed, *artifacts = sys.argv[1:]
+antialias = antialias == '1'
+managed = managed == '1'
+con = vane.connect(config={'allow_unsigned_extensions': 'true'}) if artifacts else vane.connect()
+if artifacts:
+    for artifact in artifacts:
+        con.load_extension(artifact)
+else:
+    vane.load_installed_extension('native_media', connection=con)
+# A self-contained extension must read the flag captured by its host runtime.
+# Mutating the environment after database creation must not change its binding.
+os.environ['VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION'] = '0' if managed else '1'
+con.execute("SET video_backend='native'")
+con.execute('SET threads=1')
+con.execute("SET streaming_buffer_size='512B'")
+
+def resized():
+    frames = vane.read_video_frames(path, 6, 8, connection=con, max_partition_bytes=288)
+    return frames.project('frame_index, native_resize(data, 3, 2, ' + str(antialias).lower() + ') AS data')
+
+plan = resized().explain()
+assert ('MEDIA_PROJECT' in plan) == managed, plan
+rows = resized().fetchall()
+assert [index for index, _ in rows] == list(range(12))
+pixels = [image.tolist() for _, image in rows]
+snapshots = [image.copy() for _, image in rows]
+assert len(resized().limit(2).fetchall()) == 2
+for threads in (1, 4):
+    con.execute('SET threads=' + str(threads))
+    repeated = resized().fetchall()
+    for (_, image), snapshot in zip(repeated, snapshots):
+        np.testing.assert_array_equal(image, snapshot)
+arrow = resized().to_arrow_table()
+capsule = pa.table(resized())
+assert arrow['frame_index'].to_pylist() == list(range(12))
+assert capsule['frame_index'].to_pylist() == list(range(12))
+assert arrow['data'].combine_chunks().storage.to_pylist() == capsule['data'].combine_chunks().storage.to_pylist()
+arrow_pixels = arrow['data'].combine_chunks().storage.to_pylist()
+con.close()
+for (_, image), snapshot in zip(rows, snapshots):
+    np.testing.assert_array_equal(image, snapshot)
+assert arrow['data'].combine_chunks().storage.to_pylist() == arrow_pixels
+print('RESIZE_RESULT=' + json.dumps(pixels))
+faulthandler.cancel_dump_traceback_later()
+"""
+    outputs = []
+    for managed in ("0", "1"):
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(video_path), str(int(antialias)), managed, *artifacts],
+            env={
+                **os.environ,
+                "VANE_RUNNER": "local-fast",
+                "VANE_PROGRESS": "0",
+                "VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION": managed,
+                "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+                "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "800",
+                "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+            },
+            capture_output=True,
+            text=True,
+            timeout=75,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs.append(
+            json.loads(
+                next(
+                    line.removeprefix("RESIZE_RESULT=")
+                    for line in result.stdout.splitlines()
+                    if line.startswith("RESIZE_RESULT=")
+                )
+            )
+        )
+    assert outputs[0] == outputs[1]
 
 
 def _assert_retained_video_pixels(read_frames):

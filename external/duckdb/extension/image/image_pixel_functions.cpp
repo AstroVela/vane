@@ -7,9 +7,14 @@
 #include "image_codec_contract.hpp"
 #include "image_codec.hpp"
 #include "image_transform.hpp"
+#include "image_resize_admission.hpp"
 #include "image_transform_contract.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/managed_media_scalar.hpp"
+#include "duckdb/execution/media_buffer.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include <zlib.h>
@@ -201,6 +206,17 @@ static void ResizeImage(DataChunk &args, ExpressionState &state, Vector &result)
 	    });
 }
 
+static unique_ptr<FunctionData> BindManagedResize(ClientContext &context, ScalarFunction &function,
+                                                  vector<unique_ptr<Expression>> &arguments) {
+	auto data = ImageTransformContract::BindResize(context, function, arguments);
+	if (NativeMediaScalarAdmissionEnabled(context)) {
+		// Keep constant/NULL calls visible to the managed planner. Their ordinary
+		// scalar callback must not allocate during optimizer constant folding.
+		function.SetStability(FunctionStability::VOLATILE);
+	}
+	return data;
+}
+
 static void ConvertImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	ImageTransformContract::Execute(
@@ -252,14 +268,16 @@ void RegisterImagePixelFunctions(ExtensionLoader &loader) {
 	ScalarFunction encode("native_encode_image", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BLOB,
 	                      EncodeImage, ImageOperatorContract::BindEncode);
 	ScalarFunction resize("native_resize", {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
-	                      ImageLogicalType::Create(), ResizeImage, ImageTransformContract::BindResize);
+	                      ImageLogicalType::Create(), ResizeImage, BindManagedResize);
 	ScalarFunction convert("native_convert_image", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(),
 	                       ConvertImage, ImageTransformContract::BindConvert);
 	ScalarFunction resize_antialias("native_resize",
 	                                {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
-	                                ImageLogicalType::Create(), ResizeImage, ImageTransformContract::BindResize);
+	                                ImageLogicalType::Create(), ResizeImage, BindManagedResize);
 	ScalarFunctionSet resizes("native_resize");
 	for (auto &function : {&resize, &resize_antialias}) {
+		function->SetExtraFunctionInfo(make_shared_ptr<ManagedMediaScalarFunctionInfo>(ManagedImageResize::WorkingSet,
+		                                                                               ManagedImageResize::Execute));
 		function->SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		function->SetFallible();
 		resizes.AddFunction(*function);
