@@ -92,7 +92,12 @@ if [[ ! -f "$arrow_config" ]]; then
   echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the repository root first." >&2
   exit 1
 fi
-cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
+# Keep OpenSSL on the same ABI as the pinned gRPC archives. An ambient host
+# OPENSSL_ROOT_DIR can otherwise override this prefix (for example Homebrew 4).
+cmake_args+=(
+  "-DCMAKE_PREFIX_PATH=$vcpkg_prefix"
+  "-DOPENSSL_ROOT_DIR=$vcpkg_prefix"
+)
 if [[ "$windows_host" == true ]]; then
   # vcpkg's Windows package wrappers map names such as the static zlib `zs`
   # library for CMake's generic FindZLIB module. A prefix alone cannot provide
