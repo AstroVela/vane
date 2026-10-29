@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -19,6 +21,29 @@ import time
 from pathlib import Path
 
 import psutil
+
+_OWNER_ENV = "_VANE_CI_GUARD_OWNER"
+
+
+def linux_subreaper() -> psutil.Process:
+    # Adopt orphaned descendants even when they fork and leave our session
+    # between samples. This script launches only one command tree.
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return psutil.Process()
+
+
+def reap_orphans(reaper: psutil.Process, command_pid: int) -> None:
+    for process in reaper.children():
+        if process.pid != command_pid:
+            try:
+                os.waitpid(process.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 def windows_job(pid: int):
@@ -88,10 +113,12 @@ def owned_process_tree(root: psutil.Process) -> list[psutil.Process]:
     return owned
 
 
-def stop_processes(root: psutil.Process, known: set[psutil.Process]) -> None:
+def stop_processes(
+    root: psutil.Process, known: set[psutil.Process], *, reaper: psutil.Process | None = None, token: str | None = None
+) -> None:
     deadline = time.monotonic() + 5
     while True:
-        known.update(owned_processes(root))
+        known.update(owned_processes(root, reaper=reaper, token=token))
         alive = []
         # Kill the launcher before its workers can schedule more work. Keep its
         # zombie unreaped until cleanup finishes, reserving the session ID and
@@ -110,8 +137,13 @@ def stop_processes(root: psutil.Process, known: set[psutil.Process]) -> None:
         time.sleep(0.01)
 
 
-def owned_processes(root: psutil.Process) -> list[psutil.Process]:
+def owned_processes(
+    root: psutil.Process, *, reaper: psutil.Process | None = None, token: str | None = None
+) -> list[psutil.Process]:
     processes = set(owned_process_tree(root))
+    if reaper is not None:
+        processes.update(owned_process_tree(reaper))
+        processes.discard(reaper)
     if os.name == "nt" or not root.is_running():
         return list(processes)
     # POSIX commands own a new session. Its membership survives reparenting
@@ -120,7 +152,14 @@ def owned_processes(root: psutil.Process) -> list[psutil.Process]:
     created = root.create_time()
     for process in psutil.process_iter():
         try:
-            if process.create_time() >= created and os.getsid(process.pid) == root.pid and process.is_running():
+            if process.create_time() < created:
+                continue
+            owned = os.getsid(process.pid) == root.pid
+            # macOS has no Linux-style subreaper. A fresh inherited marker
+            # retains ownership after setsid() and intermediate process exit.
+            if not owned and token is not None:
+                owned = token in process.environ().get(_OWNER_ENV, "").split(":")
+            if owned and process.is_running():
                 processes.add(process)
         except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -155,6 +194,8 @@ def main() -> int:
     root = None
     job = None
     ready_directory = None
+    reaper = None
+    token = None
     known: set[psutil.Process] = set()
     try:
         if os.name == "nt":
@@ -176,7 +217,15 @@ def main() -> int:
             job = windows_job(child.pid)
             ready.touch()
         else:
-            child = subprocess.Popen(command, start_new_session=True)
+            if sys.platform == "linux":
+                reaper = linux_subreaper()
+                environment = None
+            else:
+                token = secrets.token_hex(32)
+                # Preserve outer guards' markers when a CI step launches a
+                # nested guard, so killing the inner guard cannot orphan work.
+                environment = {**os.environ, _OWNER_ENV: f"{os.environ.get(_OWNER_ENV, '')}:{token}"}
+            child = subprocess.Popen(command, start_new_session=True, env=environment)
         try:
             root = psutil.Process(child.pid)
         except psutil.NoSuchProcess:
@@ -189,7 +238,7 @@ def main() -> int:
             elif root.status() == psutil.STATUS_ZOMBIE:
                 # Popen.poll() would reap the POSIX session leader too early.
                 break
-            processes = job_processes(job) if job is not None else owned_processes(root)
+            processes = job_processes(job) if job is not None else owned_processes(root, reaper=reaper, token=token)
             known.update(processes)
             known = {process for process in known if process.is_running()}
             for process in known:
@@ -206,6 +255,8 @@ def main() -> int:
                         break
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
+            if reaper is not None:
+                reap_orphans(reaper, child.pid)
             available = psutil.virtual_memory().available
             minimum_available = min(minimum_available, available)
             if available < reserve:
@@ -229,11 +280,13 @@ def main() -> int:
                 except psutil.NoSuchProcess:
                     pass
             if root is not None:
-                stop_processes(root, known)
+                stop_processes(root, known, reaper=reaper, token=token)
         if child is not None:
             child_code = child.wait()
             if reason is None:
                 code = child_code
+        if reaper is not None and child is not None:
+            reap_orphans(reaper, child.pid)
         if ready_directory is not None:
             ready_directory.cleanup()
         args.report.write_text(

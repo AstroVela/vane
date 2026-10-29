@@ -181,6 +181,15 @@ POSIX commands start in an owned session, so the guard also tracks descendants
 after an intermediate launcher exits or creates a separate process group.
 The session leader remains unreaped until cleanup completes. Successful commands
 also release their remaining descendants before the guard returns their exit code.
+On Linux, the guard registers as a child subreaper before starting the command,
+so orphaned descendants remain owned even if they create new sessions between
+samples. It reaps adopted children without consuming the command's exit status.
+On macOS, unique identifiers in the inherited `_VANE_CI_GUARD_OWNER` environment
+variable identify detached descendants, including work started by nested guards.
+Commands that construct replacement environments must preserve this variable
+for the macOS guard to retain ownership after reparenting.
+The marker also requires a readable process environment; macOS can hide it for
+restricted executables, as described in [psutil's environment API](https://psutil.io/api/#psutil.Process.environ).
 Linux Python 3.12 has the same six-hour job budget as macOS and Windows, including
 the additional native/provider gates; individual step deadlines stay bounded.
 
