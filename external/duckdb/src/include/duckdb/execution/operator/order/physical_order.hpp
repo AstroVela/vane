@@ -29,11 +29,13 @@ public:
 
 public:
 	PhysicalOrder(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<BoundOrderByNode> orders,
-	              vector<idx_t> projections, idx_t estimated_cardinality, bool is_index_sort = false);
+	              vector<idx_t> projections, idx_t estimated_cardinality, bool is_index_sort = false,
+	              bool media_flow_receiver = false);
 
 	vector<BoundOrderByNode> orders;
 	vector<idx_t> projections;
 	bool is_index_sort;
+	bool media_flow_receiver;
 
 public:
 	//===--------------------------------------------------------------------===//
@@ -54,10 +56,13 @@ public:
 	}
 
 	bool ParallelSource() const override {
-		return true;
+		return !media_flow_receiver;
 	}
 
 	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
+		if (media_flow_receiver) {
+			return false;
+		}
 		if (partition_info.RequiresPartitionColumns()) {
 			return false;
 		}
@@ -85,10 +90,10 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		return true;
+		return !media_flow_receiver;
 	}
 	bool SinkOrderDependent() const override {
-		return false;
+		return media_flow_receiver;
 	}
 
 public:

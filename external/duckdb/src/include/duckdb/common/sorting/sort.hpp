@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -33,6 +39,7 @@ class ColumnDataCollection;
 
 //! Class that sorts the data, follows the PhysicalOperator interface
 class Sort {
+	friend class MediaSort;
 	friend class SortLocalSinkState;
 	friend class SortGlobalSinkState;
 

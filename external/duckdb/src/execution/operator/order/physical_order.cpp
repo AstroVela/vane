@@ -8,13 +8,16 @@
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/sorting/sort.hpp"
+#include "duckdb/common/sorting/media_sort.hpp"
 
 namespace duckdb {
 
 PhysicalOrder::PhysicalOrder(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<BoundOrderByNode> orders,
-                             vector<idx_t> projections, idx_t estimated_cardinality, bool is_index_sort_p)
+                             vector<idx_t> projections, idx_t estimated_cardinality, bool is_index_sort_p,
+                             bool media_flow_receiver_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
-      orders(std::move(orders)), projections(std::move(projections)), is_index_sort(is_index_sort_p) {
+      orders(std::move(orders)), projections(std::move(projections)), is_index_sort(is_index_sort_p),
+      media_flow_receiver(media_flow_receiver_p) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -23,12 +26,18 @@ PhysicalOrder::PhysicalOrder(PhysicalPlan &physical_plan, vector<LogicalType> ty
 class OrderGlobalSinkState : public GlobalSinkState {
 public:
 	OrderGlobalSinkState(const PhysicalOrder &op, ClientContext &context)
-	    : sort(context, op.orders, op.children[0].get().types, op.projections, op.is_index_sort),
-	      state(sort.GetGlobalSinkState(context)) {
+	    : sort(op.media_flow_receiver
+	               ? nullptr
+	               : make_uniq<Sort>(context, op.orders, op.children[0].get().types, op.projections, op.is_index_sort)),
+	      media(op.media_flow_receiver
+	                ? make_uniq<MediaSort>(context, op.orders, op.children[0].get().types, op.projections)
+	                : nullptr),
+	      state(media ? media->GetGlobalSinkState(context) : sort->GetGlobalSinkState(context)) {
 	}
 
 public:
-	Sort sort;
+	unique_ptr<Sort> sort;
+	unique_ptr<MediaSort> media;
 	unique_ptr<GlobalSinkState> state;
 };
 
@@ -53,33 +62,46 @@ SinkResultType PhysicalOrder::Sink(ExecutionContext &context, DataChunk &chunk, 
 	auto &gstate = input.global_state.Cast<OrderGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<OrderLocalSinkState>();
 	if (!lstate.state) {
-		lstate.state = gstate.sort.GetLocalSinkState(context);
+		lstate.state =
+		    gstate.media ? gstate.media->GetLocalSinkState(context) : gstate.sort->GetLocalSinkState(context);
 	}
 	OperatorSinkInput sort_input {*gstate.state, *lstate.state, input.interrupt_state};
-	return gstate.sort.Sink(context, chunk, sort_input);
+	if (gstate.media) {
+		return gstate.media->Sink(context, chunk, sort_input);
+	}
+	return gstate.sort->Sink(context, chunk, sort_input);
 }
 
 SinkCombineResultType PhysicalOrder::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
 	auto &gstate = input.global_state.Cast<OrderGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<OrderLocalSinkState>();
+	if (gstate.media) {
+		return SinkCombineResultType::FINISHED;
+	}
 	if (!lstate.state) {
 		return SinkCombineResultType::FINISHED;
 	}
 	OperatorSinkCombineInput sort_input {*gstate.state, *lstate.state, input.interrupt_state};
-	return gstate.sort.Combine(context, sort_input);
+	return gstate.sort->Combine(context, sort_input);
 }
 
 SinkFinalizeType PhysicalOrder::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                          OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<OrderGlobalSinkState>();
 	OperatorSinkFinalizeInput sort_input {*gstate.state, input.interrupt_state};
-	return gstate.sort.Finalize(context, sort_input);
+	if (gstate.media) {
+		return gstate.media->Finalize(context, sort_input);
+	}
+	return gstate.sort->Finalize(context, sort_input);
 }
 
 ProgressData PhysicalOrder::GetSinkProgress(ClientContext &context, GlobalSinkState &gstate_p,
                                             const ProgressData source_progress) const {
 	auto &gstate = gstate_p.Cast<OrderGlobalSinkState>();
-	return gstate.sort.GetSinkProgress(context, *gstate.state, source_progress);
+	if (gstate.media) {
+		return gstate.media->GetSinkProgress(*gstate.state, source_progress);
+	}
+	return gstate.sort->GetSinkProgress(context, *gstate.state, source_progress);
 }
 
 //===--------------------------------------------------------------------===//
@@ -88,7 +110,9 @@ ProgressData PhysicalOrder::GetSinkProgress(ClientContext &context, GlobalSinkSt
 class OrderGlobalSourceState : public GlobalSourceState {
 public:
 	explicit OrderGlobalSourceState(ClientContext &context, OrderGlobalSinkState &sink)
-	    : sort(sink.sort), state(sort.GetGlobalSourceState(context, *sink.state)) {
+	    : sort(sink.sort.get()), media(sink.media.get()),
+	      state(media ? media->GetGlobalSourceState(context, *sink.state)
+	                  : sort->GetGlobalSourceState(context, *sink.state)) {
 	}
 
 public:
@@ -97,14 +121,16 @@ public:
 	}
 
 public:
-	Sort &sort;
+	optional_ptr<Sort> sort;
+	optional_ptr<MediaSort> media;
 	unique_ptr<GlobalSourceState> state;
 };
 
 class OrderLocalSourceState : public LocalSourceState {
 public:
 	explicit OrderLocalSourceState(ExecutionContext &context, OrderGlobalSourceState &gstate)
-	    : state(gstate.sort.GetLocalSourceState(context, *gstate.state)) {
+	    : state(gstate.media ? gstate.media->GetLocalSourceState(context, *gstate.state)
+	                         : gstate.sort->GetLocalSourceState(context, *gstate.state)) {
 	}
 
 public:
@@ -126,7 +152,10 @@ SourceResultType PhysicalOrder::GetDataInternal(ExecutionContext &context, DataC
 	auto &gstate = input.global_state.Cast<OrderGlobalSourceState>();
 	auto &lstate = input.local_state.Cast<OrderLocalSourceState>();
 	OperatorSourceInput sort_input {*gstate.state, *lstate.state, input.interrupt_state};
-	return gstate.sort.GetData(context, chunk, sort_input);
+	if (gstate.media) {
+		return gstate.media->GetData(context, chunk, sort_input);
+	}
+	return gstate.sort->GetData(context, chunk, sort_input);
 }
 
 OperatorPartitionData PhysicalOrder::GetPartitionData(ExecutionContext &context, DataChunk &chunk,
@@ -137,12 +166,18 @@ OperatorPartitionData PhysicalOrder::GetPartitionData(ExecutionContext &context,
 	if (partition_info.RequiresPartitionColumns()) {
 		throw InternalException("PhysicalOrder::GetPartitionData: partition columns not supported");
 	}
-	return gstate.sort.GetPartitionData(context, chunk, *gstate.state, *lstate.state, partition_info);
+	if (gstate.media) {
+		return OperatorPartitionData(0);
+	}
+	return gstate.sort->GetPartitionData(context, chunk, *gstate.state, *lstate.state, partition_info);
 }
 
 ProgressData PhysicalOrder::GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const {
 	auto &gstate = gstate_p.Cast<OrderGlobalSourceState>();
-	return gstate.sort.GetProgress(context, *gstate.state);
+	if (gstate.media) {
+		return gstate.media->GetProgress(*gstate.state);
+	}
+	return gstate.sort->GetProgress(context, *gstate.state);
 }
 
 InsertionOrderPreservingMap<string> PhysicalOrder::ParamsToString() const {
@@ -163,6 +198,7 @@ void PhysicalOrder::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "orders", orders);
 	serializer.WriteProperty(104, "projections", projections);
 	serializer.WriteProperty(105, "is_index_sort", is_index_sort);
+	serializer.WriteProperty(106, "media_flow_receiver", media_flow_receiver);
 }
 
 } // namespace duckdb

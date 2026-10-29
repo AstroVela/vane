@@ -9,6 +9,7 @@
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -117,14 +118,21 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p),
       execution_mode(pipeline_p.GetExecutionMode()) {
 	D_ASSERT(pipeline.source_state);
+	const bool native_media_scan = pipeline.source->type == PhysicalOperatorType::TABLE_SCAN &&
+	                               pipeline.source->Cast<PhysicalTableScan>().function.media_flow_source;
+	const bool native_media_sort = pipeline.source->type == PhysicalOperatorType::ORDER_BY &&
+	                               pipeline.source->Cast<PhysicalOrder>().media_flow_receiver;
 	if (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() &&
-	    pipeline.source->type == PhysicalOperatorType::TABLE_SCAN &&
-	    pipeline.source->Cast<PhysicalTableScan>().function.media_flow_source) {
+	    (native_media_scan || native_media_sort)) {
 		const bool bounded_result = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::RESULT_COLLECTOR &&
 		                            pipeline.sink->Cast<PhysicalResultCollector>().SupportsMediaFlowInput();
-		if (!pipeline.sink || (pipeline.sink->type != PhysicalOperatorType::STREAMING_UDF && !bounded_result)) {
+		const bool bounded_sort = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::ORDER_BY &&
+		                          pipeline.sink->Cast<PhysicalOrder>().media_flow_receiver;
+		const bool bounded_udf =
+		    pipeline.sink && native_media_scan && pipeline.sink->type == PhysicalOperatorType::STREAMING_UDF;
+		if (!bounded_udf && !bounded_result && !bounded_sort) {
 			throw NotImplementedException(
-			    "Native media flow window requires a streaming UDF or bounded result receiver; "
+			    "Native media flow window requires a supported streaming UDF, bounded sort or result receiver; "
 			    "materialization budget handoff is not implemented");
 		}
 		for (auto &op : pipeline.operators) {
