@@ -14,7 +14,10 @@ import pytest
 from packaging.tags import sys_tags
 
 import vane
+from scripts import prepare_dynamic_media_extension as dynamic_media
 from tests.fast.test_extension_wheel import _synthetic_macho, _synthetic_pe
+from tests.fast.test_native_runtime import manifest
+from vane import _native_runtime_format as fmt
 from vane._native_runtime_format import filesystem_path
 from vane_packaging import extension_wheel as binary
 from vane_packaging import media_binary
@@ -115,6 +118,67 @@ def test_native_media_macos_bundling_does_not_allow_foreign_dependency_paths(dep
         binary._validate_macos_binary_platform(
             contents, "macosx_11_0_arm64", description="codec", bundled_libraries=("codec.dylib",)
         )
+
+
+def test_macos_extension_relocation_preserves_the_complete_duckdb_metadata(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    (runtime / ".libs").mkdir(parents=True)
+    document = manifest()
+    name = document["namespace"] + "_libsoxr.dylib"
+    library = _synthetic_macho(
+        architecture="arm64",
+        minimum_macos=(11, 0, 0),
+        dynamic_libraries=(f"@loader_path/{name}",),
+        dynamic_library_command=0xD,
+    )
+    record = next(iter(document["files"].values()))
+    record.update(sha256=hashlib.sha256(library).hexdigest(), size=len(library))
+    document.update(platform="macosx_11_0_arm64", files={name: record})
+    contents = fmt.canonical_json(document)
+    (runtime / fmt.MANIFEST).write_bytes(contents)
+    (runtime / ".libs" / name).write_bytes(library)
+    original = _synthetic_macho(
+        architecture="arm64", minimum_macos=(11, 0, 0), dynamic_libraries=("@rpath/libsoxr.dylib",)
+    )
+    relocated = _synthetic_macho(
+        architecture="arm64", minimum_macos=(11, 0, 0), dynamic_libraries=(f"@loader_path/.libs/{name}",)
+    )
+    artifact = tmp_path / "native_media.duckdb_extension"
+    artifact.write_bytes(original)
+    platform_file = tmp_path / "platform"
+    platform_file.write_text("osx_arm64")
+    # Use the production CMake appender: its WebAssembly section header is
+    # outside the final 512-byte footer, and must also stay out of Mach-O tools.
+    subprocess.run(
+        [
+            "cmake",
+            f"-DEXTENSION={artifact}",
+            f"-DPLATFORM_FILE={platform_file}",
+            "-DABI_TYPE=CPP",
+            "-DVERSION_FIELD=v1.5.5",
+            "-DEXTENSION_VERSION=test",
+            f"-DNULL_FILE={dynamic_media.ROOT / 'external/duckdb/scripts/null.txt'}",
+            "-P",
+            str(dynamic_media.ROOT / "external/duckdb/scripts/append_metadata.cmake"),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    metadata = artifact.read_bytes()[len(original) :]
+    assert len(metadata) > fmt.DUCKDB_FOOTER_SIZE
+    expected_inputs = iter((original, relocated))
+
+    def relocate(target, mapping, platform):
+        assert target.read_bytes() == next(expected_inputs), "Mach-O tools must receive only the native binary"
+        assert mapping == {"libsoxr.dylib": name}
+        assert platform == document["platform"]
+        target.write_bytes(relocated)
+
+    monkeypatch.setattr(dynamic_media, "relocate_non_elf", relocate)
+    for _ in range(2):
+        dynamic_media.prepare(artifact, runtime)
+        assert artifact.read_bytes() == fmt.attach_trailer(relocated + metadata, hashlib.sha256(contents).hexdigest())
 
 
 @pytest.mark.skipif(sys.platform not in {"win32", "darwin"}, reason="native Mach-O/PE loader regression")

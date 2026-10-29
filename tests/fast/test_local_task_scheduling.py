@@ -222,8 +222,9 @@ def test_resident_startup_cannot_claim_cpu_yielded_by_a_live_task():
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("shm_capacity", ["auto", "1GiB"])
 @pytest.mark.parametrize("downstream", [None, "subprocess_task", "subprocess_actor"])
-def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, monkeypatch, downstream):
+def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, monkeypatch, downstream, shm_capacity):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -232,6 +233,7 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     monkeypatch.setenv("VANE_UDF_WORKER_SLOT_DEBUG", "1")
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", shm_capacity)
     subprocess_exec._shutdown_global_task_runtime()
     # Ray's default protected shares reserve downstream progress too. Four
     # CPUs leave room for two upstream calls with a second task operator.
@@ -275,6 +277,9 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
             schema=schema,
             execution_backend="subprocess_task",
             batch_size=256,
+            # Default 128 MiB input/output windows can admit only one task
+            # with a macOS-sized object store. These integer batches are tiny.
+            target_max_batch_bytes=1024**2,
             memory_bytes=64 * 1024**2,
         )
         if downstream is not None:
@@ -284,6 +289,7 @@ def test_one_row_group_runs_multiple_batches_with_one_native_thread(tmp_path, mo
                 schema=schema,
                 execution_backend=downstream,
                 batch_size=256,
+                target_max_batch_bytes=1024**2,
                 **options,
             )
         rows = relation.fetchall()
