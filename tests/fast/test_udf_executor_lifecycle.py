@@ -9519,7 +9519,10 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pool
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
 
 
-def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(monkeypatch):
+@pytest.mark.parametrize("collect_other_executor", [False, True])
+def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(
+    monkeypatch, collect_other_executor
+):
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -9552,14 +9555,22 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
         return 0
 
     def wake_budget():
-        events.append("wake")
-        if "wake" not in failed_once:
-            failed_once.add("wake")
-            raise RuntimeError("planned budget wakeup failure")
+        # Unrelated finalizers must not consume a one-shot wakeup failure.
+        raise RuntimeError("planned budget wakeup failure")
 
     monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
     monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_output_grant)
     monkeypatch.setattr(subprocess_exec, "wake_local_shm_ref_budget_waiters", wake_budget)
+
+    if collect_other_executor:
+        other_sock = _FakeControlSocket()
+        other_executor = _bare_shutdown_executor(subprocess_exec, other_sock, None)
+        other_ref = weakref.ref(other_executor)
+        other_executor._test_cycle = other_executor
+        del other_executor
+        gc.collect()
+        assert other_ref() is None
+        assert other_sock.closed
 
     with pytest.raises(
         RuntimeError,
@@ -9570,7 +9581,6 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
     assert events == [
         "lease:1:udf-input-close",
         "grant:3:udf-output-cancel",
-        "wake",
         "lease:1:udf-input-close",
         "lease:2:udf-input-close",
         "grant:3:udf-output-close",
@@ -9585,7 +9595,7 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
 
     executor.close(kill=True)
 
-    assert len(events) == 7
+    assert len(events) == 6
     assert executor._active_input_leases == {}
     assert executor._active_output_grants == {}
     assert executor._cleanup_finished
