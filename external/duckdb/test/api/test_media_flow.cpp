@@ -12,7 +12,9 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/helper/physical_buffered_collector.hpp"
 #include "duckdb/execution/operator/helper/physical_media_materialized_collector.hpp"
+#include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
+#include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/udf_executor.hpp"
@@ -228,6 +230,7 @@ struct FlowProbe {
 	bool hold_initial_view = false;
 	bool images = false;
 	idx_t produced = 0;
+	idx_t peak_swap = 0;
 };
 struct FlowInfo : public TableFunctionInfo {
 	explicit FlowInfo(shared_ptr<FlowProbe> probe_p) : probe(std::move(probe_p)) {
@@ -250,6 +253,7 @@ struct FlowGlobal : public GlobalTableFunctionState {
 	    : probe(std::move(probe_p)), window(make_shared_ptr<MediaFlowWindow>(8)) {
 		probe->window = window;
 		probe->produced = 0;
+		probe->peak_swap = 0;
 		if (probe->hold_initial_view) {
 			auto request = window->Request(8);
 			probe->initial_view = window->TakeGrant(*request);
@@ -275,9 +279,11 @@ unique_ptr<FunctionData> BindFlow(ClientContext &, TableFunctionBindInput &input
 unique_ptr<GlobalTableFunctionState> InitFlow(ClientContext &, TableFunctionInitInput &input) {
 	return make_uniq<FlowGlobal>(input.bind_data->Cast<FlowBind>().probe);
 }
-SourceResultType PollFlow(ClientContext &, TableFunctionInput &input, DataChunk &output,
+SourceResultType PollFlow(ClientContext &context, TableFunctionInput &input, DataChunk &output,
                           const InterruptState &interrupt) {
 	auto &state = input.global_state->Cast<FlowGlobal>();
+	state.probe->peak_swap =
+	    MaxValue<idx_t>(state.probe->peak_swap, BufferManager::GetBufferManager(context).GetUsedSwap());
 	if (state.probe->produced == 24) {
 		return SourceResultType::FINISHED;
 	}
@@ -486,7 +492,317 @@ struct MediaSortFixture {
 	unique_ptr<GlobalSourceState> source;
 	unique_ptr<LocalSourceState> source_local;
 };
+
+const PhysicalOperator &MediaTopNPlanRoot(PreparedStatement &prepared) {
+	auto root = &prepared.data->physical_plan->Root();
+	while (root->type == PhysicalOperatorType::PROJECTION) {
+		REQUIRE(root->children.size() == 1);
+		root = &root->children[0].get();
+	}
+	return *root;
+}
+
+vector<int64_t> ReadMediaTopNRows(unique_ptr<QueryResult> result, bool images = false) {
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	vector<int64_t> rows;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			const auto index = chunk->GetValue(0, row).GetValue<int64_t>();
+			rows.push_back(index);
+			if (images) {
+				auto pixels = ImageVector::Pixels(chunk->data[1], row);
+				for (idx_t pixel = 0; pixel < 128 * 128 * 3; pixel++) {
+					if (pixels[pixel] != index) {
+						FAIL("TopN changed the correspondence between keys and image pixels");
+					}
+				}
+			}
+		}
+	}
+	return rows;
+}
 } // namespace
+
+TEST_CASE("Native media TopN selects spillable sorting while ordinary TopN stays unchanged",
+          "[media-resource][media-topn]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	auto prepared = con.Prepare("SELECT i, data FROM test_media_flow() ORDER BY i DESC LIMIT 5 OFFSET 2");
+	REQUIRE_FALSE(prepared->HasError());
+	auto &root = MediaTopNPlanRoot(*prepared);
+	if (db.instance->GetMediaFlowCapacity()) {
+		REQUIRE(root.type == PhysicalOperatorType::STREAMING_LIMIT);
+		auto &limit = root.Cast<PhysicalStreamingLimit>();
+		CHECK(limit.limit_val.GetConstantValue() == 5);
+		CHECK(limit.offset_val.GetConstantValue() == 2);
+		CHECK_FALSE(limit.parallel);
+		REQUIRE(limit.children.size() == 1);
+		auto &order = limit.children[0].get().Cast<PhysicalOrder>();
+		CHECK(order.media_flow_receiver);
+		CHECK_FALSE(order.ParallelSink());
+		CHECK_FALSE(order.ParallelSource());
+		CHECK(PhysicalPlanGenerator::HasNativeMediaFlow(*con.context, root));
+	} else {
+		REQUIRE(root.type == PhysicalOperatorType::TOP_N);
+		CHECK(root.Cast<PhysicalTopN>().limit == 5);
+		CHECK(root.Cast<PhysicalTopN>().offset == 2);
+	}
+	CHECK(probe->produced == 0);
+	auto ordinary = con.Prepare("SELECT range AS i FROM range(24) ORDER BY i DESC LIMIT 5 OFFSET 2");
+	REQUIRE_FALSE(ordinary->HasError());
+	CHECK(MediaTopNPlanRoot(*ordinary).type == PhysicalOperatorType::TOP_N);
+}
+
+TEST_CASE("Native media TopN reaches EOF and spills with one row of credit before applying OFFSET",
+          "[media-resource][media-topn]") {
+	const auto streaming = GENERATE(false, true);
+	const auto batch = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	if (batch) {
+		ClientConfig::GetConfig(*con.context).get_result_collector =
+		    streaming ? CollectFlowBatches : MaterializeFlowBatches;
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	auto result = con.context->Query(
+	    "SELECT i, data FROM test_media_flow() WHERE i % 2 = 0 ORDER BY i DESC LIMIT 4 OFFSET 2", streaming);
+	const auto rows = ReadMediaTopNRows(std::move(result), true);
+	CHECK(rows == vector<int64_t> {18, 16, 14, 12});
+	CHECK(probe->produced == 24);
+	CHECK(probe->peak_swap > 0);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	CHECK(manager.GetUsedMemory() <= manager.GetMaxMemory());
+	CHECK(manager.GetUsedSwap() == 0);
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Native media TopN matches full sorting for hidden keys ties NULLs and prepared bounds",
+          "[media-resource][media-topn]") {
+	const auto nulls_first = GENERATE(false, true);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	const auto query =
+	    string("SELECT i, data FROM (SELECT i, data, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 3 END AS k ") +
+	    "FROM test_media_flow()) q ORDER BY k DESC NULLS " + (nulls_first ? "FIRST" : "LAST") +
+	    ", i ASC LIMIT 8 OFFSET 2";
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='top_n'"));
+	const auto reference = ReadMediaTopNRows(con.Query(query), true);
+	REQUIRE(reference.size() == 8);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers=''"));
+	CHECK(ReadMediaTopNRows(con.Query(query), true) == reference);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	auto hidden = con.Query("SELECT data FROM test_media_flow() ORDER BY i DESC LIMIT 3 OFFSET 1");
+	REQUIRE_FALSE(hidden->HasError());
+	idx_t count = 0;
+	while (auto chunk = hidden->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++, count++) {
+			CHECK(ImageVector::Pixels(chunk->data[0], row)[0] == 22 - count);
+		}
+	}
+	CHECK(count == 3);
+	hidden.reset();
+	auto prepared = con.Prepare("SELECT i, data FROM test_media_flow() ORDER BY i DESC LIMIT $1 OFFSET $2");
+	REQUIRE_FALSE(prepared->HasError());
+	CHECK(ReadMediaTopNRows(prepared->Execute(5, 3), true) == vector<int64_t> {20, 19, 18, 17, 16});
+	CHECK(ReadMediaTopNRows(prepared->Execute(2, 1), true) == vector<int64_t> {22, 21});
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+}
+
+TEST_CASE("Native media TopN handles zero limits empty inputs and offsets beyond EOF", "[media-resource][media-topn]") {
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	auto probe = RegisterFlow(db);
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC LIMIT 0")).empty());
+	CHECK(probe->produced == 0);
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC LIMIT 1 OFFSET 23")) ==
+	      vector<int64_t> {0});
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC LIMIT 5 OFFSET 24")).empty());
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i LIMIT 5 OFFSET 1000")).empty());
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC OFFSET 22")) ==
+	      vector<int64_t> {1, 0});
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() WHERE i < 0 ORDER BY i LIMIT 3")).empty());
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	for (auto query : {"SELECT i::VARCHAR AS k FROM test_media_flow() ORDER BY k LIMIT 3",
+	                   "SELECT [i] AS k FROM test_media_flow() ORDER BY k LIMIT 3"}) {
+		probe->produced = 0;
+		auto result = con.Query(query);
+		REQUIRE(result->HasError());
+		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("fixed-width primitive sort keys"));
+		CHECK(probe->produced == 0);
+		CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	}
+}
+
+TEST_CASE("Native media TopN cleans credits and storage on receiving spill expression and interrupt failures",
+          "[media-resource][media-topn]") {
+	const auto failure = GENERATE(0, 1, 2, 3);
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	if (failure == 0) {
+		REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='0B'"));
+	} else if (failure == 1) {
+		REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='49160B'"));
+	}
+	auto probe = RegisterFlow(db);
+	probe->images = true;
+	ExtensionLoader loader(*db.instance, "media_topn_cancel_test");
+	loader.RegisterFunction(ScalarFunction("interrupt_media_topn", {LogicalType::BIGINT}, LogicalType::BIGINT,
+	                                       [&](DataChunk &input, ExpressionState &, Vector &output) {
+		                                       output.Reference(input.data[0]);
+		                                       if (input.GetValue(0, 0) == Value::BIGINT(3)) {
+			                                       con.Interrupt();
+		                                       }
+	                                       }));
+	auto &manager = BufferManager::GetBufferManager(*con.context);
+	const auto baseline = manager.GetUsedMemory();
+	auto query = failure == 2 ? "SELECT CASE WHEN i=3 THEN CAST('bad' || i::VARCHAR AS BIGINT) ELSE i END AS k, data "
+	                            "FROM test_media_flow() ORDER BY k LIMIT 1"
+	             : failure == 3 ? "SELECT interrupt_media_topn(i) AS k, data FROM test_media_flow() ORDER BY k LIMIT 1"
+	                            : "SELECT i, data FROM test_media_flow() ORDER BY i LIMIT 1";
+	auto result = con.Query(query);
+	REQUIRE(result->HasError());
+	if (failure == 1) {
+		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("streaming_buffer_size receiving capacity"));
+	}
+	CHECK(probe->produced > 0);
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	CHECK(manager.GetUsedMemory() == baseline);
+	CHECK(manager.GetUsedSwap() == 0);
+	REQUIRE_NO_FAIL(con.Query("SET max_temp_directory_size='10MiB'"));
+	REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i, data FROM test_media_flow() ORDER BY i DESC LIMIT 1"), true) ==
+	      vector<int64_t> {23});
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Native media TopN Arrow export retains bounded receiving and detached arrays",
+          "[media-resource][media-topn]") {
+	const auto streaming = GENERATE(false, true);
+	const auto early_close = GENERATE(false, true);
+	ArrowArray retained {};
+	{
+		DuckDB db(nullptr);
+		if (!db.instance->GetMediaFlowCapacity()) {
+			return;
+		}
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET memory_limit='2MiB'"));
+		REQUIRE_NO_FAIL(con.Query("SET streaming_buffer_size='50KiB'"));
+		auto probe = RegisterFlow(db);
+		probe->images = true;
+		auto &config = ClientConfig::GetConfig(*con.context);
+		config.get_result_collector = [](ClientContext &context, PreparedStatementData &data) {
+			return PhysicalArrowCollector::Create(context, data, 1000000);
+		};
+		auto result =
+		    con.context->Query("SELECT i, data FROM test_media_flow() ORDER BY i DESC LIMIT 5 OFFSET 2", streaming);
+		INFO((result->HasError() ? result->GetError() : ""));
+		REQUIRE_FALSE(result->HasError());
+		auto wrapper = new ResultArrowArrayStreamWrapper(std::move(result), 1000000);
+		auto stream = wrapper->stream;
+		idx_t count = 0;
+		while (true) {
+			ArrowArray chunk {};
+			REQUIRE(stream.get_next(&stream, &chunk) == 0);
+			if (!chunk.release) {
+				break;
+			}
+			if (streaming) {
+				CHECK(chunk.length == 1);
+			}
+			auto indices = static_cast<const int64_t *>(chunk.children[0]->buffers[1]);
+			for (int64_t row = 0; row < chunk.length; row++, count++) {
+				CHECK(indices[row] == 21 - count);
+			}
+			if (!retained.release) {
+				retained = chunk;
+			} else {
+				chunk.release(&chunk);
+			}
+			if (early_close) {
+				break;
+			}
+		}
+		CHECK(count == (early_close && streaming ? 1 : 5));
+		stream.release(&stream);
+		CHECK(probe->produced == 24);
+		CHECK(probe->peak_swap > 0);
+		CHECK(probe->window->Snapshot().reserved.bytes == 0);
+		CHECK(probe->window->Snapshot().waiting_requests == 0);
+		config.get_result_collector = nullptr;
+		REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+	}
+	REQUIRE(retained.release);
+	CHECK(static_cast<const int64_t *>(retained.children[0]->buffers[1])[0] == 21);
+	retained.release(&retained);
+}
+
+TEST_CASE("Native media TopN cancellation does not wait for unavailable source credits",
+          "[media-resource][media-topn]") {
+	DuckDB db(nullptr);
+	if (!db.instance->GetMediaFlowCapacity()) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
+	auto probe = RegisterFlow(db);
+	probe->hold_initial_view = true;
+	auto pending = con.PendingQuery("SELECT i FROM test_media_flow() ORDER BY i DESC LIMIT 3 OFFSET 2");
+	REQUIRE_FALSE(pending->HasError());
+	for (idx_t step = 0; step < 1000; step++) {
+		pending->ExecuteTask();
+		if (probe->window && probe->window->Snapshot().waiting_requests) {
+			break;
+		}
+	}
+	REQUIRE(probe->window);
+	REQUIRE(probe->window->Snapshot().waiting_requests == 1);
+	CHECK(probe->produced == 0);
+	con.Interrupt();
+	bool cancelled = false;
+	for (idx_t step = 0; step < 1000; step++) {
+		if (pending->ExecuteTask() == PendingExecutionResult::EXECUTION_ERROR) {
+			cancelled = true;
+			break;
+		}
+	}
+	CHECK(cancelled);
+	pending.reset();
+	CHECK_FALSE(probe->initial_view->IsActive());
+	CHECK(probe->window->Snapshot().reserved.bytes == 0);
+	CHECK(probe->window->Snapshot().waiting_requests == 0);
+	probe->hold_initial_view = false;
+	CHECK(ReadMediaTopNRows(con.Query("SELECT i FROM test_media_flow() ORDER BY i DESC LIMIT 3 OFFSET 2")) ==
+	      vector<int64_t> {21, 20, 19});
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
 
 TEST_CASE("Media sort commits selected skewed payload and key storage before a receipt",
           "[media-resource][media-sort]") {
@@ -1782,7 +2098,8 @@ TEST_CASE("Enabled native flow rejects unsupported materialization before produc
 	}
 	Connection con(db);
 	auto probe = RegisterFlow(db);
-	for (auto query : {"SELECT i FROM test_media_flow() ORDER BY i LIMIT 3", "SELECT sum(i) FROM test_media_flow()"}) {
+	for (auto query :
+	     {"SELECT sum(i) FROM test_media_flow()", "SELECT i, count(*) FROM test_media_flow() GROUP BY i"}) {
 		auto result = con.Query(query);
 		REQUIRE(result->HasError());
 		CHECK_THAT(result->GetError(), Catch::Matchers::Contains("materialization budget handoff"));
