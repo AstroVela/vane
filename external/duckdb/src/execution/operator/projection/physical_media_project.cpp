@@ -7,6 +7,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/managed_media_scalar.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/media_buffer.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -75,7 +76,7 @@ struct MediaProjectBatch {
 	shared_ptr<ClientContext> context; // Storage and requests are destroyed before their host.
 	vector<unique_ptr<ColumnDataCollection>> prefixes;
 	unique_ptr<MediaAdmissionRequest> request;
-	idx_t rows = 0;
+	idx_t cache_rows = 0;
 };
 
 //! Every detached vector retains this ancestor until its actual allocation dies.
@@ -120,9 +121,10 @@ struct MediaProjectState : public StateWithBlockableTasks {
 			throw NotImplementedException("Managed media image input must be a column reference");
 		}
 		for (idx_t i = 1; i < function.children.size(); i++) {
-			if (function.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			if (!function.children[i]->IsFoldable()) {
 				throw NotImplementedException("Managed media dimensions and options must be bound constants");
 			}
+			parameters.push_back(ExpressionExecutor::EvaluateScalar(context_p, *function.children[i]));
 		}
 		for (auto &type : input_types) {
 			row_bytes = AddBytes(row_bytes, FixedBytes(type));
@@ -175,6 +177,7 @@ struct MediaProjectState : public StateWithBlockableTasks {
 	idx_t scalar_column;
 	const BoundFunctionExpression &function;
 	const ManagedMediaScalarFunctionInfo &info;
+	vector<Value> parameters;
 	ManagedMediaWorkingSet working_set {0, 0};
 	idx_t row_bytes = 0;
 	idx_t prefix_rows = 0;
@@ -294,24 +297,37 @@ SinkResultType PhysicalMediaProject::Sink(ExecutionContext &context, DataChunk &
 	}
 	auto batch = make_uniq<MediaProjectBatch>();
 	batch->context = context.client.shared_from_this();
-	batch->rows = chunk.size();
 	for (idx_t offset = 0; offset < chunk.size();) {
 		if (context.client.IsInterrupted()) {
 			throw InterruptException();
 		}
 		auto rows = MinValue(state.prefix_rows, chunk.size() - offset);
-		DataChunk selected;
-		selected.InitializeEmpty(state.input_types);
-		selected.Reference(chunk);
-		selected.Slice(offset, rows);
-		auto prefix = make_uniq<ColumnDataCollection>(context.client, state.input_types);
-		prefix->Append(selected); // Local append state releases all BufferManager pins.
-		batch->prefixes.push_back(std::move(prefix));
+		while (true) {
+			try {
+				DataChunk selected;
+				selected.InitializeEmpty(state.input_types);
+				selected.Reference(chunk);
+				selected.Slice(offset, rows);
+				auto prefix = make_uniq<ColumnDataCollection>(context.client, state.input_types);
+				prefix->Append(selected); // Local append state releases all BufferManager pins.
+				batch->prefixes.push_back(std::move(prefix));
+				break;
+			} catch (const OutOfMemoryException &) {
+				// BufferManager's pinned working set is separate from payload
+				// admission. Retry a smaller sealed prefix, with no one-row escape.
+				if (rows == 1) {
+					throw;
+				}
+				rows = MaxValue<idx_t>(1, rows / 2);
+			}
+		}
+		batch->cache_rows = MaxValue(batch->cache_rows, rows);
 		offset += rows;
 	}
 	// Queue the complete working set before ACK releases upstream credits. A
 	// subsequent producer cannot consume the bytes needed to execute this batch.
-	batch->request = state.scope->Request({0, state.reservation_bytes});
+	const auto fixed_bytes = state.reservation_bytes - state.prefix_rows * state.row_bytes;
+	batch->request = state.scope->Request({0, AddBytes(batch->cache_rows * state.row_bytes, fixed_bytes)});
 	vector<InterruptState> wakeups;
 	{
 		auto guard = state.Lock();
@@ -455,7 +471,7 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 			if (child.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 				args.data[i].Reference(owned.data[child.Cast<BoundReferenceExpression>().index]);
 			} else {
-				args.data[i].Reference(child.Cast<BoundConstantExpression>().value);
+				args.data[i].Reference(state.parameters[i - 1]);
 			}
 		}
 		args.SetCardinality(1);

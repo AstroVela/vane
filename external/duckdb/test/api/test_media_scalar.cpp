@@ -15,6 +15,7 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -204,28 +205,30 @@ TEST_CASE("Managed scalar resumes exact rows across prefix and output backpressu
 		return;
 	}
 	for (auto batch : {false, true}) {
-		ScalarFixture fixture;
-		auto input = fixture.Input(5, 0, true);
-		REQUIRE(fixture.Accept(*input, batch) == SinkResultType::NEED_MORE_INPUT);
-		DataChunk output;
-		REQUIRE(fixture.Next(output, batch) == SourceResultType::HAVE_MORE_OUTPUT);
-		auto retained = make_uniq<Vector>(output.data[1]);
-		output.Destroy();
-		CHECK(fixture.Next(output, batch) == SourceResultType::BLOCKED);
-		CHECK(fixture.probe->executed == 1);
-		retained.reset();
-		for (idx_t row = 1; row < 5; row++) {
+		for (auto retain_input : {false, true}) {
+			ScalarFixture fixture;
+			auto input = fixture.Input(5, 0, true);
+			REQUIRE(fixture.Accept(*input, batch) == SinkResultType::NEED_MORE_INPUT);
+			DataChunk output;
 			REQUIRE(fixture.Next(output, batch) == SourceResultType::HAVE_MORE_OUTPUT);
-			CHECK(output.GetValue(0, 0) == Value::BIGINT(row));
-			CHECK(FlatVector::IsNull(output.data[1], 0) == (row == 1));
-			if (row != 1) {
-				CHECK(FlatVector::GetData<uint8_t>(ArrayVector::GetEntry(output.data[1]))[0] == row);
+			auto retained = make_uniq<Vector>(output.data[retain_input ? 0 : 1]);
+			output.Destroy();
+			CHECK(fixture.Next(output, batch) == SourceResultType::BLOCKED);
+			CHECK(fixture.probe->executed == 1);
+			retained.reset();
+			for (idx_t row = 1; row < 5; row++) {
+				REQUIRE(fixture.Next(output, batch) == SourceResultType::HAVE_MORE_OUTPUT);
+				CHECK(output.GetValue(0, 0) == Value::BIGINT(row));
+				CHECK(FlatVector::IsNull(output.data[1], 0) == (row == 1));
+				if (row != 1) {
+					CHECK(FlatVector::GetData<uint8_t>(ArrayVector::GetEntry(output.data[1]))[0] == row);
+				}
 			}
+			output.Destroy();
+			CHECK(fixture.Next(output, batch) == SourceResultType::BLOCKED); // Await another input, not EOF.
+			CHECK(fixture.probe->executed == 5);
+			CHECK(fixture.Pool()->Snapshot().reserved.bytes == 0);
 		}
-		output.Destroy();
-		CHECK(fixture.Next(output, batch) == SourceResultType::BLOCKED); // Await another input, not EOF.
-		CHECK(fixture.probe->executed == 5);
-		CHECK(fixture.Pool()->Snapshot().reserved.bytes == 0);
 	}
 }
 
@@ -309,14 +312,51 @@ TEST_CASE("Managed scalar SQL plans stream with one thread and reject unsupporte
 	REQUIRE_FALSE(pending->HasError());
 	auto result = CompleteScalar(*pending);
 	REQUIRE_NO_FAIL(*result);
-	for (idx_t row = 0; row < 9; row++) {
-		auto chunk = result->Fetch();
-		REQUIRE(chunk);
-		REQUIRE(chunk->size() == 1);
-		CHECK(chunk->GetValue(0, 0) == Value::BIGINT(row));
-		CHECK(FlatVector::GetData<uint8_t>(ArrayVector::GetEntry(chunk->data[1]))[0] == 65 + row);
+	idx_t row_count = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			CHECK(chunk->GetValue(0, row) == Value::BIGINT(row_count));
+			CHECK(FlatVector::GetData<uint8_t>(ArrayVector::GetEntry(chunk->data[1]))[row * 3] == 65 + row_count);
+			row_count++;
+		}
 	}
+	CHECK(row_count == 9);
 	CHECK(probe->executed == 9);
+	REQUIRE_NO_FAIL(con.Query("SET preserve_insertion_order=false"));
+	auto ordered = con.Query("SELECT i, test_managed_resize(data,1,1) FROM "
+	                         "(SELECT * FROM scalar_input ORDER BY i DESC) t");
+	REQUIRE_NO_FAIL(*ordered);
+	row_count = 0;
+	while (auto chunk = ordered->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			CHECK(chunk->GetValue(0, row) == Value::BIGINT(8 - row_count));
+			row_count++;
+		}
+	}
+	CHECK(row_count == 9);
+	auto prepared = con.Prepare("SELECT i,test_managed_resize(data,1,1) FROM scalar_input LIMIT 2");
+	REQUIRE_FALSE(prepared->HasError());
+	for (idx_t iteration = 0; iteration < 2; iteration++) {
+		auto limited = prepared->Execute();
+		REQUIRE_NO_FAIL(*limited);
+		idx_t rows = 0;
+		while (auto chunk = limited->Fetch()) {
+			rows += chunk->size();
+		}
+		CHECK(rows == 2);
+		CHECK(db.instance->GetMediaOutputPool()->Snapshot().reserved.bytes == 0);
+	}
+	CHECK(probe->executed == 22);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='constant_folding'"));
+	auto constant_dimensions = con.Query("SELECT i,test_managed_resize(data,1+0,1) FROM scalar_input LIMIT 1");
+	REQUIRE_NO_FAIL(*constant_dimensions);
+	idx_t constant_rows = 0;
+	while (auto chunk = constant_dimensions->Fetch()) {
+		constant_rows += chunk->size();
+	}
+	CHECK(constant_rows == 1);
+	CHECK(probe->executed == 23);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers=''"));
 	for (auto sql : {"SELECT CASE WHEN i=0 THEN test_managed_resize(data,1,1) ELSE NULL END FROM scalar_input",
 	                 "SELECT i FROM scalar_input WHERE test_managed_resize(data,1,1) IS NOT NULL",
 	                 "SELECT test_managed_resize(data,1,1),test_managed_resize(data,2,1) FROM scalar_input"}) {
@@ -335,6 +375,13 @@ TEST_CASE("Managed scalar rejects a receiving capacity smaller than one row", "[
 	REQUIRE_THROWS_WITH(ScalarFixture(40, false, false, GetNativeMediaOutputPool()->Snapshot().capacity.bytes),
 	                    Catch::Matchers::Contains("minimum working set"));
 	CHECK(GetNativeMediaOutputPool()->Snapshot().reserved.bytes == 0);
+	ScalarFixture fixture;
+	auto input = fixture.Input(1);
+	REQUIRE(fixture.Accept(*input) == SinkResultType::NEED_MORE_INPUT);
+	DataChunk output;
+	REQUIRE(fixture.Next(output) == SourceResultType::HAVE_MORE_OUTPUT);
+	// A short input reserves its actual 20-byte prefix, not the 40-byte maximum.
+	CHECK(fixture.Pool()->Snapshot().reserved.bytes == 60);
 }
 
 TEST_CASE("Managed scalar copy failure leaves input unacknowledged and retryable", "[media-scalar]") {

@@ -28,7 +28,9 @@ public:
 		return true;
 	}
 	OrderPreservationType SourceOrder() const override {
-		return OrderPreservationType::INSERTION_ORDER;
+		// The serial rendezvous also preserves an explicit order from its child
+		// when preserve_insertion_order is disabled by the client.
+		return OrderPreservationType::FIXED_ORDER;
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
