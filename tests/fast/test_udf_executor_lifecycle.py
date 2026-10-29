@@ -9519,7 +9519,10 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pool
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
 
 
-def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(monkeypatch):
+@pytest.mark.parametrize("collect_unrelated_executor", [False, True])
+def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(
+    monkeypatch, collect_unrelated_executor
+):
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
@@ -9557,9 +9560,31 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
             failed_once.add("wake")
             raise RuntimeError("planned budget wakeup failure")
 
-    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
-    monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_output_grant)
-    monkeypatch.setattr(subprocess_exec, "wake_local_shm_ref_budget_waiters", wake_budget)
+    # Keep fault injection local to this executor. An unrelated executor's
+    # destructor can run during cyclic GC and consume a module-wide failure.
+    cleanup_globals = dict(
+        vars(subprocess_exec),
+        cancel_local_shm_input_lease=cancel_input_lease,
+        release_local_shm_output_grant=release_output_grant,
+        wake_local_shm_ref_budget_waiters=wake_budget,
+    )
+    for method_name in ("_cancel_active_input_leases", "_release_active_output_grants", "_cancel_scope_resources"):
+        original = getattr(type(executor), method_name)
+        isolated = types.FunctionType(
+            original.__code__, cleanup_globals, original.__name__, original.__defaults__, original.__closure__
+        )
+        isolated.__kwdefaults__ = original.__kwdefaults__
+        monkeypatch.setattr(executor, method_name, types.MethodType(isolated, executor))
+
+    if collect_unrelated_executor:
+        unrelated_sock = _FakeControlSocket()
+        unrelated_executor = _bare_shutdown_executor(subprocess_exec, unrelated_sock, None)
+        unrelated_executor._test_cycle = unrelated_executor
+        unrelated_ref = weakref.ref(unrelated_executor)
+        del unrelated_executor
+        gc.collect()
+        assert unrelated_ref() is None
+        assert unrelated_sock.closed
 
     with pytest.raises(
         RuntimeError,
