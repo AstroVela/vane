@@ -652,8 +652,11 @@ bool Executor::ResultCollectorIsBlocked() {
 	if (!HasStreamingResultCollector()) {
 		return false;
 	}
-	if (completed_pipelines + 1 != total_pipelines) {
-		// The result collector is always in the last pipeline
+	if (!physical_plan->Cast<PhysicalResultCollector>().SupportsMediaFlowInput() &&
+	    completed_pipelines + 1 != total_pipelines) {
+		// Ordinary blocking plans finish their upstream pipelines first. A
+		// bounded flow receiver can fill while resumable upstream pipelines
+		// are still active. Let Fetch drain it or none of those tasks can finish.
 		return false;
 	}
 	if (to_be_rescheduled_tasks.empty()) {

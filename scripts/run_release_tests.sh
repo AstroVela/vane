@@ -96,6 +96,7 @@ release_tests=(
 # use real native plans/subprocesses and small shared-memory budgets, without
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
+  "$project_root/tests/fast/test_native_execution_flow.py"
   "$project_root/tests/fast/test_media_scalar_admission.py"
   "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
   "$project_root/tests/fast/test_local_query_models.py::test_model_releases_output_before_completion_callback_returns"

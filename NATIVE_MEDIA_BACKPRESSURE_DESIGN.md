@@ -1,6 +1,6 @@
 # Native 多模态算子反压与资源准入详细设计
 
-状态：前六批 decoder、原始像素 buffer、UDF ingress flow、流式结果、普通物化结果和完整排序已合入集成分支；第七批 TopN 为 Draft PR #1111；第八批开始 M3 的固定尺寸 resize 实验。更新日期：2026-10-29。
+状态：前六批 decoder、原始像素 buffer、UDF ingress flow、流式结果、普通物化结果和完整排序已合入集成分支；第七批 TopN 为 Draft PR #1111；第八批在 Draft PR #1113 中实现与函数无关的 native 投影反压；固定尺寸 resize 准入保留为独立资源契约实验。更新日期：2026-10-29。
 
 Native 媒体处理需要在解码和分配大块内存之前取得资源额度，并在额度不足时暂停当前 pipeline task。下游消费、预算移交或资源释放后，调度器恢复执行。目标是同时覆盖视频扫描和图片、音频、视频重型 scalar 函数，使媒体处理速度受下游消费能力和 Worker 可用预算约束。
 
@@ -110,19 +110,41 @@ Native 媒体处理需要在解码和分配大块内存之前取得资源额度�
 
 核心 `[media-sort]` 覆盖两条 sink 路径、偏斜字符串 payload、选中行/嵌套字段、超过标准 key chunk 的行号合并、小内存真实 spill、一帧窗口 EOF、多键与 NULL、隐藏排序列、单行超限、失败回滚、取消、原始像素引用和关闭后保留的结果/Arrow。真实视频窗口 144/288 bytes 的排序、三文件输入、spill/恢复和逐像素对照进入现有 provider CI 文件 `test_native_media_admission.py`。构建身份和实际执行结果随本批 PR 记录。
 
-### 第八批：固定尺寸 resize 的流式接收和整行准入
+### 第八批：与函数无关的执行流控与可选分配准入
 
-实现分支为 `feature/media-scalar-execution`，直接基于集成分支合入 #1110 后的 `f8e5b9479`，不包含尚未合入的 #1111。它是 M3 的首个实验切片，不代表图片/音频/视频 scalar、一般表达式程序或 M3 整体已完成。
+实现分支仍为 `feature/media-scalar-execution`，Draft PR #1113 直接基于集成提交 `f8e5b9479`，不包含尚未合入的 #1111。此批交付的主线是通用执行边界，而非增加媒体函数。它覆盖 M3 的投影流控入口；不代表整个 M3/M4 或 Ray/FTE 已完成。
 
-- 在导入 Vane 前设置 `VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION=1`，并同时配置正数 `VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES` 和 `VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES`。开关在首次宿主数据库创建时固定；未设置、空串或 `0` 保持旧路径，其他值报错。此开关仅接管显式注册 capability 的 native resize，不接管 Python resize 或未注册的其他 native scalar。
-- 新物理节点 `MEDIA_PROJECT` 将输入接收和求值拆成可并发推进的 sink/source pipeline，二者都串行执行。一个输入批次尚未执行完时，下一批输入返回拒收 `BLOCKED`，保持其 receipt 有效。接收方按字节拆成独立的 BufferManager 前缀，完成所有副本并释放 append pins 后，先排入整组工作集请求，再发布并 ACK 原输入。复制失败不发布也不 ACK；等待不持有原始像素引用。
-- 最低推进预留为 `输入前缀扫描副本 + 一行独立输入 + 一行输出像素 + kernel 临时空间`。前缀行数同时受 `streaming_buffer_size` 和宿主池剩余工作集容量约束。连一个输入行都放不下时明确报资源错误，不作“一行例外”。原输入的生产窗口和像素 lease 仍按原协议释放；接收存储由 BufferManager 管理并可溢写，其磁盘/存储预算不重复计入媒体池。
-- 整组 lease 在一个输入批次的全部行执行期间保留，给输入行和输出分配建立独立子额度，避免上游抢占后续行必需的推进空间。扫描缓存按前缀大小创建，只保留一个前缀。每行先取得输入与输出子额度，再执行一次 kernel，成功后提交行位置；下游拒收重试已有输出，不重算已完成行。等待请求使用 `PollOrArm` 和调度器唤醒，不在工作线程中等待容量。
-- 输入行和 resize 输出都是独立、已准入的 primitive/ARRAY 分配。每个子 buffer 额外保留整组 lease 的祖先 lifetime，最后一个切片/Arrow owner 释放实际存储后才归还额度。关闭 scope 只取消等待请求，不撤销 detached buffer；consumer 提前结束还会关闭子 scope 并唤醒拒收的上游。prepared statement 的执行状态在任务清理后退役，不随物理计划留到下一次执行。
-- `native_resize` 的 descriptor 从函数 catalog 恢复，不通过名称猜测受管函数。只接受 canonical fixed-shape IMAGE 列引用和绑定常量尺寸/antialias；保留原来的 bilinear/antialias kernel 与 NULL 语义。antialias 下采样的 `double` 中间平面按实际两阶段过滤方向完整预留。实验模式将 resize 保留到物理规划阶段，禁止优化器在常量折叠中调用普通分配回调。
-- 首版每个查询只允许一个受管调用，且必须是投影根字段。其他输出字段和输入 schema 限固定数字、boolean、primitive ARRAY；其他输出字段只能列引用或 primitive 常量。嵌套调用、CASE/短路内部、filter predicate、动态尺寸/模式、变长输入、多个受管节点和 distributed translation 都明确拒绝。支持接到已有有界结果接收与完整排序；TopN 覆盖仍依赖第七批。受管 source 后的 UDF handoff、decode/crop/convert/encode、音频和视频 scalar 留给后续增量。
+**流控和分配准入是两个契约。** 与 Ray streaming UDF 相同，执行器可以将函数视作 opaque program，在输入交接、执行和输出交接处控制生产速度，无需知道函数名或算法。若还需要在函数分配像素或 scratch 前精确预留，则由额外的 allocation capability 描述工作集。这种 capability 不应成为通用流控的注册前提。
 
-CI 增加独立开启开关的 `[media-scalar]` 进程，覆盖满池交接、拒收不 ACK、短前缀恢复、保留像素导致的暂停、批次 envelope、NULL、异常/取消、连接销毁后祖先 lease 和不含运行时状态的序列化。该进程还直接执行与 provider 共用的 resize adapter 和真实 kernel，验证 bilinear/antialias 像素及 scratch 额度。实际 native 视频扫描 → resize → 物化/两种 Arrow 接口，以及一帧/两帧窗口与未受管执行的逐像素对照，加入已由 provider CI 显式运行的 `tests/fast/test_native_media_admission.py`。这些 provider 用例在本地没有匹配扩展时仍会跳过，验收结果须单独记录。
+在首次宿主数据库创建前设置 `VANE_NATIVE_ENABLE_EXECUTION_FLOW=1`，所有非恒等 scalar projection 使用 `NATIVE_PROJECT`。未设置、空串或 `0` 关闭，其他值报错。开关保存在宿主 ExecutionRuntime；provider 读取宿主状态，加载后修改环境不改变已创建数据库的策略。通用模式不要求设置原始像素池或视频生产窗口。
+
+该节点复用接收和执行分离的串行 sink/source：
+
+1. 接收端最多保留一个原始输入批次。按实际选中行 payload 分成前缀，完整复制至可溢写 BufferManager 存储、解除 append pin、发布成功后，才 ACK 原输入。正忙、取消或复制失败均不确认未接收数据。原始像素 allocation lease 仍随原 buffer 的最后引用释放。
+2. 输入存储是独立接收域：整批存储的逻辑字节可以超过 `streaming_buffer_size`，受 BufferManager 的 `memory_limit` 和临时存储限制约束。`streaming_buffer_size` 限制每个扫描缓存前缀与独立输入行的 payload；不能把它宣称为整个已接收批次的逻辑字节上限。BufferManager pinned 工作集分配失败时严格缩小前缀重试；单行仍放不下即报错。
+3. 执行前先申请整个输出窗口的 credit，因此每个节点只有一个正在执行或尚未 ACK 的输出 slot，包括 NULL 或零 payload 的结果。额度不足返回 `BLOCKED`，通过 `PollOrArm` 注册一次唤醒；不得先调用函数再等待下游容量。
+4. 拿到 credit 后深拷贝当前输入行，以原生 `ExpressionExecutor` 执行完整投影一次。无需 `function_info`、函数名称表或 replacement callback，保留多个函数、嵌套调用、CASE 分支与 NULL 语义。输出按真实 payload 计量，超过 `streaming_buffer_size` 时在发布前报错。未知函数的内部 heap、临时中间值和优化器常量折叠不属于此窗口的分配准入保证。
+5. 成功输出携带共享 `MediaFlowTicket`，只推进一次行位置。下游拒收重试同一输出，不能重算 volatile 函数。接收端获得独立存储后 ACK，或者所有 envelope 引用释放后归还生产额度；实际 buffer 生命周期与生产 credit 分开。consumer 提前结束会关闭 scope/window，撤回生产额度并唤醒两端；已导出副本和切片允许晚于连接销毁。
+6. prepared statement 重用时退役前一次 sink 和 rendezvous 状态，建立新 execution epoch。序列化仅保存表达式与策略，不保存 window、grant、lease 或 cursor；历史计划缺省仍为原来的精确准入策略。
+
+字符串、STRUCT、LIST 和嵌套 ARRAY 均按选中行及有效子范围计量，字典重复行重复计费，NULL LIST 不读取未定义子范围。短批拆分重新计算实际前缀和剩余 payload，不能恢复按行数比例扣减的旧算法。
+
+当前交接审计：
+
+| 执行边界 | 已实现的交接 | 限制与待验收项 |
+| --- | --- | --- |
+| native scan / native projection → `NATIVE_PROJECT` | 一批可溢写副本发布后 ACK；下个输入在忙时拒收 | resident 前缀有界；整批存储独立受 BufferManager 限制 |
+| `NATIVE_PROJECT` → streaming UDF | UDF 按实际 payload 预留输入队列容量，复制并入队后 ACK | local task/actor 定向验收；Ray 故障与跨 Worker 仍待独立验收 |
+| UDF → `NATIVE_PROJECT` → native projection | 原生接收存储与单输出 slot 逐段交接 | 不替代 UDF 原有任务/对象存储额度 |
+| projection → streaming/materialized result | 使用已有有界 collector，复制成功后 ACK | 导出结果继续由结果域记账，非媒体 RSS 总上限 |
+| projection → 完整 ORDER BY → result | 使用已合入的像素存储/key 行号交接 | TopN 依赖 #1111；排序后 UDF 尚未支持 |
+| projection → join/aggregate/window/其他 sink | 遇到未实现交接时明确报错 | 这些域及 filter 内部函数求值不属于本批通用执行入口 |
+
+CI 增加独立开启通用开关的 `[native-execution-flow]` 进程，使用没有资源声明的两个 opaque scalar，验证先额度后调用、阻塞重试不重算、两种 envelope、偏斜输入/嵌套字节、异常/取消、prepared 重用、序列化和关闭后保留输出。有界流式结果已满时允许返回可消费状态，即使上游 resumable pipeline 尚未完成；否则结果等待 EOF、上游等待结果消费会互相阻塞。多投影与真实 UDF 链路共同覆盖这个调度条件。`test_native_execution_flow.py` 在安装后的 base 包上执行，并加入 release acceptance 列表。真实 native 视频扫描与嵌套/条件 resize 的普通执行逐像素对照加入现有 provider CI 显式运行的 `test_native_media_admission.py`；本地缺少匹配 provider 时跳过，不能用 base 测试代替真实解码验收。
+
+**独立保留的精确资源准入实验。** `VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION=1` 加正数原始像素池和 in-flight 容量，使用 `MEDIA_PROJECT` 的 allocation policy。当前只有固定 canonical IMAGE 输入的 resize descriptor，预留 `输入扫描缓存 + 独立输入行 + 输出像素 + antialias scratch`，原有 kernel 和 NULL 语义保持。整批祖先 lease 被独立输入/输出子分配保留，最后 buffer 释放后归还。它仍限每查询一个顶层调用、常量尺寸/options、固定 primitive/ARRAY schema；`[media-scalar]` 和 provider 对照单独验收。
+
+两个实验开关目前必须分开启用，同时启用会在数据库创建时明确报错。原因是通用上游 ACK 后可继续预取并抢占精确下游的全局像素推进额度；联合路径的最低推进预留图尚未实现。通用流控不应据此依赖 resize；后续在统一的进度预算下组合 allocation policy，而不是逐函数复制流控逻辑。
 
 ## 1 设计结论
 
@@ -488,11 +510,13 @@ PollVideo(output, interrupt):
 
 ## 9 重型 scalar 的执行设计
 
-### 9.1 函数注册和计划节点
+### 9.1 通用执行入口与可选函数资源能力
 
-在重型函数上注册 `ManagedFunctionInfo`，描述资源类别、probe/prepare/step 能力、结果行语义、是否支持安全恢复、不可分割输出上界和协议版本。函数注册时只提供行为描述，不打开文件、不申请 decoder。
+反压主协议属于执行边界：接收存储、调用前执行额度、输出 credit、ACK、取消和唤醒。普通表达式可以直接作为 opaque program 接入，不要求为每个函数增加注册或修改算法；第八批 `NATIVE_PROJECT` 实现该投影入口。它约束在途执行与输出，而不能从函数外推断任意内部峰值分配。
 
-planner 将需要受管执行的表达式编译为 `NativeMediaExpressionProgram`。projection 使用拟议的 `LogicalMediaProject` / `PhysicalMediaProject`；其他表达式上下文通过相应 operator 的可恢复求值入口执行同一 program。普通标量计算可以作为同步步骤嵌入，不为每个算术函数引入新调度边界。
+若要求进一步在资源分配前准入，在重型函数上注册 `ManagedFunctionInfo`，描述资源类别、probe/prepare/step 能力、结果行语义、是否支持安全恢复、不可分割输出上界和协议版本。函数注册时只提供行为描述，不打开文件、不申请 decoder。
+
+下面的 probe/step program 是精确资源准入的后续设计，不是普通函数使用通用流控的必要条件。planner 将需要精确准入的表达式编译为 `NativeMediaExpressionProgram`。projection 使用拟议的 `LogicalMediaProject` / `PhysicalMediaProject`；其他表达式上下文通过相应 operator 的可恢复求值入口执行同一 program。普通标量计算可以作为同步步骤嵌入，不为每个算术函数引入新调度边界。
 
 现有 [UDFProjectRewriter](external/duckdb/src/optimizer/udf_project_rewriter.cpp) 可作为提取表达式和保持列绑定的参考，但它只允许 projection，并拒绝短路表达式中的 UDF。不能直接复用这些限制来缩减已有 native scalar 的 SQL 支持范围。
 
@@ -910,7 +934,7 @@ GPU UDF 接收输入并不保证 native 可以无限继续解码。物理预算�
 | M0 基线与契约 | 函数/表达式入口清单、分配和所有权审计、codec envelope 测量、默认容量校准、确定性失败用例 | 明确所有权边界、最小工作集和默认策略；核心方案不依赖未经证实的 TMM 硬限制 |
 | M1 公共协议 | 进程账本、scope、lease、非阻塞请求、epoch、buffer token、必要的物化/结果域适配 | 原语和所有权测试通过，预算守恒，取消竞态不泄漏，无需加载 provider |
 | M2 Native 视频扫描 | poll 接入、实际 decoder 准入、输出记账、local-fast 与 Ray scan、慢 UDF 边界 | 小线程池和小预算下完成；索引/skip/LIMIT 正确；物化与传输路径具备已验证接收方式 |
-| M3 重型 scalar 实验覆盖 | 图片、音频、视频 scalar adapter；projection/filter/短路程序；按字节批次 | 受支持上下文语义一致；未知行大小不导致增额死锁；未覆盖上下文明确可见 |
+| M3 重型 scalar 实验覆盖 | 通用表达式执行流控；可选图片/音频/视频分配 adapter；projection/filter/短路程序 | 受支持上下文语义一致；未知行大小不导致增额死锁；未覆盖上下文明确可见 |
 | M4 完整执行边界 | 其他原有表达式上下文、sort/join/window/collector、双向 UDF 混合、Ray/FTE 故障 | 合法旧调用覆盖完成，物化 EOF 可达、重试隔离、provider 兼容通过；具备默认启用条件 |
 | M5 Python 视频源统一 | 单一 slot 权威、配置兼容、输出/Arrow 生命周期适配及 fork 行为 | 混合 Python/native 查询共享容量；无双重扣费；明确已覆盖与 opaque 内存范围 |
 

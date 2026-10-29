@@ -808,8 +808,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	}
 	case PhysicalOperatorType::MEDIA_PROJECT: {
 		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");
+		auto resource_admission = deserializer.ReadPropertyWithExplicitDefault<bool>(104, "resource_admission", true);
 		return make_uniq<PhysicalMediaProject>(physical_plan, std::move(types), std::move(select_list),
-		                                       estimated_cardinality);
+		                                       estimated_cardinality, resource_admission);
 	}
 	case PhysicalOperatorType::VLLM_PROJECT: {
 		unique_ptr<Expression> prompt_expr;

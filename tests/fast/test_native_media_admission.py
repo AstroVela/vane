@@ -17,6 +17,96 @@ video_path = media.video_path
 
 
 @pytest.mark.parametrize("window_bytes", ["144", "288"])
+def test_native_video_generic_execution_flow_matches_ordinary_expressions(video_path, window_bytes):
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    artifacts = [] if providers else [str(media._artifact("video"))]
+    script = r"""
+import faulthandler
+import json
+import sys
+import numpy as np
+import pyarrow as pa
+import vane
+
+faulthandler.dump_traceback_later(60, exit=True)
+path, enabled, *artifacts = sys.argv[1:]
+con = vane.connect(config={'allow_unsigned_extensions': 'true'}) if artifacts else vane.connect()
+if artifacts:
+    for artifact in artifacts:
+        con.load_extension(artifact)
+else:
+    vane.load_installed_extension('native_media', connection=con)
+con.execute("SET video_backend='native'")
+con.execute('SET threads=4')
+con.execute("SET streaming_buffer_size='512B'")
+
+def projected():
+    frames = vane.read_video_frames(path, 6, 8, connection=con, max_partition_bytes=288)
+    return frames.project('''
+        frame_index,
+        native_resize(native_resize(data, 4, 3), 3, 2) AS nested,
+        CASE WHEN frame_index%2=0 THEN native_resize(data, 3, 2) ELSE NULL END AS conditional
+    ''')
+
+assert ('NATIVE_PROJECT' in projected().explain()) == (enabled == '1')
+rows = projected().fetchall()
+assert [row[0] for row in rows] == list(range(12))
+snapshots = [(a.copy(), None if b is None else b.copy()) for _, a, b in rows]
+pixels = [(a.tolist(), None if b is None else b.tolist()) for _, a, b in rows]
+for _ in range(2):
+    repeated = projected().fetchall()
+    for (_, a, b), (expected_a, expected_b) in zip(repeated, snapshots):
+        np.testing.assert_array_equal(a, expected_a)
+        if expected_b is None:
+            assert b is None
+        else:
+            np.testing.assert_array_equal(b, expected_b)
+assert len(projected().limit(2).fetchall()) == 2
+arrow = projected().to_arrow_table()
+capsule = pa.table(projected())
+assert arrow.equals(capsule)
+saved = arrow.to_pylist()
+con.close()
+for (_, a, b), (expected_a, expected_b) in zip(rows, snapshots):
+    np.testing.assert_array_equal(a, expected_a)
+    if b is not None:
+        np.testing.assert_array_equal(b, expected_b)
+assert arrow.to_pylist() == saved
+print('FLOW_RESULT=' + json.dumps(pixels))
+faulthandler.cancel_dump_traceback_later()
+"""
+    outputs = []
+    for enabled in ("0", "1"):
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(video_path), enabled, *artifacts],
+            env={
+                **os.environ,
+                "VANE_RUNNER": "local-fast",
+                "VANE_PROGRESS": "0",
+                "VANE_NATIVE_ENABLE_EXECUTION_FLOW": enabled,
+                "VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION": "0",
+                "VANE_NATIVE_MEDIA_MAX_CONCURRENT_DECODES": "1",
+                "VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES": "800",
+                "VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES": window_bytes,
+            },
+            capture_output=True,
+            text=True,
+            timeout=75,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs.append(
+            json.loads(
+                next(
+                    line.removeprefix("FLOW_RESULT=")
+                    for line in result.stdout.splitlines()
+                    if line.startswith("FLOW_RESULT=")
+                )
+            )
+        )
+    assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize("window_bytes", ["144", "288"])
 @pytest.mark.parametrize("antialias", [False, True])
 def test_native_video_fixed_resize_admission_matches_unmanaged_execution(video_path, window_bytes, antialias):
     providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"

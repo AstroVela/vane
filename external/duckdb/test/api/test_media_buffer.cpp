@@ -211,6 +211,56 @@ TEST_CASE("Failed media allocation and invalid reservations return capacity", "[
 	CHECK(pool.Snapshot().active_leases == 0);
 }
 
+TEST_CASE("Execution byte windows count selected nested payloads exactly", "[media-resource][execution-payload]") {
+	const auto list_type = LogicalType::LIST(LogicalType::VARCHAR);
+	DataChunk source;
+	source.Initialize(Allocator::DefaultAllocator(), {list_type}, 3);
+	source.SetValue(0, 0, Value::LIST(LogicalType::VARCHAR, {Value("a"), Value(string(80, 'x'))}));
+	source.SetValue(0, 1, Value::LIST(LogicalType::VARCHAR, {Value(string(31, 'y'))}));
+	source.SetValue(0, 2, Value(list_type));
+	source.SetCardinality(3);
+	const auto first = sizeof(list_entry_t) + 2 * sizeof(string_t) + 80;
+	const auto second = sizeof(list_entry_t) + sizeof(string_t) + 31;
+	CHECK(EstimateMediaFlowInputBytes(source) == first + second + sizeof(list_entry_t));
+	CHECK(EstimateMediaFlowInputBytes(source, 1, 1) == second);
+	CHECK(MediaFlowRowsWithinByteLimit(source, 0, 3, first + second - 1) == 1);
+	SelectionVector selection(4);
+	selection.set_index(0, 1);
+	selection.set_index(1, 0);
+	selection.set_index(2, 1);
+	selection.set_index(3, 2);
+	DataChunk selected, copied;
+	selected.InitializeEmpty(source.GetTypes());
+	selected.Slice(source, selection, 4);
+	const auto expected = first + 2 * second + sizeof(list_entry_t);
+	CHECK(EstimateMediaFlowInputBytes(selected) == expected);
+	copied.Initialize(Allocator::DefaultAllocator(), source.GetTypes(), 4);
+	selected.Copy(copied);
+	CHECK(EstimateMediaFlowInputBytes(copied) == expected);
+
+	const auto structure = LogicalType::STRUCT({{"id", LogicalType::BIGINT}, {"text", LogicalType::VARCHAR}});
+	const auto nested_type = LogicalType::LIST(structure);
+	DataChunk nested;
+	nested.Initialize(Allocator::DefaultAllocator(), {nested_type}, 2);
+	nested.SetValue(
+	    0, 0,
+	    Value::LIST(structure, {Value::STRUCT({{"id", Value::BIGINT(1)}, {"text", Value(string(80, 'x'))}}),
+	                            Value::STRUCT({{"id", Value::BIGINT(2)}, {"text", Value(string(31, 'y'))}})}));
+	nested.SetValue(0, 1, Value::LIST(structure, {}));
+	nested.SetCardinality(2);
+	CHECK(EstimateMediaFlowInputBytes(nested) ==
+	      2 * sizeof(list_entry_t) + 2 * (sizeof(int64_t) + sizeof(string_t)) + 111);
+
+	const auto array_type = LogicalType::ARRAY(LogicalType::VARCHAR, 2);
+	DataChunk arrays;
+	arrays.Initialize(Allocator::DefaultAllocator(), {array_type}, 2);
+	arrays.SetValue(0, 0, Value::ARRAY(LogicalType::VARCHAR, {Value("a"), Value(string(80, 'x'))}));
+	arrays.SetValue(0, 1, Value::ARRAY(LogicalType::VARCHAR, {Value(string(31, 'y')), Value("b")}));
+	arrays.SetCardinality(2);
+	CHECK(EstimateMediaFlowInputBytes(arrays) == 4 * sizeof(string_t) + 111);
+	CHECK(EstimateMediaFlowInputBytes(arrays, 1, 1) == 2 * sizeof(string_t) + 31);
+}
+
 TEST_CASE("IMAGE pixel writers preserve admitted storage through nested slicing", "[media-resource]") {
 	MediaResourcePool pool({0, 24});
 	auto scope = pool.CreateScope();

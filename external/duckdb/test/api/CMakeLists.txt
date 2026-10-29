@@ -36,6 +36,7 @@ set(TEST_API_OBJECTS
     test_media_buffer.cpp
     test_media_flow.cpp
     test_media_scalar.cpp
+    test_native_execution_flow.cpp
     test_insertion_order_preserving_map.cpp
     test_bignum.cpp
     test_threads.cpp

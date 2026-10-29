@@ -221,6 +221,8 @@ jobs:
           VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES=8192 \
           VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES=64 \
             build/native-cxx20/test/unittest '[media-scalar]'
+          VANE_NATIVE_ENABLE_EXECUTION_FLOW=1 \
+            build/native-cxx20/test/unittest '[native-execution-flow]'
 
       - name: Sign the real-Ray dynamic extension fixture
         if: matrix.python-version == '3.12'

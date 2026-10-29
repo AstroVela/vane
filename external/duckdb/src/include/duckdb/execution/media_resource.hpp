@@ -157,4 +157,9 @@ DUCKDB_API bool GetNativeMediaScalarAdmission();
 //! Read the installed host runtime even when called by a self-contained extension.
 DUCKDB_API bool NativeMediaScalarAdmissionEnabled(ClientContext &context);
 
+//! Host-captured, function-independent projection flow. Its receiving/storage
+//! and output windows are separate from optional exact allocation admission.
+DUCKDB_API bool GetNativeExecutionFlow();
+DUCKDB_API bool NativeExecutionFlowEnabled(ClientContext &context);
+
 } // namespace duckdb

@@ -25,9 +25,6 @@
 namespace duckdb {
 
 bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const PhysicalOperator &plan) {
-	if (!DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity()) {
-		return false;
-	}
 	auto current = &plan;
 	while (current->type != PhysicalOperatorType::TABLE_SCAN) {
 		if (current->type == PhysicalOperatorType::MEDIA_PROJECT) {
@@ -47,7 +44,8 @@ bool PhysicalPlanGenerator::HasNativeMediaFlow(ClientContext &context, const Phy
 		}
 		current = &children[0].get();
 	}
-	return current->Cast<PhysicalTableScan>().function.media_flow_source;
+	return DatabaseInstance::GetDatabase(context).GetMediaFlowCapacity() &&
+	       current->Cast<PhysicalTableScan>().function.media_flow_source;
 }
 
 PhysicalPlanGenerator::PhysicalPlanGenerator(ClientContext &context) : context(context) {

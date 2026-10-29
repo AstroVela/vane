@@ -110,26 +110,39 @@ void Wake(vector<InterruptState> tasks) {
 
 struct MediaProjectState : public StateWithBlockableTasks {
 	MediaProjectState(ClientContext &context_p, const PhysicalMediaProject &op)
-	    : input_types(op.children[0].get().GetTypes()), scalar_column(ManagedColumn(op.select_list)),
-	      function(op.select_list[scalar_column]->Cast<BoundFunctionExpression>()),
-	      info(*GetManagedMediaScalar(function)) {
+	    : input_types(op.children[0].get().GetTypes()), resource_admission(op.resource_admission),
+	      scalar_column(DConstants::INVALID_INDEX) {
+		copy_limit = ClientConfig::GetConfig(context_p).streaming_buffer_size;
+		if (!copy_limit) {
+			throw InvalidInputException("Native execution flow requires positive streaming_buffer_size");
+		}
+		if (!resource_admission) {
+			if (!NativeExecutionFlowEnabled(context_p)) {
+				throw InvalidInputException("NATIVE_PROJECT requires VANE_NATIVE_ENABLE_EXECUTION_FLOW=1 on the host");
+			}
+			output_window = make_shared_ptr<MediaFlowWindow>(copy_limit);
+			return;
+		}
+		scalar_column = ManagedColumn(op.select_list);
+		function = &op.select_list[scalar_column]->Cast<BoundFunctionExpression>();
+		info = GetManagedMediaScalar(*function);
 		auto &db = DatabaseInstance::GetDatabase(context_p);
 		if (!NativeMediaScalarAdmissionEnabled(context_p) || !db.GetMediaOutputPool()) {
 			throw InvalidInputException("MEDIA_PROJECT requires native media scalar admission on the executing host");
 		}
-		if (function.children.empty() || function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+		if (function->children.empty() || function->children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
 			throw NotImplementedException("Managed media image input must be a column reference");
 		}
-		for (idx_t i = 1; i < function.children.size(); i++) {
-			if (!function.children[i]->IsFoldable()) {
+		for (idx_t i = 1; i < function->children.size(); i++) {
+			if (!function->children[i]->IsFoldable()) {
 				throw NotImplementedException("Managed media dimensions and options must be bound constants");
 			}
-			parameters.push_back(ExpressionExecutor::EvaluateScalar(context_p, *function.children[i]));
+			parameters.push_back(ExpressionExecutor::EvaluateScalar(context_p, *function->children[i]));
 		}
 		for (auto &type : input_types) {
 			row_bytes = AddBytes(row_bytes, FixedBytes(type));
 		}
-		working_set = info.working_set(context_p, function);
+		working_set = info->working_set(context_p, *function);
 		if (!working_set.output_bytes) {
 			throw InvalidInputException("Managed media scalar must declare a nonempty output reservation");
 		}
@@ -138,13 +151,14 @@ struct MediaProjectState : public StateWithBlockableTasks {
 		if (rest >= capacity || row_bytes > capacity - rest) {
 			throw OutOfMemoryException("Managed media minimum working set exceeds VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES");
 		}
-		auto copy_limit = MinValue(capacity - rest, ClientConfig::GetConfig(context_p).streaming_buffer_size);
+		copy_limit = MinValue(capacity - rest, copy_limit);
 		prefix_rows = MinValue<idx_t>(STANDARD_VECTOR_SIZE, copy_limit / row_bytes);
 		if (!prefix_rows) {
 			throw OutOfMemoryException("Managed media input row exceeds streaming_buffer_size receiving capacity");
 		}
 		reservation_bytes = AddBytes(prefix_rows * row_bytes, rest);
 		scope = db.GetMediaOutputPool()->CreateScope();
+		output_window = make_shared_ptr<MediaFlowWindow>(copy_limit);
 	}
 
 	~MediaProjectState() {
@@ -164,7 +178,10 @@ struct MediaProjectState : public StateWithBlockableTasks {
 			wakeups = TakeBlockedTasks(guard);
 		}
 		// Cancellation and receipt callbacks must never run under the rendezvous lock.
-		scope->Close();
+		if (scope) {
+			scope->Close();
+		}
+		output_window->Close();
 		if (active) {
 			active->row_scope->Close();
 			active->output_scope->Close();
@@ -174,9 +191,12 @@ struct MediaProjectState : public StateWithBlockableTasks {
 	}
 
 	vector<LogicalType> input_types;
+	bool resource_admission;
 	idx_t scalar_column;
-	const BoundFunctionExpression &function;
-	const ManagedMediaScalarFunctionInfo &info;
+	optional_ptr<const BoundFunctionExpression> function;
+	const ManagedMediaScalarFunctionInfo *info = nullptr;
+	idx_t copy_limit = 0;
+	shared_ptr<MediaFlowWindow> output_window;
 	vector<Value> parameters;
 	ManagedMediaWorkingSet working_set {0, 0};
 	idx_t row_bytes = 0;
@@ -212,6 +232,9 @@ struct MediaProjectLocalState : public LocalSourceState {
 	unique_ptr<MediaAdmissionRequest> output_request;
 	unique_ptr<MediaAdmissionRequest> row_request;
 	MediaResourceLease output_lease;
+	unique_ptr<MediaAdmissionRequest> flow_request;
+	shared_ptr<MediaFlowTicket> output_ticket;
+	unique_ptr<ExpressionExecutor> executor;
 	DataChunk cache;
 	idx_t prefix = 0;
 	idx_t row = 0;
@@ -240,8 +263,10 @@ void CopyOwnedRow(MediaProjectState &state, MediaProjectLocalState &local, DataC
 } // namespace
 
 PhysicalMediaProject::PhysicalMediaProject(PhysicalPlan &plan, vector<LogicalType> types,
-                                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality)
-    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), select_list(std::move(expressions)) {
+                                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality,
+                                           bool resource_admission_p)
+    : PhysicalOperator(plan, TYPE, std::move(types), estimated_cardinality), select_list(std::move(expressions)),
+      resource_admission(resource_admission_p) {
 }
 
 shared_ptr<MediaProjectState> PhysicalMediaProject::GetState(ClientContext &context) const {
@@ -304,7 +329,12 @@ SinkResultType PhysicalMediaProject::Sink(ExecutionContext &context, DataChunk &
 		if (context.client.IsInterrupted()) {
 			throw InterruptException();
 		}
-		auto rows = MinValue(state.prefix_rows, chunk.size() - offset);
+		auto rows = state.resource_admission
+		                ? MinValue(state.prefix_rows, chunk.size() - offset)
+		                : MediaFlowRowsWithinByteLimit(chunk, offset, chunk.size() - offset, state.copy_limit);
+		if (!rows) {
+			throw OutOfMemoryException("Native execution input row exceeds streaming_buffer_size receiving capacity");
+		}
 		while (true) {
 			try {
 				DataChunk selected;
@@ -329,8 +359,10 @@ SinkResultType PhysicalMediaProject::Sink(ExecutionContext &context, DataChunk &
 	}
 	// Queue the complete working set before ACK releases upstream credits. A
 	// subsequent producer cannot consume the bytes needed to execute this batch.
-	const auto fixed_bytes = state.reservation_bytes - state.prefix_rows * state.row_bytes;
-	batch->request = state.scope->Request({0, AddBytes(batch->cache_rows * state.row_bytes, fixed_bytes)});
+	if (state.resource_admission) {
+		const auto fixed_bytes = state.reservation_bytes - state.prefix_rows * state.row_bytes;
+		batch->request = state.scope->Request({0, AddBytes(batch->cache_rows * state.row_bytes, fixed_bytes)});
+	}
 	vector<InterruptState> wakeups;
 	{
 		auto guard = state.Lock();
@@ -363,8 +395,13 @@ unique_ptr<GlobalSourceState> PhysicalMediaProject::GetGlobalSourceState(ClientC
 	return make_uniq<MediaProjectSourceState>(GetState(context));
 }
 
-unique_ptr<LocalSourceState> PhysicalMediaProject::GetLocalSourceState(ExecutionContext &, GlobalSourceState &) const {
-	return make_uniq<MediaProjectLocalState>();
+unique_ptr<LocalSourceState> PhysicalMediaProject::GetLocalSourceState(ExecutionContext &context,
+                                                                       GlobalSourceState &) const {
+	auto local = make_uniq<MediaProjectLocalState>();
+	if (!resource_admission) {
+		local->executor = make_uniq<ExpressionExecutor>(context.client, select_list);
+	}
+	return std::move(local);
 }
 
 SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
@@ -394,7 +431,7 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 				}
 			}
 		}
-		if (!local.lifetime) {
+		if (state.resource_admission && !local.lifetime) {
 			auto status = local.batch->request->PollOrArm(input.interrupt_state);
 			if (status == MediaAdmissionStatus::WAITING) {
 				return SourceResultType::BLOCKED;
@@ -440,6 +477,50 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 			prefix->Scan(scan, local.cache);
 			local.row = 0;
 		}
+		if (!local.output_ticket) {
+			if (!local.flow_request) {
+				// Reserve one complete output window before invoking the opaque
+				// program. This is one execution/output slot even for zero-byte rows.
+				local.flow_request = state.output_window->Request(state.copy_limit);
+			}
+			auto status = local.flow_request->PollOrArm(input.interrupt_state);
+			if (status == MediaAdmissionStatus::WAITING) {
+				return SourceResultType::BLOCKED;
+			}
+			if (status == MediaAdmissionStatus::CANCELLED) {
+				return SourceResultType::FINISHED;
+			}
+			local.output_ticket = state.output_window->TakeGrant(*local.flow_request);
+			local.flow_request.reset();
+			if (!local.output_ticket) {
+				return SourceResultType::FINISHED;
+			}
+		}
+		if (!state.resource_admission) {
+			DataChunk owned;
+			owned.Initialize(Allocator::DefaultAllocator(), state.input_types, 1);
+			for (idx_t column = 0; column < state.input_types.size(); column++) {
+				VectorOperations::Copy(local.cache.data[column], owned.data[column], local.row + 1, local.row, 0);
+			}
+			owned.SetCardinality(1);
+			chunk.Destroy();
+			chunk.Initialize(Allocator::DefaultAllocator(), types, 1);
+			try {
+				local.executor->Execute(owned, chunk);
+			} catch (...) {
+				local.executor->ResetInput();
+				state.Close();
+				throw;
+			}
+			local.executor->ResetInput();
+			if (EstimateMediaFlowInputBytes(chunk) > state.copy_limit) {
+				state.Close();
+				throw OutOfMemoryException("Native execution output row exceeds streaming_buffer_size output capacity");
+			}
+			chunk.AddMediaFlow(std::move(local.output_ticket));
+			local.row++;
+			return SourceResultType::HAVE_MORE_OUTPUT;
+		}
 		if (!local.output_lease) {
 			if (!local.output_request) {
 				local.output_request = local.lifetime->output_scope->Request({0, state.working_set.output_bytes});
@@ -468,9 +549,9 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 		CopyOwnedRow(state, local, owned, local.row_request->TakeGrant());
 		local.row_request.reset();
 		DataChunk args;
-		args.InitializeEmpty(state.function.function.arguments);
-		for (idx_t i = 0; i < state.function.children.size(); i++) {
-			auto &child = *state.function.children[i];
+		args.InitializeEmpty(state.function->function.arguments);
+		for (idx_t i = 0; i < state.function->children.size(); i++) {
+			auto &child = *state.function->children[i];
 			if (child.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 				args.data[i].Reference(owned.data[child.Cast<BoundReferenceExpression>().index]);
 			} else {
@@ -478,8 +559,8 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 			}
 		}
 		args.SetCardinality(1);
-		state.info.execute(context.client, args, chunk.data[state.scalar_column], std::move(local.output_lease),
-		                   local.lifetime);
+		state.info->execute(context.client, args, chunk.data[state.scalar_column], std::move(local.output_lease),
+		                    local.lifetime);
 		for (idx_t i = 0; i < select_list.size(); i++) {
 			if (i == state.scalar_column) {
 				continue;
@@ -492,6 +573,10 @@ SourceResultType PhysicalMediaProject::GetDataInternal(ExecutionContext &context
 			}
 		}
 		chunk.SetCardinality(1);
+		if (EstimateMediaFlowInputBytes(chunk) > state.copy_limit) {
+			throw OutOfMemoryException("Native execution output row exceeds streaming_buffer_size output capacity");
+		}
+		chunk.AddMediaFlow(std::move(local.output_ticket));
 		local.row++; // Commit once. A blocked downstream retries this output, never the scalar.
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -507,13 +592,16 @@ InsertionOrderPreservingMap<string> PhysicalMediaProject::ParamsToString() const
 		expressions += expression->GetName();
 	}
 	result["__projections__"] = expressions;
-	result["media_admission"] = "fixed-shape scalar; one receiving batch; one row working set";
+	result["native_execution"] = "one spillable receiving batch; bounded input cache; one execution/output slot";
+	result["allocation_admission"] =
+	    resource_admission ? "exact scalar contract" : "opaque program; internal heap excluded";
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }
 
 void PhysicalMediaProject::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "select_list", select_list);
+	serializer.WriteProperty(104, "resource_admission", resource_admission);
 }
 
 void ValidateManagedMediaPlan(ClientContext &context, LogicalOperator &root) {

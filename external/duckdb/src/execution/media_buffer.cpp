@@ -47,20 +47,62 @@ idx_t MultiplyInputBytes(idx_t count, idx_t width) {
 	return count * width;
 }
 
+idx_t MediaFlowVectorInputBytes(const Vector &vector, idx_t rows);
+
+idx_t MediaFlowRangeInputBytes(const Vector &vector, idx_t offset, idx_t rows) {
+	if (!rows) {
+		return 0;
+	}
+	Vector selected(vector, offset, AddInputBytes(offset, rows));
+	return MediaFlowVectorInputBytes(selected, rows);
+}
+
 idx_t MediaFlowVectorInputBytes(const Vector &vector, idx_t rows) {
+	if (!rows) {
+		return 0;
+	}
 	const auto &type = vector.GetType();
 	const auto physical = type.InternalType();
 	if (physical == PhysicalType::ARRAY) {
 		const auto &child = ArrayType::GetChildType(type);
-		if (child.IsNested() || child.InternalType() == PhysicalType::VARCHAR) {
-			throw NotImplementedException("Native media flow receiver requires fixed arrays of primitive values");
+		if (!child.IsNested() && child.InternalType() != PhysicalType::VARCHAR) {
+			return MultiplyInputBytes(MultiplyInputBytes(rows, ArrayType::GetSize(type)),
+			                          GetTypeIdSize(child.InternalType()));
 		}
-		return MultiplyInputBytes(MultiplyInputBytes(rows, ArrayType::GetSize(type)),
-		                          GetTypeIdSize(child.InternalType()));
+		Vector view(type, nullptr);
+		view.Reference(vector);
+		UnifiedVectorFormat format;
+		view.ToUnifiedFormat(rows, format);
+		auto &elements = ArrayVector::GetEntry(view);
+		const auto width = ArrayType::GetSize(type);
+		idx_t bytes = 0;
+		for (idx_t row = 0; row < rows; row++) {
+			auto offset = MultiplyInputBytes(format.sel->get_index(row), width);
+			bytes = AddInputBytes(bytes, MediaFlowRangeInputBytes(elements, offset, width));
+		}
+		return bytes;
 	}
 	if (physical == PhysicalType::LIST) {
-		throw NotImplementedException("Native media flow receiver does not support variable-sized nested input; "
-		                              "cast images to IMAGE(mode, height, width) before the receiver");
+		Vector view(type, nullptr);
+		view.Reference(vector);
+		UnifiedVectorFormat format;
+		view.ToUnifiedFormat(rows, format);
+		auto entries = UnifiedVectorFormat::GetData<list_entry_t>(format);
+		auto &elements = ListVector::GetEntry(view);
+		const auto count = ListVector::GetListSize(view);
+		auto bytes = MultiplyInputBytes(rows, sizeof(list_entry_t));
+		for (idx_t row = 0; row < rows; row++) {
+			auto index = format.sel->get_index(row);
+			if (!format.validity.RowIsValid(index)) {
+				continue;
+			}
+			auto entry = entries[index];
+			if (entry.offset > count || entry.length > count - entry.offset) {
+				throw InvalidInputException("Execution payload contains invalid nested offsets");
+			}
+			bytes = AddInputBytes(bytes, MediaFlowRangeInputBytes(elements, entry.offset, entry.length));
+		}
+		return bytes;
 	}
 	if (physical == PhysicalType::STRUCT) {
 		idx_t bytes = 0;

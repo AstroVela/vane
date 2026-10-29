@@ -87,6 +87,11 @@ DatabaseInstance::DatabaseInstance() : db_validity(*this) {
 	media_output_pool = GetNativeMediaOutputPool();
 	media_flow_capacity = GetNativeMediaFlowCapacity();
 	execution_runtime->native_media_scalar_admission = GetNativeMediaScalarAdmission();
+	execution_runtime->native_execution_flow = GetNativeExecutionFlow();
+	if (execution_runtime->native_execution_flow && execution_runtime->native_media_scalar_admission) {
+		throw InvalidInputException("Native execution flow and the experimental exact scalar admission mode "
+		                            "must be enabled separately; combined progress reservations are not implemented");
+	}
 	if (execution_runtime->native_media_scalar_admission && (!media_output_pool || !media_flow_capacity)) {
 		throw InvalidInputException("Native media scalar admission requires VANE_NATIVE_MEDIA_MAX_OUTPUT_BYTES "
 		                            "and VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES");

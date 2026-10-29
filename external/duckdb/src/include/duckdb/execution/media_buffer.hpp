@@ -30,8 +30,9 @@ DUCKDB_API void AllocateMediaList(Vector &list, idx_t rows, idx_t count, MediaRe
                                   shared_ptr<MediaFlowTicket> flow = nullptr);
 
 //! Payload reservation for a fresh bounded receiver copy: primitive slots, fixed
-//! primitive arrays, structs and out-of-line strings. Variable-sized nested
-//! collections require a separate capacity contract and are rejected.
+//! arrays, structs, out-of-line strings and selected variable-sized collections.
+//! Nested offsets/dictionaries are measured from actual selected rows, never
+//! using a proportional fraction of a whole batch.
 //! Excludes validity masks, allocator slack, bookkeeping and later task copies.
 DUCKDB_API idx_t EstimateMediaFlowInputBytes(const DataChunk &chunk);
 //! Measure an actual row slice without allocating the receiving payload.

@@ -242,6 +242,26 @@ progress reservations for interdependent media operators are still pending.
 The complete target, implementation status and remaining validation are in
 [Native media backpressure design](NATIVE_MEDIA_BACKPRESSURE_DESIGN.md).
 
+The function-independent projection experiment uses
+`VANE_NATIVE_ENABLE_EXECUTION_FLOW=1`, captured when the host database is first
+created. It defaults to disabled and accepts only `0` or `1`. `NATIVE_PROJECT`
+executes ordinary projection expressions without per-function registration,
+including nested calls, multiple functions, CASE and NULLs. It copies one input
+batch to spillable BufferManager storage before acknowledging it, then reserves
+one execution/output slot before evaluating each row. A blocked receiver cannot
+cause an already completed row to be evaluated again.
+
+`streaming_buffer_size` bounds the resident input-prefix payload, owned input row
+and each output row. The complete received batch can be larger and belongs to
+BufferManager's memory/temp-storage domain. Output size is checked before
+publication; opaque function-internal allocations, intermediate expressions,
+compiler constant folding and process RSS are outside this flow guarantee.
+Strings, STRUCT, LIST and nested ARRAY payloads use the actual selected rows.
+Local native/UDF handoffs, bounded result collectors and full ORDER BY receivers
+share the existing ACK protocol. Other sink boundaries fail explicitly when no
+budget handoff exists; filter-internal evaluation, distributed execution and
+TopN are outside this increment's acceptance scope.
+
 An additional opt-in experiment, `VANE_NATIVE_MEDIA_ENABLE_SCALAR_ADMISSION=1`,
 adds fixed-shape `native_resize` to the host output pool. Set it before importing
 Vane together with both positive output-byte and in-flight-byte capacities. It
@@ -259,7 +279,10 @@ storage; the other fields must be column references or primitive constants.
 Nested calls, conditional/filter contexts, dynamic shapes, multiple managed
 nodes and distributed translation raise explicit unsupported errors. Python
 resize and other native media functions retain their existing contracts. This
-is the first M3 slice; it does not enable the full scalar roadmap by default.
+is an optional allocation contract, separate from the generic flow protocol.
+The two experimental flags must currently be enabled separately: combined
+progress reservations across their shared pixel pool are not implemented.
+Neither experiment enables the full scalar roadmap by default.
 
 `VANE_NATIVE_MEDIA_MAX_INFLIGHT_OUTPUT_BYTES` enables an additional experimental
 **per-scan production window**, shared by that scan's parallel workers. Configure

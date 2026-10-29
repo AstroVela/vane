@@ -338,6 +338,24 @@ bool NativeMediaScalarAdmissionEnabled(ClientContext &context) {
 	return DatabaseInstance::GetDatabase(context).GetExecutionRuntime().native_media_scalar_admission;
 }
 
+bool GetNativeExecutionFlow() {
+	static const bool enabled = [] {
+		const auto value = FileSystem::GetEnvVariable("VANE_NATIVE_ENABLE_EXECUTION_FLOW");
+		if (value.empty() || value == "0") {
+			return false;
+		}
+		if (value != "1") {
+			throw InvalidInputException("VANE_NATIVE_ENABLE_EXECUTION_FLOW must be 0 or 1");
+		}
+		return true;
+	}();
+	return enabled;
+}
+
+bool NativeExecutionFlowEnabled(ClientContext &context) {
+	return DatabaseInstance::GetDatabase(context).GetExecutionRuntime().native_execution_flow;
+}
+
 struct MediaFlowWindowState {
 	explicit MediaFlowWindowState(idx_t bytes) : pool({0, bytes}), scope(pool.CreateScope()) {
 	}

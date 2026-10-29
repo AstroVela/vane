@@ -39,6 +39,11 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalProjection &op) {
 		}
 	}
 
+	if (NativeExecutionFlowEnabled(context)) {
+		auto &flow = Make<PhysicalMediaProject>(op.types, std::move(op.expressions), op.estimated_cardinality, false);
+		flow.children.push_back(plan);
+		return flow;
+	}
 	if (NativeMediaScalarAdmissionEnabled(context)) {
 		for (auto &expression : op.expressions) {
 			if (GetManagedMediaScalar(*expression)) {

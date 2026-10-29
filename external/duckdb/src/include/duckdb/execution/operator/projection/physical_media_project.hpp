@@ -13,13 +13,14 @@ namespace duckdb {
 struct MediaProjectState;
 
 //! Serial, streaming receive/execute rendezvous. Input is copied to sealed
-//! BufferManager storage before acknowledgement; each row runs only after its
-//! entire working set has been admitted. No worker waits on a resource mutex.
+//! BufferManager storage before acknowledgement; each row waits for an output
+//! slot before evaluation. Optional exact resource admission additionally
+//! reserves the declared working set. No worker waits on a resource mutex.
 class PhysicalMediaProject : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::MEDIA_PROJECT;
 	PhysicalMediaProject(PhysicalPlan &plan, vector<LogicalType> types, vector<unique_ptr<Expression>> expressions,
-	                     idx_t estimated_cardinality);
+	                     idx_t estimated_cardinality, bool resource_admission = true);
 
 	bool IsSink() const override {
 		return true;
@@ -51,6 +52,12 @@ public:
 	void SerializeOperatorData(Serializer &serializer) const override;
 
 	vector<unique_ptr<Expression>> select_list;
+	//! Runtime flow is function-independent. Exact per-allocation admission is
+	//! an additional experimental policy with its own capability requirements.
+	const bool resource_admission;
+	string GetName() const override {
+		return resource_admission ? "MEDIA_PROJECT" : "NATIVE_PROJECT";
+	}
 
 private:
 	shared_ptr<MediaProjectState> GetState(ClientContext &context) const;

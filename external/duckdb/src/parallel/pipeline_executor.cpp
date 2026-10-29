@@ -123,14 +123,14 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	const bool native_media_sort = pipeline.source->type == PhysicalOperatorType::ORDER_BY &&
 	                               pipeline.source->Cast<PhysicalOrder>().media_flow_receiver;
 	const bool managed_media = pipeline.source->type == PhysicalOperatorType::MEDIA_PROJECT;
-	if (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() &&
-	    (native_media_scan || native_media_sort || managed_media)) {
+	if (managed_media || native_media_sort ||
+	    (DatabaseInstance::GetDatabase(context.client).GetMediaFlowCapacity() && native_media_scan)) {
 		const bool bounded_result = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::RESULT_COLLECTOR &&
 		                            pipeline.sink->Cast<PhysicalResultCollector>().SupportsMediaFlowInput();
 		const bool bounded_sort = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::ORDER_BY &&
 		                          pipeline.sink->Cast<PhysicalOrder>().media_flow_receiver;
-		const bool bounded_udf =
-		    pipeline.sink && native_media_scan && pipeline.sink->type == PhysicalOperatorType::STREAMING_UDF;
+		const bool bounded_udf = pipeline.sink && (native_media_scan || managed_media) &&
+		                         pipeline.sink->type == PhysicalOperatorType::STREAMING_UDF;
 		const bool bounded_scalar = pipeline.sink && pipeline.sink->type == PhysicalOperatorType::MEDIA_PROJECT;
 		if (!bounded_udf && !bounded_result && !bounded_sort && !bounded_scalar) {
 			throw NotImplementedException(

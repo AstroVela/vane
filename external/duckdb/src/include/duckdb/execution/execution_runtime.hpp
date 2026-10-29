@@ -19,6 +19,7 @@ namespace duckdb {
 struct ExecutionRuntime {
 	//! Captured by the host constructor; extensions must read this same runtime.
 	bool native_media_scalar_admission = false;
+	bool native_execution_flow = false;
 	//! Embedders install their defaults once, including when connections race
 	//! to open a cached database. Later connections must preserve overrides.
 	std::once_flag initialization;
