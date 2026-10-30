@@ -426,7 +426,7 @@ jobs:
       - name: Verify the base installation Quickstart outside the checkout
         run: |
           cd "$RUNNER_TEMP"
-          env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
+          env -u VANE_RUNNER python -X utf8 "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
 
       # Give each process-isolated release phase its own deadline so the non-Ray
       # suite cannot consume the Ray phases' budget. The common guarded shell
