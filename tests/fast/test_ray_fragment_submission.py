@@ -14898,10 +14898,15 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
     actor._closing_native_queries = set()
     actor._closing_native_tasks = set()
     closed = []
+    interrupt_errors = []
 
     class _Cursor:
         def close(self):
             closed.append("cursor")
+
+        def interrupt(self):
+            if closed:
+                raise RuntimeError("Connection already closed!")
 
     cursor = _Cursor()
     session_conn = SimpleNamespace(cursor=lambda: cursor)
@@ -14928,7 +14933,11 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         ),
     }
 
-    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
+    def close_snapshot_cursor(cursor):
+        cursor.close()
+        interrupt_errors.extend(actor_cls._close_worker_native_query(actor, "query-a"))
+
+    actor._close_snapshot_execution_cursor = close_snapshot_cursor
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
@@ -14983,6 +14992,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         )
 
     assert closed == ["cursor"]
+    assert interrupt_errors == []
     assert actor._active_native_cursors == set()
     assert actor._native_cursor_query_ids == {}
     assert getattr(actor, "_native_query_cleanup_contexts", {}) == {}
