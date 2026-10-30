@@ -3,7 +3,6 @@
 
 """Exercise the actual media CMake function with small stand-ins for DuckDB targets."""
 
-import ctypes
 import os
 import shutil
 import subprocess
@@ -159,6 +158,22 @@ def _run(*command):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def _check_library_function(library, function, expected):
+    # ctypes does not unload DLLs when its wrapper is discarded. A child owns
+    # the probe so Windows can delete the library before the fixture cleans up.
+    _run(
+        sys.executable,
+        "-I",
+        "-c",
+        "import ctypes, sys; library = ctypes.CDLL(sys.argv[1]); "
+        "assert getattr(library, sys.argv[2])() == int(sys.argv[3])",
+        str(library),
+        function,
+        str(expected),
+    )
+    library.unlink()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DLL export decorations")
 def test_windows_static_engine_keeps_loadable_extension_entrypoints(tmp_path):
     header = ROOT / "external/duckdb/src/include/duckdb/common/winapi.hpp"
@@ -173,7 +188,7 @@ def test_windows_static_engine_keeps_loadable_extension_entrypoints(tmp_path):
     build = tmp_path / "build"
     _run("cmake", "-S", str(tmp_path), "-B", str(build), "-G", GENERATORS[0])
     _run("cmake", "--build", str(build), "--config", "Release")
-    assert ctypes.CDLL(str(next(build.rglob("probe.dll")))).media_answer() == 42
+    _check_library_function(next(build.rglob("probe.dll")), "media_answer", 42)
 
 
 def test_dynamic_media_sdk_and_incremental_relocation(media_project):
@@ -215,6 +230,12 @@ def test_dynamic_media_sdk_and_incremental_relocation(media_project):
         _run(*command)
         assert len(runs.read_text().splitlines()) == count
 
+    library_name = {
+        "win32": "native_media_loadable_extension.dll",
+        "darwin": "libnative_media_loadable_extension.dylib",
+    }.get(sys.platform, "libnative_media_loadable_extension.so")
+    _check_library_function(next(build.rglob(library_name)), "probe", 42)
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="MSVC static-library/import-thunk collision")
 @pytest.mark.parametrize("host_scope", ["before", "after", "sibling"])
@@ -253,7 +274,7 @@ def test_dynamic_media_reuses_the_hosts_windows_zlib(media_project, host_scope):
     _run("cmake", "-S", str(root), "-B", str(build), "-G", GENERATORS[0])
     _run("cmake", "--build", str(build), "--config", "Release", "--target", "native_media_loadable_extension")
     library = next(build.rglob("native_media_loadable_extension.dll"))
-    assert ctypes.CDLL(str(library)).probe() == 42
+    _check_library_function(library, "probe", 42)
 
 
 def test_dynamic_media_rejects_sdk_without_boost_even_when_host_has_it(media_project):
