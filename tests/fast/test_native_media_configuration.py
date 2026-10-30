@@ -301,9 +301,15 @@ def test_loadable_staging_recovers_runtime_files_without_relinking(media_project
         _run(*command)
         assert staged.read_text() == "shared runtime fixture\n"
         assert artifact.read_bytes() == original_artifact
-    (root / "runtime/.libs/fixture.so").write_text("updated runtime fixture\n")
+    runtime_library = root / "runtime/.libs/fixture.so"
+    original_times = runtime_library.stat()
+    runtime_library.write_text("edited runtime fixture\n")
+    assert runtime_library.stat().st_size == original_times.st_size
+    # Runtime replacements can preserve timestamps, and Make also compares
+    # timestamps at coarser resolution than the filesystem on macOS.
+    os.utime(runtime_library, ns=(original_times.st_atime_ns, original_times.st_mtime_ns))
     _run(*command)
-    assert staged.read_text() == "updated runtime fixture\n"
+    assert staged.read_text() == "edited runtime fixture\n"
     _run(*command)
     assert next(build.rglob("*.runs")).read_text().splitlines() == ["prepared"]
     (root / "runtime/.libs/fixture.so").unlink()
