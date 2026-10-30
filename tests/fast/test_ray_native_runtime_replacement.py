@@ -115,8 +115,9 @@ def test_ray_nodes_admit_only_the_exact_authorized_replacement(tmp_path, mismatc
                             if mismatch and index == 1:
                                 assert 'differs from the coordinator' in observed['error'], observed
                             else:
-                                assert observed == {'version': expected, 'path': str(node_paths[index]),
-                                                    'snapshot': snapshot}, observed
+                                assert observed['version'] == expected, observed
+                                assert Path(observed['path']).samefile(node_paths[index]), observed
+                                assert observed['snapshot'] == snapshot, observed
                         if not mismatch:
                             quoted = audio.replace("'", "''")
                             relation = con.sql(
