@@ -249,8 +249,8 @@ def test_media_benchmark_observes_http_and_spool_costs(tmp_path, domain, operati
         capture_output=True,
         text=True,
         timeout=90,
-        check=True,
     )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     result = json.loads(completed.stdout)
     assert result["aggregate_results_match"]
     assert result["concurrency"] == 2
