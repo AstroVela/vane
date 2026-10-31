@@ -155,7 +155,7 @@
     "packages/vane-media-runtime/components.json": "8306b59fd94132314a8c16ddd45ccd7d055c7e24f0a16cb9a9802fe01e4eb723",
     "packages/vane-media-runtime/source-licenses.json": "3b7d893b21c012c652969b474c5ce1a3eb1bf72669d76f7a1eb8a7f6540ff8a9",
     "scripts/build_extension_wheel.py": "3b15bfffe44d7a4fae5fce21a05b396308c8ca43e0a3769d0028b05b1a3b2135",
-    "scripts/build_media_release.py": "856039c836da475a5be7879018a0da237df9ee4b54a580d7a434545c54d96353",
+    "scripts/build_media_release.py": "7402bf6a15e7f592863fca44d111ddb7b7b2ed79a8b6ba02da9b5bb964658dd4",
     "scripts/check_copyleft.py": "bb568268fb46f57bc33e3575f2030f31e29a6e1a1ae81001ac2cb57d7b0b7b6c",
     "vane/experimental/spark/LICENSE": "ff5aa49c52e9830627582e9854fa76827d19c3b040b856162d172d72a9e95067",
     "vane_packaging/copyleft_policy.py": "fc4ab4b0cc2c403ec95d77f6c9853ac2e75cb02c29aa340060ede9adeecd78bc",

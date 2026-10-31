@@ -550,7 +550,16 @@ jobs:
           python -m pip install --upgrade pip
           wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
           test -n "$wheel_path"
-          python -m pip install --force-reinstall "${wheel_path}[qdrant]" pytest
+          # Metadata response truncation can escape pip's connection retries.
+          for attempt in 1 2 3; do
+            if python -m pip install --force-reinstall "${wheel_path}[qdrant]" pytest; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
           python -m pip check
           python -c 'import qdrant_client'
 

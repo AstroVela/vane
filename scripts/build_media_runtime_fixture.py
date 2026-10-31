@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from vane_packaging.media_downloads import prefetch_media_sources
 from vane_packaging.media_rebuild import rebuild_soxr
 from vane_packaging.media_runtime import read_runtime_wheel, runtime_triplet, verify_runtime_source
 from vane_packaging.media_sources import export_sdist, read_source_archive, read_source_file
@@ -35,6 +36,8 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
     # SDK, including archives for host helper ports such as vcpkg-make.
     environment["VCPKG_BINARY_SOURCES"] = "clear"
     environment.pop("VCPKG_HOST_TRIPLET", None)
+    downloads = Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads")))
+    prefetch_media_sources(project, downloads)
     subprocess.run(
         [
             str(vcpkg / ("vcpkg.exe" if sys.platform == "win32" else "vcpkg")),
@@ -53,7 +56,7 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
         project,
         vcpkg,
         directory / "vcpkg/installed",
-        Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads"))),
+        downloads,
         directory / "dist",
     )
     source_root = directory / "source"
