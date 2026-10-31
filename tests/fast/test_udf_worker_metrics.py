@@ -1594,8 +1594,8 @@ def test_direct_ipc_response_failure_precedes_cleanup(monkeypatch, failure, clea
 
     def invalid_size(sock):
         message, payload = receive(sock)
-        if message == local._MSG_OK:
-            return message, local.struct.pack("<Q", 1)
+        if message in (local._MSG_OK, local._MSG_IPC_RESULT):
+            return message, local.struct.pack("<Q", 1) + payload[8:]
         return message, payload
 
     def invalid_ipc(*_args):

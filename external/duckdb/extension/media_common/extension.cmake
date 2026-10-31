@@ -28,8 +28,10 @@ function(vane_build_native_media_extension)
     set(dependencies ${FFMPEG_LIBRARIES} TIFF::TIFF JPEG::JPEG ZLIB::ZLIB
                      WebP::webp WebP::webpdemux SndFile::sndfile ${VANE_SOXR_LIBRARY})
   else()
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-      message(FATAL_ERROR "The native media runtime currently supports Linux x86-64 only")
+    if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+       AND NOT (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+       AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+      message(FATAL_ERROR "The native media runtime requires Linux x86-64, macOS arm64 or Windows x86-64")
     endif()
     if(NOT EXTENSION_STATIC_BUILD)
       message(FATAL_ERROR "Dynamic media libraries still require EXTENSION_STATIC_BUILD=ON")
@@ -43,6 +45,11 @@ function(vane_build_native_media_extension)
     if(NOT EXISTS "${boost_multiprecision_DIR}/boost_multiprecision-config.cmake")
       message(FATAL_ERROR "Missing Boost.Multiprecision in VANE_MEDIA_RUNTIME_SDK")
     endif()
+    if(WIN32 AND NOT TARGET ZLIB::ZLIB)
+      # Resolve the host dependency before adding the SDK to the search path.
+      # Arrow may have created a directory-local target in a sibling scope.
+      find_package(ZLIB REQUIRED)
+    endif()
     list(PREPEND CMAKE_PREFIX_PATH "${VANE_MEDIA_RUNTIME_SDK}")
     file(GLOB boost_configs "${VANE_MEDIA_RUNTIME_SDK}/share/boost_*/*-config.cmake")
     foreach(config IN LISTS boost_configs)
@@ -54,11 +61,25 @@ function(vane_build_native_media_extension)
                  PATHS "${boost_multiprecision_DIR}")
     include_directories("${VANE_MEDIA_RUNTIME_SDK}/include")
     foreach(library avformat avcodec avutil swscale swresample sndfile soxr tiff jpeg z webp webpdemux)
-      set(shared_library "${VANE_MEDIA_RUNTIME_SDK}/lib/lib${library}.so")
-      if(NOT EXISTS "${shared_library}")
-        message(FATAL_ERROR "Missing native media shared library: ${shared_library}")
+      set(names "${library}" "lib${library}")
+      if(WIN32 AND library STREQUAL "z")
+        set(names z zlib)
       endif()
-      list(APPEND dependencies "${shared_library}")
+      unset(shared_library)
+      unset(shared_library CACHE)
+      # Windows links the SDK's DLL import libraries. Never fall back to a
+      # cached static dependency from the base wheel's separate vcpkg tree.
+      find_library(shared_library NAMES ${names} PATHS "${VANE_MEDIA_RUNTIME_SDK}/lib" NO_DEFAULT_PATH)
+      if(NOT shared_library)
+        message(FATAL_ERROR "Missing native media SDK library: ${library}")
+      endif()
+      if(WIN32 AND library STREQUAL "z")
+        # Do not mix the host's static definitions with SDK import thunks.
+        # Codec DLLs retain their separate, namespaced runtime zlib.
+        list(APPEND dependencies ZLIB::ZLIB)
+      else()
+        list(APPEND dependencies "${shared_library}")
+      endif()
     endforeach()
   endif()
 
@@ -68,27 +89,53 @@ function(vane_build_native_media_extension)
     # Media readers and exact video time arithmetic require C++17.
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_link_libraries(${target} file_extension Boost::multiprecision ${dependencies})
+    if(APPLE)
+      target_link_options(${target} PRIVATE "LINKER:-headerpad_max_install_names")
+    endif()
   endforeach()
   if(NOT VANE_MEDIA_STATIC_DEVELOPMENT_BUILD)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set_property(TARGET native_media_loadable_extension PROPERTY
                  VANE_LOADABLE_RUNTIME_DIRECTORY "${VANE_MEDIA_RUNTIME_DIRECTORY}/.libs")
     get_filename_component(vane_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../.." ABSOLUTE)
-    set_property(TARGET native_media_loadable_extension APPEND PROPERTY LINK_DEPENDS
+    set(runtime_link_dependencies
                  "${VANE_MEDIA_RUNTIME_DIRECTORY}/runtime-manifest.json"
                  "${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                 "${vane_root}/cmake/prepare_dynamic_media_extension.cmake"
                  "${vane_root}/vane/_native_runtime_format.py"
                  "${vane_root}/vane_packaging/media_runtime.py"
+                 "${vane_root}/vane_packaging/media_binary.py"
                  "${vane_root}/vane_packaging/extension_wheel.py"
                  "${vane_root}/vane_packaging/archive_safety.py"
                  "${vane_root}/vane_packaging/artifact_limits.py"
                  "${vane_root}/vane_packaging/extension_materials.py"
                  "${vane_root}/vane_packaging/manylinux_policy.py"
                  "${vane_root}/vane_packaging/_vendor/auditwheel/manylinux-policy.json")
-    add_custom_command(TARGET native_media_loadable_extension POST_BUILD
-      COMMAND "${Python3_EXECUTABLE}" "${vane_root}/scripts/prepare_dynamic_media_extension.py"
-              --artifact "$<TARGET_FILE:native_media_loadable_extension>"
-              --runtime "${VANE_MEDIA_RUNTIME_DIRECTORY}"
+    set_property(TARGET native_media_loadable_extension APPEND PROPERTY LINK_DEPENDS ${runtime_link_dependencies})
+    # Visual Studio does not implement LINK_DEPENDS. A generated translation
+    # unit makes SDK/relocator changes trigger one relink on every generator.
+    set(runtime_stamp "${CMAKE_CURRENT_BINARY_DIR}/native_media_runtime_stamp.cpp")
+    add_custom_command(OUTPUT "${runtime_stamp}"
+      COMMAND "${CMAKE_COMMAND}" -E touch "${runtime_stamp}"
+      DEPENDS ${runtime_link_dependencies}
       VERBATIM)
+    target_sources(native_media_loadable_extension PRIVATE "${runtime_stamp}")
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+      add_custom_command(TARGET native_media_loadable_extension POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" "-DPYTHON=${Python3_EXECUTABLE}"
+                "-DPREPARE=${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                "-DARTIFACT=$<TARGET_FILE:native_media_loadable_extension>"
+                "-DRUNTIME=${VANE_MEDIA_RUNTIME_DIRECTORY}"
+                "-DSTAMP=${CMAKE_CURRENT_BINARY_DIR}/native_media_prepared_$<CONFIG>.stamp"
+                "-DINPUTS=$<TARGET_FILE:native_media_loadable_extension>;${runtime_link_dependencies}"
+                -P "${vane_root}/cmake/prepare_dynamic_media_extension.cmake"
+        VERBATIM)
+    else()
+      add_custom_command(TARGET native_media_loadable_extension POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${vane_root}/scripts/prepare_dynamic_media_extension.py"
+                --artifact "$<TARGET_FILE:native_media_loadable_extension>"
+                --runtime "${VANE_MEDIA_RUNTIME_DIRECTORY}"
+        VERBATIM)
+    endif()
   endif()
 endfunction()

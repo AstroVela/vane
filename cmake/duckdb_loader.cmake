@@ -857,12 +857,15 @@ function(duckdb_stage_loadable_extensions)
         COMMAND
         ${CMAKE_COMMAND}
         -E
-        copy_directory
+        copy_directory_if_different
         "${_VANE_RUNTIME_DIRECTORY}"
         "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs")
     endif()
-    add_custom_command(
-      OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_STAGED_RUNTIME_FILES}
+    # Check content on every staging request: Make can miss same-second updates,
+    # and replacement runtime libraries can retain their timestamps.
+    # copy_if_different keeps unchanged outputs stable without relinking.
+    add_custom_target(
+      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
       COMMAND ${CMAKE_COMMAND} -E make_directory
               "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
       COMMAND
@@ -870,13 +873,10 @@ function(duckdb_stage_loadable_extensions)
         "$<TARGET_FILE:${_VANE_LOADABLE_EXTENSION_TARGET}>"
         "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_RUNTIME_COMMANDS}
       DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}" ${_VANE_RUNTIME_INPUTS}
+      BYPRODUCTS "${_VANE_STAGED_LOADABLE_EXTENSION}"
+                 ${_VANE_STAGED_RUNTIME_FILES}
       COMMENT "Staging Vane loadable extension ${_VANE_LOADABLE_EXTENSION_NAME}"
       VERBATIM)
-
-    add_custom_target(
-      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
-      DEPENDS "${_VANE_STAGED_LOADABLE_EXTENSION}"
-              ${_VANE_STAGED_RUNTIME_FILES})
     add_dependencies(vane_loadable_extensions
                      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}")
   endforeach()

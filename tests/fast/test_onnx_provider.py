@@ -31,11 +31,11 @@ def sdk(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["text", "image", "audio", "video", "multimodal"])
 @pytest.mark.parametrize("dimensions", [128, 256, 512, 768])
-def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeypatch, kind, dimensions):
+def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeypatch, tmp_path, kind, dimensions):
     for name in ("onnxruntime", "onnx", "transformers", "torch"):
         monkeypatch.setitem(sys.modules, name, None)
     descriptor = getattr(load_provider("onnx"), f"get_{kind}_embedder")(
-        dimensions=dimensions, options={"model_path": "/not/provisioned", "model_sha256": "a" * 64}
+        dimensions=dimensions, options={"model_path": str(tmp_path / "not-provisioned"), "model_sha256": "a" * 64}
     )
     restored = pickle.loads(pickle.dumps(descriptor))
     assert restored.get_model() == ONNX_MODEL

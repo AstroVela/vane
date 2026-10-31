@@ -125,15 +125,88 @@ class inside a pybind11 lambda caused excessive MSVC frontend memory use.
 The Bash test launchers also support Git Bash with native Windows Python;
 building a wheel does not establish compatibility of every runtime backend.
 
+Native runner and UDF environment settings use owned process-environment
+snapshots. On Windows, read through `GetEnvironmentVariableW` so changes made
+by Python remain visible across statically linked CRTs, including Unicode
+values. Linux and macOS continue to read `getenv`. Keep the snapshot alive
+while using its value, and preserve the distinction between unset and empty
+variables. Exercise configuration changes after import with
+`tests/fast/test_vane_config.py` through the installed test launcher.
+Native FTE workers retain the POSIX `sysconf` capacity probe where available
+and fall back to psutil's physical-memory total on Windows or probe failure.
+The Python module also stops the process-local Flight service at interpreter
+exit, before Windows terminates the gRPC threads during DLL teardown.
+
 Windows local UDF workers use duplicated sockets and a job object to retain
-ownership of their descendants through shutdown. Shared memory follows Windows
-handle lifetime: keep a raw descriptor alive until its receiver has adopted it,
+ownership of their descendants through shutdown. In a Windows virtual
+environment, launch its base interpreter
+with `__PYVENV_LAUNCHER__` pointing at the virtual-environment executable, as
+CPython's multiprocessing launcher does. This preserves the environment while
+making `Popen.pid` the actual worker PID for socket duplication, process
+ownership, worker-loss detection and GPU placement diagnostics.
+Shared memory follows Windows handle lifetime: keep a raw descriptor alive until
+its receiver has adopted it,
 or release it explicitly. Production subprocess output uses parent-owned arena
 grants. Direct Arrow IPC output grows by replacing the named mapping and sending
 the new name to the parent. Exercise these paths with
 `tests/fast/test_windows_udf_transport.py`,
 `tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output`
 and `tests/fast/test_ai_image_embedding.py` through the installed test launcher.
+
+Darwin allows only one size allocation per POSIX shared-memory object. Direct
+IPC growth recreates the original parent-owned name, so cleanup still knows
+which name to unlink if the worker fails before announcing its result. The
+parent remaps a grown result before handling cancellation; a reused worker's
+next small result must not be read from the old, unlinked mapping. Linux keeps
+its in-place growth and Windows keeps its named-mapping handoff.
+
+The native CI jobs share `.github/workflows/native-python.yml`. macOS arm64
+and Windows x64 use Python 3.12 and the same test steps as Linux Python 3.12:
+native unit tests, signed extension callbacks and wheel verification,
+Gravitino, dynamic native media and replacement runtimes, VaneFS, Quickstart,
+the three release phases, and coexistence with the official DuckDB package.
+The remaining Linux Python versions and Linux fast-test shards are unchanged.
+`scripts/run_ci_step.py` runs each build/test step through
+`scripts/run_with_memory_guard.py`, which preserves build concurrency,
+stops only its owned process tree on a memory limit or deadline, and records
+usage in a JSON report. The per-process limit is 4 GiB (Windows private bytes,
+POSIX resident bytes). Windows reserves 4 GiB of available physical memory;
+the Linux and macOS runners reserve 1.5 GiB. The local Windows build retains
+default MSBuild `/m` concurrency and its 4 GiB physical-memory reserve.
+The Windows guard assigns the command to a Job Object before it starts work,
+retaining ownership when an intermediate Git Bash process exits. Its process
+list includes nested worker jobs; the guard never changes CPU or process-count
+limits.
+POSIX commands start in an owned session, so the guard also tracks descendants
+after an intermediate launcher exits or creates a separate process group.
+The session leader remains unreaped until cleanup completes. Successful commands
+also release their remaining descendants before the guard returns their exit code.
+On Linux, the guard registers as a child subreaper before starting the command,
+so orphaned descendants remain owned even if they create new sessions between
+samples. It reaps adopted children without consuming the command's exit status.
+On macOS, unique identifiers in the inherited `_VANE_CI_GUARD_OWNER` environment
+variable identify detached descendants, including work started by nested guards.
+Commands that construct replacement environments must preserve this variable
+for the macOS guard to retain ownership after reparenting.
+The marker also requires a readable process environment; macOS can hide it for
+restricted executables, as described in [psutil's environment API](https://psutil.io/api/#psutil.Process.environ).
+Linux Python 3.12 has the same six-hour job budget as macOS and Windows, including
+the additional native/provider gates; individual step deadlines stay bounded.
+
+Windows CI installs into a short virtual-environment path, `build/py`, so the
+namespaced codec DLLs in media provider wheels also install with the default
+`MAX_PATH` limit. Use a similarly short path for local media qualification when
+Windows long paths are disabled.
+Gravitino accepts native Windows storage-location paths and returns local
+filenames with native separators. Fileset-relative paths and S3 locations use
+forward slashes.
+
+Windows local shuffle storage uses bounded, case-safe node names and Win32
+extended paths for filesystem and Arrow I/O beyond `MAX_PATH`; it does not
+require changing the machine's `LongPathsEnabled` registry setting. Object-store
+keys retain the same layout across platforms.
+Both ordinary extension loads and media runtime loads apply this path conversion,
+including verified cache paths beneath a long user temporary directory.
 
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
@@ -493,9 +566,8 @@ scripts/run_native_tests.sh "test name" -s
 scripts/run_native_tests.sh
 ```
 
-The build uses two parallel compile jobs by default to stay within standard CI
-runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
-machine has more capacity.
+The build uses the selected generator's default parallelism. Set
+`VANE_NATIVE_BUILD_JOBS` to request an explicit worker count when needed.
 
 The launcher uses Ninja's single Release configuration by default. Windows CI
 disables Git's automatic CRLF conversion before checkout so source-license

@@ -11,16 +11,17 @@ import json
 import os
 import subprocess
 import sys
-import tarfile
+import tempfile
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from vane_packaging.media_downloads import prefetch_media_sources
 from vane_packaging.media_rebuild import rebuild_soxr
-from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
-from vane_packaging.media_sources import export_sdist
+from vane_packaging.media_runtime import read_runtime_wheel, runtime_triplet, verify_runtime_source
+from vane_packaging.media_sources import export_sdist, read_source_archive, read_source_file
 
 
 def build(vcpkg: Path, directory: Path, platform: str) -> None:
@@ -31,15 +32,17 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
     if actual != manifest["builtin-baseline"]:
         raise ValueError("fixture vcpkg checkout must use the media project's pinned baseline")
     environment = dict(os.environ)
-    environment.setdefault("VCPKG_MAX_CONCURRENCY", "2")
     # Binary caches do not contain the upstream archives required by the source
     # SDK, including archives for host helper ports such as vcpkg-make.
     environment["VCPKG_BINARY_SOURCES"] = "clear"
+    environment.pop("VCPKG_HOST_TRIPLET", None)
+    downloads = Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads")))
+    prefetch_media_sources(project, downloads)
     subprocess.run(
         [
-            str(vcpkg / "vcpkg"),
+            str(vcpkg / ("vcpkg.exe" if sys.platform == "win32" else "vcpkg")),
             "install",
-            "--triplet=x64-linux-vane-media",
+            f"--triplet={runtime_triplet()}",
             f"--x-manifest-root={project}",
             f"--overlay-triplets={project / 'triplets'}",
             f"--x-install-root={directory / 'vcpkg/installed'}",
@@ -53,14 +56,17 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
         project,
         vcpkg,
         directory / "vcpkg/installed",
-        Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads"))),
+        downloads,
         directory / "dist",
     )
     source_root = directory / "source"
     source_root.mkdir(exist_ok=True)
-    with tarfile.open(archive) as stream:
-        stream.extractall(source_root, filter="data")
-    source_project = source_root / archive.name[:-7]
+    source_project = Path(tempfile.mkdtemp(prefix="sdk-", dir=source_root))
+    for name, contents in read_source_archive(read_source_file(archive), archive.name).items():
+        destination = source_project / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(contents)
+        destination.chmod(0o755 if name.endswith(".sh") else 0o644)
     settings = {
         "platform-tag": platform,
         "source-archive": str(archive),
@@ -119,7 +125,8 @@ print(backend.build_wheel(sys.argv[2], json.loads(sys.argv[3])))
             destination = directory / "runtime" / name.removeprefix("vane_media_runtime/")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(stream.read(name))
-    rebuild_soxr(local_source, directory / "runtime", directory, jobs=int(environment["VCPKG_MAX_CONCURRENCY"]))
+    jobs = environment.get("VCPKG_MAX_CONCURRENCY")
+    rebuild_soxr(local_source, directory / "runtime", directory, jobs=int(jobs) if jobs else None)
     paths = {
         "runtime_wheel": str(wheel),
         "source_archive": str(archive),

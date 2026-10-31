@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from vane_packaging.media_binary import relocate_non_elf
 from vane_packaging.media_runtime import validate_library_graph
 
 
@@ -51,6 +52,9 @@ def prepare_local(runtime: Path, replacements: dict[str, Path], output: Path, *,
             if not 0 < len(contents) <= fmt.MAX_FILE_BYTES:
                 raise ValueError("local replacement library exceeds its size bound")
             target.write_bytes(contents)
+            if manifest["platform"].startswith(("win_", "macosx_")):
+                relocate_non_elf(target, mapping, manifest["platform"], library_name=mapping[original])
+                continue
             arguments = [patchelf, "--set-soname", mapping[original], "--set-rpath", "$ORIGIN"]
             for old, new in mapping.items():
                 arguments.extend(("--replace-needed", old, new))

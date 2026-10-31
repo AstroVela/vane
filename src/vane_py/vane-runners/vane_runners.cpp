@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Native bindings for Vane's runner implementations.
+#include "duckdb/common/environment.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 
@@ -108,7 +109,8 @@ struct RunnerConfig {
 
 // ---------------- Env helpers ---------------- //
 static std::pair<bool, size_t> parse_usize_env_var(const char *var_name) {
-	const char *v = std::getenv(var_name);
+	const duckdb::EnvironmentVariable v_env(var_name);
+	const char *v = v_env.GetValue();
 	if (!v)
 		return std::make_pair(false, size_t(0));
 	try {
@@ -124,7 +126,8 @@ static RunnerConfig get_ray_runner_config_from_env() {
 	const char *VANE_RAY_MAX_TASK_BACKLOG = "VANE_RAY_MAX_TASK_BACKLOG";
 
 	std::pair<bool, std::string> address = std::make_pair(false, std::string());
-	const char *addr = std::getenv(RAY_ADDRESS);
+	const duckdb::EnvironmentVariable addr_env(RAY_ADDRESS);
+	const char *addr = addr_env.GetValue();
 	if (addr)
 		address = std::make_pair(true, std::string(addr));
 

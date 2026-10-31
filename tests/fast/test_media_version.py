@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 
 import pytest
@@ -161,17 +162,19 @@ def test_checkout_version_records_commits_and_dirty_state(tmp_path):
     assert source_version(project) == untracked
     extra.chmod(0o755)
     executable = source_version(project)
-    assert executable["version"] != untracked["version"]
+    if os.name != "nt":
+        assert executable["version"] != untracked["version"]
     extra.unlink()
     deleted = source_version(project)
     assert deleted["version"] != executable["version"]
-    extra.symlink_to("source.txt")
-    linked = source_version(project)
-    assert linked["version"] != deleted["version"]
-    extra.unlink()
-    extra.symlink_to("elsewhere.txt")
-    assert source_version(project)["version"] != linked["version"]
-    extra.unlink()
+    if os.name != "nt":
+        extra.symlink_to("source.txt")
+        linked = source_version(project)
+        assert linked["version"] != deleted["version"]
+        extra.unlink()
+        extra.symlink_to("elsewhere.txt")
+        assert source_version(project)["version"] != linked["version"]
+        extra.unlink()
     git("add", ".")
     git("commit", "-qm", "change source")
     changed = source_version(project)

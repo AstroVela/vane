@@ -41,7 +41,7 @@ def use_native_media_runtime(directory: str | Path, *, allow_distributed: bool =
     global _override, _override_manifest_sha256, _override_distributed
     if not isinstance(allow_distributed, bool):
         raise TypeError("allow_distributed must be a bool")
-    path = Path(directory).expanduser().resolve(strict=True)
+    path = fmt.filesystem_path(Path(directory).expanduser()).resolve(strict=True)
     document = fmt.read_file(path, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES)
     manifest = fmt.parse_manifest(document)
     fmt.verify_files(path / ".libs", manifest)
@@ -94,20 +94,26 @@ def _runtime_source(descriptor: DynamicExtensionDescriptor) -> tuple[Path, bytes
 
 
 def _validate_snapshot_layout(target: Path, manifest: dict[str, Any]) -> None:
+    from vane.extensions import _secure_native_cache_path
+
     expected = {target.name, fmt.MANIFEST, fmt.SIGNATURE, "effective-runtime.json", ".libs"}
     if {entry.name for entry in target.parent.iterdir()} != expected:
         raise ValueError("native media snapshot has missing or unexpected entries")
     for path in (target.parent, *target.parent.iterdir(), *(target.parent / ".libs").iterdir()):
         info = path.lstat()
-        if info.st_uid not in {0, os.geteuid()}:
+        if os.name != "nt" and info.st_uid not in {0, os.geteuid()}:
             raise ValueError("native media snapshot has an untrusted owner")
         if stat.S_ISDIR(info.st_mode):
-            if info.st_mode & 0o077:
+            if os.name == "nt":
+                _secure_native_cache_path(path, directory=True)
+            elif info.st_mode & 0o077:
                 raise ValueError("native media snapshot directories must be private")
         elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o222:
             raise ValueError(
                 "native media snapshot files must be regular, read-only, and free of additional hard links"
             )
+        elif os.name == "nt":
+            _secure_native_cache_path(path, directory=False)
     fmt.verify_files(target.parent / ".libs", manifest)
 
 
@@ -146,6 +152,7 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
 
     if descriptor.native_runtime is None:
         raise ValueError("native media snapshot requires a runtime reference")
+    cache_root = fmt.filesystem_path(cache_root)
     with _lock:
         source, official, signature, effective, manifest = _runtime_source(descriptor)
         if not _native._verify_native_runtime_signature(official, signature, False):
@@ -202,6 +209,10 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
             return target
         finally:
             if staging.exists():
+                if os.name == "nt":
+                    for path in staging.rglob("*"):
+                        if stat.S_ISREG(path.lstat().st_mode) and not path.is_symlink():
+                            path.chmod(0o600)
                 shutil.rmtree(staging)
 
 

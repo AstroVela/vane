@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
 #include "duckdb/execution/distributed/exchange/flight_server.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
@@ -54,12 +55,14 @@ struct FlightServiceConfig {
 };
 
 inline std::string ResolveFlightExchangeEnvString(const char *name) {
-	const char *value = std::getenv(name);
+	const duckdb::EnvironmentVariable value_env(name);
+	const char *value = value_env.GetValue();
 	return value ? std::string(value) : std::string();
 }
 
 inline int ResolveFlightExchangeEnvInt(const char *name, int fallback) {
-	const char *value = std::getenv(name);
+	const duckdb::EnvironmentVariable value_env(name);
+	const char *value = value_env.GetValue();
 	if (!value || !*value) {
 		return fallback;
 	}
@@ -71,7 +74,8 @@ inline int ResolveFlightExchangeEnvInt(const char *name, int fallback) {
 }
 
 inline double ResolveFlightExchangeEnvTimeoutSeconds(const char *name, double fallback) {
-	const char *value = std::getenv(name);
+	const duckdb::EnvironmentVariable value_env(name);
+	const char *value = value_env.GetValue();
 	if (!value || !*value) {
 		return fallback;
 	}
@@ -161,8 +165,14 @@ inline vector<string> ResolveFlightExchangeLocalDirsFromEnv() {
 	if (dirs.find("://") != std::string::npos) {
 		return {dirs};
 	}
+#if defined(_WIN32)
+	// Windows lists use ';' (or the explicit ',' form above). A drive's ':'
+	// belongs to the path and must not split a single local directory.
+	return {dirs};
+#else
 	auto result = split_dirs(':');
 	return result.empty() ? DefaultFlightExchangeLocalDirs() : result;
+#endif
 }
 
 inline std::string ResolveFlightExchangeNodeIdFromEnv() {

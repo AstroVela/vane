@@ -545,7 +545,9 @@ bool ExtensionHelper::TryInitialLoad(DatabaseInstance &db, FileSystem &fs, const
 	auto dopen_from = filename;
 #endif
 
-	auto lib_hdl = dlopen(dopen_from.c_str(), RTLD_NOW | RTLD_LOCAL);
+	auto lib_hdl = parsed_metadata.native_runtime_sha256.empty()
+	                   ? dlopen(dopen_from.c_str(), RTLD_NOW | RTLD_LOCAL)
+	                   : dlopen_with_runtime(dopen_from.c_str(), RTLD_NOW | RTLD_LOCAL);
 	if (!lib_hdl) {
 		throw IOException("Extension \"%s\" could not be loaded: %s", filename, GetDLError());
 	}

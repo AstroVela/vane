@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
@@ -107,7 +108,8 @@ idx_t ResolveExchangeSourceTaskCount(idx_t num_partitions, const DuckDBExecution
 		}
 	}
 
-	const char *env_val = std::getenv("VANE_EXCHANGE_SOURCE_TASKS");
+	const duckdb::EnvironmentVariable env_val_env("VANE_EXCHANGE_SOURCE_TASKS");
+	const char *env_val = env_val_env.GetValue();
 	if (env_val && env_val[0]) {
 		try {
 			auto parsed = static_cast<idx_t>(std::stoull(env_val));

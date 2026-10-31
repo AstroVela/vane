@@ -276,7 +276,7 @@ def test_bad_codec_fails_without_output(gravitino_connection, gravitino_http):
 
 def test_literal_root_and_selected_location(gravitino_connection, gravitino_http):
     _state, endpoint, directory = gravitino_http
-    root = directory / "literal*[a]?#%20"
+    root = directory / ("literal[a]#%20" if os.name == "nt" else "literal*[a]?#%20")
     root.mkdir()
     catalog = attach(gravitino_connection, endpoint, location_name="hot")
     catalog.create_schema("clips")

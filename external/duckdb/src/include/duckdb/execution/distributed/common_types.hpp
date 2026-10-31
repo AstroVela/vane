@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -774,7 +775,8 @@ public:
 
 private:
 	static std::pair<bool, std::string> parse_string_from_env(const char *env_name, bool trim_whitespace = false) {
-		const char *val = std::getenv(env_name);
+		const duckdb::EnvironmentVariable val_env(env_name);
+		const char *val = val_env.GetValue();
 		if (val == nullptr) {
 			return std::make_pair(false, std::string());
 		}
@@ -789,7 +791,8 @@ private:
 	}
 
 	static std::pair<bool, int> parse_int_from_env(const char *env_name) {
-		const char *val = std::getenv(env_name);
+		const duckdb::EnvironmentVariable val_env(env_name);
+		const char *val = val_env.GetValue();
 		if (val == nullptr) {
 			return std::make_pair(false, 0);
 		}

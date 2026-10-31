@@ -19,8 +19,8 @@ case "${1:-}" in
     ;;
 esac
 
-build_jobs="${VANE_NATIVE_BUILD_JOBS:-2}"
-if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
+build_jobs="${VANE_NATIVE_BUILD_JOBS:-}"
+if [[ -n "$build_jobs" && ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
   echo "VANE_NATIVE_BUILD_JOBS must be a positive integer: $build_jobs" >&2
   exit 2
 fi
@@ -92,7 +92,12 @@ if [[ ! -f "$arrow_config" ]]; then
   echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the repository root first." >&2
   exit 1
 fi
-cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
+# Keep OpenSSL on the same ABI as the pinned gRPC archives. An ambient host
+# OPENSSL_ROOT_DIR can otherwise override this prefix (for example Homebrew 4).
+cmake_args+=(
+  "-DCMAKE_PREFIX_PATH=$vcpkg_prefix"
+  "-DOPENSSL_ROOT_DIR=$vcpkg_prefix"
+)
 if [[ "$windows_host" == true ]]; then
   # vcpkg's Windows package wrappers map names such as the static zlib `zs`
   # library for CMake's generic FindZLIB module. A prefix alone cannot provide
@@ -147,6 +152,7 @@ cmake --fresh \
 build_targets=(
   unittest
   loadable_extension_demo_loadable_extension
+  loadable_extension_batch_demo_loadable_extension
 )
 case "$kernel_name" in
   MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT* | SunOS)
@@ -160,8 +166,11 @@ esac
 build_args=(
   --target
   "${build_targets[@]}"
-  --parallel "$build_jobs"
+  --parallel
 )
+if [[ -n "$build_jobs" ]]; then
+  build_args+=("$build_jobs")
+fi
 if [[ "$multi_config" == true ]]; then
   build_args=(--config Release "${build_args[@]}")
 fi

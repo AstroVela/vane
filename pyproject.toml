@@ -683,6 +683,7 @@ pypi = [ # dependencies used by the pypi cleanup script
     "requests>=2.32.4",
 ]
 build = [
+    "lief>=0.17.6,<0.18; sys_platform == 'win32'",
     "cmake>=3.29.0",
     "ninja>=1.10",
     "packaging>=24.2",

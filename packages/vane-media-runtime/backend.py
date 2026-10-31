@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
@@ -53,6 +54,22 @@ def _format():
     return module
 
 
+@contextmanager
+def _source_build_project():
+    from vane_packaging.media_version import runtime_format
+
+    parent = Path(tempfile.gettempdir()).resolve()
+    project = Path(tempfile.mkdtemp(prefix="vane-media-source-", dir=parent))
+    try:
+        yield project
+    finally:
+        if project.resolve().parent != parent:
+            raise ValueError("media build cleanup must remain inside its temporary parent")
+        # Build tools need ordinary paths, but recursive Python cleanup must
+        # handle deep Boost source paths on Windows without a registry change.
+        shutil.rmtree(runtime_format().filesystem_path(project))
+
+
 def _build_sdk(project):
     if not (project / "source-inventory.json").is_file():
         raise ValueError("build runtime wheels from the exported source distribution")
@@ -61,17 +78,26 @@ def _build_sdk(project):
     if build.exists():
         raise ValueError("runtime source rebuild requires a fresh SDK extraction without a build directory")
     build.mkdir()
-    vcpkg = sdk / "vcpkg/vcpkg"
+    vcpkg = sdk / "vcpkg" / ("vcpkg.exe" if sys.platform == "win32" else "vcpkg")
     (vcpkg.parent / "ports").mkdir(exist_ok=True)
     environment = dict(os.environ)
     for name in ("VCPKG_OVERLAY_PORTS", "VCPKG_OVERLAY_TRIPLETS"):
         environment.pop(name, None)
+    environment.pop("VCPKG_HOST_TRIPLET", None)
     environment["VCPKG_ROOT"] = str(vcpkg.parent)
     environment["VCPKG_DOWNLOADS"] = str(sdk / "downloads")
     # A source rebuild must compile the selected sources, including user edits.
     environment["VCPKG_BINARY_SOURCES"] = "clear"
+    bootstrap = (
+        ["cmd.exe", "/c", str(vcpkg.parent / "bootstrap-vcpkg.bat"), "-disableMetrics"]
+        if sys.platform == "win32"
+        else ["bash", str(vcpkg.parent / "bootstrap-vcpkg.sh"), "-disableMetrics"]
+    )
+    from vane_packaging.media_runtime import runtime_triplet
+
+    triplet = runtime_triplet()
     subprocess.run(
-        ["bash", str(vcpkg.parent / "bootstrap-vcpkg.sh"), "-disableMetrics"],
+        bootstrap,
         check=True,
         env=environment,
         cwd=project,
@@ -80,7 +106,7 @@ def _build_sdk(project):
         [
             str(vcpkg),
             "install",
-            "--triplet=x64-linux-vane-media",
+            f"--triplet={triplet}",
             f"--x-manifest-root={sdk / 'manifest'}",
             f"--overlay-ports={sdk / 'ports'}",
             f"--overlay-triplets={project / 'triplets'}",
@@ -92,7 +118,7 @@ def _build_sdk(project):
         env=environment,
         cwd=project,
     )
-    return build / "installed/x64-linux-vane-media"
+    return build / "installed" / triplet
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
@@ -136,8 +162,7 @@ def _build_verified_wheel(wheel_directory, settings):
         local = PROJECT / name
         if local.is_symlink() or not local.is_file() or local.read_bytes() != contents:
             raise ValueError(f"runtime build source differs from its published archive: {name}")
-    with tempfile.TemporaryDirectory(prefix="vane-media-source-") as temporary:
-        project = Path(temporary)
+    with _source_build_project() as project:
         for name, contents in files.items():
             destination = project / name
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -151,6 +176,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
 
     from vane_packaging.media_runtime import (
         PROJECT_NOTICES,
+        component_notice,
         runtime_license_expression,
         stage_libraries,
         validate_library_graph,
@@ -177,9 +203,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
         notices[name] = contents
     owners = {}
     for component, record in components.items():
-        notice = (prefix / "share" / component / "copyright").read_bytes()
-        if hashlib.sha256(notice).hexdigest() != record["notice_sha256"]:
-            raise ValueError(f"unreviewed media license notice: {component}")
+        notice = component_notice(prefix / "share" / component / "copyright", record["notice_sha256"])
         notices[f"{component}.txt"] = notice
         document = json.loads((prefix / "share" / component / "vcpkg.spdx.json").read_bytes())
         actual_version = next(p["versionInfo"] for p in document["packages"] if p["SPDXID"] == "SPDXRef-port")
@@ -187,6 +211,18 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
             raise ValueError(f"unreviewed media component version: {component}")
         for item in document["files"]:
             name = item["fileName"]
+            if sys.platform == "win32" and name.startswith("./bin/") and name.lower().endswith(".dll"):
+                owners[Path(name).name.casefold()] = component
+                continue
+            if sys.platform == "darwin" and name.startswith("./lib/") and name.endswith(".dylib"):
+                from vane_packaging.media_binary import macho_linkage
+
+                library = prefix / name
+                if library.is_file():
+                    install_name, _, _ = macho_linkage(library.read_bytes())
+                    if install_name is not None:
+                        owners[Path(install_name).name] = component
+                continue
             if not name.startswith("./lib/") or ".so" not in name:
                 continue
             library = prefix / name

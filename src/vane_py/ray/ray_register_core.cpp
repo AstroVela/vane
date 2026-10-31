@@ -52,6 +52,9 @@ void RegisterRayCoreBindings(py::module_ &m) {
 			throw std::runtime_error(result.error().what());
 		}
 	});
+	// Windows terminates other threads before DLL static destructors run. Stop
+	// Flight while its gRPC threads can still complete shutdown and join.
+	py::module_::import("atexit").attr("register")(m.attr("shutdown_local_flight_service"));
 
 	py::class_<RayResultPartitionRef>(m, "RayResultPartitionRef")
 	    .def(py::init<py::object, size_t, size_t, py::object>())
