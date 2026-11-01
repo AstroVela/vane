@@ -54,12 +54,13 @@ def _windows_headroom() -> dict[str, int]:
             )
         ]
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Resolve Windows-only ctypes exports at call time on every type-check host.
+    kernel = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
     query = kernel.GlobalMemoryStatusEx
     query.argtypes, query.restype = [ctypes.POINTER(MemoryStatus)], ctypes.c_int
     result = MemoryStatus(length=ctypes.sizeof(MemoryStatus))
     if not query(ctypes.byref(result)):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise getattr(ctypes, "WinError")(getattr(ctypes, "get_last_error")())
     # ullAvailPageFile is the amount the CURRENT PROCESS can commit, at most
     # the system's remaining commit. It is not free physical RAM or swap size.
     return {"commit_available": result.commit_available, "virtual_available": result.virtual_available}
@@ -78,7 +79,7 @@ def _cgroup_headroom(proc: Path = Path("/proc/self")) -> dict[str, int]:
             memberships.append(("cgroup2", group))
         elif "memory" in controllers.split(","):
             memberships.append(("cgroup", group))
-    available = {}
+    available: dict[str, int] = {}
     resolved = set()
     for line in (proc / "mountinfo").read_text().splitlines():
         fields, filesystem = line.split(" - ", 1)
@@ -91,11 +92,11 @@ def _cgroup_headroom(proc: Path = Path("/proc/self")) -> dict[str, int]:
         for member_kind, raw_group in memberships:
             if member_kind != kind:
                 continue
-            group = PurePosixPath(raw_group)
-            if not group.is_absolute() or ".." in group.parts:
+            group_path = PurePosixPath(raw_group)
+            if not group_path.is_absolute() or ".." in group_path.parts:
                 raise RuntimeError("invalid cgroup membership path")
-            if ".." not in mount_root.parts and group.is_relative_to(mount_root):
-                relative = group.relative_to(mount_root)
+            if ".." not in mount_root.parts and group_path.is_relative_to(mount_root):
+                relative = group_path.relative_to(mount_root)
             else:
                 continue
             directory = mount.joinpath(*relative.parts)
@@ -146,7 +147,7 @@ def memory_headroom() -> dict[str, int]:
     if application_limit is not None:
         # Same accounting as the command guard; leave the remainder for the
         # arena and apply the 30% fraction below to retain heap/copy headroom.
-        used = process.private if sys.platform == "win32" else process.rss
+        used = int(getattr(process, "private")) if sys.platform == "win32" else process.rss
         values["application_available"] = max(0, application_limit - used)
     return values
 

@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 import importlib
 import os
+import re
 import subprocess
 import sys
 import types
@@ -18,6 +20,35 @@ from packaging.version import Version
 import vane
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_release_launcher_references_existing_test_nodes():
+    launcher = (REPOSITORY_ROOT / "scripts/run_release_tests.sh").read_text(encoding="utf-8")
+    selectors = re.findall(r'"\$project_root/(tests/[^"\n]+)"', launcher)
+    assert selectors, "release launcher has no test selectors"
+    missing = []
+    for selector in selectors:
+        filename, *nodes = selector.split("::")
+        path = REPOSITORY_ROOT / filename
+        if not path.is_file():
+            missing.append(selector)
+            continue
+        scope = ast.parse(path.read_text(encoding="utf-8")).body
+        for node in nodes:
+            name = node.split("[", 1)[0]
+            match = next(
+                (
+                    item
+                    for item in scope
+                    if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
+                ),
+                None,
+            )
+            if match is None:
+                missing.append(selector)
+                break
+            scope = match.body
+    assert not missing, "release launcher selects missing test nodes: " + ", ".join(missing)
 
 
 def test_vane_public_exports_are_unique_and_resolvable():
