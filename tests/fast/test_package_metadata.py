@@ -23,6 +23,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_release_launcher_references_existing_test_nodes():
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
     launcher = (REPOSITORY_ROOT / "scripts/run_release_tests.sh").read_text(encoding="utf-8")
     selectors = re.findall(r'"\$project_root/(tests/[^"\n]+)"', launcher)
     assert selectors, "release launcher has no test selectors"
@@ -49,6 +54,10 @@ def test_release_launcher_references_existing_test_nodes():
                 break
             scope = match.body
     assert not missing, "release launcher selects missing test nodes: " + ", ".join(missing)
+    config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    included = set(config["tool"]["scikit-build"]["sdist"]["include"])
+    unpackaged = sorted({selector.split("::", 1)[0] for selector in selectors} - {path[1:] for path in included})
+    assert not unpackaged, "release launcher tests missing from sdist allowlist: " + ", ".join(unpackaged)
 
 
 def test_vane_public_exports_are_unique_and_resolvable():

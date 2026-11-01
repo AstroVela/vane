@@ -387,6 +387,7 @@ include = [
     "/tests/fast/test_expression_udf_contracts.py",
     "/tests/fast/test_local_e2e.py",
     "/tests/fast/test_local_task_scheduling.py",
+    "/tests/fast/test_local_shm_capacity.py",
     "/tests/fast/test_local_shm_credit_progress.py",
     "/tests/fast/test_local_shm_store_capacity.py",
     "/tests/fast/test_local_runtime_baseline.py",
