@@ -3903,6 +3903,12 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 raise ValueError("UDF node already has a task progress binding")
 
     try:
+        if udf_nodes:
+            if startup_cancellation is not None:
+                startup_cancellation.raise_if_cancelled("local shared-memory preparation")
+            query_store = LocalQueryShmStore()
+            created.append(query_store)
+            query_store.store.ensure_mapped()
         identity = id(udf_nodes) if plan_identity is None else plan_identity
         for node in udf_nodes:
             raw_payload = node.get("payload") or {}
@@ -4011,8 +4017,6 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 env=os.environ,
             )
             runtime = _global_task_runtime()
-            query_store = LocalQueryShmStore()
-            created.append(query_store)
             fraction = float(os.environ.get("VANE_QUERY_OBJECT_STORE_FRACTION", "0.5"))
             heap_reserve = int(os.environ.get("VANE_QUERY_HEAP_RESERVE_BYTES_PER_NODE", "0"))
             if not math.isfinite(fraction) or not 0 < fraction <= 1:

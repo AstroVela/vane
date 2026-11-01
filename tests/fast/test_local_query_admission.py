@@ -87,7 +87,7 @@ def test_query_capacity_uses_pinned_physical_store_once(monkeypatch, transport_l
         query = next(owner for owner in resources if isinstance(owner, LocalQueryAdmission))
         arena = next(owner for owner in resources if isinstance(owner, storage.LocalQueryShmStore))
         assert query.manager.allocation.resources.object_store_bytes == int(capacity * float(fraction))
-        assert arena.store.snapshot()["mapped_capacity_bytes"] == 0
+        assert arena.store.snapshot()["mapped_capacity_bytes"] == capacity
         # Task-only queries prepare before their workers start. Their arena must
         # match admission even if available memory changes before the first task.
         monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "32MiB")

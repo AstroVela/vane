@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
-import os
 
 import pytest
 
@@ -20,7 +19,7 @@ def pooled_shm_worker(monkeypatch):
 
     monkeypatch.setattr(storage, "current_store", acquire)
     peer = storage.ParentShmPeer()
-    client = storage.WorkerShmClient(os.dup(peer.child_sock.fileno()))
+    client = storage.WorkerShmClient(peer.child_sock.dup().detach())
     peer.child_sock.close()
     monkeypatch.setattr(storage, "_worker_client", client)
     try:

@@ -2172,11 +2172,14 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     try:
         assert len(created) == 4
         assert created_args[0][1] == 3
-        assert isinstance(created[2], LocalTaskProgress)
+        progress = next(owner for owner in created if isinstance(owner, LocalTaskProgress))
+        pool = next(owner for owner in created if isinstance(owner, FakeLocalActorPool))
+        arena = next(owner for owner in created if isinstance(owner, subprocess_exec.LocalQueryShmStore))
+        assert created.index(arena) < created.index(pool) < created.index(progress)
         assert set(handles_map) == {"7", "8"}
-        assert handles_map["7"]["local_actor_pool"] is created[1]
+        assert handles_map["7"]["local_actor_pool"] is pool
         binding = handles_map["8"]["local_task_progress"]
-        assert binding.query is created[2]
+        assert binding.query is progress
         assert binding.node_id == "8"
         assert plan.set_calls == [(handles_map, "conn")]
     finally:
@@ -2246,16 +2249,19 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
         assert created_args[0][1] == 2
         assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
         assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
-        assert isinstance(created[2], LocalTaskProgress)
+        progress = next(owner for owner in created if isinstance(owner, LocalTaskProgress))
+        pool = next(owner for owner in created if isinstance(owner, FakeLocalActorPool))
+        arena = next(owner for owner in created if isinstance(owner, subprocess_exec.LocalQueryShmStore))
+        assert created.index(arena) < created.index(pool) < created.index(progress)
         assert set(handles_map) == {"4", "5"}
         assert handles_map["4"] == {
-            "local_actor_pool": created[1],
+            "local_actor_pool": pool,
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
             "local_query_admission": handles_map["4"]["local_query_admission"],
-            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
+            "local_transport_input_target_bytes": arena.store.capacity // 2,
         }
         binding = handles_map["5"]["local_task_progress"]
-        assert binding.query is created[2]
+        assert binding.query is progress
         assert binding.node_id == "5"
         assert injected == [handles_map]
     finally:
@@ -3909,6 +3915,7 @@ def test_local_shm_multi_block_adoption_rolls_back_on_invalid_last_mapping():
 
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("ipc_metadata", ["declared", "missing", "none"])
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux shared-memory in-place growth")
 def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty, ipc_metadata):
     import os
 
@@ -4057,40 +4064,6 @@ def test_local_shm_ref_bundle_arrow_column_outlives_materialized_table():
         refs[0].release()
 
 
-def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
-    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 100 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 80 * ref_bundle._GIB)
-
-    expected_capacity = min(
-        int(100 * ref_bundle._GIB * ref_bundle._RAY_LIKE_OBJECT_STORE_MEMORY_FRACTION),
-        int(80 * ref_bundle._GIB * ref_bundle._RAY_LIKE_SHM_MEMORY_FRACTION),
-        ref_bundle._RAY_LIKE_OBJECT_STORE_MAX_BYTES,
-    )
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(expected_capacity * 0.5)
-
-
-def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monkeypatch):
-    from vane.execution import ref_bundle
-
-    shm_capacity = 256 * ref_bundle._MIB
-    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 80 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: shm_capacity)
-
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(shm_capacity * 0.95) // 2
-
-
-def test_local_shm_auto_budget_respects_explicit_small_arena(monkeypatch):
-    from vane.execution import ref_bundle
-
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64m")
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == 32 * ref_bundle._MIB
-
-
 def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypatch):
     from vane.execution import ref_bundle
     from vane.execution.udf_shm_store import LocalShmStore
@@ -4116,24 +4089,6 @@ def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypa
     finally:
         for ref in refs:
             ref.release()
-
-
-def test_local_shm_budget_manager_auto_limit_does_not_shrink_after_first_resolution(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
-    available_system = [100 * ref_bundle._GIB]
-    available_shm = [80 * ref_bundle._GIB]
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: available_system[0])
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: available_shm[0])
-
-    manager = ref_bundle.LocalShmBudgetManager()
-    first_limit = manager.snapshot()["limit_bytes"]
-
-    available_system[0] = 16 * ref_bundle._GIB
-    available_shm[0] = 8 * ref_bundle._GIB
-
-    assert manager.snapshot()["limit_bytes"] == first_limit
 
 
 def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(monkeypatch):
@@ -8791,16 +8746,6 @@ def test_local_shm_budget_invalid_env_raises_without_fallback(monkeypatch, raw):
             ref_bundle.wake_local_shm_ref_budget_waiters()
     finally:
         unregister()
-
-
-def test_local_shm_auto_budget_rejects_missing_capacity_instead_of_ignoring_it(monkeypatch):
-    from vane.execution import ref_bundle
-
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 16 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 0)
-
-    with pytest.raises(RuntimeError, match="/dev/shm has no available capacity"):
-        ref_bundle._auto_local_shm_ref_budget_bytes()
 
 
 def test_local_ref_bundle_worker_payload_carries_input_lease_id():

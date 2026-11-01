@@ -166,6 +166,22 @@ def owned_processes(
     return list(processes)
 
 
+def local_memory_environment(environment: dict[str, str], limit: int, reserve: int) -> dict[str, str]:
+    """Pass the guard's policy to local arena sizing, preserving stricter parents."""
+    result = dict(environment)
+    for name, requested, combine in (
+        ("VANE_LOCAL_MEMORY_LIMIT_BYTES", limit, min),
+        ("VANE_LOCAL_MEMORY_RESERVE_BYTES", reserve, max),
+    ):
+        existing = result.get(name)
+        if existing is not None:
+            if not existing.isascii() or not existing.isdecimal():
+                raise ValueError(f"{name} must be a nonnegative integer byte count")
+            requested = combine(requested, int(existing))
+        result[name] = str(requested)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
@@ -185,6 +201,7 @@ def main() -> int:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     limit = args.max_process_mib * 1024**2
     reserve = args.min_available_mib * 1024**2
+    environment = local_memory_environment(os.environ, int(limit), int(reserve))
     started = time.monotonic()
     peaks: dict[str, int] = {}
     minimum_available = psutil.virtual_memory().available
@@ -212,19 +229,18 @@ def main() -> int:
                     str(ready),
                     *command,
                 ],
-                env={**os.environ, "__PYVENV_LAUNCHER__": sys.executable},
+                env={**environment, "__PYVENV_LAUNCHER__": sys.executable},
             )
             job = windows_job(child.pid)
             ready.touch()
         else:
             if sys.platform == "linux":
                 reaper = linux_subreaper()
-                environment = None
             else:
                 token = secrets.token_hex(32)
                 # Preserve outer guards' markers when a CI step launches a
                 # nested guard, so killing the inner guard cannot orphan work.
-                environment = {**os.environ, _OWNER_ENV: f"{os.environ.get(_OWNER_ENV, '')}:{token}"}
+                environment = {**environment, _OWNER_ENV: f"{environment.get(_OWNER_ENV, '')}:{token}"}
             child = subprocess.Popen(command, start_new_session=True, env=environment)
         try:
             root = psutil.Process(child.pid)
