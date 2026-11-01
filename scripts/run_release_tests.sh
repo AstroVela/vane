@@ -61,6 +61,7 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_windows_udf_transport.py"
+  "$project_root/tests/fast/test_header_linkage.py"
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_mlx_provider.py"
   "$project_root/tests/fast/test_mlx_image_provider.py"

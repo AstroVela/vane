@@ -334,6 +334,7 @@ include = [
     "/tests/result_stream_helpers.py",
     "/tests/windows_test_timeout.py",
     "/tests/fast/test_ai_release_contracts.py",
+    "/tests/fast/test_header_linkage.py",
     "/tests/fast/test_ai_client_config.py",
     "/tests/fast/test_ai_embedding_requests.py",
     "/tests/fast/test_ai_image_embedding.py",
