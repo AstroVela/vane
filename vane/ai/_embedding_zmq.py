@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
 from vane.ai import _embedding_ipc as ipc
 from vane.ai import _embedding_shared_memory as shm
 from vane.ai import _embedding_stream as stream

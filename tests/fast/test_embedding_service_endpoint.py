@@ -9,6 +9,7 @@ import socket
 
 import numpy as np
 import pytest
+
 from tests.fast.test_embedding_service import client
 from tests.fast.test_native_multimodal import install_sdk
 from vane.ai._embedding_inputs import EmbeddingConfigurationError

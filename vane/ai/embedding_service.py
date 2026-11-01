@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
