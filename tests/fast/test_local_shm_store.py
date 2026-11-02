@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import select
 import subprocess
 import sys
@@ -637,6 +638,7 @@ finally:
         ("explicit", "store"),
     ],
 )
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
 def test_fork_exit_finalizers_preserve_parent_data_and_skip_inherited_locks(scenario, held_lock):
     child = subprocess.run(
         [sys.executable, "-I", "-c", _FORK_FINALIZERS, scenario, held_lock],
@@ -772,6 +774,7 @@ def _line(proc):
 
 @pytest.mark.parametrize("crash", [False, True])
 @pytest.mark.parametrize("view_kind", ["arrow", "numpy"])
+@pytest.mark.skipif(os.name != "posix", reason="requires pass_fds and selectable POSIX pipes")
 def test_remote_view_survives_parent_ref_release_and_pins_until_last_buffer_or_exit(monkeypatch, crash, view_kind):
     store = storage.LocalShmStore(4096)
 

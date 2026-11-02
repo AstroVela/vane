@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import gc
+import logging
 import mmap
 import os
 import queue
@@ -27,9 +28,12 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from itertools import count
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
+
+if TYPE_CHECKING:
+    from vane.execution.local_shm_capacity import ShmCapacity
 
 _RELEASE = struct.Struct("!Q")
 _ALIGNMENT = 64
@@ -37,6 +41,8 @@ _registry_pid = os.getpid()
 _registry_lock = threading.RLock()
 _stores: dict[str, LocalShmStore] = {}
 _current_store: LocalShmStore | None = None
+_capacity_bytes: int | None = None
+_capacity_pending: tuple[tuple[str | None, ...], ShmCapacity] | None = None
 _worker_client: WorkerShmClient | None = None
 _gc_lock = threading.RLock()
 _gc_holds = 0
@@ -106,6 +112,9 @@ class _ForkLock:
 # Always acquire this after registry/store locks. Fork preparation takes only
 # this lock, so a different thread holding a public store lock cannot block it.
 _fork_lock = _ForkLock()
+# Capacity probing can allocate Python objects. Defer automatic GC while its
+# decision lock is held so raw-ref finalizers cannot reenter the budget manager.
+_capacity_lock = _ForkLock()
 _fork_holds: set[_ForkHold] = set()
 _pending_fork: _ForkHold | None = None
 _inherited_fork_writers: set[int] = set()
@@ -218,6 +227,7 @@ def _resume_parent_after_fork() -> None:
 def _reset_registry_after_fork() -> None:
     global _registry_pid, _registry_lock, _stores, _current_store, _fork_lock, _fork_holds, _pending_fork
     global _worker_clients, _gc_lock, _gc_holds
+    global _capacity_lock, _capacity_bytes, _capacity_pending
     # Other parent threads may have been waiting for the mutation lock, or
     # holding the GC-state lock. Neither their locks nor their hold count
     # survives in the child. Keep one pause until registry reset completes.
@@ -240,6 +250,9 @@ def _reset_registry_after_fork() -> None:
         _registry_lock = threading.RLock()
         _stores = {}
         _current_store = None
+        _capacity_lock = _ForkLock()
+        _capacity_bytes = None
+        _capacity_pending = None
         _registry_pid = os.getpid()
     finally:
         _resume_automatic_gc()
@@ -358,6 +371,8 @@ class LocalShmStore:
         if type(capacity) is not int or capacity < _ALIGNMENT:
             raise ValueError("shared-memory store capacity must be at least 64 bytes")
         self.capacity = capacity
+        self.capacity_decision: ShmCapacity | None = None
+        self.capacity_configuration: tuple[str | None, ...] | None = None
         self.store_id = uuid.uuid4().hex
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
@@ -385,6 +400,38 @@ class LocalShmStore:
     def _require_owner(self) -> None:
         if self._owner_pid != os.getpid():
             raise RuntimeError("shared-memory store belongs to a different process")
+
+    def ensure_mapped(self) -> None:
+        """Commit the arena before starting workers or consuming any inputs."""
+        self._require_owner()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("shared-memory store is closed")
+            if self._shm is None:
+                from vane.execution.ref_bundle import _create_shm
+
+                decision = self.capacity_decision
+                diagnostics = {} if decision is None else decision.headroom
+                logger = logging.getLogger(__name__)
+                logger.info("local shared-memory arena requested_bytes=%d headroom=%s", self.capacity, diagnostics)
+                try:
+                    self._shm = _create_shm(self.capacity, track=False)
+                except OSError as error:
+                    from vane.execution.local_shm_capacity import memory_headroom
+
+                    # Only numeric budget/OS fields: never log the payload or
+                    # mapping name. Preserve the original error as the cause.
+                    try:
+                        current = memory_headroom()
+                    except (OSError, ValueError, RuntimeError):
+                        current = {}
+                    message = (
+                        f"local shared-memory arena allocation failed: requested_bytes={self.capacity}, "
+                        f"headroom={diagnostics}, current_headroom={current}, "
+                        f"errno={error.errno}, winerror={getattr(error, 'winerror', None)}"
+                    )
+                    logger.error(message)
+                    raise MemoryError(message) from error
 
     def add_client(self, client_id: str) -> bool:
         """Register atomically, or let the caller replace a retired arena."""
@@ -491,10 +538,7 @@ class LocalShmStore:
                     f"largest_free={max((length for _, length in self._free), default=0)}; "
                     "live buffers must be released before retry"
                 )
-            if self._shm is None:
-                from vane.execution.ref_bundle import _create_shm
-
-                self._shm = _create_shm(self.capacity, track=False)
+            self.ensure_mapped()
             offset, length = self._free.pop(index)
             if length > required:
                 self._free.insert(index, (offset + required, length - required))
@@ -805,30 +849,83 @@ class LocalShmStore:
             }
 
 
+def _capacity_configuration() -> tuple[str | None, ...]:
+    return tuple(
+        os.environ.get(name)
+        for name in (
+            "VANE_LOCAL_SHM_STORE_BYTES",
+            "VANE_LOCAL_MEMORY_LIMIT_BYTES",
+            "VANE_LOCAL_MEMORY_RESERVE_BYTES",
+        )
+    )
+
+
+def _resolve_capacity_decision() -> ShmCapacity:
+    from vane.execution.local_shm_capacity import resolve_capacity
+    from vane.execution.ref_bundle import _parse_byte_size
+
+    raw = os.environ.get("VANE_LOCAL_SHM_STORE_BYTES", "auto").strip().lower()
+    return resolve_capacity(None if raw == "auto" else _parse_byte_size(raw))
+
+
+def _current_arena_locked() -> LocalShmStore:
+    global _current_store, _capacity_bytes, _capacity_pending
+    configuration = _capacity_configuration()
+    if _current_store is not None:
+        _current_store._require_owner()
+        with _current_store._lock:
+            if (
+                not _current_store._clients
+                and not _current_store._live
+                and _current_store.capacity_configuration != configuration
+            ):
+                _current_store.close()
+            if not _current_store._closed:
+                return _current_store
+    with _fork_lock:
+        for key, store in list(_stores.items()):
+            if store._closed:
+                del _stores[key]
+    with _capacity_lock:
+        decision = (
+            _capacity_pending[1]
+            if _capacity_pending is not None and _capacity_pending[0] == configuration
+            else _resolve_capacity_decision()
+        )
+        _capacity_bytes = decision.capacity
+        _capacity_pending = None
+    _current_store = LocalShmStore(decision.capacity)
+    _current_store.capacity_decision = decision
+    _current_store.capacity_configuration = configuration
+    return _current_store
+
+
+def current_store_capacity() -> int:
+    """Read the resolved capacity without acquiring registry or store locks.
+
+    Budget callbacks can run under the manager condition. Snapshot/reclamation
+    takes registry -> manager, so the reverse path must never take registry.
+    Keep the last scalar through retirement: cleanup must not probe new system
+    limits or fail because memory headroom changed while releasing buffers.
+    """
+    global _capacity_bytes, _capacity_pending
+    _require_registry_owner()
+    with _capacity_lock:
+        if _capacity_bytes is None:
+            decision = _resolve_capacity_decision()
+            _capacity_pending = (_capacity_configuration(), decision)
+            _capacity_bytes = decision.capacity
+        return _capacity_bytes
+
+
 def current_store(client_id: str) -> LocalShmStore:
-    global _current_store
     _require_registry_owner()
     with _registry_lock:
-        if _current_store is not None:
-            _current_store._require_owner()
-            with _current_store._lock:
-                if not _current_store._clients and not _current_store._live:
-                    _current_store.close()
-        with _fork_lock:
-            for key, store in list(_stores.items()):
-                if store._closed:
-                    del _stores[key]
-        # Retirement can race with this lookup. add_client() checks and pins
-        # under the store lock, so failure means we must create a new arena.
-        if _current_store is not None and _current_store.add_client(client_id):
-            return _current_store
-        from vane.execution.ref_bundle import _auto_local_shm_store_capacity_bytes, _parse_byte_size
-
-        raw = os.environ.get("VANE_LOCAL_SHM_STORE_BYTES", "auto").strip().lower()
-        capacity = _auto_local_shm_store_capacity_bytes() if raw == "auto" else _parse_byte_size(raw)
-        _current_store = LocalShmStore(capacity)
-        _current_store.add_client(client_id)
-        return _current_store
+        while True:
+            store = _current_arena_locked()
+            # Retirement can race with lookup; add_client pins under its lock.
+            if store.add_client(client_id):
+                return store
 
 
 class LocalQueryShmStore:
