@@ -102,7 +102,7 @@ def test_service_preserves_unequal_audio_and_small_hwc_media(tmp_path, options, 
                 ("image", image),
                 ("audio", AudioClip(np.zeros((16000, 1), dtype=np.float32), 16000)),
                 ("audio", AudioClip(np.zeros((32000, 1), dtype=np.float32), 16000)),
-                ("video", VideoClip((image, image.copy()), (0.0, 1.0), (0, 1))),
+                ("video", VideoClip((image, image.copy()), (0.25, 61.75), (9, 10))),
             )
         )
     )
@@ -125,7 +125,8 @@ def test_service_preserves_unequal_audio_and_small_hwc_media(tmp_path, options, 
             assert processed["images_kwargs"]["input_data_format"] == "channels_last"
             assert processed["videos_kwargs"]["input_data_format"] == "channels_last"
             np.testing.assert_array_equal(processed["images"][0][0], image)
-            np.testing.assert_array_equal(processed["videos"][0], np.stack([image, image]))
+            np.testing.assert_array_equal(np.concatenate(processed["videos"]), np.stack([image, image]))
+            assert processed["text"] == ["<|image|><|audio|><|audio|>00:00 <|video|> 01:01 <|video|>"]
         finally:
             await client.aclose()
             await service.aclose()

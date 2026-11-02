@@ -18,6 +18,7 @@ import numpy as np
 from vane.ai._audio_embedding import AudioClip
 from vane.ai._embedding_content import EmbeddingContent
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._onnx_options import ONNX_ENCODING_VERSION
 from vane.ai._video_embedding import VideoClip
 from vane.ai.provider import _ProviderResultError, _translate_missing_provider_dependency
 from vane.ai.providers._onnx_artifacts import bundle_sha256, validate_external_data
@@ -44,7 +45,9 @@ def validate_software_contract(ort: Any) -> None:
     if ort.__version__ != "1.26.0" or any(
         value.split("+", 1)[0] != PROCESSOR_VERSIONS[name] for name, value in processor_versions().items()
     ):
-        raise EmbeddingConfigurationError("ONNX requires runtime 1.26.0 and the declared onnx-py1 processor versions")
+        raise EmbeddingConfigurationError(
+            f"ONNX requires runtime 1.26.0 and the declared onnx-py{ONNX_ENCODING_VERSION} processor versions"
+        )
 
 
 def validate_parts(rows: list[list[tuple[str, Any]]], max_input_bytes: int) -> None:
@@ -249,15 +252,21 @@ class ONNXEmbedder:
                 value = ((QUERY_PREFIX if role == "query" else DOCUMENT_PREFIX) + value) if first_text else value
                 first_text = False
                 text.append(value)
+            elif kind == "video":
+                # Match the processor's timestamped frame-block layout using
+                # the supplied PTS directly. Its VideoMetadata derives times
+                # from frame indices / FPS, which cannot represent VFR here.
+                # One single-frame video per placeholder keeps its official
+                # pixel preprocessing and feature order without re-sampling.
+                frames = []
+                for seconds, frame in zip(value.frame_times, value.frames, strict=True):
+                    stamp = f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+                    frames.append(f"{stamp} {MEDIA_TOKENS[kind]}")
+                    media[kind].append(frame[None, ...])
+                text.append(" ".join(frames))
             else:
                 text.append(MEDIA_TOKENS[kind])
-                media[kind].append(
-                    value.samples[:, 0].astype(np.float32)
-                    if kind == "audio"
-                    else np.stack(value.frames)
-                    if kind == "video"
-                    else value
-                )
+                media[kind].append(value.samples[:, 0].astype(np.float32) if kind == "audio" else value)
         prompt = "".join(text)
         if (
             len(prompt.encode("utf-8")) + sum(value.nbytes for values in media.values() for value in values)
@@ -283,6 +292,7 @@ class ONNXEmbedder:
                     "device": "cpu",
                     "input_data_format": "channels_last",
                     "do_sample_frames": False,
+                    # Actual timestamps are already in the frame-block prompt.
                     "add_timestamps": False,
                 },
             )

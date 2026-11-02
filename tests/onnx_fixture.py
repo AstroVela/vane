@@ -165,7 +165,6 @@ def install_sdk(monkeypatch):
             sdk.events.append(("process", threading.get_ident(), kwargs))
             prompt = kwargs["text"][0]
             values = {}
-            counts = {}
             for kind, key, position in (
                 ("image", "images", "image_position_ids"),
                 ("video", "videos", "video_position_ids"),
@@ -178,23 +177,22 @@ def install_sdk(monkeypatch):
                     if kind == "video"
                     else media
                 )
-                counts[kind] = len(media)
                 if media:
                     values["pixel_values" if kind == "image" else "pixel_values_videos"] = np.stack(
                         [np.full((1, 768), np.mean(image), np.float32) for image in media]
                     )
                     values[position] = np.zeros((len(media), 1, 2), dtype=np.int64)
             audio = kwargs.get("audio", [])
-            counts["audio"] = len(audio)
             if audio:
                 values["input_features"] = np.stack([np.full((1, 128), np.mean(clip), np.float32) for clip in audio])
                 values["input_features_mask"] = np.ones((len(audio), 1), dtype=bool)
             ids = [2]
+            video_counts = iter(len(video) for video in kwargs.get("videos", []))
             while prompt:
                 matched = next((token for token in TOKENS if prompt.startswith(token)), None)
                 if matched:
                     kind = {3: "image", 4: "video", 5: "audio"}[TOKENS[matched]]
-                    count = counts[kind] if kind == "video" else 1
+                    count = next(video_counts) if kind == "video" else 1
                     ids.extend([TOKENS[matched]] * count)
                     prompt = prompt[len(matched) :]
                 else:

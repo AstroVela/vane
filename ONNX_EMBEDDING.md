@@ -20,7 +20,7 @@ already exist locally; remote code and model downloads are disabled at runtime.
 The runtime target is ONNX Runtime 1.26.0, with the official CUDA 12.8 GPU
 package for CUDA execution. The processor contract pins Transformers 5.21.0,
 Torch 2.14.1, torchvision 0.29.1 and Pillow 12.3.0. Output spaces and service
-requests also carry encoding version `onnx-py1`; a different processor
+requests also carry encoding version `onnx-py2`; a different processor
 implementation must not claim this identity merely because it uses the same
 weights. In particular, the JavaScript and Python image resamplers can produce
 different pixels from the same source image.
@@ -143,8 +143,19 @@ Image and video preprocessing explicitly uses `channels_last`. Multiple audio
 parts are padded together with validity masks, independently of unpadded text;
 truncation remains disabled for both modalities.
 Video uses every supplied frame, in order, up to 32 frames with equal shape;
-frame selection belongs to the caller and the model's visual-only video path
-does not add timestamps. Audio is bounded to 180 seconds at 16 kHz. Each row
+frame selection belongs to the caller. Each frame's supplied `frame_time` is
+encoded before its video block using the processor's `mm:ss` timestamp format.
+This format has whole-second resolution; subsecond source PTS remain in the
+caller/Context evidence. Times are never reconstructed from an average FPS or
+source-frame index. The adapter gives the official processor one single-frame
+video per timestamped block and disables its additional sampling/timestamp
+generation, preserving pixels, feature order and mixed-part placement.
+Encoding identity `onnx-py2` separates these vectors from the former timestamp-free
+representation; package versions and model weights are unchanged. Existing
+timestamp-free indexes need reingestion to use the new representation.
+Passing timestamps does not itself qualify the model for accurate audiovisual
+temporal reasoning; evaluate that separately from input preservation.
+Audio is bounded to 180 seconds at 16 kHz. Each row
 has at most 16 parts, each batch at most 256 rows/64 MiB, and rows obey
 `max_input_bytes` (16 MiB by default). `max_length` is 1–8192 tokens including
 media placeholders. Overflow fails without truncation. Character chunk

@@ -41,7 +41,7 @@ def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeyp
     assert restored.get_model() == ONNX_MODEL
     assert restored.get_provider() == "onnx"
     assert restored.get_output_spec() == descriptor.get_output_spec()
-    assert restored.get_output_spec().outputs[0].space == ONNX_MODEL + ":onnx-py1:" + "a" * 64
+    assert restored.get_output_spec().outputs[0].space == ONNX_MODEL + ":onnx-py2:" + "a" * 64
     assert restored.get_dimensions() == dimensions
     assert restored.get_udf_options().num_gpus == 0
 
@@ -132,12 +132,12 @@ def test_processor_drift_is_rejected_before_session_creation(options, sdk, monke
     monkeypatch.setattr(
         _onnx_model, "processor_versions", lambda: _onnx_model.PROCESSOR_VERSIONS | {"torchvision": "0.30.0"}
     )
-    with pytest.raises(EmbeddingConfigurationError, match="onnx-py1 processor"):
+    with pytest.raises(EmbeddingConfigurationError, match="onnx-py2 processor"):
         load_provider("onnx").get_text_embedder(options=options).instantiate()
     assert not any(event[0] == "load" for event in sdk.events)
 
 
-@pytest.mark.parametrize("encoding_version", [True, 0, 2])
+@pytest.mark.parametrize("encoding_version", [True, 0, 1, 3])
 def test_service_encoding_version_is_closed(encoding_version):
     from vane.ai import _embedding_ipc as ipc
 
@@ -289,13 +289,91 @@ def test_media_and_ordered_composition_route_through_encoders_then_text_graph(op
         runs = [event[1] for event in sdk.events if event[0] == "run"]
         assert runs == ["vision_encoder", "vision_encoder", "audio_encoder", "model"]
         processed = next(event[2] for event in sdk.events if event[0] == "process")
-        assert processed["text"] == ["title: none | text: look<|image|><|audio|><|video|>"]
+        assert processed["text"] == ["title: none | text: look<|image|><|audio|>00:00 <|video|> 00:01 <|video|>"]
         assert processed["videos_kwargs"] == {
             "device": "cpu",
             "input_data_format": "channels_last",
             "do_sample_frames": False,
             "add_timestamps": False,
         }
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "frame_times, expected",
+    [
+        ((0.0, 1.5, 9.75), "00:00 <|video|> 00:01 <|video|> 00:09 <|video|>"),
+        ((0.2, 0.2, 61.99), "00:00 <|video|> 00:00 <|video|> 01:01 <|video|>"),
+        ((127.25,), "02:07 <|video|>"),
+    ],
+)
+def test_supplied_video_pts_reach_the_prompt_without_resampling(options, sdk, frame_times, expected):
+    frames = tuple(np.full((8, 12, 3), index * 40, np.uint8) for index in range(len(frame_times)))
+    video = VideoClip(frames, frame_times, tuple(range(40, 40 + len(frames))))
+    runtime = load_provider("onnx").get_video_embedder(options=options).instantiate()
+    try:
+        runtime.embed_video([video])
+        processed = next(event[2] for event in sdk.events if event[0] == "process")
+        assert processed["text"] == [expected]
+        actual = [frame for clip in processed["videos"] for frame in clip]
+        assert len(actual) == len(frames)
+        for supplied, received in zip(frames, actual, strict=True):
+            np.testing.assert_array_equal(supplied, received)
+        assert processed["videos_kwargs"]["do_sample_frames"] is False
+        assert processed["videos_kwargs"]["add_timestamps"] is False
+    finally:
+        runtime.close()
+
+
+def test_video_time_changes_affect_model_inputs_and_vectors(options, sdk):
+    image = np.full((8, 12, 3), 40, np.uint8)
+    frames = (image, image + 1)
+    runtime = load_provider("onnx").get_video_embedder(options=options).instantiate()
+    try:
+        values = runtime.embed_video([VideoClip(frames, (0.0, 3.0), (0, 1)), VideoClip(frames, (0.0, 9.0), (0, 1))])
+        prompts = [event[2]["text"][0] for event in sdk.events if event[0] == "process"]
+        assert prompts == ["00:00 <|video|> 00:03 <|video|>", "00:00 <|video|> 00:09 <|video|>"]
+        assert not np.array_equal(values[0], values[1])
+    finally:
+        runtime.close()
+
+
+def test_multiple_videos_keep_actual_times_and_mixed_part_placement(options, sdk):
+    image = np.full((8, 12, 3), 40, np.uint8)
+    audio = AudioClip(np.full((1600, 1), 0.2, np.float32), 16000)
+    first = VideoClip((image, image + 1), (5.25, 8.5), (50, 51))
+    second = VideoClip((image + 2,), (62.75,), (125,))
+    content = EmbeddingContent(
+        tuple(
+            EmbeddingPart(EmbeddingPartSpec(kind), value)
+            for kind, value in (("video", first), ("audio", audio), ("text", "look"), ("video", second))
+        )
+    )
+    runtime = load_provider("onnx").get_multimodal_embedder(options=options).instantiate()
+    try:
+        runtime.embed_multimodal([content])
+        processed = next(event[2] for event in sdk.events if event[0] == "process")
+        assert processed["text"] == ["00:05 <|video|> 00:08 <|video|><|audio|>title: none | text: look01:02 <|video|>"]
+        actual = [frame for clip in processed["videos"] for frame in clip]
+        for supplied, received in zip((*first.frames, *second.frames), actual, strict=True):
+            np.testing.assert_array_equal(supplied, received)
+        np.testing.assert_array_equal(processed["audio"][0], audio.samples[:, 0])
+    finally:
+        runtime.close()
+
+
+def test_timestamp_prompt_bytes_are_checked_before_processing(options, sdk):
+    image = np.full((8, 12, 3), 40, np.uint8)
+    runtime = (
+        load_provider("onnx")
+        .get_video_embedder(options=options | {"max_input_bytes": 2 * image.nbytes + len("<|video|>")})
+        .instantiate()
+    )
+    try:
+        with pytest.raises(EmbeddingConfigurationError, match="including retrieval prefixes"):
+            runtime.embed_video([VideoClip((image, image + 1), (0.0, 1.0), (0, 1))])
+        assert not [event for event in sdk.events if event[0] in {"process", "run"}]
     finally:
         runtime.close()
 
@@ -324,7 +402,7 @@ def test_mixed_media_keeps_audio_padding_separate_and_decoded_rgb_channels_last(
         assert processed["images_kwargs"]["input_data_format"] == "channels_last"
         assert processed["videos_kwargs"]["input_data_format"] == "channels_last"
         assert processed["images"][0][0].shape == (3, 7, 3)
-        assert processed["videos"][0].shape == (2, 3, 7, 3)
+        assert [video.shape for video in processed["videos"]] == [(1, 3, 7, 3), (1, 3, 7, 3)]
     finally:
         runtime.close()
 
