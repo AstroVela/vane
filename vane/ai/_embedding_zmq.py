@@ -54,6 +54,14 @@ def _private(info: os.stat_result) -> None:
         raise EmbeddingConfigurationError("Embedding rendezvous requires a private file/directory owned by this UID")
 
 
+def validate_endpoint(endpoint: str) -> None:
+    """Named shared memory and this protocol are restricted to IPv4 loopback."""
+    if not isinstance(endpoint, str) or not re.fullmatch(r"tcp://127\.0\.0\.1:[1-9][0-9]{0,4}", endpoint):
+        raise EmbeddingConfigurationError("Embedding service requires a loopback endpoint")
+    if int(endpoint.rsplit(":", 1)[1]) > 65535:
+        raise EmbeddingConfigurationError("Invalid embedding endpoint port")
+
+
 def _read_endpoint(path: str) -> tuple[str, bytes]:
     _private(Path(path).parent.stat())
     if Path(path).is_symlink():
@@ -75,9 +83,8 @@ def _read_endpoint(path: str) -> tuple[str, bytes]:
     if not isinstance(data, dict) or set(data) != {"protocol", "endpoint", "key"} or data["protocol"] != PROTOCOL:
         raise EmbeddingConfigurationError("Embedding rendezvous protocol mismatch")
     endpoint, key = data["endpoint"], data["key"]
-    if not isinstance(endpoint, str) or not re.fullmatch(r"tcp://127\.0\.0\.1:[1-9][0-9]{0,4}", endpoint):
-        raise EmbeddingConfigurationError("Embedding service requires a loopback endpoint")
-    if int(endpoint.rsplit(":", 1)[1]) > 65535 or not isinstance(key, str) or not re.fullmatch("[0-9a-f]{64}", key):
+    validate_endpoint(endpoint)
+    if not isinstance(key, str) or not re.fullmatch("[0-9a-f]{64}", key):
         raise EmbeddingConfigurationError("Invalid embedding rendezvous configuration")
     return endpoint, bytes.fromhex(key)
 
@@ -250,8 +257,12 @@ class Server:
         zmq = _zmq()
         self.context = zmq.asyncio.Context()
         self.socket = _socket(self.context, zmq.STREAM)
-        port = self.socket.bind_to_random_port("tcp://127.0.0.1")
-        self.endpoint = f"tcp://127.0.0.1:{port}"
+        if self.owner.endpoint is None:
+            port = self.socket.bind_to_random_port("tcp://127.0.0.1")
+            self.endpoint = f"tcp://127.0.0.1:{port}"
+        else:
+            self.socket.bind(self.owner.endpoint)
+            self.endpoint = self.owner.endpoint
 
     def listen(self) -> None:
         assert self.file_fd is not None
