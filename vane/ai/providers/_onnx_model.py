@@ -247,11 +247,14 @@ class ONNXEmbedder:
         text: list[str] = []
         media: dict[str, list[np.ndarray]] = {"image": [], "audio": [], "video": []}
         first_text = True
+        separate_timestamp = False
         for kind, value in parts:
             if kind == "text":
                 value = ((QUERY_PREFIX if role == "query" else DOCUMENT_PREFIX) + value) if first_text else value
                 first_text = False
                 text.append(value)
+                if value:
+                    separate_timestamp = not value[-1].isspace()
             elif kind == "video":
                 # Match the processor's timestamped frame-block layout using
                 # the supplied PTS directly. Its VideoMetadata derives times
@@ -263,10 +266,12 @@ class ONNXEmbedder:
                     stamp = f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
                     frames.append(f"{stamp} {MEDIA_TOKENS[kind]}")
                     media[kind].append(np.stack([frame]))
-                text.append(" ".join(frames))
+                text.append((" " if separate_timestamp else "") + " ".join(frames))
+                separate_timestamp = False
             else:
                 text.append(MEDIA_TOKENS[kind])
                 media[kind].append(value.samples[:, 0].astype(np.float32) if kind == "audio" else value)
+                separate_timestamp = False
         prompt = "".join(text)
         if (
             len(prompt.encode("utf-8")) + sum(value.nbytes for values in media.values() for value in values)

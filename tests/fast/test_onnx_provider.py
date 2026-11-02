@@ -376,11 +376,32 @@ def test_multiple_videos_keep_actual_times_and_mixed_part_placement(options, sdk
     try:
         runtime.embed_multimodal([content])
         processed = next(event[2] for event in sdk.events if event[0] == "process")
-        assert processed["text"] == ["00:05 <|video|> 00:08 <|video|><|audio|>title: none | text: look01:02 <|video|>"]
+        assert processed["text"] == ["00:05 <|video|> 00:08 <|video|><|audio|>title: none | text: look 01:02 <|video|>"]
         actual = [frame for clip in processed["videos"] for frame in clip]
         for supplied, received in zip((*first.frames, *second.frames), actual, strict=True):
             np.testing.assert_array_equal(supplied, received)
         np.testing.assert_array_equal(processed["audio"][0], audio.samples[:, 0])
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("empty_part", [False, True])
+def test_timestamps_cannot_merge_with_adjacent_caller_text(options, sdk, empty_part):
+    image = np.full((8, 12, 3), 40, np.uint8)
+
+    def content(text, seconds):
+        values = [("text", text)]
+        if empty_part:
+            values.append(("text", ""))
+        values.append(("video", VideoClip((image,), (seconds,), (0,))))
+        return EmbeddingContent(tuple(EmbeddingPart(EmbeddingPartSpec(kind), value) for kind, value in values))
+
+    runtime = load_provider("onnx").get_multimodal_embedder(options=options).instantiate()
+    try:
+        values = runtime.embed_multimodal([content("event 1", 62.0), content("event ", 6062.0)])
+        prompts = [event[2]["text"][0] for event in sdk.events if event[0] == "process"]
+        assert prompts == ["title: none | text: event 1 01:02 <|video|>", "title: none | text: event 101:02 <|video|>"]
+        assert not np.array_equal(values[0], values[1])
     finally:
         runtime.close()
 
