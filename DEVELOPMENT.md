@@ -871,3 +871,18 @@ preset/local gate checks model-owned tokenization for ingestion and search.
 Compare real token counts and vectors to an independent checkpoint processor;
 protocol fixtures alone do not qualify numerical behavior. Only related checks
 are required; no native rebuild, full/release suite or Ray tests.
+
+## Configured static extension and header contracts
+
+The native loader links extensions from DuckDB's resolved directory configuration,
+using each extension's `SHOULD_LINK` flag. External static extensions therefore
+participate even when their names were not supplied through `BUILD_EXTENSIONS`;
+loadable-only extensions remain excluded. This rule is shared by all platforms.
+
+`tests/fast/test_loadable_extension_configuration.py` checks the real linker with
+single- and multi-config generators. `tests/fast/test_header_linkage.py` compiles
+both distributed/function header orders in separate translation units, treats
+class/struct tag mismatches as errors, links them and runs the result. Run these
+with `pytest --noconftest -o addopts=` in a compiler/CMake/Ninja environment; they
+do not require importing the native Python runtime. The installed release gate
+also includes the header test. Report the compiler and OS actually exercised.
