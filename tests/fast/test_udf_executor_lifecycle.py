@@ -11298,23 +11298,40 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
 
 
+@pytest.fixture
+def prefetch_store(monkeypatch):
+    from vane.execution import udf_shm_store
+
+    # Use the normal arena acquisition path so the transport budget and the
+    # physical store share one capacity decision, independent of earlier tests.
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    monkeypatch.setattr(udf_shm_store, "_current_store", None)
+    monkeypatch.setattr(udf_shm_store, "_stores", {})
+    monkeypatch.setattr(udf_shm_store, "_capacity_bytes", None)
+    monkeypatch.setattr(udf_shm_store, "_capacity_pending", None)
+    store = udf_shm_store.current_store("prefetch-test")
+    try:
+        yield store
+    finally:
+        store.remove_client("prefetch-test")
+        snapshot = store.snapshot()
+        assert snapshot["clients"] == snapshot["live_allocations"] == snapshot["mapped_capacity_bytes"] == 0
+
+
 @pytest.mark.parametrize("budget", ["auto", "0"])
 @pytest.mark.parametrize("input_kib,output_kib,cancel_prefetch", [(32, 32, False), (8, 64, False), (32, 32, True)])
 def test_prefetch_preserves_running_calls_output_capacity(
-    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch
+    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch, prefetch_store
 ):
     import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", budget)
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     # Auto limits are cached per manager. Use a new query budget so preceding
     # tests cannot leave this case using a much larger arena's cached limit.
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("prefetch-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
     entered, release = tmp_path / "entered", tmp_path / "release"
 
     class Actor:
@@ -11399,24 +11416,20 @@ def test_prefetch_preserves_running_calls_output_capacity(
         second.close(kill=True)
         first.close(kill=True)
         pool.shutdown(kill=True)
-        store.remove_client("prefetch-test")
     assert all(ref._closed for ref in captured)
     assert store.snapshot()["live_allocations"] == 0
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path):
+def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path, prefetch_store):
     import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("reclaim-race-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
     entered, release = tmp_path / "entered", tmp_path / "release"
 
     class Actor:
@@ -11498,24 +11511,22 @@ def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(m
             executor.close(kill=True)
         for pool in pools:
             pool.shutdown(kill=True)
-        store.remove_client("reclaim-race-test")
     assert store.snapshot()["live_allocations"] == 0
     assert manager.snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
 
 
 @pytest.mark.parametrize("reclaim_first", [False, True])
-def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeypatch, tmp_path, reclaim_first):
+def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(
+    monkeypatch, tmp_path, reclaim_first, prefetch_store
+):
     import vane.execution.udf_subprocess as local
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("inflight-reclaim-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
 
     def wait_for(path):
         deadline = time.monotonic() + 15
@@ -11616,7 +11627,6 @@ def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeyp
             executor.close(kill=True)
         for pool in pools:
             pool.shutdown(kill=True)
-        store.remove_client("inflight-reclaim-test")
     assert store.snapshot()["live_allocations"] == 0
     assert manager.snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0

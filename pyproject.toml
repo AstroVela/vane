@@ -309,6 +309,7 @@ include = [
     "/scripts/run_installed_pytest.sh",
     "/scripts/run_fast_tests.sh",
     "/scripts/run_release_tests.sh",
+    "/scripts/run_with_memory_guard.py",
     "/scripts/validate_local_serving.py",
     "/scripts/validate_local_serving_soak.py",
     "/scripts/local_serving_streaming.py",

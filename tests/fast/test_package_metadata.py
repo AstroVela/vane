@@ -56,8 +56,13 @@ def test_release_launcher_references_existing_test_nodes():
     assert not missing, "release launcher selects missing test nodes: " + ", ".join(missing)
     config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     included = set(config["tool"]["scikit-build"]["sdist"]["include"])
-    unpackaged = sorted({selector.split("::", 1)[0] for selector in selectors} - {path[1:] for path in included})
-    assert not unpackaged, "release launcher tests missing from sdist allowlist: " + ", ".join(unpackaged)
+    required_paths = {selector.split("::", 1)[0] for selector in selectors}
+    # The capacity release tests import this helper from the source tree.
+    required_paths.add("scripts/run_with_memory_guard.py")
+    missing = sorted(path for path in required_paths if not (REPOSITORY_ROOT / path).is_file())
+    assert not missing, "release test dependencies missing from source tree: " + ", ".join(missing)
+    unpackaged = sorted(required_paths - {path[1:] for path in included})
+    assert not unpackaged, "release test dependencies missing from sdist allowlist: " + ", ".join(unpackaged)
 
 
 def test_vane_public_exports_are_unique_and_resolvable():
