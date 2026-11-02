@@ -91,6 +91,7 @@ def build_local_admission_graph(
                     materialized_input_unit_ids=tuple(
                         output_ids[parent] for parent in node["materialized_input_node_ids"]
                     ),
+                    retains_object_store_inputs=False,
                 )
             )
         if node["udf_payload"] is not None:

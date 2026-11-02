@@ -59,6 +59,11 @@ class MaterializationBarrierSpec:
     Before completion only ``materialized_input_unit_ids`` feed that node;
     after completion the same node may emit final work from its remaining
     inputs before downstream execution continues.
+
+    ``retains_object_store_inputs`` describes the materializer's input
+    lifetime, not its blocking semantics. Streaming local native operators
+    drain transport blocks into DuckDB-owned state; atomic remote fragments
+    retain managed input objects until their invocation completes.
     """
 
     query_id: str
@@ -66,6 +71,7 @@ class MaterializationBarrierSpec:
     physical_node_id: str
     materializer_unit_id: str
     materialized_input_unit_ids: tuple[str, ...]
+    retains_object_store_inputs: bool = True
 
     _FIELDS: ClassVar[tuple[str, ...]] = (
         "query_id",
@@ -73,9 +79,12 @@ class MaterializationBarrierSpec:
         "physical_node_id",
         "materializer_unit_id",
         "materialized_input_unit_ids",
+        "retains_object_store_inputs",
     )
 
     def __post_init__(self) -> None:
+        if type(self.retains_object_store_inputs) is not bool:
+            raise ValueError("retains_object_store_inputs must be a boolean")
         object.__setattr__(self, "query_id", str(self.query_id).strip())
         object.__setattr__(self, "barrier_id", str(self.barrier_id).strip())
         object.__setattr__(self, "physical_node_id", str(self.physical_node_id).strip())
@@ -93,6 +102,7 @@ class MaterializationBarrierSpec:
             "physical_node_id": self.physical_node_id,
             "materializer_unit_id": self.materializer_unit_id,
             "materialized_input_unit_ids": list(self.materialized_input_unit_ids),
+            "retains_object_store_inputs": self.retains_object_store_inputs,
         }
 
     @classmethod
@@ -105,6 +115,7 @@ class MaterializationBarrierSpec:
             physical_node_id=str(values["physical_node_id"]),
             materializer_unit_id=str(values["materializer_unit_id"]),
             materialized_input_unit_ids=tuple(str(item) for item in values["materialized_input_unit_ids"]),
+            retains_object_store_inputs=values["retains_object_store_inputs"],
         )
 
 

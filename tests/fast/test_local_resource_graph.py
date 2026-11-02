@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
 
 import pytest
 
@@ -701,7 +702,11 @@ def test_native_sink_metadata_uses_the_shared_phase_model(tmp_path, transform, h
         # longer translates through a distributed execution graph.
         ray = build_query_resource_graph(local_metadata, env={})
         assert bool(local.materialization_barriers) == has_barrier
-        assert local.materialization_barriers == ray.materialization_barriers
+        assert all(not barrier.retains_object_store_inputs for barrier in local.materialization_barriers)
+        assert all(barrier.retains_object_store_inputs for barrier in ray.materialization_barriers)
+        assert local.materialization_barriers == tuple(
+            replace(barrier, retains_object_store_inputs=False) for barrier in ray.materialization_barriers
+        )
         assert local.topological_unit_ids() == ray.topological_unit_ids()
         ids = [barrier.barrier_id for barrier in local.materialization_barriers]
         for count in range(len(ids) + 1):
@@ -709,9 +714,9 @@ def test_native_sink_metadata_uses_the_shared_phase_model(tmp_path, transform, h
                 assert local.eligible_resource_unit_ids(set(completed)) == ray.eligible_resource_unit_ids(
                     set(completed)
                 )
-                assert local.frontier_materialization_barriers(set(completed)) == ray.frontier_materialization_barriers(
-                    set(completed)
-                )
+                assert tuple(
+                    barrier.barrier_id for barrier in local.frontier_materialization_barriers(set(completed))
+                ) == tuple(barrier.barrier_id for barrier in ray.frontier_materialization_barriers(set(completed)))
 
 
 @pytest.mark.parametrize("join_type", ["INNER", "FULL"])

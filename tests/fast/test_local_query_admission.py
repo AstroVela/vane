@@ -565,6 +565,8 @@ def test_native_barrier_frontier_reopens_when_downstream_receives_materialized_i
     )
     authority = _authority(query, bindings["1"], pool)
     try:
+        assert all(not barrier.retains_object_store_inputs for barrier in graph.materialization_barriers)
+        assert query.snapshot()["execution_phase"]["object_store_unlimited_unit_ids"] == []
         assert bindings["1"] not in query.manager.current_eligible_resource_unit_ids()
         lease = _take(authority)
         assert bindings["1"] in query.manager.current_eligible_resource_unit_ids()

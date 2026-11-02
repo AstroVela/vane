@@ -134,6 +134,7 @@ def build_query_resource_graph(
                     materialized_input_unit_ids=tuple(
                         output_unit_by_node[parent] for parent in node["materialized_input_node_ids"]
                     ),
+                    retains_object_store_inputs=True,
                 )
             )
         udf_unit = _udf_unit(
