@@ -65,9 +65,10 @@ def test_service_planning_retains_native_space_and_reserves_no_gpu(tmp_path, opt
     assert not (tmp_path / "service").exists()
 
 
-def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, options, sdk):
+@pytest.mark.parametrize("backend", ["cpu", "cuda"])
+def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, options, sdk, backend):
     async def scenario():
-        service = instance(tmp_path, options)
+        service = instance(tmp_path, options | {"backend": backend})
         await service.start()
         provider = load_provider("onnx")
         document = provider.get_text_embedder(dimensions=128, options=client_options(tmp_path, options)).instantiate()
@@ -79,6 +80,9 @@ def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, 
             assert not np.array_equal(docs[0], queries[0])
             assert len([event for event in sdk.events if event[0] == "load"]) == 3
             assert len({event[2] for event in sdk.events if event[0] in {"load", "run"}}) == 1
+            if backend == "cuda":
+                assert sdk.cuda_queries == [next(event[2] for event in sdk.events if event[0] == "load")]
+                assert all(value == {"memory.enable_memory_arena_shrinkage": "gpu:0"} for _, value in sdk.run_options)
         finally:
             await document.aclose()
             await query.aclose()
