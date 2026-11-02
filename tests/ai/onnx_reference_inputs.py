@@ -52,7 +52,13 @@ if __name__ == "__main__":
     audio = np.asarray(data["audio"], dtype=np.float32)
     video = np.asarray(data["frames"], dtype=np.uint8)
     image_options = {"device": "cpu", "input_data_format": "channels_last"}
-    video_options = image_options | {"do_sample_frames": False, "add_timestamps": False}
+    # Independent reference: let the official processor expand timestamps for
+    # the real fixture PTS (0s, 1s), rather than copying the adapter's prompt.
+    video_options = image_options | {
+        "do_sample_frames": False,
+        "add_timestamps": True,
+        "video_metadata": [{"total_num_frames": 2, "fps": 1.0, "frames_indices": [0, 1]}],
+    }
     cases = {
         "documents": dict(text=["title: none | text: " + value for value in DOCUMENTS]),
         "queries": dict(text=["task: search result | query: " + value for value in QUERIES]),
@@ -91,6 +97,7 @@ if __name__ == "__main__":
         ),
     }
     result = {
+        "encoding": "onnx-py2",
         "processor_versions": {name: version(name) for name in ("transformers", "torch", "torchvision", "Pillow")},
         "cases": {},
     }

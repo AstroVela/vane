@@ -11,6 +11,7 @@ const [modelPath, inputPath, outputPath, bundleSHA256] = process.argv.slice(2);
 env.allowRemoteModels = false;
 env.allowLocalModels = true;
 const fixture = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+if (fixture.encoding !== 'onnx-py2') throw new Error('Expected timestamped ONNX processor inputs (onnx-py2)');
 const model = await AutoModel.from_pretrained(modelPath, { local_files_only: true, device: 'cpu', dtype: 'fp32' });
 // Share the declared official Python preprocessing contract, so this reference
 // measures model execution rather than different image resampling libraries.
@@ -37,7 +38,7 @@ try {
         ...(await embedding('tiny_video')),
         ...(await embedding('unequal_audio')),
     ];
-    fs.writeFileSync(outputPath, JSON.stringify({ bundle_sha256: bundleSHA256, processor_versions: fixture.processor_versions, documents, queries, media }));
+    fs.writeFileSync(outputPath, JSON.stringify({ encoding: fixture.encoding, bundle_sha256: bundleSHA256, processor_versions: fixture.processor_versions, documents, queries, media }));
 } finally {
     await model.dispose();
 }

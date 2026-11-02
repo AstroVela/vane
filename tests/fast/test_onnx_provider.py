@@ -326,6 +326,28 @@ def test_supplied_video_pts_reach_the_prompt_without_resampling(options, sdk, fr
         runtime.close()
 
 
+@pytest.mark.parametrize("layout", ["horizontal_flip", "channel_reverse", "fortran"])
+def test_video_frame_views_remain_supported_by_the_processor(options, sdk, layout):
+    image = np.arange(8 * 12 * 3, dtype=np.uint8).reshape(8, 12, 3)
+    frame = (
+        image[:, ::-1, :]
+        if layout == "horizontal_flip"
+        else image[:, :, ::-1]
+        if layout == "channel_reverse"
+        else np.asfortranarray(image)
+    )
+    runtime = load_provider("onnx").get_video_embedder(options=options).instantiate()
+    try:
+        runtime.embed_video([VideoClip((frame,), (1.25,), (4,))])
+        processed = next(event[2] for event in sdk.events if event[0] == "process")
+        received = processed["videos"][0]
+        assert received.flags.writeable and all(stride >= 0 for stride in received.strides)
+        assert not np.shares_memory(received, frame)
+        np.testing.assert_array_equal(received, np.stack([frame]))
+    finally:
+        runtime.close()
+
+
 def test_video_time_changes_affect_model_inputs_and_vectors(options, sdk):
     image = np.full((8, 12, 3), 40, np.uint8)
     frames = (image, image + 1)

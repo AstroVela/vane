@@ -16,7 +16,7 @@ import pytest
 
 from tests.ai.onnx_reference_inputs import DOCUMENTS, QUERIES, fixture
 from vane.ai import AudioClip, EmbeddingContent, EmbeddingPart, EmbeddingPartSpec
-from vane.ai._onnx_options import ONNX_MODEL
+from vane.ai._onnx_options import ONNX_ENCODING_VERSION, ONNX_MODEL
 from vane.ai._video_embedding import VideoClip
 from vane.ai.provider import load_provider
 
@@ -46,6 +46,7 @@ def test_real_native_service_reference_and_public_apis(tmp_path, monkeypatch, ba
         "max_length": 2048,
     }
     reference = json.loads(Path(os.environ["VANE_TEST_ONNX_REFERENCE_PATH"]).read_text())
+    assert reference["encoding"] == f"onnx-py{ONNX_ENCODING_VERSION}"
     assert reference["bundle_sha256"] == options["model_sha256"]
     expected = np.asarray([*reference["documents"], *reference["queries"], *reference["media"]], dtype=np.float64)[
         :, :dimensions

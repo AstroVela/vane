@@ -262,7 +262,7 @@ class ONNXEmbedder:
                 for seconds, frame in zip(value.frame_times, value.frames, strict=True):
                     stamp = f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
                     frames.append(f"{stamp} {MEDIA_TOKENS[kind]}")
-                    media[kind].append(frame[None, ...])
+                    media[kind].append(np.stack([frame]))
                 text.append(" ".join(frames))
             else:
                 text.append(MEDIA_TOKENS[kind])
