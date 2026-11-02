@@ -1432,6 +1432,7 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
         closing_target = target.removeprefix("control_").removesuffix("_error")
         entered, release = threading.Event(), threading.Event()
         attempts, query_threads = [], []
+        attempts_lock = threading.Lock()
         runtime = None
         if registration == "attached":
             # Database-owned handles outlive their opening query and do not
@@ -1455,7 +1456,11 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
                 return
             if not runtime.resource_snapshot()["request_admission"]["active_requests"]:
                 return
-            attempts.append(threading.get_ident())
+            # Multiple native workers can pass the early attempts check.
+            with attempts_lock:
+                if attempts:
+                    return
+                attempts.append(threading.get_ident())
             if controlled:
                 entered.set()
                 assert release.wait(5)
