@@ -193,8 +193,10 @@ def test_backend_initialization_failure_never_retries_on_cpu(options, sdk):
     assert loads[0][5] == {}
 
 
-def test_cuda_execution_failure_propagates_without_recreating_sessions(options, sdk, monkeypatch):
-    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "cuda"}).instantiate()
+@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_execution_failure_propagates_without_recreating_sessions(options, sdk, monkeypatch, backend):
+    sdk.automatic_provider = "CUDAExecutionProvider"
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": backend}).instantiate()
     attempts = []
     error = RuntimeError("CUDA execution failed")
 
