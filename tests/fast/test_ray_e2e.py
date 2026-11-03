@@ -3750,6 +3750,38 @@ def test_ray_perfect_hash_group_by(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+_ARROW_EXTENSION_KEYS_SOURCE = """
+    SELECT
+        i AS id,
+        ('00000000-0000-0000-0000-00000000000' || (i % 4))::UUID AS u,
+        ('{"a": ' || (i % 3) || '}')::JSON AS j,
+        (CASE WHEN i = 0 THEN '170141183460469231731687303715884105727'::HUGEINT
+              WHEN i = 1 THEN '-170141183460469231731687303715884105728'::HUGEINT
+              ELSE (i % 3)::HUGEINT END) AS h,
+        (CASE WHEN i = 0 THEN '340282366920938463463374607431768211455'::UHUGEINT
+              ELSE (i % 3)::UHUGEINT END) AS uh,
+        ('1010' || (i % 2)::VARCHAR)::BIT AS b,
+        {'u': ('00000000-0000-0000-0000-00000000000' || (i % 2))::UUID} AS s,
+        [('00000000-0000-0000-0000-00000000000' || (i % 2))::UUID] AS l
+    FROM range(0, 12) AS t(i)
+"""
+
+
+@pytest.mark.parametrize("key", ["u", "j", "h", "uh", "b", "s", "l"])
+def test_ray_group_by_shuffles_keys_without_native_arrow_types(ray_runner, duckdb_conn, key):
+    # The keys cross the Flight shuffle but are absent from the result, so the
+    # default arrow_lossless_conversion=false must not change their logical types.
+    sql = f"SELECT COUNT(*) AS cnt, MIN(id) AS first_id FROM ({_ARROW_EXTENSION_KEYS_SOURCE}) GROUP BY {key}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        f"test_ray_e2e: shuffle {key} keys",
+        require_all=["HASH_GROUP_BY"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_partitioned_aggregate(ray_runner, duckdb_conn, partitioned_parquet_path):
     label = "test_ray_e2e: partitioned aggregate"
     sql = f"""

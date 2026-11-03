@@ -136,6 +136,15 @@ bool IsAggregateStateType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::AGGREGATE_STATE;
 }
 
+// Shuffle files are an internal transport between Vane workers. UUID, JSON,
+// HUGEINT, UHUGEINT, and BIT have no native Arrow type, so they must keep their
+// logical types across the shuffle regardless of the user's Arrow output settings.
+ClientProperties ShuffleArrowClientProperties(ClientContext &context) {
+	auto properties = context.GetClientProperties();
+	properties.arrow_lossless_conversion = true;
+	return properties;
+}
+
 vector<LogicalType> ToArrowTypes(const vector<LogicalType> &types) {
 	vector<LogicalType> result;
 	result.reserve(types.size());
@@ -1185,7 +1194,7 @@ DuckDBResult<void> ShuffleCache::EnsureSchemaFile(ClientContext &context, const 
 
 	ArrowSchema schema;
 	schema.Init();
-	auto client_properties = context.GetClientProperties();
+	auto client_properties = ShuffleArrowClientProperties(context);
 	ArrowConverter::ToArrowSchema(&schema, types, names, client_properties);
 
 	auto schema_res = arrow::ImportSchema(&schema);
@@ -1488,7 +1497,7 @@ DuckDBResult<ShufflePartitionFile> ShuffleCache::WriteCollectionToFile(ClientCon
 	auto output = std::move(output_res.value());
 
 	// Create writer — we'll write multiple record batches from the collection's chunks.
-	auto client_properties = context.GetClientProperties();
+	auto client_properties = ShuffleArrowClientProperties(context);
 	std::shared_ptr<arrow::Schema> record_schema;
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> writer;
 	bool writer_initialized = false;
