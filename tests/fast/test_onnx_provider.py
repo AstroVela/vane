@@ -53,7 +53,7 @@ def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeyp
         {"model_path": "https://host/model"},
         {"model_sha256": "bad"},
         {"dtype": "int3"},
-        {"backend": "auto"},
+        {"backend": "manual"},
         {"max_length": True},
         {"max_length": 8193},
         {"max_input_bytes": 0},
@@ -84,6 +84,37 @@ def test_public_preparation_uses_explicit_backend_resources_and_never_retries(op
     for unsupported in ({"max_retries": 1}, {"max_chunk_chars": 100}, {"chunk_overlap_chars": 0}):
         with pytest.raises(EmbeddingConfigurationError):
             _prepare_embed_call("onnx", None, 128, "ignore", options | unsupported, relation=True)
+
+
+@pytest.mark.parametrize("selected", ["CPUExecutionProvider", "CUDAExecutionProvider", "CoreMLExecutionProvider"])
+def test_auto_uses_native_selection_policy_without_explicit_providers(options, sdk, selected):
+    sdk.automatic_provider = selected
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert [session.get_providers() for session in runtime.sessions.values()] == [[selected]] * 3
+        assert len([event for event in sdk.events if event[0] == "native_selection_policy"]) == 3
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+        assert not sdk.cuda_queries
+        assert not any(event[0] == "preload_cuda" for event in sdk.events)
+        assert all(event[4] is False for event in sdk.events if event[0] == "load")
+        assert len([event for event in sdk.events if event[0] == "disable_fallback"]) == 3
+    finally:
+        runtime.close()
+
+
+def test_auto_initialization_error_does_not_select_another_provider(options, sdk):
+    sdk.failure = RuntimeError("native provider selection failed")
+    with pytest.raises(RuntimeError, match="native provider selection failed"):
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 1
+    assert len([event for event in sdk.events if event[0] == "load"]) == 1
+
+
+def test_auto_native_udf_does_not_guess_accelerator_resources(options):
+    descriptor = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"})
+    with pytest.raises(EmbeddingConfigurationError, match="owned model service"):
+        descriptor.get_udf_options()
 
 
 @pytest.mark.parametrize(

@@ -48,15 +48,22 @@ def install_sdk(monkeypatch):
         provider_options=[],
         run_options=[],
         cuda_queries=[],
+        automatic_provider="CPUExecutionProvider",
     )
     ort = ModuleType("onnxruntime")
     ort.__version__ = "1.26.0"
     ort.get_available_providers = lambda: list(sdk.available)
     ort.preload_dlls = lambda **kwargs: sdk.events.append(("preload_cuda", kwargs))
+    ort.OrtExecutionProviderDevicePolicy = SimpleNamespace(PREFER_GPU="native-prefer-gpu")
 
     class Settings:
         def __init__(self):
             self.entries = {}
+            self.selection_policy = None
+
+        def set_provider_selection_policy(self, policy):
+            self.selection_policy = policy
+            sdk.events.append(("native_selection_policy", policy))
 
         def add_session_config_entry(self, key, value):
             self.entries[key] = value
@@ -73,11 +80,16 @@ def install_sdk(monkeypatch):
     ort.RunOptions = RunSettings
 
     class Session:
-        def __init__(self, path, *, sess_options, providers, enable_fallback):
+        def __init__(self, path, *, sess_options, enable_fallback, providers=None):
             self.tower = Path(path).stem
-            self.selected = providers[0][0]
+            if providers is None:
+                assert sess_options.selection_policy == ort.OrtExecutionProviderDevicePolicy.PREFER_GPU
+                self.selected = sdk.automatic_provider
+                sdk.events.append(("automatic_load", self.tower))
+            else:
+                self.selected = providers[0][0]
             self.live = False
-            sdk.provider_options.append((self.tower, dict(providers[0][1])))
+            sdk.provider_options.append((self.tower, {} if providers is None else dict(providers[0][1])))
             sdk.events.append(
                 ("load", self.tower, threading.get_ident(), self.selected, enable_fallback, sess_options.entries.copy())
             )

@@ -103,8 +103,8 @@ def validate_onnx_options(options: Any, *, text: bool, service: bool = False) ->
             prepared.setdefault(setting, initial)
         if not isinstance(prepared["dtype"], str) or prepared["dtype"] not in ONNX_DTYPES:
             raise EmbeddingConfigurationError("ONNX dtype must be fp32, fp16, q8, q4 or q4f16")
-        if prepared["backend"] not in ("cpu", "cuda", "coreml"):
-            raise EmbeddingConfigurationError("ONNX backend must be cpu, cuda or coreml")
+        if prepared["backend"] not in ("auto", "cpu", "cuda", "coreml"):
+            raise EmbeddingConfigurationError("ONNX backend must be auto, cpu, cuda or coreml")
         for name, minimum, maximum in (("num_threads", 1, 256),):
             if type(prepared[name]) is not int or not minimum <= prepared[name] <= maximum:
                 raise EmbeddingConfigurationError(f"ONNX {name} must be an integer from {minimum} to {maximum}")

@@ -159,8 +159,9 @@ class ONNXEmbedder:
         AutoProcessor = modules["transformers"].AutoProcessor
         validate_software_contract(ort)
 
-        selected = EXECUTION_PROVIDERS[self.options["backend"]]
-        if selected not in ort.get_available_providers():
+        automatic = self.options["backend"] == "auto"
+        selected = None if automatic else EXECUTION_PROVIDERS[self.options["backend"]]
+        if selected is not None and selected not in ort.get_available_providers():
             raise EmbeddingConfigurationError(f"ONNX execution provider {selected} is unavailable")
         if self.options["backend"] == "cuda":
             from vane.ai.providers._onnx_cuda import cuda_arena_limit
@@ -191,13 +192,18 @@ class ONNXEmbedder:
             settings = ort.SessionOptions()
             settings.intra_op_num_threads = self.options["num_threads"]
             settings.inter_op_num_threads = 1
+            provider_arguments: dict[str, Any] = {}
+            if automatic:
+                settings.set_provider_selection_policy(ort.OrtExecutionProviderDevicePolicy.PREFER_GPU)
+            else:
+                provider_arguments["providers"] = [(selected, provider_options)]
             # ORT assigns shape/control nodes to CPU even with CUDA. Keep that
             # graph partitioning; enable_fallback=False forbids backend retries.
             self.sessions[tower] = ort.InferenceSession(
-                str(path), sess_options=settings, providers=[(selected, provider_options)], enable_fallback=False
+                str(path), sess_options=settings, enable_fallback=False, **provider_arguments
             )
             self.sessions[tower].disable_fallback()
-            if self.sessions[tower].get_providers()[0] != selected:
+            if selected is not None and self.sessions[tower].get_providers()[0] != selected:
                 raise EmbeddingConfigurationError("ONNX did not initialize the explicitly selected execution provider")
             expected_inputs = (
                 {"input_ids", "attention_mask", "image_features", "video_features", "audio_features"}

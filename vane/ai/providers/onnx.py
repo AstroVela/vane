@@ -68,6 +68,11 @@ class _ONNXDescriptor:
         return dict(self.options)
 
     def get_udf_options(self) -> UDFOptions:
+        if self.options["backend"] == "auto":
+            raise EmbeddingConfigurationError(
+                "Automatic ONNX device selection requires an owned model service for UDF execution; "
+                "native UDF actors require an explicit backend for accelerator reservation"
+            )
         return UDFOptions(num_gpus=1 if self.options["backend"] == "cuda" else 0)
 
     def get_output_spec(self, *, dimensions: int | None = None) -> EmbeddingOutputSpec:

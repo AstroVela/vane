@@ -80,7 +80,17 @@ inputs receive no text prefix. Use the unified `embed` API with typed
 relations. Native relation calls default to one subprocess actor. CUDA reserves
 a Vane worker GPU; CPU and CoreML reserve none.
 
-The explicit `backend` selects `cpu`, `cuda` or `coreml`.
+The explicit `backend` selects `cpu`, `cuda` or `coreml`. Use `backend="auto"`
+for direct instantiation or a shared model service to delegate selection to
+ONNX Runtime's `SessionOptions.set_provider_selection_policy(PREFER_GPU)`.
+Automatic sessions do not supply a provider list or probe/rank hardware in Vane.
+ORT chooses from its natively discovered EP devices; a compiled-in provider is
+not necessarily discoverable through this API. If only CPU is discovered, the
+native policy selects CPU. Automatic sessions use ORT's provider defaults.
+Initialization and execution errors propagate without provider retries.
+Native UDF actors require an explicit backend for accelerator reservation;
+automatic selection belongs in their shared service, whose clients reserve no
+GPU. The low-level native descriptor's default remains `cpu`.
 CUDA selects logical device 0 in the worker's assigned visible devices;
 use `CUDA_VISIBLE_DEVICES` to select a physical GPU for an external service.
 An unavailable backend or unsupported graph fails. Session initialization and
@@ -89,7 +99,7 @@ its normal graph partitioning: CUDA executes supported model kernels while
 shape/control nodes may execute on CPU. This does not promise every node runs
 on the selected accelerator.
 
-CUDA sessions use a finite arena ceiling derived once from visible device 0's
+Explicit CUDA sessions use a finite arena ceiling derived once from visible device 0's
 free memory, reserving the larger of 25% of total device memory or 512 MiB for
 the other graph sessions and SDK/driver allocations. The probe balances its
 primary-context retain and context-stack push/pop before constructing any ORT
