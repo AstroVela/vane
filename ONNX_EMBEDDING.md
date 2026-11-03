@@ -86,6 +86,8 @@ selection to ORT's `SessionOptions.set_provider_selection_policy(PREFER_GPU)`.
 Automatic sessions do not pass an explicit provider list, probe hardware in
 Vane or retry another backend after failure. If ORT discovers no GPU, its
 initial selection may be CPU. An initialization or inference error propagates.
+Auto sessions retain explicit CUDA's disabled TF32 setting through native EP
+session configuration; device selection does not change that numerical policy.
 
 A CUDA-enabled ORT package first registers its bundled CUDA EP library through
 `register_execution_provider_library()`, after `preload_dlls(directory="")`.
@@ -99,7 +101,7 @@ The fixed ORT 1.26.0 native factory list does not expose CoreML. Use explicit
 Native UDF actors need an explicit backend to reserve accelerator resources.
 Their automatic selection must live in a shared service; service clients still
 reserve zero GPUs. The low-level native descriptor default remains `cpu`.
-This changes neither encoding identity nor package/dependency versions.
+This changes neither encoding identity, dependency pins nor version configuration.
 
 CUDA selects logical device 0 in the worker's assigned visible devices;
 use `CUDA_VISIBLE_DEVICES` to select a physical GPU for an external service.

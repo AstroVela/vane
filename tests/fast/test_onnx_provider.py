@@ -5,6 +5,7 @@
 
 import pickle
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -93,10 +94,18 @@ def test_auto_delegates_selection_to_ort_without_explicit_providers(options, sdk
     try:
         assert len(runtime.embed_text(["query"])) == 1
         assert [session.get_providers() for session in runtime.sessions.values()] == [[selected]] * 3
-        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+        preloads = [event for event in sdk.events if event[0] == "preload_cuda"]
+        registrations = [event for event in sdk.events if event[0] == "register_native_ep"]
+        assert len(preloads) == len(registrations) == 1
+        assert preloads[0][1] == {"directory": ""}
+        library = "onnxruntime_providers_cuda.dll" if sys.platform == "win32" else "libonnxruntime_providers_cuda.so"
+        assert registrations[0][2] == str(Path(sys.modules["onnxruntime"].__file__).parent / "capi" / library)
+        first_load = next(event for event in sdk.events if event[0] == "automatic_load")
+        assert sdk.events.index(preloads[0]) < sdk.events.index(registrations[0]) < sdk.events.index(first_load)
         assert len([event for event in sdk.events if event[0] == "native_selection_policy"]) == 3
         assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
         assert all(event[4] is False for event in sdk.events if event[0] == "load")
+        assert all(event[5] == {"ep.cudaexecutionprovider.use_tf32": "0"} for event in sdk.events if event[0] == "load")
         assert len([event for event in sdk.events if event[0] == "disable_fallback"]) == 3
     finally:
         runtime.close()

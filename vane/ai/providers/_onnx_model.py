@@ -198,6 +198,7 @@ class ONNXEmbedder:
             provider_arguments: dict[str, Any] = {}
             if automatic:
                 settings.set_provider_selection_policy(ort.OrtExecutionProviderDevicePolicy.PREFER_GPU)
+                settings.add_session_config_entry("ep.cudaexecutionprovider.use_tf32", "0")
             else:
                 provider_arguments["providers"] = [(selected, provider_options)]
             # ORT assigns shape/control nodes to CPU even with CUDA. Keep that
