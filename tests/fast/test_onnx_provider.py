@@ -53,7 +53,7 @@ def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeyp
         {"model_path": "https://host/model"},
         {"model_sha256": "bad"},
         {"dtype": "int3"},
-        {"backend": "auto"},
+        {"backend": "manual"},
         {"max_length": True},
         {"max_length": 8193},
         {"max_input_bytes": 0},
@@ -84,6 +84,95 @@ def test_public_preparation_uses_explicit_backend_resources_and_never_retries(op
     for unsupported in ({"max_retries": 1}, {"max_chunk_chars": 100}, {"chunk_overlap_chars": 0}):
         with pytest.raises(EmbeddingConfigurationError):
             _prepare_embed_call("onnx", None, 128, "ignore", options | unsupported, relation=True)
+
+
+@pytest.mark.parametrize("selected", ["CPUExecutionProvider", "CUDAExecutionProvider"])
+def test_auto_delegates_selection_to_ort_without_explicit_providers(options, sdk, selected):
+    sdk.automatic_provider = selected
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert [session.get_providers() for session in runtime.sessions.values()] == [[selected]] * 3
+        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+        assert len([event for event in sdk.events if event[0] == "native_selection_policy"]) == 3
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+        assert all(event[4] is False for event in sdk.events if event[0] == "load")
+        assert len([event for event in sdk.events if event[0] == "disable_fallback"]) == 3
+    finally:
+        runtime.close()
+
+
+def test_auto_cpu_only_runtime_does_not_register_cuda(options, sdk):
+    sdk.available = ["CPUExecutionProvider"]
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert not any(event[0] in {"register_native_ep", "preload_cuda"} for event in sdk.events)
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+    finally:
+        runtime.close()
+
+
+def test_auto_instances_share_registration_after_another_model_closes(options, sdk):
+    first = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    second = None
+    try:
+        second = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+        first.close()
+        assert len(second.embed_text(["query"])) == 1
+        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+        assert len([event for event in sdk.events if event[0] == "load"]) == 6
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+    assert sdk.active == 0
+
+
+def test_auto_registration_failure_never_starts_cpu_sessions(options, sdk):
+    error = sdk.registration_failure = RuntimeError("CUDA EP registration failed")
+    with pytest.raises(RuntimeError) as caught:
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert caught.value is error
+    assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+    assert not any(event[0] == "load" for event in sdk.events)
+
+
+def test_auto_session_initialization_failure_never_retries(options, sdk):
+    sdk.failure = RuntimeError("native provider initialization failed")
+    with pytest.raises(RuntimeError, match="native provider initialization"):
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 1
+    assert len([event for event in sdk.events if event[0] == "load"]) == 1
+
+
+def test_auto_execution_failure_does_not_recreate_sessions(options, sdk, monkeypatch):
+    sdk.automatic_provider = "CUDAExecutionProvider"
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    attempts = []
+    error = RuntimeError("native provider execution failed")
+
+    def fail(*args, **kwargs):
+        attempts.append(1)
+        raise error
+
+    monkeypatch.setattr(type(runtime.sessions["model"]), "run", fail)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            runtime.embed_text(["query"])
+        assert caught.value is error and attempts == [1]
+        assert len([event for event in sdk.events if event[0] == "load"]) == 3
+    finally:
+        error.__traceback__ = None
+        del caught
+        runtime.close()
+    assert sdk.active == 0
+
+
+def test_auto_native_udf_requires_explicit_accelerator_reservation(options):
+    descriptor = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"})
+    with pytest.raises(EmbeddingConfigurationError, match="owned model service"):
+        descriptor.get_udf_options()
 
 
 @pytest.mark.parametrize(

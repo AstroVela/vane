@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from weakref import WeakSet
 
 import numpy as np
 
@@ -32,8 +34,24 @@ EXECUTION_PROVIDERS = {
     "cuda": "CUDAExecutionProvider",
     "coreml": "CoreMLExecutionProvider",
 }
+_NATIVE_EP_LOCK = threading.Lock()
+_CUDA_REGISTERED: WeakSet = WeakSet()
 
 PROCESSOR_VERSIONS = {"transformers": "5.21.0", "torch": "2.14.1", "torchvision": "0.29.1", "Pillow": "12.3.0"}
+
+
+def register_native_cuda(ort: Any) -> None:
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        return
+    with _NATIVE_EP_LOCK:
+        if ort in _CUDA_REGISTERED:
+            return
+        ort.preload_dlls(directory="")
+        library = "onnxruntime_providers_cuda.dll" if sys.platform == "win32" else "libonnxruntime_providers_cuda.so"
+        ort.register_execution_provider_library("vane-onnx-cuda", str(Path(ort.__file__).parent / "capi" / library))
+        # ORT owns this process-wide factory. Other model instances may still
+        # use it after this instance releases its sessions.
+        _CUDA_REGISTERED.add(ort)
 
 
 def processor_versions() -> dict[str, str]:
@@ -154,8 +172,11 @@ class ONNXEmbedder:
         AutoProcessor = modules["transformers"].AutoProcessor
         validate_software_contract(ort)
 
-        selected = EXECUTION_PROVIDERS[self.options["backend"]]
-        if selected not in ort.get_available_providers():
+        automatic = self.options["backend"] == "auto"
+        if automatic:
+            register_native_cuda(ort)
+        selected = None if automatic else EXECUTION_PROVIDERS[self.options["backend"]]
+        if selected is not None and selected not in ort.get_available_providers():
             raise EmbeddingConfigurationError(f"ONNX execution provider {selected} is unavailable")
         if self.options["backend"] == "cuda":
             ort.preload_dlls(directory="")
@@ -174,13 +195,18 @@ class ONNXEmbedder:
             settings = ort.SessionOptions()
             settings.intra_op_num_threads = self.options["num_threads"]
             settings.inter_op_num_threads = 1
+            provider_arguments: dict[str, Any] = {}
+            if automatic:
+                settings.set_provider_selection_policy(ort.OrtExecutionProviderDevicePolicy.PREFER_GPU)
+            else:
+                provider_arguments["providers"] = [(selected, provider_options)]
             # ORT assigns shape/control nodes to CPU even with CUDA. Keep that
             # graph partitioning; enable_fallback=False forbids backend retries.
             self.sessions[tower] = ort.InferenceSession(
-                str(path), sess_options=settings, providers=[(selected, provider_options)], enable_fallback=False
+                str(path), sess_options=settings, enable_fallback=False, **provider_arguments
             )
             self.sessions[tower].disable_fallback()
-            if self.sessions[tower].get_providers()[0] != selected:
+            if selected is not None and self.sessions[tower].get_providers()[0] != selected:
                 raise EmbeddingConfigurationError("ONNX did not initialize the explicitly selected execution provider")
             expected_inputs = (
                 {"input_ids", "attention_mask", "image_features", "video_features", "audio_features"}

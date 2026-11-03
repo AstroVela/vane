@@ -65,9 +65,13 @@ def test_service_planning_retains_native_space_and_reserves_no_gpu(tmp_path, opt
     assert not (tmp_path / "service").exists()
 
 
-def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, options, sdk):
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "auto"])
+def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, options, sdk, backend):
+    if backend == "auto":
+        sdk.automatic_provider = "CUDAExecutionProvider"
+
     async def scenario():
-        service = instance(tmp_path, options)
+        service = instance(tmp_path, options | {"backend": backend})
         await service.start()
         provider = load_provider("onnx")
         document = provider.get_text_embedder(dimensions=128, options=client_options(tmp_path, options)).instantiate()
@@ -79,6 +83,9 @@ def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, 
             assert not np.array_equal(docs[0], queries[0])
             assert len([event for event in sdk.events if event[0] == "load"]) == 3
             assert len({event[2] for event in sdk.events if event[0] in {"load", "run"}}) == 1
+            if backend == "auto":
+                assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+                assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
         finally:
             await document.aclose()
             await query.aclose()
