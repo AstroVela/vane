@@ -47,9 +47,11 @@ def install_sdk(monkeypatch):
         returned_provider=None,
         automatic_provider="CPUExecutionProvider",
         registration_failure=None,
+        external_cuda_registered=False,
     )
     ort = ModuleType("onnxruntime")
     ort.__version__ = "1.26.0"
+    ort.cuda_version = "12.8"
     ort.__file__ = str(Path("fixture-sdk") / "onnxruntime" / "__init__.py")
     ort.get_available_providers = lambda: list(sdk.available)
     ort.preload_dlls = lambda **kwargs: sdk.events.append(("preload_cuda", kwargs))
@@ -83,7 +85,7 @@ def install_sdk(monkeypatch):
                 assert sess_options.selection_policy == ort.OrtExecutionProviderDevicePolicy.PREFER_GPU
                 self.selected = sdk.automatic_provider
                 if self.selected == "CUDAExecutionProvider":
-                    assert any(event[0] == "register_native_ep" for event in sdk.events)
+                    assert sdk.external_cuda_registered or any(event[0] == "register_native_ep" for event in sdk.events)
                 sdk.events.append(("automatic_load", self.tower))
             else:
                 self.selected = providers[0][0]

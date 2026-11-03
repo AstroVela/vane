@@ -111,11 +111,16 @@ def test_auto_delegates_selection_to_ort_without_explicit_providers(options, sdk
         runtime.close()
 
 
-def test_auto_cpu_only_runtime_does_not_register_cuda(options, sdk):
-    sdk.available = ["CPUExecutionProvider"]
+@pytest.mark.parametrize("external_cuda", [False, True])
+def test_auto_cpu_package_does_not_load_bundled_cuda(options, sdk, external_cuda):
+    sys.modules["onnxruntime"].cuda_version = ""
+    sdk.available = ["CPUExecutionProvider"] + (["CUDAExecutionProvider"] if external_cuda else [])
+    sdk.external_cuda_registered = external_cuda
+    sdk.automatic_provider = "CUDAExecutionProvider" if external_cuda else "CPUExecutionProvider"
     runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
     try:
         assert len(runtime.embed_text(["query"])) == 1
+        assert [session.get_providers() for session in runtime.sessions.values()] == [[sdk.automatic_provider]] * 3
         assert not any(event[0] in {"register_native_ep", "preload_cuda"} for event in sdk.events)
         assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
     finally:

@@ -41,7 +41,7 @@ PROCESSOR_VERSIONS = {"transformers": "5.21.0", "torch": "2.14.1", "torchvision"
 
 
 def register_native_cuda(ort: Any) -> None:
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
+    if not ort.cuda_version:
         return
     with _NATIVE_EP_LOCK:
         if ort in _CUDA_REGISTERED:

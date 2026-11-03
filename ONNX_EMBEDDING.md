@@ -91,8 +91,10 @@ session configuration; device selection does not change that numerical policy.
 
 A CUDA-enabled ORT package first registers its bundled CUDA EP library through
 `register_execution_provider_library()`, after `preload_dlls(directory="")`.
-The compiled provider list only identifies the library to register; actual
-hardware discovery and selection belong to ORT. The process-wide ORT environment
+ORT's `cuda_version` package metadata identifies a bundled CUDA build. The
+available-provider list can include host-registered external EPs and does not
+identify package contents. Hardware discovery and selection belong to ORT.
+The process-wide ORT environment
 owns this registration, shared by model instances so closing one model cannot
 unregister a factory still used by another. Registration errors propagate.
 The fixed ORT 1.26.0 native factory list does not expose CoreML. Use explicit
