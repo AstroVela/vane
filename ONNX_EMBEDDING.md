@@ -112,6 +112,26 @@ execution failures propagate without retrying another backend. ORT still uses
 its normal graph partitioning: CUDA executes supported model kernels while
 shape/control nodes may execute on CPU. This does not promise every node runs
 on the selected accelerator.
+
+CUDA sessions use a finite arena ceiling derived once from visible device 0's
+free memory, reserving the larger of 25% of total device memory or 512 MiB for
+the other graph sessions and SDK/driver allocations. The probe balances its
+primary-context retain and context-stack push/pop before constructing any ORT
+session. It does not load a GPU Torch model or require NVML.
+The three sessions run serially. Every graph call uses ORT's
+`memory.enable_memory_arena_shrinkage=gpu:0`, paired with
+`arena_extend_strategy=kSameAsRequested`, to return unused CUDA arena blocks
+between encoders and the sentence model while keeping live model weights.
+Exact-size arena growth without reclamation is insufficient: varying frame
+counts can retain fragmented workspaces and spill into Windows shared GPU
+memory. All supplied frames and the processor/embedding identity are preserved.
+
+This ceiling limits each ORT CUDA arena, not total process/device usage or
+allocations outside that arena. Other processes can consume memory after the
+probe. Capacity and inference errors propagate without retries, backend
+switches or frame truncation. CPU/CoreML retain their existing session policy.
+No extra Context configuration is required; `local_shm_store_bytes` controls
+CPU IPC storage independently of CUDA workspace memory.
 ONNX Runtime supports multiple operating systems, but availability and graph/
 quantization support depend on the selected execution provider. A platform
 claim requires a real run there. The generic Vane subprocess launcher currently

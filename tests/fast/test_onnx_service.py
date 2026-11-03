@@ -86,6 +86,9 @@ def test_concurrent_roles_use_one_external_engine_and_release_credits(tmp_path, 
             if backend == "auto":
                 assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
                 assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+            if backend == "cuda":
+                assert sdk.cuda_queries == [next(event[2] for event in sdk.events if event[0] == "load")]
+                assert all(value == {"memory.enable_memory_arena_shrinkage": "gpu:0"} for _, value in sdk.run_options)
         finally:
             await document.aclose()
             await query.aclose()

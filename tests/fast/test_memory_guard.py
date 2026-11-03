@@ -133,6 +133,65 @@ def test_memory_guard_ignores_inaccessible_sessions(monkeypatch):
     assert module.owned_processes(root) == [root]
 
 
+@pytest.fixture
+def environment_ownership_probe(monkeypatch):
+    spec = importlib.util.spec_from_file_location("vane_memory_guard", _GUARD)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    root = psutil.Process()
+
+    class Process:
+        def __init__(self, pid, environment):
+            self.pid, self.environment = pid, environment
+
+        def create_time(self):
+            return root.create_time() + 1
+
+        def is_running(self):
+            return True
+
+        def environ(self):
+            if isinstance(self.environment, Exception):
+                raise self.environment
+            return {module._OWNER_ENV: self.environment}
+
+    monkeypatch.setattr(module, "owned_process_tree", lambda _: [root])
+    monkeypatch.setattr(os, "getsid", lambda _pid: root.pid + 100)
+    return module, root, Process
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX environment ownership")
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_memory_guard_skips_denied_environments_and_retains_owned_processes(
+    monkeypatch, environment_ownership_probe, wrapped
+):
+    module, root, Process = environment_ownership_probe
+    error = PermissionError("force permission denied")
+    if wrapped:
+        wrapper = SystemError("proc_environ returned a result with an exception set")
+        wrapper.__cause__ = error
+        error = wrapper
+    inaccessible = Process(10, error)
+    known_child = Process(11, error)
+    detached_owner = Process(12, "parent:chosen:child")
+    unrelated = Process(13, "chosen-suffix")
+    monkeypatch.setattr(module, "owned_process_tree", lambda _: [root, known_child])
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter([inaccessible, known_child, detached_owner, unrelated]))
+    assert set(module.owned_processes(root, token="chosen")) == {root, known_child, detached_owner}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX environment ownership")
+@pytest.mark.parametrize("cause", [None, ValueError("unexpected parser failure")])
+def test_memory_guard_propagates_unexpected_environment_system_errors(monkeypatch, environment_ownership_probe, cause):
+    module, root, Process = environment_ownership_probe
+    error = SystemError("unexpected environment failure")
+    error.__cause__ = cause
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter([Process(10, error)]))
+    with pytest.raises(SystemError) as caught:
+        module.owned_processes(root, token="chosen")
+    assert caught.value is error
+
+
 @pytest.mark.parametrize("failure", ["memory", "timeout"])
 @pytest.mark.parametrize(
     "separate_process_group",
