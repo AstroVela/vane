@@ -96,11 +96,48 @@ def test_auto_uses_native_selection_policy_without_explicit_providers(options, s
         assert len([event for event in sdk.events if event[0] == "native_selection_policy"]) == 3
         assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
         assert not sdk.cuda_queries
-        assert not any(event[0] == "preload_cuda" for event in sdk.events)
+        assert len([event for event in sdk.events if event[0] == "preload_cuda"]) == 1
+        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
         assert all(event[4] is False for event in sdk.events if event[0] == "load")
         assert len([event for event in sdk.events if event[0] == "disable_fallback"]) == 3
     finally:
         runtime.close()
+
+
+def test_auto_cpu_only_runtime_does_not_register_cuda(options, sdk):
+    sdk.available = ["CPUExecutionProvider"]
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert not any(event[0] in {"register_native_ep", "preload_cuda"} for event in sdk.events)
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+    finally:
+        runtime.close()
+
+
+def test_auto_model_instances_share_one_process_registration(options, sdk):
+    first = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    second = None
+    try:
+        second = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+        first.close()
+        assert len(second.embed_text(["query"])) == 1
+        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+        assert len([event for event in sdk.events if event[0] == "load"]) == 6
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+    assert sdk.active == 0
+
+
+def test_auto_registration_failure_does_not_start_cpu_sessions(options, sdk):
+    error = sdk.registration_failure = RuntimeError("CUDA EP registration failed")
+    with pytest.raises(RuntimeError) as caught:
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert caught.value is error
+    assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+    assert not any(event[0] == "load" for event in sdk.events)
 
 
 def test_auto_initialization_error_does_not_select_another_provider(options, sdk):

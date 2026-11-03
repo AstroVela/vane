@@ -49,12 +49,21 @@ def install_sdk(monkeypatch):
         run_options=[],
         cuda_queries=[],
         automatic_provider="CPUExecutionProvider",
+        registration_failure=None,
     )
     ort = ModuleType("onnxruntime")
     ort.__version__ = "1.26.0"
+    ort.__file__ = str(Path("fixture-sdk") / "onnxruntime" / "__init__.py")
     ort.get_available_providers = lambda: list(sdk.available)
     ort.preload_dlls = lambda **kwargs: sdk.events.append(("preload_cuda", kwargs))
     ort.OrtExecutionProviderDevicePolicy = SimpleNamespace(PREFER_GPU="native-prefer-gpu")
+
+    def register_library(name, path):
+        sdk.events.append(("register_native_ep", name, path))
+        if sdk.registration_failure is not None:
+            raise sdk.registration_failure
+
+    ort.register_execution_provider_library = register_library
 
     class Settings:
         def __init__(self):

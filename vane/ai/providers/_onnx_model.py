@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from weakref import WeakSet
 
 import numpy as np
 
@@ -33,8 +35,24 @@ EXECUTION_PROVIDERS = {
     "cuda": "CUDAExecutionProvider",
     "coreml": "CoreMLExecutionProvider",
 }
+_NATIVE_EP_LOCK = threading.Lock()
+_CUDA_REGISTERED: WeakSet = WeakSet()
 
 PROCESSOR_VERSIONS = {"transformers": "5.21.0", "torch": "2.14.1", "torchvision": "0.29.1", "Pillow": "12.3.0"}
+
+
+def register_native_cuda(ort: Any) -> None:
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        return
+    with _NATIVE_EP_LOCK:
+        if ort in _CUDA_REGISTERED:
+            return
+        ort.preload_dlls(directory="")
+        library = "onnxruntime_providers_cuda.dll" if sys.platform == "win32" else "libonnxruntime_providers_cuda.so"
+        ort.register_execution_provider_library("vane-onnx-cuda", str(Path(ort.__file__).parent / "capi" / library))
+        # ORT's process environment owns the factory. Keep it registered while
+        # other model instances may still have sessions using the same factory.
+        _CUDA_REGISTERED.add(ort)
 
 
 def processor_versions() -> dict[str, str]:
@@ -160,6 +178,8 @@ class ONNXEmbedder:
         validate_software_contract(ort)
 
         automatic = self.options["backend"] == "auto"
+        if automatic:
+            register_native_cuda(ort)
         selected = None if automatic else EXECUTION_PROVIDERS[self.options["backend"]]
         if selected is not None and selected not in ort.get_available_providers():
             raise EmbeddingConfigurationError(f"ONNX execution provider {selected} is unavailable")

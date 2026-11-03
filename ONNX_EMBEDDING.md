@@ -83,6 +83,12 @@ a Vane worker GPU; CPU and CoreML reserve none.
 The explicit `backend` selects `cpu`, `cuda` or `coreml`. Use `backend="auto"`
 for direct instantiation or a shared model service to delegate selection to
 ONNX Runtime's `SessionOptions.set_provider_selection_policy(PREFER_GPU)`.
+For a CUDA-enabled ORT package, Vane first calls ORT's
+`register_execution_provider_library()` for that package's CUDA EP library.
+The compiled provider list identifies the library to register, not hardware to
+select. ORT then discovers the actual GPU devices. Registration is shared by
+model instances for the lifetime of ORT's process environment; model sessions
+are still released by their owner. Registration failures propagate directly.
 Automatic sessions do not supply a provider list or probe/rank hardware in Vane.
 ORT chooses from its natively discovered EP devices; a compiled-in provider is
 not necessarily discoverable through this API. If only CPU is discovered, the
