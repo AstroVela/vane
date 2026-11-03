@@ -360,6 +360,7 @@ include = [
     "/tests/ai/test_mlx_text_embedding.py",
     "/tests/fast/test_litert_provider.py",
     "/tests/fast/test_onnx_provider.py",
+    "/tests/fast/test_onnx_cuda_memory.py",
     "/tests/fast/test_onnx_service.py",
     "/tests/onnx_fixture.py",
     "/tests/ai/test_onnx_embedding.py",
