@@ -214,7 +214,7 @@ def install_sdk(monkeypatch):
         sdk.cuda_queries.append(threading.get_ident())
         return 8 * 1024**3
 
-    monkeypatch.setattr(_onnx_cuda, "cuda_arena_limit", cuda_limit)
+    monkeypatch.setitem(_onnx_cuda.__dict__, "cuda_arena_limit", cuda_limit)
 
     monkeypatch.setitem(_onnx_model.__dict__, "processor_versions", lambda: dict(_onnx_model.PROCESSOR_VERSIONS))
     return sdk
