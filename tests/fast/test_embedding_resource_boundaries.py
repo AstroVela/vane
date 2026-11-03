@@ -116,7 +116,7 @@ def test_native_allocation_failure_precedes_ignore_and_retry(monkeypatch, family
 
     sdk.on_embedding = fail
     descriptor = getattr(load_provider(family), f"get_{'multimodal' if joint else 'text'}_embedder")(
-        "fixture", 2, options={"gpus_per_actor": 0}
+        "fixture", 2, options={"gpus_per_actor": 1}
     )
     kwargs = {"parts": (EmbeddingPartSpec("text"),)} if joint else {}
     wrapper = (_EmbedMultimodalBatch if joint else _EmbedTextBatch)(
@@ -153,7 +153,7 @@ def test_service_wrapped_allocation_returns_fatal_category(tmp_path, monkeypatch
         family=family,
         model="fixture",
         dimensions=2,
-        options={"gpus_per_actor": 0},
+        options={"gpus_per_actor": 1},
         max_inflight=1,
     )
 
@@ -192,7 +192,7 @@ def test_service_client_allocation_failure_is_fatal_and_closes_socket(tmp_path, 
         family=family,
         model="fixture",
         dimensions=2,
-        options={"gpus_per_actor": 0},
+        options={"gpus_per_actor": 1},
         max_inflight=1,
     )
 
@@ -251,7 +251,7 @@ def test_native_image_modes_reach_processor_without_conversion(monkeypatch, fami
     sdk = install_sdk(monkeypatch.setitem)
     pixels = pixels_for(mode, channels, dtype)
     descriptor = getattr(load_provider(family), f"get_{'multimodal' if joint else 'image'}_embedder")(
-        "fixture", 2, options={"gpus_per_actor": 0}
+        "fixture", 2, options={"gpus_per_actor": 1}
     )
 
     async def run():
@@ -295,7 +295,7 @@ def test_native_image_validation_keeps_joint_limits(monkeypatch, family, invalid
         pixels = pixels[:, :, 0]
     elif invalid == "dtype":
         pixels = pixels.astype(np.float64)
-    options = {"gpus_per_actor": 0, "max_input_bytes": pixels.nbytes + 2}
+    options = {"gpus_per_actor": 1, "max_input_bytes": pixels.nbytes + 2}
     if invalid == "layout":
         options["input_modalities"] = ["text"]
     descriptor = load_provider(family).get_multimodal_embedder("fixture", 2, options=options)
@@ -341,7 +341,7 @@ def test_native_float_image_real_processor_parity(monkeypatch, make_real_video_p
         text=["<|image_pad|>"], images=[pixels], do_rescale=False, return_tensors="pt", add_special_tokens=False
     )
     descriptor = load_provider(family).get_image_embedder(
-        "fixture", 2, options={"gpus_per_actor": 0, "processor_kwargs": {"images_kwargs": {"do_rescale": False}}}
+        "fixture", 2, options={"gpus_per_actor": 1, "processor_kwargs": {"images_kwargs": {"do_rescale": False}}}
     )
     wrapper = _EmbedImageBatch(descriptor, "image", "vector", 2, on_error="ignore")
     runtime = AsyncRuntime()
@@ -381,6 +381,12 @@ def check_public_native_resource_failure(monkeypatch, family, backend, *, phase=
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
     class WorkerDescriptor(NativeMultimodalEmbedderDescriptor):
+        def get_udf_options(self):
+            # The SDK double runs on CPU; this is not a production admission bypass.
+            from vane.ai.typing import UDFOptions
+
+            return UDFOptions(num_gpus=0)
+
         def instantiate(self):
             if phase == "initialization":
                 raise MemoryError("private native initialization credential")
@@ -406,7 +412,7 @@ def check_public_native_resource_failure(monkeypatch, family, backend, *, phase=
                 provider=family,
                 model="fixture",
                 dimensions=2,
-                gpus_per_actor=0,
+                gpus_per_actor=1,
                 execution_backend=backend,
                 on_error=on_error,
                 max_retries=3,

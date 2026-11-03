@@ -387,6 +387,9 @@ def test_vllm_engine_initialization_error_is_credential_safe(monkeypatch):
     fake_vllm.AsyncEngineArgs = AsyncEngineArgs
     fake_vllm.AsyncLLMEngine = object
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    platforms = ModuleType("vllm.platforms")
+    platforms.current_platform = SimpleNamespace(device_type="cuda")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
 
     executor = LocalVLLMExecutor.__new__(LocalVLLMExecutor)
     executor.model = "local-model"

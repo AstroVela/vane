@@ -31,6 +31,7 @@ from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
 from vane.ai._errors import _raise_if_resource_error
 from vane.ai._media import PromptMedia, normalize_media_content_type
+from vane.ai._native_device import normalize_native_gpu_options, require_native_cuda
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.embedding import Modality
 from vane.ai.options import (
@@ -92,25 +93,15 @@ def _engine_options(family: str, options: dict[str, Any], *, embedding: bool) ->
     args["trust_remote_code"] = False
     # An engine must stay inside its Vane worker's resource reservation.
     if family == "vllm":
-        parallel = ("tensor_parallel_size", "pipeline_parallel_size")
         if args.get("distributed_executor_backend", "mp") != "mp" or args.get("data_parallel_size", 1) != 1:
             raise ValueError("Native multimodal vLLM requires worker-local mp execution and data_parallel_size=1")
         args["distributed_executor_backend"] = "mp"
         args["runner"] = "pooling" if embedding else "generate"
     else:
-        parallel = ("tp_size", "pp_size")
         if args.get("nnodes", 1) != 1 or args.get("dp_size", 1) != 1:
             raise ValueError("Native multimodal SGLang requires nnodes=1 and dp_size=1")
         args["is_embedding"] = embedding
-    required = 1
-    for name in parallel:
-        value = args.get(name, 1)
-        if type(value) is not int or value < 1:
-            raise ValueError(f"engine_args.{name} must be a positive integer")
-        required *= value
-    gpus = options.setdefault("gpus_per_actor", required)
-    if type(gpus) is not int or gpus < 0 or (gpus and gpus < required):
-        raise ValueError("gpus_per_actor must be a nonnegative integer covering engine parallelism")
+    normalize_native_gpu_options(family, options)
     _positive(options, "max_input_bytes", 64 * 1024**2, 64 * 1024**2)
     if embedding or family == "vllm":
         _positive(options, "max_frames", 64, 256)
@@ -419,6 +410,7 @@ class _NativeRuntime:
         self.closed = False
         self._closing = False
         with _translate_missing_provider_dependency(descriptor.family, descriptor.family):
+            require_native_cuda(descriptor.family, self.options["engine_args"])
             from transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
                 AutoProcessor,
                 PreTrainedTokenizerBase,

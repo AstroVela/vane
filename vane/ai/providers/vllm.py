@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._native_device import normalize_native_gpu_options
 from vane.ai._redaction import Secret, wrap_sensitive_options
 from vane.ai.options import (
     _reject_sensitive_prompt_options,
@@ -126,11 +127,6 @@ def _validate_vllm_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
         _require_prompt_int(copied, name, minimum=0)
     _require_prompt_number(copied, "prefix_match_threshold", minimum=0, maximum=1)
     _require_prompt_number(copied, "engine_init_timeout_s", minimum=0, nullable=True)
-    if "gpus_per_actor" in copied:
-        _require_prompt_number(copied, "gpus_per_actor", minimum=0)
-        value = float(copied["gpus_per_actor"])
-        if value <= 0 or (value >= 1 and not value.is_integer()):
-            raise ValueError("Prompt option 'gpus_per_actor' must be positive and must be an integer when >= 1")
     if "do_prefix_routing" in copied and not isinstance(copied["do_prefix_routing"], bool):
         raise ValueError("Prompt option 'do_prefix_routing' must be a bool")
 
@@ -157,6 +153,7 @@ def _validate_vllm_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
         _require_prompt_number({nested_name: sampling_params["temperature"]}, nested_name, minimum=0, nullable=True)
 
     engine_args = copied.get("engine_args", {})
+    normalize_native_gpu_options("vllm", copied, fractional=True)
     if "model" in engine_args:
         raise ValueError("Prompt option 'engine_args.model' is not supported; use the top-level 'model' argument")
     if "trust_remote_code" in engine_args and not isinstance(engine_args["trust_remote_code"], bool):

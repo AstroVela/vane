@@ -20,6 +20,7 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.ai._errors import DiagnosticError
+from vane.ai._native_device import normalize_native_gpu_options, require_native_cuda
 from vane.ai.provider import (
     _SafeProviderError,
     _translate_missing_provider_dependency,
@@ -202,6 +203,7 @@ class LocalVLLMExecutor(VLLMExecutor, LocalEngineExecutor):
 
     def _create_engine(self) -> None:
         with _translate_missing_provider_dependency("vllm", "vllm"):
+            require_native_cuda("vllm", self.engine_args)
             from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
                 AsyncEngineArgs,
                 AsyncLLMEngine,
@@ -1704,19 +1706,6 @@ def _boolean_option(name: str, value: Any) -> bool:
     return value
 
 
-def _fractional_gpu_option(value: Any) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
-        raise ValueError("vllm gpus_per_actor must be a finite positive number")
-    result = float(value)
-    if not math.isfinite(result) or result <= 0:
-        raise ValueError("vllm gpus_per_actor must be a finite positive number")
-    if result >= 1:
-        if not result.is_integer():
-            raise ValueError("vllm gpus_per_actor values >= 1 must be integers")
-        return int(result)
-    return result
-
-
 def _unit_interval_option(name: str, value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
         raise ValueError(f"vllm {name} must be a finite number in [0, 1]")
@@ -1753,7 +1742,6 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
         raise ValueError(f"unknown vllm option(s): {', '.join(unknown)}")
     merged.update(options)
     merged["concurrency"] = _integer_option("concurrency", merged["concurrency"], minimum=1)
-    merged["gpus_per_actor"] = _fractional_gpu_option(merged["gpus_per_actor"])
     for name in (
         "do_prefix_routing",
         "use_ray",
@@ -1783,6 +1771,9 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
     merged["on_error"] = on_error
     merged["engine_args"] = dict(merged["engine_args"] or {})
     merged["generate_args"] = dict(merged["generate_args"] or {})
+    if "gpus_per_actor" not in options:
+        merged.pop("gpus_per_actor")
+    normalize_native_gpu_options("vllm", merged, fractional=True)
     if "ray_actor_pool_name" in merged and merged["ray_actor_pool_name"] is not None:
         merged["ray_actor_pool_name"] = str(merged["ray_actor_pool_name"])
         # Shared actor pool: low inflight_limit (default 128) enforces streaming

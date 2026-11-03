@@ -752,7 +752,7 @@ def test_long_text_uses_input_budget_and_matches_native_processor(tmp_path, monk
     size = len(value.encode("utf-8")) + (96 if joint else 0)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
-    options = {"gpus_per_actor": 0, "max_input_bytes": size}
+    options = {"gpus_per_actor": 1, "max_input_bytes": size}
     descriptor = getattr(load_provider(family), f"get_{'multimodal' if joint else 'text'}_embedder")(
         "fixture", 2, options=options
     )
@@ -848,7 +848,7 @@ def test_input_and_identity_errors_are_not_ignored(process, family):
 def test_joint_audio_video_and_text_use_one_native_request(tmp_path, monkeypatch, family, transport):
     state = install_sdk(monkeypatch.setitem)
     options = {
-        "gpus_per_actor": 0,
+        "gpus_per_actor": 1,
         "input_modalities": ["text", "image", "video", "audio"],
         "sample_rate": 16000,
         "max_samples": 16000,
@@ -916,7 +916,7 @@ def test_real_processor_equal_for_direct_and_shared_frames(
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
     options = {
-        "gpus_per_actor": 0,
+        "gpus_per_actor": 1,
         "processor_kwargs": {"videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}}},
     }
     clip = VideoClip(
@@ -1207,7 +1207,7 @@ def test_resource_failures_remain_fatal_with_ignore(tmp_path, monkeypatch, failu
         family="sglang",
         model="fixture",
         dimensions=2,
-        options={"gpus_per_actor": 0},
+        options={"gpus_per_actor": 1},
     )
 
     async def run():
@@ -1249,7 +1249,7 @@ def test_handler_cancellation_joins_processor_before_unmapping(tmp_path, monkeyp
             family="sglang",
             model="fixture",
             dimensions=2,
-            options={"gpus_per_actor": 0},
+            options={"gpus_per_actor": 1},
         )
         await service.start()
         instance = client(root)
@@ -1851,6 +1851,6 @@ def make_service(root, family="sglang", **options):
         family=family,
         model="fixture",
         dimensions=2,
-        options={"gpus_per_actor": 0},
+        options={"gpus_per_actor": 1},
         **options,
     )

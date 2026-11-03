@@ -20,7 +20,7 @@ from vane.ai.providers._embedding_service_backend import create_service_backend
 def test_native_backend_owns_one_original_engine(monkeypatch, family):
     for module in ("sglang", "vllm", "mlx", "mlx_vlm"):
         monkeypatch.setitem(sys.modules, module, None)
-    backend = create_service_backend(family, "fixture", 2, {"gpus_per_actor": 0})
+    backend = create_service_backend(family, "fixture", 2, {"gpus_per_actor": 1})
     assert backend.runtime is None
     assert backend.get_input_spec().supported_parts
     sdk = install_sdk(monkeypatch.setitem)

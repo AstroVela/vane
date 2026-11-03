@@ -16,6 +16,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from vane.ai._native_device import normalize_native_gpu_options, require_native_cuda
 from vane.ai.provider import (
     _SafeProviderError,
     _translate_missing_provider_dependency,
@@ -62,6 +63,7 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
 
     def _create_engine(self) -> None:
         with _translate_missing_provider_dependency("sglang", "sglang"):
+            require_native_cuda("sglang", self.engine_args)
             from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         self.llm = Engine(model_path=self.model, **self.engine_args)
@@ -172,6 +174,9 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
     merged.update(options)
     merged["engine_args"] = dict(merged.get("engine_args") or {})
     merged["generate_args"] = dict(merged.get("generate_args") or {})
+    if "gpus_per_actor" not in options:
+        merged.pop("gpus_per_actor")
+    normalize_native_gpu_options("sglang", merged, fractional=True)
     if "model_path" in merged["engine_args"]:
         raise ValueError("sglang engine_args.model_path is not supported; use the top-level model argument")
     if "stream" in merged["generate_args"]:

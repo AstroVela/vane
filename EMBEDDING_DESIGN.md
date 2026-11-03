@@ -546,6 +546,37 @@ uncertain atomic Lance write.
 
 ## 8. Native Python and shared memory
 
+Vane's worker-owned vLLM 0.31 and SGLang 0.5.17 paths require CUDA. Their
+descriptors and native Prompt options validate GPU reservations before creating
+workers: `gpus_per_actor=0` is rejected, and the default covers tensor parallelism
+times pipeline parallelism. Explicit reservations for parallel engines must cover
+that same count.
+Text-only Prompt retains fractional reservations for a single-GPU engine;
+native embedding and media Prompt require positive integer reservations.
+
+Device selection belongs to the executing worker's SDK. vLLM 0.31 selects its
+platform internally and does not accept `engine_args.device`. SGLang accepts an
+omitted/null device, `device="cuda"` or the worker-local alias `"cuda:0"`.
+CPU, nonzero CUDA indices and other accelerator configurations are rejected
+during planning. A worker whose
+SDK selects a non-CUDA platform fails before processor/model loading, including
+when its environment selects a CPU runtime. GPU initialization errors propagate
+without a CPU retry. Native CPU inference needs separate model and SDK
+qualification before it can use a zero-GPU resource contract.
+
+`tests/fast/test_native_device_resources.py` covers planning, native wire options,
+SDK platform checks and initialization failure propagation without a model SDK.
+The base release gate includes it. Run
+`scripts/run_installed_pytest.sh tests/ai/test_native_device_resources_cuda.py -s`
+in an isolated SDK environment to check real Ray GPU assignments, CUDA inference
+and rejection of an SDK-selected CPU platform. Set
+`VANE_TEST_NATIVE_DEVICE_PROVIDER` (`vllm` or `sglang`),
+`VANE_TEST_NATIVE_DEVICE_MODEL` (a reviewed local embedding checkpoint),
+`VANE_TEST_NATIVE_DEVICE_DIMENSIONS` (default 2048), and
+`VANE_TEST_NATIVE_DEVICE_ENGINE_ARGS` (a JSON object appropriate for the model and
+available GPU memory). GPU process memory checks require `nvidia-ml-py`.
+The test uses offline model loading and owns its cluster.
+
 One persistent engine owner per model configuration serves ingest and search.
 SGLang and vLLM adapters run inside that process. Clients send control metadata,
 text and descriptors; CPU arrays live in bounded shared memory. Arbitrary Python

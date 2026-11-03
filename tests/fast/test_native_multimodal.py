@@ -145,8 +145,10 @@ def install_sdk(setitem, *, mock_transformers=True):
             "SamplingParams": SimpleNamespace,
         },
         "vllm.sampling_params": {"StructuredOutputsParams": SimpleNamespace},
+        "vllm.platforms": {"current_platform": SimpleNamespace(device_type="cuda")},
         "vllm.multimodal.media": {"ImageMediaIO": SimpleNamespace, "VideoMediaIO": VideoIO},
         "sglang": {"Engine": Engine},
+        "sglang.srt.utils": {"get_device": lambda: "cuda"},
         "sglang.srt.managers.io_struct": {"EmbeddingReqInput": EmbeddingRequest},
     }.items():
         if not mock_transformers and name.startswith("transformers"):
@@ -268,7 +270,7 @@ def test_worker_native_cleanup_acknowledges_only_a_stopped_engine(family, kind, 
     from vane.pickle import dumps
 
     provider = load_provider(family)
-    options = {"gpus_per_actor": 0}
+    options = {"gpus_per_actor": 1}
     if kind == "embed":
         wrapper = _EmbedTextBatch(
             provider.get_text_embedder("configured-encoder", 2, options=options), "text", "out", 2
@@ -347,6 +349,12 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
     marker = str(tmp_path / "engine-events.jsonl")
 
     class WorkerEmbedding(NativeTextEmbedderDescriptor):
+        def get_udf_options(self):
+            # This engine double uses CPU only; production descriptors reserve CUDA.
+            from vane.ai.typing import UDFOptions
+
+            return UDFOptions(num_gpus=0)
+
         def instantiate(self):
             import subprocess
 
@@ -390,7 +398,7 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
             runtime._ensure_engine = ensure_engine
             return runtime
 
-    descriptor = load_provider(family).get_text_embedder("configured-encoder", 2, options={"gpus_per_actor": 0})
+    descriptor = load_provider(family).get_text_embedder("configured-encoder", 2, options={"gpus_per_actor": 1})
     descriptor.__class__ = WorkerEmbedding
     worker = None
     try:
@@ -467,7 +475,7 @@ def test_real_native_worker_retains_failed_task_cleanup(tmp_path, monkeypatch, f
                     provider=WorkerProvider(),
                     model="configured-encoder",
                     dimensions=2,
-                    gpus_per_actor=0,
+                    gpus_per_actor=1,
                     execution_backend=backend,
                     max_retries=0,
                 )
@@ -517,7 +525,7 @@ def test_native_single_text_preserves_blanks_and_nulls(family, on_error, sdk):
     from vane.execution._async_runtime import AsyncRuntime
 
     descriptor = load_provider(family).get_text_embedder(
-        "fixture", 2, options={"gpus_per_actor": 0, "max_input_bytes": 8}
+        "fixture", 2, options={"gpus_per_actor": 1, "max_input_bytes": 8}
     )
     wrapper = _EmbedTextBatch(descriptor, "text", "vector", 2, on_error=on_error, normalize=False)
     loop = AsyncRuntime()
@@ -783,7 +791,7 @@ def test_explicit_processing_source_is_used_on_the_first_load(family, kind, sdk)
     args = {key: "separate-processing-source", "revision": "model-revision"}
     if family == "vllm":
         args["tokenizer_revision"] = "processing-revision"
-    options = {"engine_args": args, "gpus_per_actor": 0}
+    options = {"engine_args": args, "gpus_per_actor": 1}
     provider = load_provider(family)
     if kind == "prompt":
         descriptor = provider.get_prompter(
@@ -823,7 +831,7 @@ def test_native_text_embedding_formats_tokenizer_messages(family, processing, sd
             return "\n".join(message["role"] + ": " + message["content"] for message in messages)
 
     monkeypatch.setattr(transformers, "AutoProcessor", Tokenizer)
-    options = {"gpus_per_actor": 0, "instruction": "Find related items"}
+    options = {"gpus_per_actor": 1, "instruction": "Find related items"}
     if processing:
         options["processor_kwargs"] = {"add_special_tokens": False}
     descriptor = load_provider(family).get_text_embedder("configured-text-encoder", 2, options=options)
@@ -858,7 +866,7 @@ def test_tokenizer_rejects_media_before_engine_initialization(family, kind, sdk,
         SimpleNamespace(from_pretrained=lambda *args, **kwargs: transformers.PreTrainedTokenizerBase()),
     )
     descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
-        "configured-text-encoder", 2, options={"gpus_per_actor": 0}
+        "configured-text-encoder", 2, options={"gpus_per_actor": 1}
     )
 
     async def run():
@@ -881,7 +889,7 @@ def test_native_embedding_enforces_input_bytes_before_preprocessing(family, kind
 
     async def run(limit):
         descriptor = getattr(load_provider(family), f"get_{kind}_embedder")(
-            "configured-encoder", 2, options={"gpus_per_actor": 0, "max_input_bytes": limit}
+            "configured-encoder", 2, options={"gpus_per_actor": 1, "max_input_bytes": limit}
         )
         runtime = descriptor.instantiate()
         try:
@@ -900,7 +908,7 @@ def test_native_embedding_enforces_input_bytes_before_preprocessing(family, kind
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 @pytest.mark.parametrize("kind", ["text", "image", "video"])
 def test_native_embedding_preserves_inputs_and_reuses_engine(family, kind, sdk):
-    options = {"gpus_per_actor": 0, "instruction": "Find related items", "paired_image_queries": True}
+    options = {"gpus_per_actor": 1, "instruction": "Find related items", "paired_image_queries": True}
     desc = getattr(load_provider(family), f"get_{kind}_embedder")("configured-encoder", 2, options=options)
     value = "query" if kind == "text" else clip().frames[0] if kind == "image" else clip()
 
@@ -936,7 +944,7 @@ def test_native_embedding_preserves_inputs_and_reuses_engine(family, kind, sdk):
 @pytest.mark.parametrize("family", ["vllm", "sglang"])
 def test_embedding_dimension_override_is_explicit(family, sdk):
     descriptor = load_provider(family).get_text_embedder(
-        "matryoshka-model", 2, options={"gpus_per_actor": 0, "supports_overriding_dimensions": True}
+        "matryoshka-model", 2, options={"gpus_per_actor": 1, "supports_overriding_dimensions": True}
     )
 
     async def run():
@@ -955,7 +963,7 @@ def test_native_prompt_forwards_model_settings_and_structured_output(family, sdk
     schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
     options = {
         "media_mime_types": ["video/mp4"],
-        "gpus_per_actor": 0,
+        "gpus_per_actor": 1,
         "max_tokens": 128,
         "engine_args": {"dtype": "float16"},
         "generate_args": {"sampling_params": {"top_k": 7}},
@@ -965,7 +973,7 @@ def test_native_prompt_forwards_model_settings_and_structured_output(family, sdk
     desc, udf, *_ = _prepare_prompt_call(
         family, "/models/custom-vlm", schema, "system", False, "raise", options, relation=True
     )
-    assert isinstance(desc, PrompterDescriptor) and udf.num_gpus == 0
+    assert isinstance(desc, PrompterDescriptor) and udf.num_gpus == 1
 
     async def run():
         runtime = desc.instantiate()
@@ -992,7 +1000,7 @@ def test_native_prompt_forwards_model_settings_and_structured_output(family, sdk
 @pytest.mark.parametrize("mode", ["engine_error", "length", "budget", "mime"])
 def test_failures_are_explicit_and_engine_is_released(family, mode, sdk):
     desc = load_provider(family).get_prompter(
-        "model", options={"media_mime_types": ["video/mp4"], "gpus_per_actor": 0, "max_input_bytes": 32}
+        "model", options={"media_mime_types": ["video/mp4"], "gpus_per_actor": 1, "max_input_bytes": 32}
     )
     sdk.fail = mode == "engine_error"
     sdk.finish = "length" if mode == "length" else "stop"
@@ -1058,7 +1066,7 @@ def test_sglang_embedding_request_is_closed_on_success_or_failure(sdk, failure):
 
     async def run():
         runtime = (
-            load_provider("sglang").get_text_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+            load_provider("sglang").get_text_embedder("configured", 2, options={"gpus_per_actor": 1}).instantiate()
         )
         try:
             if failure:
@@ -1078,7 +1086,7 @@ def test_sglang_text_token_budget_is_checked_before_engine_startup(sdk):
     async def run():
         runtime = (
             load_provider("sglang")
-            .get_text_embedder("configured", 2, options={"gpus_per_actor": 0, "engine_args": {"context_length": 2}})
+            .get_text_embedder("configured", 2, options={"gpus_per_actor": 1, "engine_args": {"context_length": 2}})
             .instantiate()
         )
         try:
@@ -1107,7 +1115,7 @@ def test_scalar_video_timing_rejects_unrepresentable_clips_before_engine_startup
     frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in times)
 
     async def run():
-        runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 0}).instantiate()
+        runtime = load_provider(family).get_video_embedder("configured", 2, options={"gpus_per_actor": 1}).instantiate()
         runtime.configure_execution(on_error="ignore", max_retries=2, validate=lambda v: v)
         try:
             with pytest.raises(ValueError, match=error):
@@ -1125,7 +1133,7 @@ def test_vllm_rejects_ambiguous_media_options_before_engine_startup(kind, sdk):
         "configured",
         2,
         options={
-            "gpus_per_actor": 0,
+            "gpus_per_actor": 1,
             "processor_kwargs": {"do_resize": True, f"{kind}s_kwargs": {"do_resize": False}},
         },
     )
@@ -1166,7 +1174,7 @@ def test_native_embedding_with_real_text_tokenizer(family, processing, monkeypat
         "configured-text-encoder",
         2,
         options={
-            "gpus_per_actor": 0,
+            "gpus_per_actor": 1,
             "instruction": "Find related items",
             "processor_kwargs": {"add_special_tokens": False} if processing else {},
         },
@@ -1240,7 +1248,7 @@ def test_sglang_text_only_prompt_preserves_real_template_tokens(tmp_path, proces
         tokenizer.save_pretrained(tmp_path)
     state = install_sdk(monkeypatch.setitem, mock_transformers=False)
     descriptor = load_provider("sglang").get_prompter(
-        str(tmp_path), options={"media_mime_types": ["image/png"], "gpus_per_actor": 0, "max_tokens": 64}
+        str(tmp_path), options={"media_mime_types": ["image/png"], "gpus_per_actor": 1, "max_tokens": 64}
     )
 
     async def run():
@@ -1276,7 +1284,7 @@ def test_real_standalone_tokenizer_loads_with_weights_only_checkpoint(tmp_path, 
     async def run():
         runtime = (
             load_provider(family)
-            .get_text_embedder(str(model), 2, options={"gpus_per_actor": 0, "engine_args": {key: str(processing)}})
+            .get_text_embedder(str(model), 2, options={"gpus_per_actor": 1, "engine_args": {key: str(processing)}})
             .instantiate()
         )
         try:
@@ -1350,7 +1358,7 @@ def test_vllm_engine_loads_separate_real_processor_with_original_weights(
 
     monkeypatch.setattr(engine, "from_engine_args", create_with_processor)
     options = {
-        "gpus_per_actor": 0,
+        "gpus_per_actor": 1,
         "engine_args": {
             "tokenizer": str(processing),
             "revision": "weights-revision",
@@ -1418,7 +1426,7 @@ def test_vllm_processor_model_view_survives_until_engine_cleanup(tmp_path, failu
         runtime = (
             load_provider("vllm")
             .get_image_embedder(
-                str(checkpoint), 2, options={"gpus_per_actor": 0, "engine_args": {"tokenizer": "separate-processor"}}
+                str(checkpoint), 2, options={"gpus_per_actor": 1, "engine_args": {"tokenizer": "separate-processor"}}
             )
             .instantiate()
         )
@@ -1463,7 +1471,7 @@ def test_native_template_token_ids_are_submitted_without_retokenization(
     async def run():
         runtime = (
             load_provider(family)
-            .get_text_embedder(str(tmp_path), 2, options={"gpus_per_actor": 0, "processor_kwargs": processing})
+            .get_text_embedder(str(tmp_path), 2, options={"gpus_per_actor": 1, "processor_kwargs": processing})
             .instantiate()
         )
         try:
@@ -1597,7 +1605,7 @@ def test_vllm_real_sdk_accepts_processor_options(
             other = "images_kwargs" if kind == "video" else "videos_kwargs"
             options[other] = {"size": {"shortest_edge": 16384, "longest_edge": 32768}}
     descriptor = getattr(load_provider("vllm"), f"get_{kind}_embedder")(
-        "configured-model", 2, options={"gpus_per_actor": 0, "processor_kwargs": options}
+        "configured-model", 2, options={"gpus_per_actor": 1, "processor_kwargs": options}
     )
     before = descriptor.get_options()
     frames = tuple(np.full((64, 64, 3), value, dtype=np.uint8) for value in (10, 20))
@@ -1696,7 +1704,7 @@ def test_sglang_with_real_video_processor_retains_timestamps(monkeypatch, text_o
         "custom-local-checkpoint",
         2,
         options={
-            "gpus_per_actor": 0,
+            "gpus_per_actor": 1,
             "processor_kwargs": {
                 "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}, "do_sample_frames": False},
                 **text_options,
@@ -1741,7 +1749,7 @@ def test_real_video_processor_preserves_sampling_interval(
         "custom-local-checkpoint",
         2,
         options={
-            "gpus_per_actor": 0,
+            "gpus_per_actor": 1,
             "processor_kwargs": {
                 "videos_kwargs": {"size": {"shortest_edge": 4096, "longest_edge": 8192}},
             },
@@ -1796,7 +1804,7 @@ def test_sglang_real_processor_accepts_nested_text_options(monkeypatch, kind, ma
         "custom-local-checkpoint",
         2,
         options={
-            "gpus_per_actor": 0,
+            "gpus_per_actor": 1,
             "processor_kwargs": {
                 "text_kwargs": {"padding": False, "truncation": False, "add_special_tokens": False},
             },
@@ -1824,10 +1832,10 @@ def test_native_descriptors_run_on_existing_ray_worker(family, ray_local):
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
     descriptor = load_provider(family).get_prompter(
-        "configured-model", options={"media_mime_types": ["video/mp4"], "gpus_per_actor": 0}
+        "configured-model", options={"media_mime_types": ["video/mp4"], "gpus_per_actor": 1}
     )
     embedding = load_provider(family).get_video_embedder(
-        "configured-encoder", 2, options={"gpus_per_actor": 0, "max_concurrency_per_actor": 2}
+        "configured-encoder", 2, options={"gpus_per_actor": 1, "max_concurrency_per_actor": 2}
     )
 
     @ray.remote
@@ -1899,11 +1907,21 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
     class WorkerPrompt(NativeMediaPrompterDescriptor):
+        def get_udf_options(self):
+            from vane.ai.typing import UDFOptions
+
+            return UDFOptions(num_gpus=0)
+
         def instantiate(self):
             install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
             return super().instantiate()
 
     class WorkerEmbedding(NativeTextEmbedderDescriptor):
+        def get_udf_options(self):
+            from vane.ai.typing import UDFOptions
+
+            return UDFOptions(num_gpus=0)
+
         def instantiate(self):
             state = install_sdk(lambda mapping, key, value: mapping.__setitem__(key, value))
             active = 0
@@ -1956,7 +1974,7 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
                 provider=family,
                 model="configured-encoder",
                 dimensions=2,
-                gpus_per_actor=0,
+                gpus_per_actor=1,
                 normalize=True,
                 max_retries=0,
                 batch_size=4,
@@ -1969,7 +1987,7 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
                 [vane.col("q"), vane.col("media")],
                 provider=family,
                 model="configured-vlm",
-                gpus_per_actor=0,
+                gpus_per_actor=1,
                 media_mime_types=["video/mp4"],
                 return_format=schema,
                 max_retries=0,
@@ -1979,7 +1997,7 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
 
             vectors = conn.sql(
                 """select ai_embed(q, provider => ?, model => 'configured-encoder', dimensions => 2,
-                options => {gpus_per_actor: 0, normalize: true, max_retries: 0,
+                options => {gpus_per_actor: 1, normalize: true, max_retries: 0,
                             batch_size: 4, max_concurrency_per_actor: 2})
                 from (values (NULL::VARCHAR), ('first'), ('second')) t(q)""",
                 params=[family],
@@ -1989,7 +2007,7 @@ def test_public_native_prompt_and_embedding_with_null_rows(family, entry, monkey
             result = conn.sql(
                 """select id, ai_prompt(q, media,
                 provider => ?, model => 'configured-vlm', return_format => ?,
-                options => {gpus_per_actor: 0, media_mime_types: ['video/mp4']}) from prompts order by id""",
+                options => {gpus_per_actor: 1, media_mime_types: ['video/mp4']}) from prompts order by id""",
                 params=[family, json.dumps(schema)],
             ).fetchall()
         assert [(row[0], row[-1]) for row in result] == [(0, {"answer": "ok"}), (1, {"answer": "ok"})]

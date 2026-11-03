@@ -376,6 +376,8 @@ include = [
     "/tests/ai/test_mlx_video_embedding.py",
     "/tests/ai/test_mlx_multimodal_embedding.py",
     "/tests/fast/test_native_multimodal.py",
+    "/tests/fast/test_native_device_resources.py",
+    "/tests/ai/test_native_device_resources_cuda.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
     "/tests/fast/test_doris_datasink.py",

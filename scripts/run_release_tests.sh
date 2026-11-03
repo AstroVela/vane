@@ -63,6 +63,7 @@ release_tests=(
   "$project_root/tests/fast/test_windows_udf_transport.py"
   "$project_root/tests/fast/test_header_linkage.py"
   "$project_root/tests/fast/test_ai_release_contracts.py"
+  "$project_root/tests/fast/test_native_device_resources.py"
   "$project_root/tests/fast/test_mlx_provider.py"
   "$project_root/tests/fast/test_mlx_image_provider.py"
   "$project_root/tests/fast/test_mlx_audio_provider.py"

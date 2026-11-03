@@ -47,6 +47,13 @@ class _FakeEngine:
         self.shutdown_loop = asyncio.get_running_loop()
 
 
+@pytest.fixture(autouse=True)
+def fake_sdk_device(monkeypatch):
+    utils = types.ModuleType("sglang.srt.utils")
+    utils.get_device = lambda: "cuda"
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils", utils)
+
+
 def _install_fake_sglang(monkeypatch):
     """Register a fake SGLang package exposing the public Engine API."""
     sglang_module = types.ModuleType("sglang")

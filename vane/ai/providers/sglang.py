@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping
 
+from vane.ai._native_device import normalize_native_gpu_options
 from vane.ai.options import (
     _reject_sensitive_prompt_options,
     _require_prompt_int,
@@ -54,12 +55,6 @@ def _validate_sglang_prompt_options(options: Mapping[str, Any]) -> dict[str, Any
         _require_prompt_int(copied, name, minimum=0)
     _require_prompt_number(copied, "engine_init_timeout_s", minimum=0, nullable=True)
 
-    if "gpus_per_actor" in copied:
-        _require_prompt_number(copied, "gpus_per_actor", minimum=0)
-        value = float(copied["gpus_per_actor"])
-        if value <= 0 or (value >= 1 and not value.is_integer()):
-            raise ValueError("Prompt option 'gpus_per_actor' must be positive and must be an integer when >= 1")
-
     for name in ("engine_args", "generate_args"):
         if name not in copied:
             continue
@@ -69,6 +64,7 @@ def _validate_sglang_prompt_options(options: Mapping[str, Any]) -> dict[str, Any
         _validate_sglang_json(value, name)
 
     engine_args = copied.get("engine_args", {})
+    normalize_native_gpu_options("sglang", copied, fractional=True)
     if "model_path" in engine_args:
         raise ValueError("Prompt option 'engine_args.model_path' is not supported; use the top-level 'model' argument")
 

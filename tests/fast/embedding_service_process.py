@@ -44,7 +44,7 @@ async def main():
         family=family,
         model="fixture",
         dimensions=2,
-        options={"gpus_per_actor": 0},
+        options={"gpus_per_actor": 1},
         **config,
     )
     stopped = asyncio.Event()
