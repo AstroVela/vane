@@ -186,6 +186,64 @@ def test_cuda_execution_failure_propagates_without_recreating_sessions(options, 
     assert sdk.active == 0
 
 
+def test_cuda_budget_and_reclamation_cover_every_graph_without_changing_inputs(options, sdk):
+    provider = load_provider("onnx")
+    runtime = provider.get_multimodal_embedder(options=options | {"backend": "cuda", "max_length": 512}).instantiate()
+    image = np.full((8, 12, 3), 40, np.uint8)
+    audio = AudioClip(np.full((1600, 1), 0.2, np.float32), 16000)
+    video = VideoClip((image, image + 1), (0.0, 1.0), (0, 1))
+    content = EmbeddingContent(
+        tuple(
+            EmbeddingPart(EmbeddingPartSpec(kind), value)
+            for kind, value in (("text", "look"), ("image", image), ("video", video), ("audio", audio))
+        )
+    )
+    try:
+        first = runtime.embed_multimodal([content])[0]
+        repeated = runtime.embed_multimodal([content])[0]
+        np.testing.assert_array_equal(first, repeated)
+        runtime.embed_text(["query"])
+        assert len(sdk.cuda_queries) == 1
+        assert len(sdk.provider_options) == 3
+        for _, values in sdk.provider_options:
+            assert values == {
+                "device_id": 0,
+                "use_tf32": 0,
+                "gpu_mem_limit": 8 * 1024**3,
+                "arena_extend_strategy": "kSameAsRequested",
+            }
+        assert {tower for tower, _ in sdk.run_options} == {"vision_encoder", "audio_encoder", "model"}
+        assert all(values == {"memory.enable_memory_arena_shrinkage": "gpu:0"} for _, values in sdk.run_options)
+        assert len([event for event in sdk.events if event[0] == "load"]) == 3
+    finally:
+        runtime.close()
+    assert sdk.active == 0
+
+
+@pytest.mark.parametrize("backend", ["cpu", "coreml"])
+def test_non_cuda_graphs_do_not_probe_cuda_or_apply_gpu_run_options(options, sdk, backend):
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": backend}).instantiate()
+    try:
+        runtime.embed_text(["query"])
+        assert not sdk.cuda_queries
+        assert all(values is None for _, values in sdk.run_options)
+        assert all("gpu_mem_limit" not in values for _, values in sdk.provider_options)
+    finally:
+        runtime.close()
+
+
+def test_cuda_budget_failure_starts_no_session_and_does_not_retry(options, sdk, monkeypatch):
+    from vane.ai.providers import _onnx_cuda
+
+    def exhausted():
+        raise MemoryError("no CUDA headroom")
+
+    monkeypatch.setattr(_onnx_cuda, "cuda_arena_limit", exhausted)
+    with pytest.raises(MemoryError, match="no CUDA headroom"):
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "cuda"}).instantiate()
+    assert not [event for event in sdk.events if event[0] == "load"]
+
+
 def test_partial_initialization_releases_the_preceding_session(options, sdk):
     sdk.failure, sdk.fail_tower = RuntimeError("bad graph"), "vision_encoder"
     with pytest.raises(RuntimeError, match="bad graph"):

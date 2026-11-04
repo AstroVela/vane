@@ -158,7 +158,14 @@ def owned_processes(
             # macOS has no Linux-style subreaper. A fresh inherited marker
             # retains ownership after setsid() and intermediate process exit.
             if not owned and token is not None:
-                owned = token in process.environ().get(_OWNER_ENV, "").split(":")
+                try:
+                    environment = process.environ()
+                except SystemError as error:
+                    # psutil's macOS extension can wrap a denied sysctl read.
+                    if not isinstance(error.__cause__, PermissionError):
+                        raise
+                    continue
+                owned = token in environment.get(_OWNER_ENV, "").split(":")
             if owned and process.is_running():
                 processes.add(process)
         except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):

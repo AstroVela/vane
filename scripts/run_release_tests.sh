@@ -73,6 +73,7 @@ release_tests=(
   "$project_root/tests/fast/test_litert_provider.py"
   "$project_root/tests/fast/test_litert_service.py"
   "$project_root/tests/fast/test_onnx_provider.py"
+  "$project_root/tests/fast/test_onnx_cuda_memory.py"
   "$project_root/tests/fast/test_onnx_service.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"
