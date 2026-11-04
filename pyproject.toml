@@ -920,5 +920,6 @@ archs = ["AMD64"]
 build = "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64 cp313-win_amd64 cp314-win_amd64"
 # cibuildwheel runs test commands through cmd.exe on Windows, so this command
 # must not rely on POSIX `env -u`. The isolated test environment never sets
-# VANE_RUNNER, and the smoke test exercises the default Ray runner.
-test-command = "python {project}/scripts/verify_base_install.py"
+# VANE_RUNNER, and `-X utf8` keeps the smoke test's table output printable on
+# consoles whose code page is not UTF-8.
+test-command = "python -X utf8 {project}/scripts/verify_base_install.py"

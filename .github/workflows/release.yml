@@ -390,16 +390,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Read-write cache: the wheel jobs only restore it. A cold cache costs
-      # about an hour here and then makes every matrix job start in minutes.
-      - name: Build or reuse the vcpkg binary cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-
-
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -419,6 +409,27 @@ jobs:
 
       - name: Install pinned vcpkg dependencies
         run: bash "${{ steps.package.outputs.path }}/scripts/bootstrap_vcpkg.sh" "${{ steps.package.outputs.path }}"
+
+      # vcpkg's own binary cache cannot be reused across runs: the runner image
+      # updates its MSVC toolset, which changes every package ABI hash, so a
+      # restored cache yielded "Restored 0 package(s)" and rebuilt 89 packages.
+      # Hand the installed tree and the toolchain scripts to the wheel jobs as
+      # artifacts instead; they then never invoke vcpkg.
+      - name: Upload the installed vcpkg tree
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-vcpkg-installed
+          path: package/vcpkg_installed
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the vcpkg toolchain scripts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-vcpkg-toolchain
+          path: .cache/vcpkg/scripts
+          if-no-files-found: error
+          retention-days: 7
 
   wheels-windows:
     name: Build Windows x64 wheels (cp${{ matrix.minor }})
@@ -439,7 +450,6 @@ jobs:
         shell: bash
     env:
       VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
       VCPKG_TARGET_TRIPLET: x64-windows-static-release
       VCPKG_HOST_TRIPLET: x64-windows-static-release
     steps:
@@ -455,14 +465,6 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-
-      - name: Restore the vcpkg binary cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-
 
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -481,8 +483,17 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
-      - name: Install pinned vcpkg dependencies
-        run: bash "${{ steps.package.outputs.path }}/scripts/bootstrap_vcpkg.sh" "${{ steps.package.outputs.path }}"
+      - name: Download the installed vcpkg tree
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: windows-vcpkg-installed
+          path: package/vcpkg_installed
+
+      - name: Download the vcpkg toolchain scripts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: windows-vcpkg-toolchain
+          path: .cache/vcpkg/scripts
 
       - name: Install release validation tooling
         run: python -m pip install --upgrade packaging
