@@ -324,6 +324,9 @@ jobs:
           package-dir: ${{ steps.package.outputs.path }}
           output-dir: wheelhouse
           config-file: "{package}/pyproject.toml"
+          # The uv build frontend needs a uv binary on PATH; host runners do
+          # not provide one, so let the action install and expose it.
+          extras: uv
 
       - name: Validate wheels
         env:
@@ -432,6 +435,9 @@ jobs:
           package-dir: ${{ steps.package.outputs.path }}
           output-dir: wheelhouse
           config-file: "{package}/pyproject.toml"
+          # The uv build frontend needs a uv binary on PATH; host runners do
+          # not provide one, so let the action install and expose it.
+          extras: uv
 
       - name: Validate wheels
         env:
