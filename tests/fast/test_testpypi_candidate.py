@@ -10,6 +10,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+import yaml
 from packaging.version import Version
 
 from scripts.validate_testpypi_candidate import (
@@ -102,22 +103,35 @@ def test_testpypi_extension_signing_key_is_candidate_only():
     assert hashlib.sha256(public_key_der).hexdigest() == TESTPYPI_EXTENSION_KEY_FINGERPRINT
     assert TESTPYPI_EXTENSION_KEY_FINGERPRINT in key_block.group(0)
 
-    workflow_setting = (
-        'CIBW_CONFIG_SETTINGS: "cmake.define.'
-        f"{option_name}=${{{{ inputs.operation == 'testpypi-dev' && 'ON' || 'OFF' }}}}\""
-    )
-    workflows = sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yml"))
-    workflow_settings = {}
-    for path in workflows:
-        settings = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if option_name in line]
-        if settings:
-            workflow_settings[path.name] = settings
+    gated_setting = f"cmake.define.{option_name}=${{{{ inputs.operation == 'testpypi-dev' && 'ON' || 'OFF' }}}}"
+    release = yaml.safe_load((REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8"))
+    settings = {}
+    for job_name, job in release["jobs"].items():
+        for step in job.get("steps", []):
+            value = step.get("env", {}).get("CIBW_CONFIG_SETTINGS")
+            if value is not None:
+                settings[job_name] = value
+    # Every wheel build keeps candidate trust gated on the operation input.
+    assert settings == {
+        "wheels-linux": gated_setting,
+        "wheels-macos": gated_setting,
+        "wheels-windows": (
+            f"{gated_setting} cmake.define.CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "
+            "cmake.define.DISABLE_UNITY=1 build.tool-args=/m"
+        ),
+    }
     # The media build explicitly disables candidate trust. Check each setting
     # and its workflow so unconditional enables or extra uses still fail.
-    assert workflow_settings == {
-        "release.yml": [workflow_setting],
-        "media-release.yml": [f"-Ccmake.define.{option_name}=OFF"],
-    }
+    media_settings = [
+        line.strip()
+        for line in (REPOSITORY_ROOT / ".github/workflows/media-release.yml").read_text(encoding="utf-8").splitlines()
+        if option_name in line
+    ]
+    assert media_settings == [f"-Ccmake.define.{option_name}=OFF"]
+    for path in sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yml")):
+        if path.name in {"release.yml", "media-release.yml"}:
+            continue
+        assert option_name not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_production_extension_signing_key_is_unconditional_and_independent():
