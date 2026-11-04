@@ -423,11 +423,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload the vcpkg toolchain scripts
+      - name: Upload the vcpkg toolchain
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-vcpkg-toolchain
-          path: .cache/vcpkg/scripts
+          path: |
+            .cache/vcpkg/scripts
+            .cache/vcpkg/triplets
+            .cache/vcpkg/vcpkg.exe
+            .cache/vcpkg/bootstrap-vcpkg.bat
           if-no-files-found: error
           retention-days: 7
 
@@ -489,11 +493,16 @@ jobs:
           name: windows-vcpkg-installed
           path: package/vcpkg_installed
 
-      - name: Download the vcpkg toolchain scripts
+      - name: Download the vcpkg toolchain
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: windows-vcpkg-toolchain
-          path: .cache/vcpkg/scripts
+          path: .cache/vcpkg
+
+      # vcpkg's toolchain locates its checkout root through this marker; the
+      # artifact omits dotted entries, so recreate the marker here.
+      - name: Mark the vcpkg checkout root
+        run: touch .cache/vcpkg/.vcpkg-root
 
       - name: Install release validation tooling
         run: python -m pip install --upgrade packaging
