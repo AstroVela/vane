@@ -115,11 +115,25 @@ def test_testpypi_extension_signing_key_is_candidate_only():
     assert settings == {
         "wheels-linux": gated_setting,
         "wheels-macos": gated_setting,
-        "wheels-windows": (
-            f"{gated_setting} cmake.define.CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "
-            "cmake.define.DISABLE_UNITY=1 build.tool-args=/m"
-        ),
     }
+    # The Windows build composes the same gated setting plus its vcpkg
+    # toolchain at run time, because the toolchain path must be converted to a
+    # POSIX form that cibuildwheel's shlex parsing keeps intact.
+    windows_steps = release["jobs"]["wheels-windows"]["steps"]
+    assert all("CIBW_CONFIG_SETTINGS" not in step.get("env", {}) for step in windows_steps)
+    windows_scripts = [step.get("run", "") for step in windows_steps]
+    exporters = [
+        script for script in windows_scripts if 'echo "CIBW_CONFIG_SETTINGS=$settings" >> "$GITHUB_ENV"' in script
+    ]
+    assert len(exporters) == 1
+    assert gated_setting in exporters[0]
+    assert "cmake.define.CMAKE_TOOLCHAIN_FILE=$workspace/.cache/vcpkg/scripts/buildsystems/vcpkg.cmake" in exporters[0]
+    assert "cmake.define.VCPKG_INSTALLED_DIR=$workspace/package/vcpkg_installed" in exporters[0]
+    assert "cmake.define.VCPKG_TARGET_TRIPLET=x64-windows-static-release" in exporters[0]
+    assert "cmake.define.VCPKG_MANIFEST_MODE=OFF" in exporters[0]
+    assert "cmake.define.CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" in exporters[0]
+    assert "cmake.define.DISABLE_UNITY=1" in exporters[0]
+    assert "build.tool-args=/m" in exporters[0]
     # The media build explicitly disables candidate trust. Check each setting
     # and its workflow so unconditional enables or extra uses still fail.
     media_settings = [
