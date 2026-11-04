@@ -223,7 +223,7 @@ class _NativeFragmentState:
 
 
 class QueryResourceManager:
-    """Own Ray execution and streaming-output resources for one query DAG.
+    """Own shared execution and streaming-output resources for one query DAG.
 
     DuckDB owns native-fragment CPU, heap, scheduling, and spill. Native units
     remain in this graph only so Ray-side object-store windows, task leases,
@@ -590,6 +590,12 @@ class QueryResourceManager:
         eligible = set(self._eligible_resource_unit_ids_locked())
         boundary: set[str] = set()
         for barrier in barriers:
+            if not barrier.retains_object_store_inputs:
+                # A streaming native materializer drains transport blocks into
+                # DuckDB-owned state. Its complete working set is not an object
+                # store commitment. Keep input/output reservations and bounded
+                # liveness active on that branch, including on fixed arenas.
+                continue
             # A blocking materializer must be able to drain its complete input
             # branch even after the direct input's accumulated bytes exceed the
             # soft query budget.  Lifting the cap only on that direct input can

@@ -487,7 +487,8 @@ def test_nested_deferred_barrier_materializes_in_parallel_without_reviving_retir
     )
 
 
-def test_graph_serialization_round_trip_is_strict_and_stable():
+@pytest.mark.parametrize("retains_objects", [False, True])
+def test_graph_serialization_round_trip_is_strict_and_stable(retains_objects):
     scan = _unit("resource:fragment-1:scan")
     sink = _unit(
         "resource:fragment-2:sink",
@@ -496,7 +497,9 @@ def test_graph_serialization_round_trip_is_strict_and_stable():
         target_output_block_bytes=0,
         generator_buffer_blocks=0,
     )
-    barrier = _barrier("sink", sink)
+    from dataclasses import replace
+
+    barrier = replace(_barrier("sink", sink), retains_object_store_inputs=retains_objects)
     graph = _graph(
         scan,
         sink,
@@ -507,6 +510,14 @@ def test_graph_serialization_round_trip_is_strict_and_stable():
     payload = graph.to_dict()
 
     assert QueryResourceGraph.from_dict(payload) == graph
+    assert payload["materialization_barriers"][0]["retains_object_store_inputs"] is retains_objects
+    other = replace(
+        graph, materialization_barriers=(replace(barrier, retains_object_store_inputs=not retains_objects),)
+    )
+    assert graph.normalized_digest() != other.normalized_digest()
+    for invalid in (None, 0, 1, "false"):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            MaterializationBarrierSpec.from_dict({**barrier.to_dict(), "retains_object_store_inputs": invalid})
     assert payload["materialization_barriers"][0]["materialized_input_unit_ids"] == [scan.resource_unit_id]
     assert list(payload) == [
         "query_id",

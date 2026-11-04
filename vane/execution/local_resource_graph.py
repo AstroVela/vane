@@ -181,6 +181,7 @@ def build_local_resource_graph(metadata: Mapping[str, Any], *, query_id: str) ->
                     materialized_input_unit_ids=tuple(
                         output_units[parent] for parent in node["materialized_input_node_ids"]
                     ),
+                    retains_object_store_inputs=False,
                 )
             )
         payload = node["udf_payload"]

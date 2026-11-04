@@ -211,7 +211,7 @@ def _manager(
     )
 
 
-def _barrier(node_id, unit, *, materialized_inputs=None):
+def _barrier(node_id, unit, *, materialized_inputs=None, retains_objects=True):
     return MaterializationBarrierSpec(
         query_id="q",
         barrier_id=f"barrier:q:node:{node_id}",
@@ -220,6 +220,7 @@ def _barrier(node_id, unit, *, materialized_inputs=None):
         materialized_input_unit_ids=(
             unit.input_unit_ids if materialized_inputs is None else tuple(materialized_inputs)
         ),
+        retains_object_store_inputs=retains_objects,
     )
 
 
@@ -3379,7 +3380,8 @@ def test_prefetched_actor_admission_does_not_reserve_a_second_generator_window()
     assert manager.snapshot()["usage"]["object_store_bytes"] == 100
 
 
-def test_frontier_materializer_disables_object_store_backpressure_for_input():
+@pytest.mark.parametrize("retains_objects", [False, True])
+def test_frontier_materializer_backpressure_matches_input_lifetime(retains_objects):
     upstream = _unit(
         "resource:f:materializer-input",
         resources=_r(cpu=1),
@@ -3407,7 +3409,7 @@ def test_frontier_materializer_disables_object_store_backpressure_for_input():
         materializer,
         downstream,
         resources=_r(cpu=2, store=50),
-        barriers=(_barrier("blocking-materializer", materializer),),
+        barriers=(_barrier("blocking-materializer", materializer, retains_objects=retains_objects),),
     )
     _ready(
         manager,
@@ -3428,10 +3430,11 @@ def test_frontier_materializer_disables_object_store_backpressure_for_input():
     )
 
     assert task.granted
-    assert output.granted and not output.liveness
+    assert task.lease.liveness is (not retains_objects)
+    assert output.granted and output.liveness is (not retains_objects)
     snapshot = manager.snapshot()
     assert snapshot["soft_object_store_debt_bytes"] == 100
-    assert snapshot["units"][upstream.resource_unit_id]["object_store_backpressure_disabled"] is True
+    assert snapshot["units"][upstream.resource_unit_id]["object_store_backpressure_disabled"] is retains_objects
 
 
 def test_asymmetric_frontier_lifts_object_store_cap_for_materialized_branch_only():

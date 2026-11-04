@@ -153,6 +153,26 @@ the new name to the parent. Exercise these paths with
 `tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output`
 and `tests/fast/test_ai_image_embedding.py` through the installed test launcher.
 
+Local and Ray execution share query admission, protected input/output budgets,
+and bounded liveness. Materialization barriers declare whether their native
+invocation retains managed object-store inputs. Local native operators drain
+transport blocks into DuckDB-owned state, so their upstream UDF branches retain
+normal object-store backpressure and pending-output reservations. Atomic Ray
+fragments retain the existing materialization exception. Do not infer transport
+ownership from the mere presence of a blocking SQL operator.
+
+The arena's existing physical capacity checks, pinned-input diagnostics and
+interruptible waits still apply. Do not infer transitive deadlock merely from
+the static query DAG: native execution can create more dispatchers after known
+dispatchers drain, and UDFs can release input without producing output. Such
+inference requires execution-owned evidence that future consumers are sealed.
+For changes to the admission/materialization contract, run
+`test_query_resource_manager.py`, `test_query_resource_graph.py`,
+`test_query_resource_graph_builder.py`, `test_local_query_admission.py`,
+`test_local_resource_graph.py`, and
+`test_local_materialization_backpressure.py` under `tests/fast/` through the
+installed test launcher. Keep real Ray comparison queries in a separate process.
+
 Darwin allows only one size allocation per POSIX shared-memory object. Direct
 IPC growth recreates the original parent-owned name, so cleanup still knows
 which name to unlink if the worker fails before announcing its result. The
