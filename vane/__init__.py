@@ -290,6 +290,7 @@ from vane.datasink import (
 )
 from vane.datasink.doris import DorisStreamLoadSink
 from vane.datasink.milvus import MilvusSink
+from vane.datasink.postgres import PostgresSink
 from vane.datasink.qdrant import QdrantSink
 from vane.extensions import (
     DEFAULT_EXTENSION_CATALOG_URL,
@@ -509,6 +510,7 @@ __all__: list[str] = [
     "MapValue",
     "MediaType",
     "MilvusSink",
+    "PostgresSink",
     "QdrantSink",
     "NUMBER",
     "NotImplementedException",
