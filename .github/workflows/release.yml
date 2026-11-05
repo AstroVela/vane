@@ -441,11 +441,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The image version is part of the key: a new runner image ships a new
-      # toolchain, which invalidates the trees built by the previous one.
-      - name: Record the runner image version
-        id: image
-        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      # The tree stays valid as long as the compiler that built it is the same,
+      # so key on the Apple clang version rather than on the runner image: the
+      # image label changes between runner pools while the toolchain does not.
+      - name: Record the Apple clang version
+        id: toolchain
+        run: |
+          version="$(clang --version | head -n 1)"
+          digest="$(python -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "$version")"
+          echo "version=$digest" >> "$GITHUB_OUTPUT"
+          echo "Apple clang: $version ($digest)"
 
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -471,7 +476,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
-          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-tree-${{ runner.os }}-clang-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vcpkg.json') }}
 
       - name: Bootstrap vcpkg when the tree cache missed
         id: bootstrap
@@ -499,7 +504,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
-          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-tree-${{ runner.os }}-clang-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vcpkg.json') }}
 
       - name: Upload the vcpkg install tree
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -639,11 +644,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The image version is part of the key: a new runner image ships a new
-      # MSVC toolset, and a tree built by the previous toolset is unusable.
-      - name: Record the runner image version
-        id: image
-        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      # The tree stays valid as long as the compiler that built it is the same,
+      # so key on the MSVC toolset version rather than on the runner image: the
+      # image label changes between runner pools while the toolset does not.
+      - name: Record the MSVC toolset version
+        id: toolchain
+        run: |
+          vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          version="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion | tr -d '\r')"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSVC toolset: $version"
 
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -672,7 +683,7 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
-          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-tree-${{ runner.os }}-msvc-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vcpkg.json') }}
 
       - name: Bootstrap vcpkg when the tree cache missed
         id: bootstrap
@@ -700,7 +711,7 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
-          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-tree-${{ runner.os }}-msvc-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vcpkg.json') }}
 
       # Hand the installed tree and the toolchain scripts to the wheel jobs as
       # artifacts; they then never invoke vcpkg.
