@@ -247,14 +247,15 @@ jobs:
       # The manylinux image digest is pinned above, so a tree built by a
       # previous run stays valid; caching the tree lets a warm run skip the
       # container bootstrap entirely.
+      # exact key only: a prefix restore could hand back a tree built for an
+      # older vcpkg.json, and the bootstrap guard cannot tell that apart from a
+      # current one, so a manifest change must rebuild the tree.
       - name: Restore the vcpkg install tree
         id: tree
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
           key: vcpkg-tree-linux-cibuildwheel-4.2.0-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-tree-linux-cibuildwheel-4.2.0-
 
       - name: Install the pinned vcpkg dependencies
         run: |
@@ -451,13 +452,14 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
+      # exact key only: a prefix restore could hand back a tree built for an
+      # older vcpkg.json, and the bootstrap guard cannot tell that apart from a
+      # current one, so a manifest change must rebuild the tree.
       - name: Restore the vcpkg install tree
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
           key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-
 
       - name: Bootstrap vcpkg when the tree cache missed
         id: bootstrap
@@ -641,13 +643,14 @@ jobs:
       # vcpkg's per-package binary cache cannot survive a toolset change, so
       # cache the finished install tree instead and skip the bootstrap when it
       # is there.
+      # exact key only: a prefix restore could hand back a tree built for an
+      # older vcpkg.json, and the bootstrap guard cannot tell that apart from a
+      # current one, so a manifest change must rebuild the tree.
       - name: Restore the vcpkg install tree
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: package/vcpkg_installed
           key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-
 
       - name: Bootstrap vcpkg when the tree cache missed
         id: bootstrap
@@ -1088,7 +1091,7 @@ jobs:
       - name: Run the public smoke test outside a source checkout
         run: |
           cd vane-smoke
-          env -u VANE_RUNNER python verify_base_install.py
+          env -u VANE_RUNNER python -X utf8 verify_base_install.py
 
   publish-pypi:
     name: Publish to PyPI
@@ -1209,7 +1212,7 @@ jobs:
       - name: Run the public smoke test outside a source checkout
         run: |
           cd vane-smoke
-          env -u VANE_RUNNER python verify_base_install.py
+          env -u VANE_RUNNER python -X utf8 verify_base_install.py
 
   publish-github-release:
     name: Publish the draft GitHub Release
