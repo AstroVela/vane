@@ -218,16 +218,27 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
-      # The manylinux image pins the container toolchain, so its vcpkg binary
-      # cache stays valid between runs and is worth keeping. The cibuildwheel
-      # version is part of the key because it selects the image digest.
-      - name: Restore the manylinux vcpkg cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      # The manylinux image is pinned by the cibuildwheel version, so the
+      # installed tree stays valid across runs. Caching the tree (not vcpkg's
+      # per-package ABI cache) lets a warm run skip the bootstrap entirely.
+      - name: Restore the vcpkg install tree
+        id: tree
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: package/.cache/vcpkg-archives
-          key: vcpkg-manylinux_2_28-cibuildwheel-4.2.0-${{ hashFiles('vcpkg.json') }}
+          path: package/vcpkg_installed
+          key: vcpkg-tree-linux-cibuildwheel-4.2.0-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-manylinux_2_28-cibuildwheel-4.2.0-
+            vcpkg-tree-linux-cibuildwheel-4.2.0-
+
+      - name: Configure the dependency bootstrap
+        run: |
+          yum="yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip"
+          if [ -f package/vcpkg_installed/x64-linux-release/share/arrow/ArrowConfig.cmake ]; then
+            echo "reusing the cached vcpkg install tree"
+            echo "CIBW_BEFORE_ALL=$yum" >> "$GITHUB_ENV"
+          else
+            echo "CIBW_BEFORE_ALL=$yum && bash {package}/scripts/bootstrap_manylinux_bison.sh && bash {package}/scripts/bootstrap_vcpkg.sh {package}" >> "$GITHUB_ENV"
+          fi
 
       - name: Build the cp310 wheel from the source package
         uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v4.2.0
@@ -246,10 +257,25 @@ jobs:
           test "$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
           python scripts/check_release_artifacts.py --expected-version "$EXPECTED_VERSION" wheelhouse/*.whl
 
-      # The manylinux container writes the cache as root; hand it back to the
-      # runner so the cache save in the post step can read it.
-      - name: Hand the vcpkg cache back to the runner
-        run: sudo chown -R "$(id -u):$(id -g)" package/.cache
+      # The container writes the install tree as root; hand it back to the
+      # runner so the cache save and the artifact upload can read it.
+      - name: Hand the vcpkg install tree back to the runner
+        run: sudo chown -R "$(id -u):$(id -g)" package/vcpkg_installed
+
+      - name: Save the vcpkg install tree
+        if: steps.tree.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: package/vcpkg_installed
+          key: vcpkg-tree-linux-cibuildwheel-4.2.0-${{ hashFiles('vcpkg.json') }}
+
+      - name: Upload the vcpkg install tree
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-vcpkg-installed
+          path: package/vcpkg_installed
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload the wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -306,13 +332,16 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
-      - name: Restore the manylinux vcpkg cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Download the vcpkg install tree
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          path: package/.cache/vcpkg-archives
-          key: vcpkg-manylinux_2_28-cibuildwheel-4.2.0-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-manylinux_2_28-cibuildwheel-4.2.0-
+          name: linux-vcpkg-installed
+          path: package/vcpkg_installed
+
+      - name: Configure the dependency bootstrap
+        run: |
+          yum="yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip"
+          echo "CIBW_BEFORE_ALL=$yum" >> "$GITHUB_ENV"
 
       - name: Build the cp${{ matrix.minor }} wheel from the source package
         uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v4.2.0
@@ -360,20 +389,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  wheels-macos:
-    name: Build macOS arm64 wheels (cp${{ matrix.minor }})
+  macos-vcpkg:
+    name: Prepare macOS vcpkg dependencies
     needs: source-package
     runs-on: macos-15
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - minor: "310"
-          - minor: "311"
-          - minor: "312"
-          - minor: "313"
-          - minor: "314"
     defaults:
       run:
         shell: bash
@@ -399,13 +419,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Restore the vcpkg binary cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_TARGET_TRIPLET }}-
+      # The image version is part of the key: a new runner image ships a new
+      # toolchain, which invalidates the trees built by the previous one.
+      - name: Record the runner image version
+        id: image
+        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -424,8 +442,90 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
-      - name: Install pinned vcpkg dependencies
-        run: bash "${{ steps.package.outputs.path }}/scripts/bootstrap_vcpkg.sh" "${{ steps.package.outputs.path }}"
+      - name: Restore the vcpkg install tree
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: package/vcpkg_installed
+          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-
+
+      - name: Bootstrap vcpkg when the tree cache missed
+        id: bootstrap
+        run: |
+          if [ -f package/vcpkg_installed/arm64-osx-release/share/arrow/ArrowConfig.cmake ]; then
+            echo "reusing the cached vcpkg install tree"
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            bash package/scripts/bootstrap_vcpkg.sh package
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the vcpkg install tree
+        if: steps.bootstrap.outputs.reused == 'false'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: package/vcpkg_installed
+          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Upload the vcpkg install tree
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-vcpkg-installed
+          path: package/vcpkg_installed
+          if-no-files-found: error
+          retention-days: 7
+
+  wheels-macos:
+    name: Build macOS arm64 wheels (cp${{ matrix.minor }})
+    needs: [source-package, macos-vcpkg]
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - minor: "310"
+          - minor: "311"
+          - minor: "312"
+          - minor: "313"
+          - minor: "314"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the exact source package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-sdist
+          path: dist
+
+      - name: Extract the exact source package
+        id: package
+        run: |
+          tarball="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$tarball"
+          rm -rf package
+          mkdir -p package
+          tar --extract --gzip --file "$tarball" --directory package --strip-components=1
+          test -f package/pyproject.toml
+          echo "path=package" >> "$GITHUB_OUTPUT"
+
+      - name: Download the vcpkg install tree
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macos-vcpkg-installed
+          path: package/vcpkg_installed
 
       - name: Install release validation tooling
         run: python -m pip install --upgrade packaging
@@ -506,6 +606,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The image version is part of the key: a new runner image ships a new
+      # MSVC toolset, and a tree built by the previous toolset is unusable.
+      - name: Record the runner image version
+        id: image
+        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -523,14 +629,37 @@ jobs:
           test -f package/pyproject.toml
           echo "path=package" >> "$GITHUB_OUTPUT"
 
-      - name: Install pinned vcpkg dependencies
-        run: bash "${{ steps.package.outputs.path }}/scripts/bootstrap_vcpkg.sh" "${{ steps.package.outputs.path }}"
+      # vcpkg's per-package binary cache cannot survive a toolset change, so
+      # cache the finished install tree instead and skip the bootstrap when it
+      # is there.
+      - name: Restore the vcpkg install tree
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: package/vcpkg_installed
+          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-
 
-      # vcpkg's own binary cache cannot be reused across runs: the runner image
-      # updates its MSVC toolset, which changes every package ABI hash, so a
-      # restored cache yielded "Restored 0 package(s)" and rebuilt 89 packages.
+      - name: Bootstrap vcpkg when the tree cache missed
+        id: bootstrap
+        run: |
+          if [ -f package/vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake ]; then
+            echo "reusing the cached vcpkg install tree"
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            bash package/scripts/bootstrap_vcpkg.sh package
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the vcpkg install tree
+        if: steps.bootstrap.outputs.reused == 'false'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: package/vcpkg_installed
+          key: vcpkg-tree-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+
       # Hand the installed tree and the toolchain scripts to the wheel jobs as
-      # artifacts instead; they then never invoke vcpkg.
+      # artifacts; they then never invoke vcpkg.
       - name: Upload the installed vcpkg tree
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
