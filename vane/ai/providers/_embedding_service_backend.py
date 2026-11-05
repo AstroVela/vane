@@ -10,7 +10,7 @@ after the transport has exclusively reserved its rendezvous path.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from vane.ai import _embedding_ipc as ipc
 from vane.ai._embedding_content import EmbeddingContent, MultimodalInputSpec
@@ -50,6 +50,11 @@ class ServiceBackend(Protocol):
     async def aclose(self) -> None: ...
 
 
+@runtime_checkable
+class BatchServiceBackend(Protocol):
+    async def embed_batch(self, contents: list[EmbeddingContent], context: ipc.RequestContext) -> list[Any]: ...
+
+
 class NativeServiceBackend:
     """Delegate SGLang/vLLM encoding and teardown to their existing runtime."""
 
@@ -84,6 +89,10 @@ class NativeServiceBackend:
     async def embed(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
         self.validate_request(context, [])
         return await self.runtime._embed_content(content)
+
+    async def embed_batch(self, contents: list[EmbeddingContent], context: ipc.RequestContext) -> list[Any]:
+        self.validate_request(context, [])
+        return await self.runtime._embed_many("multimodal", contents, collect_row_errors=True)
 
     async def aclose(self) -> None:
         if self.runtime is not None:
