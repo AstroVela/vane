@@ -263,18 +263,30 @@ jobs:
             echo "reusing the cached vcpkg install tree"
             exit 0
           fi
-          docker run --rm \
-            -v "$PWD/package:/package" \
-            -w /package \
-            -e VCPKG_ROOT=/package/.cache/vcpkg \
-            -e VCPKG_DEFAULT_BINARY_CACHE=/package/.cache/vcpkg-archives \
-            "$VANE_MANYLINUX_IMAGE" \
-            bash -lc '
-              set -euo pipefail
-              yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip
-              bash scripts/bootstrap_manylinux_bison.sh
-              bash scripts/bootstrap_vcpkg.sh /package
-            '
+          # vcpkg downloads its own binary and package archives; a transient CDN
+          # error should not fail the whole release.
+          bootstrapped=0
+          for attempt in 1 2 3; do
+            if docker run --rm \
+              -v "$PWD/package:/package" \
+              -w /package \
+              -e VCPKG_ROOT=/package/.cache/vcpkg \
+              -e VCPKG_DEFAULT_BINARY_CACHE=/package/.cache/vcpkg-archives \
+              "$VANE_MANYLINUX_IMAGE" \
+              bash -lc '
+                set -euo pipefail
+                yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip
+                bash scripts/bootstrap_manylinux_bison.sh
+                bash scripts/bootstrap_vcpkg.sh /package
+              '; then
+              bootstrapped=1
+              break
+            fi
+            echo "bootstrap attempt ${attempt} failed; retrying" >&2
+            sleep 30
+          done
+          test "$bootstrapped" = 1
+          test -f package/vcpkg_installed/x64-linux-release/share/arrow/ArrowConfig.cmake
           # The container writes as root; hand the tree back for the cache save
           # and the artifact upload.
           sudo chown -R "$(id -u):$(id -g)" package/vcpkg_installed
@@ -467,10 +479,20 @@ jobs:
           if [ -f package/vcpkg_installed/arm64-osx-release/share/arrow/ArrowConfig.cmake ]; then
             echo "reusing the cached vcpkg install tree"
             echo "reused=true" >> "$GITHUB_OUTPUT"
-          else
-            bash package/scripts/bootstrap_vcpkg.sh package
-            echo "reused=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # vcpkg downloads its own binary and package archives; a transient CDN
+          # error should not fail the whole release.
+          for attempt in 1 2 3; do
+            if bash package/scripts/bootstrap_vcpkg.sh package; then
+              echo "reused=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "bootstrap attempt ${attempt} failed; retrying" >&2
+            sleep 30
+          done
+          echo "bootstrap failed after 3 attempts" >&2
+          exit 1
 
       - name: Save the vcpkg install tree
         if: steps.bootstrap.outputs.reused == 'false'
@@ -658,10 +680,20 @@ jobs:
           if [ -f package/vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake ]; then
             echo "reusing the cached vcpkg install tree"
             echo "reused=true" >> "$GITHUB_OUTPUT"
-          else
-            bash package/scripts/bootstrap_vcpkg.sh package
-            echo "reused=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # vcpkg downloads its own binary and package archives; a transient CDN
+          # error should not fail the whole release.
+          for attempt in 1 2 3; do
+            if bash package/scripts/bootstrap_vcpkg.sh package; then
+              echo "reused=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "bootstrap attempt ${attempt} failed; retrying" >&2
+            sleep 30
+          done
+          echo "bootstrap failed after 3 attempts" >&2
+          exit 1
 
       - name: Save the vcpkg install tree
         if: steps.bootstrap.outputs.reused == 'false'
