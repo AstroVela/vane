@@ -8,6 +8,8 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
+#include "duckdb/execution/distributed/pipeline_node/materialized_cte.hpp"
+#include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
@@ -91,23 +93,27 @@ std::shared_ptr<DistributedPipelineNode> MakeScanSourceNode(PipelineNodeContext 
 
 } // namespace
 
-std::shared_ptr<DistributedPipelineNode>
-PhysicalPlanToPipelineNodeTranslator::TranslateCTESource(PhysicalOperator &op) {
-	DuckPhysicalPlanRef scan_plan;
-	if (plan_ && plan_->HasRoot() && &plan_->Root() == &op) {
-		scan_plan = plan_;
-	} else {
-		Allocator &alloc = Allocator::DefaultAllocator();
-		scan_plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
-		scan_plan->SetRoot(op);
+void PhysicalPlanToPipelineNodeTranslator::VisitMaterializedCTE(PhysicalOperator &op) {
+	auto &cte = op.Cast<PhysicalCTE>();
+	if (cte.children.size() != 2) {
+		throw InternalException("Distributed materialized CTE requires a definition and a consumer");
 	}
-
-	std::vector<duckdb::distributed::ScanSplit> scan_splits;
-	auto schema = MakeSchemaFromTypes(op.GetTypes());
-	auto exec_cfg = ResolveExecutionConfig(plan_config_);
-	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
-	                                                  get_next_pipeline_node_id(), "ScanSource"),
-	                          std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, false);
+	VisitOperator(cte.children[0]);
+	auto definition = std::move(node_stack_.back());
+	node_stack_.pop_back();
+	auto input = MakeMaterializedCTEInput(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, get_next_pipeline_node_id(), "CTEInput"),
+	    std::move(definition), exchange_mgr_, ordered_ctes_.count(cte.table_index) != 0);
+	if (!cte_inputs_.emplace(cte.table_index, input).second) {
+		throw InternalException("Duplicate distributed CTE binding %llu", cte.table_index);
+	}
+	VisitOperator(cte.children[1]);
+	auto body = std::move(node_stack_.back());
+	node_stack_.pop_back();
+	cte_inputs_.erase(cte.table_index);
+	node_stack_.push_back(MakeMaterializedCTEScope(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, get_next_pipeline_node_id(), "CTE"),
+	    std::move(input), std::move(body)));
 }
 
 std::shared_ptr<DistributedPipelineNode>
@@ -162,7 +168,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateColumnDataScanSource(const Physic
 std::shared_ptr<DistributedPipelineNode>
 PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan &op) {
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
-	auto scan_node_id = get_next_pipeline_node_id();
+	int scan_node_id;
 	DuckPhysicalPlanRef scan_plan;
 	std::vector<duckdb::distributed::ScanSplit> scan_splits;
 
@@ -172,6 +178,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 			pipeline_node_id_counter_ = scan_node_id;
 		}
 	} else {
+		scan_node_id = get_next_pipeline_node_id();
 		op.extra_info.scan_node_id = optional_idx(static_cast<idx_t>(scan_node_id));
 	}
 	if (!op.extra_info.scan_group_id.IsValid()) {

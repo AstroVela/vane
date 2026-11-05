@@ -65,6 +65,7 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/translator_order_limit.cpp
     pipeline_node/translator_scan.cpp
     pipeline_node/translator_source.cpp
+    pipeline_node/materialized_cte.cpp
     pipeline_node/translator_union.cpp
     pipeline_node/translator_unary.cpp
     pipeline_node/scan_source.cpp

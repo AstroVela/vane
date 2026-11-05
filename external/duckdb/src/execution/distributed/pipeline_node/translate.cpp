@@ -31,6 +31,8 @@
 #include "duckdb/execution/operator/aggregate/physical_window.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/operator/set/physical_cte.hpp"
+#include "duckdb/execution/distributed/pipeline_node/materialized_cte.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
@@ -107,6 +109,29 @@ PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(
 
 void PhysicalPlanToPipelineNodeTranslator::CollectUnionOrderRequirements(const PhysicalOperator &op,
                                                                          bool output_order_required) {
+	// Physical scans may already have IDs from an earlier planning pass. Reserve them before
+	// allocating pipeline IDs, including IDs for CTE nodes that precede another table scan.
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto id = op.Cast<PhysicalTableScan>().extra_info.scan_node_id;
+		if (id.IsValid()) {
+			reserved_source_ids_.insert(NumericCast<int>(id.GetIndex()));
+		}
+	} else if (op.type == PhysicalOperatorType::COLUMN_DATA_SCAN || op.type == PhysicalOperatorType::CHUNK_SCAN ||
+	           op.type == PhysicalOperatorType::DELIM_SCAN) {
+		auto id = op.Cast<PhysicalColumnDataScan>().source_node_id;
+		if (id.IsValid()) {
+			reserved_source_ids_.insert(NumericCast<int>(id.GetIndex()));
+		}
+	}
+	if (op.type == PhysicalOperatorType::CTE) {
+		auto &cte = op.Cast<PhysicalCTE>();
+		CollectUnionOrderRequirements(cte.children[1], output_order_required);
+		CollectUnionOrderRequirements(cte.children[0], ordered_ctes_.count(cte.table_index) != 0);
+		return;
+	}
+	if (op.type == PhysicalOperatorType::CTE_SCAN && output_order_required) {
+		ordered_ctes_.insert(op.Cast<PhysicalColumnDataScan>().cte_index);
+	}
 	bool child_order_required;
 	if (op.type == PhysicalOperatorType::UNION) {
 		auto &union_op = op.Cast<PhysicalUnion>();
@@ -250,6 +275,22 @@ PhysicalPlanToPipelineNodeTranslator::gen_ordered_gather_node(std::shared_ptr<Di
 }
 
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::CTE) {
+		VisitMaterializedCTE(op);
+		return;
+	}
+	if (op.type == PhysicalOperatorType::CTE_SCAN) {
+		auto &scan = op.Cast<PhysicalColumnDataScan>();
+		auto entry = cte_inputs_.find(scan.cte_index);
+		if (entry == cte_inputs_.end()) {
+			throw InvalidInputException("Distributed CTE scan has no producer for binding %llu", scan.cte_index);
+		}
+		node_stack_.push_back(
+		    MakeMaterializedCTEScan(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
+		                                                    get_next_pipeline_node_id(), "CTEScan"),
+		                            entry->second, scan.GetTypes()));
+		return;
+	}
 	auto physical_children = TranslationChildren(op);
 	for (auto &child : physical_children) {
 		VisitOperator(child.get());
@@ -439,10 +480,6 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		node_impl = TranslateDelimJoin(dj, children);
 		break;
 	}
-	case PhysicalOperatorType::CTE: {
-		node_stack_.push_back(TranslateCTESource(op));
-		return;
-	}
 	case PhysicalOperatorType::DUMMY_SCAN: {
 		auto &dummy_scan = static_cast<PhysicalDummyScan &>(op);
 		node_stack_.push_back(TranslateDummyScanSource(dummy_scan));
@@ -455,7 +492,6 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	}
 	case PhysicalOperatorType::COLUMN_DATA_SCAN:
 	case PhysicalOperatorType::CHUNK_SCAN:
-	case PhysicalOperatorType::CTE_SCAN:
 	case PhysicalOperatorType::DELIM_SCAN: {
 		auto &col_scan = static_cast<PhysicalColumnDataScan &>(op);
 		node_stack_.push_back(TranslateColumnDataScanSource(col_scan));

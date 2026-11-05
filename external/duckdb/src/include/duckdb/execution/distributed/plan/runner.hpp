@@ -187,6 +187,8 @@ public:
 // PlanExecutionContext
 //==============================================================================
 
+struct MaterializedCTEOutput;
+
 class PlanExecutionContext {
 private:
 	duckdb::shared_ptr<::duckdb::ClientContext> client_context_;
@@ -194,6 +196,8 @@ private:
 	std::shared_ptr<FteTaskSubmitter> fte_task_submitter_;
 	TaskIDCounter task_id_counter_;
 	TaskInputs initial_inputs_;
+	// Built on the plan-producing thread. Reader streams retain their own immutable snapshot.
+	std::unordered_map<NodeID, std::shared_ptr<const MaterializedCTEOutput>> cte_outputs_;
 
 public:
 	explicit PlanExecutionContext(std::shared_ptr<PlanTaskExecutor> task_executor,
@@ -230,6 +234,20 @@ public:
 	// Return a new TaskIDCounter reference that allows generating new task ids
 	TaskIDCounter &task_id_counter() {
 		return task_id_counter_;
+	}
+
+	void PublishCTE(NodeID producer, std::shared_ptr<const MaterializedCTEOutput> output) {
+		if (!cte_outputs_.emplace(producer, std::move(output)).second) {
+			throw InternalException("Materialized CTE producer %llu was published twice", producer);
+		}
+	}
+
+	std::shared_ptr<const MaterializedCTEOutput> ReadCTE(NodeID producer) const {
+		auto entry = cte_outputs_.find(producer);
+		if (entry == cte_outputs_.end()) {
+			throw InternalException("Materialized CTE producer %llu has not published its result", producer);
+		}
+		return entry->second;
 	}
 
 	::duckdb::ClientContext *client_context() const {
@@ -726,8 +744,9 @@ public:
 		idx_t copy_sink_count = 0;
 		idx_t callback_sink_count = 0;
 		idx_t data_sink_count = 0;
+		std::unordered_set<NodeID> visited_sinks;
 		std::function<void(const DistributedPipelineNodeRef &)> find_sinks = [&](const DistributedPipelineNodeRef &n) {
-			if (!n) {
+			if (!n || !visited_sinks.insert(n->node_id()).second) {
 				return;
 			}
 			auto impl = n->inner();
