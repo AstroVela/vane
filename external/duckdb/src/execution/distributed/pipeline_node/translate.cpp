@@ -283,8 +283,13 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		auto &scan = op.Cast<PhysicalColumnDataScan>();
 		auto entry = cte_inputs_.find(scan.cte_index);
 		if (entry == cte_inputs_.end()) {
+			if (scan.collection.is_owned()) {
+				node_stack_.push_back(TranslateColumnDataScanSource(scan));
+				return;
+			}
 			throw InvalidInputException("Distributed CTE scan has no producer for binding %llu", scan.cte_index);
 		}
+		translated_cte_scans_.insert(&scan);
 		node_stack_.push_back(
 		    MakeMaterializedCTEScan(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
 		                                                    get_next_pipeline_node_id(), "CTEScan"),

@@ -1025,15 +1025,17 @@ def test_exchange_source_task_descriptor_preserves_replicated_distribution():
     assert vane.ray_cxx.exchange_source_task_source_handles_for_test(split[0][1]) == handles
 
 
-def test_flight_exchange_selected_attempt_runtime_path():
-    handles = vane.ray_cxx.flight_exchange_selected_attempt_handles_for_test()
+@pytest.mark.parametrize("partition_by_task", [False, True])
+def test_flight_exchange_selected_attempt_runtime_path(partition_by_task):
+    handles = vane.ray_cxx.flight_exchange_selected_attempt_handles_for_test(partition_by_task)
 
-    assert len(handles) == 4
     sink0_handles = [h for h in handles if "__sink_0__" in h["path"]]
     sink1_handles = [h for h in handles if "__sink_1__" in h["path"]]
-    assert len(sink0_handles) == 2
-    assert len(sink1_handles) == 2
-    assert {h["partition_id"] for h in sink0_handles} == {0, 1}
+    expected_count = 1 if partition_by_task else 2
+    assert len(handles) == 2 * expected_count
+    assert len(sink0_handles) == len(sink1_handles) == expected_count
+    assert {h["partition_id"] for h in sink0_handles} == ({0} if partition_by_task else {0, 1})
+    assert {h["partition_id"] for h in sink1_handles} == ({1} if partition_by_task else {0, 1})
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_host"] == "flight-retry.internal" for h in sink0_handles)

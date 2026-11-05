@@ -391,7 +391,9 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 		serializer.WriteProperty(114, "mark_join_build_expressions", mark_join_build_expressions_);
 	}
 	serializer.WritePropertyWithDefault<bool>(115, "preserve_order", preserve_order_, false);
-	serializer.WritePropertyWithDefault<bool>(116, "partition_by_task", partition_by_task_, false);
+	if (partition_by_task_) {
+		serializer.WriteProperty<bool>(116, "partition_by_task", true);
+	}
 }
 
 } // namespace duckdb

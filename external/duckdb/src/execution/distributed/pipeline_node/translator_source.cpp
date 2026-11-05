@@ -57,7 +57,9 @@ DuckPhysicalPlanRef MakeColumnDataScanPlan(const duckdb::PhysicalColumnDataScan 
 		return optionally_owned_ptr<duckdb::ColumnDataCollection>(CopyColumnDataCollection(*scan.collection));
 	}();
 
-	auto &scan_op = plan->Make<duckdb::PhysicalColumnDataScan>(scan.GetTypes(), scan.type, scan.estimated_cardinality,
+	// A standalone owned collection has no native CTE writer in its worker fragment.
+	auto scan_type = scan.type == PhysicalOperatorType::CTE_SCAN ? PhysicalOperatorType::COLUMN_DATA_SCAN : scan.type;
+	auto &scan_op = plan->Make<duckdb::PhysicalColumnDataScan>(scan.GetTypes(), scan_type, scan.estimated_cardinality,
 	                                                           std::move(collection))
 	                    .Cast<duckdb::PhysicalColumnDataScan>();
 	scan_op.cte_index = scan.cte_index;
@@ -103,11 +105,17 @@ void PhysicalPlanToPipelineNodeTranslator::VisitMaterializedCTE(PhysicalOperator
 	node_stack_.pop_back();
 	auto input = MakeMaterializedCTEInput(
 	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, get_next_pipeline_node_id(), "CTEInput"),
-	    std::move(definition), exchange_mgr_, ordered_ctes_.count(cte.table_index) != 0);
+	    std::move(definition), ordered_ctes_.count(cte.table_index) != 0);
 	if (!cte_inputs_.emplace(cte.table_index, input).second) {
 		throw InternalException("Duplicate distributed CTE binding %llu", cte.table_index);
 	}
 	VisitOperator(cte.children[1]);
+	for (const auto &scan : cte.cte_scans) {
+		if (!translated_cte_scans_.erase(&scan.get())) {
+			throw NotImplementedException(
+			    "Distributed CTE binding %llu has a reader inside an unsupported native subtree", cte.table_index);
+		}
+	}
 	auto body = std::move(node_stack_.back());
 	node_stack_.pop_back();
 	cte_inputs_.erase(cte.table_index);

@@ -195,9 +195,13 @@ private:
 	std::shared_ptr<PlanTaskExecutor> task_executor_;
 	std::shared_ptr<FteTaskSubmitter> fte_task_submitter_;
 	TaskIDCounter task_id_counter_;
-	TaskInputs initial_inputs_;
-	// Built on the plan-producing thread. Reader streams retain their own immutable snapshot.
-	std::unordered_map<NodeID, std::shared_ptr<const MaterializedCTEOutput>> cte_outputs_;
+	std::shared_ptr<const TaskInputs> initial_inputs_;
+	struct CTEBinding {
+		NodeID producer;
+		std::shared_ptr<const MaterializedCTEOutput> output;
+		std::shared_ptr<const CTEBinding> outer;
+	};
+	std::shared_ptr<const CTEBinding> cte_bindings_;
 
 public:
 	explicit PlanExecutionContext(std::shared_ptr<PlanTaskExecutor> task_executor,
@@ -206,13 +210,13 @@ public:
 	                              std::shared_ptr<FteTaskSubmitter> fte_task_submitter = nullptr)
 	    : client_context_(std::move(client_context)), task_executor_(std::move(task_executor)),
 	      fte_task_submitter_(std::move(fte_task_submitter)), task_id_counter_(),
-	      initial_inputs_(std::move(initial_inputs)) {
+	      initial_inputs_(std::make_shared<const TaskInputs>(std::move(initial_inputs))) {
 	}
 
 	PlanExecutionContext(PlanExecutionContext &&) noexcept = default;
 	PlanExecutionContext &operator=(PlanExecutionContext &&) noexcept = default;
-	PlanExecutionContext(const PlanExecutionContext &) = delete;
-	PlanExecutionContext &operator=(const PlanExecutionContext &) = delete;
+	PlanExecutionContext(const PlanExecutionContext &) = default;
+	PlanExecutionContext &operator=(const PlanExecutionContext &) = default;
 
 	std::shared_ptr<FteTaskSubmitter> fte_task_submitter_ref() const {
 		return fte_task_submitter_;
@@ -236,18 +240,21 @@ public:
 		return task_id_counter_;
 	}
 
-	void PublishCTE(NodeID producer, std::shared_ptr<const MaterializedCTEOutput> output) {
-		if (!cte_outputs_.emplace(producer, std::move(output)).second) {
-			throw InternalException("Materialized CTE producer %llu was published twice", producer);
-		}
+	// Each branch gets an immutable lexical binding. Deferred UNION branches can safely
+	// keep a context copy even after their enclosing scope stops producing tasks.
+	PlanExecutionContext WithCTE(NodeID producer, std::shared_ptr<const MaterializedCTEOutput> output) const {
+		auto scoped = *this;
+		scoped.cte_bindings_ = std::make_shared<CTEBinding>(CTEBinding {producer, std::move(output), cte_bindings_});
+		return scoped;
 	}
 
 	std::shared_ptr<const MaterializedCTEOutput> ReadCTE(NodeID producer) const {
-		auto entry = cte_outputs_.find(producer);
-		if (entry == cte_outputs_.end()) {
-			throw InternalException("Materialized CTE producer %llu has not published its result", producer);
+		for (auto binding = cte_bindings_; binding; binding = binding->outer) {
+			if (binding->producer == producer) {
+				return binding->output;
+			}
 		}
-		return entry->second;
+		throw InternalException("Materialized CTE producer %llu has not published its result", producer);
 	}
 
 	::duckdb::ClientContext *client_context() const {
@@ -255,8 +262,8 @@ public:
 	}
 
 	const TaskInput *lookup_initial_input(SourceNodeId node_id) const {
-		auto entry = initial_inputs_.find(node_id);
-		if (entry == initial_inputs_.end()) {
+		auto entry = initial_inputs_->find(node_id);
+		if (entry == initial_inputs_->end()) {
 			return nullptr;
 		}
 		return &entry->second;

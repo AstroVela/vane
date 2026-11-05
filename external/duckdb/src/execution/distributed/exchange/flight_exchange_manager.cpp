@@ -1224,24 +1224,33 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 		return file;
 	};
 
-	for (idx_t partition_id = 0; partition_id < output_partition_count_; partition_id++) {
+	auto append_handle = [&](idx_t partition_id, const std::pair<idx_t, SinkAttemptMetadata> &entry) {
+		const auto source_task_partition_id = entry.first;
+		const auto attempt_id = entry.second.attempt_id;
+		const auto &attempt_metadata = entry.second;
+		ExchangeSourceHandle handle;
+		handle.partition_id = partition_id;
+		handle.source_task_partition_id = source_task_partition_id;
+		handle.attempt_id = attempt_id;
+		handle.node_id = attempt_metadata.node_id;
+		handle.mark_join_build_summary = mark_join_build_summary;
+		if (FlightExchangeUsesNetworkTransport(config_)) {
+			handle.flight_host = attempt_metadata.flight_host;
+			handle.flight_port = attempt_metadata.flight_port;
+			handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+		}
+		handle.files.push_back(build_source_file(attempt_metadata, partition_id));
+		handles.push_back(std::move(handle));
+	};
+	if (ctx_.partition_by_task) {
 		for (const auto &entry : selected_attempts) {
-			const auto source_task_partition_id = entry.first;
-			const auto attempt_id = entry.second.attempt_id;
-			const auto &attempt_metadata = entry.second;
-			ExchangeSourceHandle handle;
-			handle.partition_id = partition_id;
-			handle.source_task_partition_id = source_task_partition_id;
-			handle.attempt_id = attempt_id;
-			handle.node_id = attempt_metadata.node_id;
-			handle.mark_join_build_summary = mark_join_build_summary;
-			if (FlightExchangeUsesNetworkTransport(config_)) {
-				handle.flight_host = attempt_metadata.flight_host;
-				handle.flight_port = attempt_metadata.flight_port;
-				handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			append_handle(entry.first % output_partition_count_, entry);
+		}
+	} else {
+		for (idx_t partition_id = 0; partition_id < output_partition_count_; partition_id++) {
+			for (const auto &entry : selected_attempts) {
+				append_handle(partition_id, entry);
 			}
-			handle.files.push_back(build_source_file(attempt_metadata, partition_id));
-			handles.push_back(std::move(handle));
 		}
 	}
 	return handles;

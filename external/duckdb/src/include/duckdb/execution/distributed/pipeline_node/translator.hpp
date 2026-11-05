@@ -79,6 +79,7 @@ private:
 	std::unordered_set<const PhysicalUnion *> ordered_unions_;
 	std::unordered_set<idx_t> ordered_ctes_;
 	std::unordered_map<idx_t, DistributedPipelineNodeRef> cte_inputs_;
+	std::unordered_set<const PhysicalOperator *> translated_cte_scans_;
 	std::unordered_set<int> reserved_source_ids_;
 
 	int get_next_pipeline_node_id() {

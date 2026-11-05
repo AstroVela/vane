@@ -512,6 +512,8 @@ def build_progress_snapshot(
                 "id": str(fragment_execution.get("fragment_id") or display_index),
                 "display_id": str(display_index),
                 "name": f"Fragment {display_index}",
+                "total_partitions": partition_total,
+                "completed_partitions": partition_done,
                 "pending_partitions": fragment_pending_partitions,
                 "pipelines": pipelines,
             }

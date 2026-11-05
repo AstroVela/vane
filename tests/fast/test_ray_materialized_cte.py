@@ -70,6 +70,18 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
             SELECT c.x FROM c JOIN range(2) t(i) ON x=i ORDER BY x""",
             [(0,), (1,)],
         ),
+        (
+            """SELECT * FROM
+                 ((WITH c(x) AS MATERIALIZED (VALUES (2),(3)) SELECT x FROM c) UNION ALL SELECT 4) a
+                 POSITIONAL JOIN
+                 ((WITH c(y) AS MATERIALIZED (VALUES (5),(6)) SELECT y FROM c) UNION ALL SELECT 7) b""",
+            [(2, 5), (3, 6), (4, 7)],
+        ),
+        (
+            """WITH c(x) AS MATERIALIZED (VALUES (NULL::BIGINT), (7), (7))
+            SELECT x FROM c ORDER BY x NULLS FIRST""",
+            [(None,), (7,), (7,)],
+        ),
     ]
     for sql, expected in cases:
         assert ray_con.sql(sql).fetchall() == expected, sql
@@ -78,6 +90,24 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
 def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_path, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import ray
+
+    from vane.runners.ray.driver import RayQueryDriverClient
+
+    # Inspect the live scheduler after the first result, while the query still owns its fragments.
+    snapshots = []
+    stream_plan = RayQueryDriverClient.stream_plan
+
+    def observe_scan(client, plan):
+        for index, partition in enumerate(stream_plan(client, plan)):
+            if index == 0:
+                snapshot = ray.get(
+                    client.runner.progress_snapshot.remote(client._owner_id, plan.session_id(), plan.idx())
+                )
+                snapshots.append((str(plan.idx()), snapshot))
+            yield partition
+
+    monkeypatch.setattr(RayQueryDriverClient, "stream_plan", observe_scan)
 
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
@@ -89,7 +119,11 @@ def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_
     explicit = f"WITH c AS MATERIALIZED (SELECT x FROM {source}) SELECT count(*) FROM c"
     repeated = f"SELECT DISTINCT x FROM {source}"
     automatic = f"SELECT a.x FROM ({repeated}) a JOIN ({repeated}) b USING (x) ORDER BY a.x"
-    for sql, cte_count in [(direct, 0), (explicit, 1), (automatic, 1)]:
+    for sql, cte_count, expected in [
+        (direct, 0, [(12,)]),
+        (explicit, 1, [(12,)]),
+        (automatic, 1, [(x,) for x in range(12)]),
+    ]:
         plan = _physical_plan(ray_con, sql)
         graph = plan.collect_query_resource_graph_metadata(conn=ray_con)
         nodes = graph["nodes"]
@@ -98,8 +132,27 @@ def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_
         assert scan["num_partitions"] == 4
         splits = plan.scan_split_batch_map()
         assert [len(batch) for batch in splits.values()] == [4]
-    assert ray_con.sql(direct).fetchall() == ray_con.sql(explicit).fetchall() == [(12,)]
-    assert ray_con.sql(automatic).fetchall() == [(x,) for x in range(12)]
+        assert ray_con.sql(sql).fetchall() == expected
+        ((query_id, snapshot),) = snapshots
+        snapshots.clear()
+        (scan_fragment,) = [f for f in snapshot["fragments"] if f["id"] == f"{query_id}:node:{scan['node_id']}"]
+        assert scan_fragment["total_partitions"] == scan_fragment["completed_partitions"] == 4
+
+
+def test_ray_cte_planning_rejects_hidden_reader_and_prints_shared_nodes_once(ray_con):
+    sql = """WITH c(x) AS MATERIALIZED (VALUES (1),(2),(3))
+        SELECT i,(SELECT count(*) FROM c WHERE x<i) FROM range(3) t(i)"""
+    with pytest.raises(vane.NotImplementedException, match="reader inside an unsupported native subtree"):
+        _physical_plan(ray_con, sql).collect_query_resource_graph_metadata(conn=ray_con)
+    definitions = ["c0 AS MATERIALIZED (SELECT i AS x FROM range(3) t(i))"]
+    for index in range(1, 9):
+        name = f"c{index - 1}"
+        definitions.append(f"c{index} AS MATERIALIZED (SELECT a.x FROM {name} a JOIN {name} b USING (x))")
+    plan = _physical_plan(ray_con, "WITH " + ", ".join(definitions) + " SELECT * FROM c8")
+    graph = plan.collect_query_resource_graph_metadata(conn=ray_con)
+    tree = plan.repr_ascii(True)
+    assert "reference to node" in tree
+    assert len(tree.splitlines()) < 4 * len(graph["nodes"])
 
 
 def test_ray_cte_producer_failure_releases_query(ray_con):

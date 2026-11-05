@@ -26,6 +26,8 @@ namespace distributed {
 struct ExchangeContext {
 	std::string query_id;
 	std::string exchange_id;
+	// All rows of a CTE writer land in its logical task partition modulo the output width.
+	bool partition_by_task = false;
 };
 
 // ─── Sink Handles ────────────────────────────────────────

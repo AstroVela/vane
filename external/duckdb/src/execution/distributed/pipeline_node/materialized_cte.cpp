@@ -4,11 +4,10 @@
 #include "duckdb/execution/distributed/pipeline_node/materialized_cte.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
+#include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
-#include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 
 namespace duckdb {
@@ -25,10 +24,9 @@ struct MaterializedCTEOutput {
 // Both the scope and all its CTE scans reference this same node in the resource graph.
 class MaterializedCTEInput : public PipelineNodeImpl, public std::enable_shared_from_this<MaterializedCTEInput> {
 public:
-	MaterializedCTEInput(PipelineNodeContext context, DistributedPipelineNodeRef definition,
-	                     std::shared_ptr<ExchangeManager> manager, bool preserve_order)
-	    : context_(std::move(context)), definition_(std::move(definition)), manager_(std::move(manager)),
-	      preserve_order_(preserve_order),
+	MaterializedCTEInput(PipelineNodeContext context, DistributedPipelineNodeRef definition, bool preserve_order)
+	    : context_(std::move(context)), definition_(std::move(definition)),
+	      flight_config_(ResolveFlightExchangeConfigFromEnv()), preserve_order_(preserve_order),
 	      config_(definition_->config().schema(), definition_->config().execution_config(),
 	              ClusteringSpec::unknown_with_num_partitions(preserve_order_ ? 1 : definition_->num_partitions())) {
 	}
@@ -56,26 +54,24 @@ public:
 		return definition_->produce_tasks(ctx);
 	}
 
-	void Publish(PlanExecutionContext &ctx) {
+	std::shared_ptr<const MaterializedCTEOutput> Publish(PlanExecutionContext &ctx) {
 		const auto partition_count = config_.clustering_spec()->num_partitions();
 		auto output = std::make_shared<MaterializedCTEOutput>();
 		output->exchange_id = context_.query_id() + "_cte_" + std::to_string(node_id());
-		output->manager = manager_;
+		output->manager = std::make_shared<FlightExchangeManager>(flight_config_, ctx.client_context());
 		output->preserve_order = preserve_order_;
 		output->partitions.resize(partition_count);
 		auto submitter = ctx.fte_task_submitter_ref();
 		if (!submitter) {
 			throw InternalException("Materialized CTE requires an FTE task submitter");
 		}
-		manager_->SetContext(ctx.client_context());
-		auto exchange = manager_->CreateExchange({context_.query_id(), output->exchange_id}, partition_count);
+		auto exchange =
+		    output->manager->CreateExchange({context_.query_id(), output->exchange_id, true}, partition_count);
 		auto writes = produce_tasks(ctx).pipeline_instruction(
 		    shared_from_this(),
 		    [&](DuckPhysicalPlanRef plan) {
-			    auto sink = AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, manager_, false, {},
-			                                          preserve_order_);
-			    sink->Root().Cast<PhysicalRemoteExchangeSink>().EnableTaskPartitioning();
-			    return sink;
+			    return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, output->manager, false, {},
+			                                     preserve_order_);
 		    },
 		    ctx.client_context());
 		if (preserve_order_) {
@@ -97,7 +93,6 @@ public:
 		}
 		// Closing the coordinator exchange leaves selected attempts under the query's shuffle-cache ownership.
 		exchange->Close();
-		ctx.PublishCTE(node_id(), std::move(output));
 		if (FteRunnerDebugEnabled()) {
 			std::unordered_set<idx_t> writers;
 			for (const auto &task : completed.outputs) {
@@ -111,12 +106,13 @@ public:
 		if (ready.is_err()) {
 			throw IOException("Publishing materialized CTE failed: %s", ready.error().what());
 		}
+		return output;
 	}
 
 private:
 	PipelineNodeContext context_;
 	DistributedPipelineNodeRef definition_;
-	std::shared_ptr<ExchangeManager> manager_;
+	FlightExchangeConfig flight_config_;
 	bool preserve_order_;
 	PipelineNodeConfig config_;
 };
@@ -221,9 +217,10 @@ public:
 	}
 
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &ctx) override {
-		std::static_pointer_cast<MaterializedCTEInput>(input_->implementation())->Publish(ctx);
+		auto input = std::static_pointer_cast<MaterializedCTEInput>(input_->implementation());
+		auto body_context = ctx.WithCTE(input->node_id(), input->Publish(ctx));
 		// The scope contributes a dependency and a task identity, but no physical operator.
-		return body_->produce_tasks(ctx).map_tasks([scope = context_](SubmittableTask<WorkerTask> submitted) {
+		return body_->produce_tasks(body_context).map_tasks([scope = context_](SubmittableTask<WorkerTask> submitted) {
 			auto *task = submitted.task();
 			auto id = task->task_context();
 			id.add_node_id(scope.node_id());
@@ -243,9 +240,9 @@ private:
 } // namespace
 
 DistributedPipelineNodeRef MakeMaterializedCTEInput(PipelineNodeContext context, DistributedPipelineNodeRef definition,
-                                                    std::shared_ptr<ExchangeManager> manager, bool preserve_order) {
-	return std::make_shared<DistributedPipelineNode>(std::make_shared<MaterializedCTEInput>(
-	    std::move(context), std::move(definition), std::move(manager), preserve_order));
+                                                    bool preserve_order) {
+	return std::make_shared<DistributedPipelineNode>(
+	    std::make_shared<MaterializedCTEInput>(std::move(context), std::move(definition), preserve_order));
 }
 
 DistributedPipelineNodeRef MakeMaterializedCTEScan(PipelineNodeContext context, DistributedPipelineNodeRef input,
