@@ -70,6 +70,7 @@ Changelog = "https://github.com/AstroVela/vane/releases"
 [project.optional-dependencies]
 doris = ["aiohttp>=3.14.3,<4"]
 milvus = ["pymilvus>=3.0.1,<4"]
+postgres = ["adbc-driver-manager>=1.12,<2", "adbc-driver-postgresql>=1.12,<2"] # 1.13 requires Python 3.11
 qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 embedding_http = ["httpx>=0.27,<1", "pillow>=10.4"] # Inference HTTP clients, without local inference engines
@@ -166,6 +167,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "imagecodecs>=2024.1.1", # TIFF compression and 16-bit PNG
     "aiohttp>=3.14.3,<4", # Apache Doris Arrow Stream Load DataSink
     "pymilvus>=3.0.1,<4", # Milvus DataSink
+    "adbc-driver-postgresql>=1.12,<2", # PostgreSQL DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
     "soundfile>=0.14", # AudioFile metadata and waveform decoding
     "soxr>=1.0,<2", # AudioFile sample-rate conversion
@@ -384,6 +386,7 @@ include = [
     "/tests/fast/test_doris_datasink.py",
     "/tests/fast/test_extension_catalog.py",
     "/tests/fast/test_milvus_datasink.py",
+    "/tests/fast/test_postgres_datasink.py",
     "/tests/fast/test_qdrant_datasink.py",
     "/tests/fast/test_package_metadata.py",
     "/tests/fast/test_ray_test_profile.py",
@@ -764,6 +767,8 @@ ignore_errors = true
 module = [
     "adbc_driver_manager",
     "adbc_driver_manager.*",
+    "adbc_driver_postgresql",
+    "adbc_driver_postgresql.*",
     "aiohttp",
     "aiohttp.*",
     "anthropic",
