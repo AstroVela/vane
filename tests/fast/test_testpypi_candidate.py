@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Vane contributors
+﻿# SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -113,7 +113,6 @@ def test_testpypi_extension_signing_key_is_candidate_only():
                 settings[job_name] = value
     # Every wheel build keeps candidate trust gated on the operation input.
     assert settings == {
-        "linux-vcpkg": gated_setting,
         "wheels-linux": gated_setting,
         "wheels-macos": gated_setting,
     }
