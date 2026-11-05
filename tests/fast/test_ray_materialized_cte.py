@@ -75,6 +75,33 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
         assert ray_con.sql(sql).fetchall() == expected, sql
 
 
+def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    for file_id in range(4):
+        pq.write_table(pa.table({"x": list(range(file_id * 3, file_id * 3 + 3))}), tmp_path / f"{file_id}.parquet")
+    source = "read_parquet('" + (tmp_path / "*.parquet").as_posix().replace("'", "''") + "')"
+    direct = f"SELECT count(*) FROM {source}"
+    explicit = f"WITH c AS MATERIALIZED (SELECT x FROM {source}) SELECT count(*) FROM c"
+    repeated = f"SELECT DISTINCT x FROM {source}"
+    automatic = f"SELECT a.x FROM ({repeated}) a JOIN ({repeated}) b USING (x) ORDER BY a.x"
+    for sql, cte_count in [(direct, 0), (explicit, 1), (automatic, 1)]:
+        plan = _physical_plan(ray_con, sql)
+        graph = plan.collect_query_resource_graph_metadata(conn=ray_con)
+        nodes = graph["nodes"]
+        assert sum(n["node_name"] == "CTEInput" for n in nodes) == cte_count
+        (scan,) = [n for n in nodes if n["node_name"] == "ScanSource"]
+        assert scan["num_partitions"] == 4
+        splits = plan.scan_split_batch_map()
+        assert [len(batch) for batch in splits.values()] == [4]
+    assert ray_con.sql(direct).fetchall() == ray_con.sql(explicit).fetchall() == [(12,)]
+    assert ray_con.sql(automatic).fetchall() == [(x,) for x in range(12)]
+
+
 def test_ray_cte_producer_failure_releases_query(ray_con):
     def fail(i):
         raise ValueError("cte-producer-failed")

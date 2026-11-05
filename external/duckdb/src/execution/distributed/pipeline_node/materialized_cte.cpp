@@ -8,6 +8,7 @@
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
+#include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 
 namespace duckdb {
@@ -29,7 +30,7 @@ public:
 	    : context_(std::move(context)), definition_(std::move(definition)), manager_(std::move(manager)),
 	      preserve_order_(preserve_order),
 	      config_(definition_->config().schema(), definition_->config().execution_config(),
-	              ClusteringSpec::unknown_with_num_partitions(1)) {
+	              ClusteringSpec::unknown_with_num_partitions(preserve_order_ ? 1 : definition_->num_partitions())) {
 	}
 
 	const PipelineNodeContext &context() const override {
@@ -71,8 +72,10 @@ public:
 		auto writes = produce_tasks(ctx).pipeline_instruction(
 		    shared_from_this(),
 		    [&](DuckPhysicalPlanRef plan) {
-			    return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, manager_, false, {},
+			    auto sink = AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, manager_, false, {},
 			                                          preserve_order_);
+			    sink->Root().Cast<PhysicalRemoteExchangeSink>().EnableTaskPartitioning();
+			    return sink;
 		    },
 		    ctx.client_context());
 		if (preserve_order_) {
