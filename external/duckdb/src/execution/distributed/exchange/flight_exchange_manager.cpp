@@ -241,6 +241,19 @@ bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const Lo
 	if (expected_type.id() == LogicalTypeId::AGGREGATE_STATE && arrow_type.id() == LogicalTypeId::BLOB) {
 		return true;
 	}
+	// Arrow decodes an ENUM dictionary to its labels, including inside lists and structs.
+	// Check the complete wire type before casting labels back through the producer's ENUM.
+	if (TypeVisitor::Contains(expected_type, LogicalTypeId::ENUM) &&
+	    !TypeVisitor::Contains(expected_type, [](const LogicalType &type) {
+		    return type.HasAlias() && type.id() != LogicalTypeId::ENUM && !GovernedLogicalType::IsGoverned(type);
+	    })) {
+		auto label_type = TypeVisitor::VisitReplace(expected_type, [](const LogicalType &type) -> LogicalType {
+			return type.id() == LogicalTypeId::ENUM ? LogicalType::VARCHAR : type;
+		});
+		if (arrow_type == label_type) {
+			return true;
+		}
+	}
 	return TypeVisitor::Contains(expected_type, GovernedLogicalType::IsGoverned) &&
 	       GovernedLogicalType::IsCanonicalStorageType(arrow_type, expected_type);
 }

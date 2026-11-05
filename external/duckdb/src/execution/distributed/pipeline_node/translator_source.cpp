@@ -4,6 +4,7 @@
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/environment.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -96,6 +97,14 @@ std::shared_ptr<DistributedPipelineNode> MakeScanSourceNode(PipelineNodeContext 
 } // namespace
 
 void PhysicalPlanToPipelineNodeTranslator::VisitMaterializedCTE(PhysicalOperator &op) {
+	const EnvironmentVariable setting("VANE_RAY_MATERIALIZED_CTE");
+	if (setting.GetValue()) {
+		auto enabled = StringUtil::Lower(setting.GetValue());
+		if (enabled == "0" || enabled == "false" || enabled == "off" || enabled == "no") {
+			throw NotImplementedException(
+			    "Distributed materialized CTE execution is disabled by VANE_RAY_MATERIALIZED_CTE");
+		}
+	}
 	auto &cte = op.Cast<PhysicalCTE>();
 	if (cte.children.size() != 2) {
 		throw InternalException("Distributed materialized CTE requires a definition and a consumer");
@@ -110,12 +119,6 @@ void PhysicalPlanToPipelineNodeTranslator::VisitMaterializedCTE(PhysicalOperator
 		throw InternalException("Duplicate distributed CTE binding %llu", cte.table_index);
 	}
 	VisitOperator(cte.children[1]);
-	for (const auto &scan : cte.cte_scans) {
-		if (!translated_cte_scans_.erase(&scan.get())) {
-			throw NotImplementedException(
-			    "Distributed CTE binding %llu has a reader inside an unsupported native subtree", cte.table_index);
-		}
-	}
 	auto body = std::move(node_stack_.back());
 	node_stack_.pop_back();
 	cte_inputs_.erase(cte.table_index);

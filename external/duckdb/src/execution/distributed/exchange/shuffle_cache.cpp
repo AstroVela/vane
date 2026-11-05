@@ -43,6 +43,15 @@
 namespace duckdb {
 namespace distributed {
 
+std::string LocalShufflePathForArrow(const std::string &path) {
+#ifdef _WIN32
+	auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
+	return WindowsUtil::UnicodeToUTF8(native_path.c_str());
+#else
+	return path;
+#endif
+}
+
 namespace {
 
 std::string ShuffleCacheSanitizePathComponent(const std::string &value, bool local_path) {
@@ -87,13 +96,7 @@ DuckDBError ShuffleCacheArrowToError(const arrow::Status &status, const std::str
 }
 
 DuckDBResult<std::shared_ptr<arrow::io::OutputStream>> OpenPosixArrowOutput(const std::string &path) {
-#ifdef _WIN32
-	auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
-	auto output_path = WindowsUtil::UnicodeToUTF8(native_path.c_str());
-#else
-	const auto &output_path = path;
-#endif
-	auto out_res = arrow::io::FileOutputStream::Open(output_path);
+	auto out_res = arrow::io::FileOutputStream::Open(LocalShufflePathForArrow(path));
 	if (!out_res.ok()) {
 		return DuckDBResult<std::shared_ptr<arrow::io::OutputStream>>::err(
 		    ShuffleCacheArrowToError(out_res.status(), "open shuffle output"));
@@ -102,13 +105,7 @@ DuckDBResult<std::shared_ptr<arrow::io::OutputStream>> OpenPosixArrowOutput(cons
 }
 
 DuckDBResult<std::shared_ptr<arrow::io::InputStream>> OpenPosixArrowInput(const std::string &path) {
-#ifdef _WIN32
-	auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
-	auto input_path = WindowsUtil::UnicodeToUTF8(native_path.c_str());
-#else
-	const auto &input_path = path;
-#endif
-	auto in_res = arrow::io::ReadableFile::Open(input_path);
+	auto in_res = arrow::io::ReadableFile::Open(LocalShufflePathForArrow(path));
 	if (!in_res.ok()) {
 		return DuckDBResult<std::shared_ptr<arrow::io::InputStream>>::err(
 		    ShuffleCacheArrowToError(in_res.status(), "open shuffle input"));

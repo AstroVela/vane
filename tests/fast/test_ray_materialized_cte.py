@@ -82,6 +82,16 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
             SELECT x FROM c ORDER BY x NULLS FIRST""",
             [(None,), (7,), (7,)],
         ),
+        (
+            """WITH c AS MATERIALIZED (SELECT 'b'::ENUM('z','b') AS x)
+            SELECT x::VARCHAR, enum_range(x)::VARCHAR[] FROM c""",
+            [("b", ["z", "b"])],
+        ),
+        (
+            """WITH c AS MATERIALIZED (SELECT {'v': ['z'::ENUM('z','b'), NULL]} AS x)
+            SELECT x.v::VARCHAR[] FROM c""",
+            [(["z", None],)],
+        ),
     ]
     for sql, expected in cases:
         assert ray_con.sql(sql).fetchall() == expected, sql
@@ -112,6 +122,7 @@ def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
     monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    monkeypatch.setenv("VANE_RAY_MAX_TASK_BACKLOG", "1")
     for file_id in range(4):
         pq.write_table(pa.table({"x": list(range(file_id * 3, file_id * 3 + 3))}), tmp_path / f"{file_id}.parquet")
     source = "read_parquet('" + (tmp_path / "*.parquet").as_posix().replace("'", "''") + "')"
@@ -137,13 +148,21 @@ def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_
         snapshots.clear()
         (scan_fragment,) = [f for f in snapshot["fragments"] if f["id"] == f"{query_id}:node:{scan['node_id']}"]
         assert scan_fragment["total_partitions"] == scan_fragment["completed_partitions"] == 4
+    # The UNION continues pulling the external scan after its enclosing CTE returns the stream.
+    assert ray_con.sql(
+        f"WITH c(x) AS MATERIALIZED (VALUES (-1)) SELECT x FROM (SELECT x FROM c UNION ALL SELECT x FROM {source}) ORDER BY x"
+    ).fetchall() == [(x,) for x in range(-1, 12)]
 
 
-def test_ray_cte_planning_rejects_hidden_reader_and_prints_shared_nodes_once(ray_con):
-    sql = """WITH c(x) AS MATERIALIZED (VALUES (1),(2),(3))
-        SELECT i,(SELECT count(*) FROM c WHERE x<i) FROM range(3) t(i)"""
-    with pytest.raises(vane.NotImplementedException, match="reader inside an unsupported native subtree"):
-        _physical_plan(ray_con, sql).collect_query_resource_graph_metadata(conn=ray_con)
+def test_ray_cte_planning_rejects_hidden_reader_and_prints_shared_nodes_once(ray_con, monkeypatch):
+    for sql in [
+        """WITH c(x) AS MATERIALIZED (VALUES (1),(2),(3))
+           SELECT i,(SELECT count(*) FROM c WHERE x<i) FROM range(3) t(i)""",
+        """SELECT i,(WITH c AS MATERIALIZED (SELECT x FROM range(3)t(x) WHERE x<i)
+           SELECT count(*) FROM c) FROM range(3)t(i)""",
+    ]:
+        with pytest.raises(vane.InvalidInputException, match="inside an unsupported native subtree"):
+            _physical_plan(ray_con, sql).collect_query_resource_graph_metadata(conn=ray_con)
     definitions = ["c0 AS MATERIALIZED (SELECT i AS x FROM range(3) t(i))"]
     for index in range(1, 9):
         name = f"c{index - 1}"
@@ -153,6 +172,9 @@ def test_ray_cte_planning_rejects_hidden_reader_and_prints_shared_nodes_once(ray
     tree = plan.repr_ascii(True)
     assert "reference to node" in tree
     assert len(tree.splitlines()) < 4 * len(graph["nodes"])
+    monkeypatch.setenv("VANE_RAY_MATERIALIZED_CTE", "0")
+    with pytest.raises(vane.InvalidInputException, match="disabled by VANE_RAY_MATERIALIZED_CTE"):
+        _physical_plan(ray_con, "WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c").repr_ascii(True)
 
 
 def test_ray_cte_producer_failure_releases_query(ray_con):

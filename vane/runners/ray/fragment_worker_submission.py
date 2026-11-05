@@ -1063,7 +1063,10 @@ class FteWorkerSubmissionMixin:
                         }
                         if not registration_query_ids or "" in registration_query_ids:
                             raise RuntimeError("fragment registration requires non-empty query identity")
-                        registration_ref = self.actor_handle.register_fragments.remote(fragment_payloads)
+                        method = self._fragment_registration_method(
+                            entry["plan"] for entry in fragments_to_register.values()
+                        )
+                        registration_ref = method.remote(fragment_payloads)
                         registration_fragment_ids = tuple(sorted(fragments_to_register))
                         self._registered_fragment_ids.update(registration_fragment_ids)
                         for submitted_fragment_id in registration_fragment_ids:

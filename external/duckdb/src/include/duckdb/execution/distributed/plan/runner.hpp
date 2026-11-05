@@ -235,8 +235,8 @@ public:
 		});
 	}
 
-	// Return a new TaskIDCounter reference that allows generating new task ids
-	TaskIDCounter &task_id_counter() {
+	// A deferred task can outlive its lexical context. Counter copies share the same atomic.
+	TaskIDCounter task_id_counter() const {
 		return task_id_counter_;
 	}
 

@@ -1336,8 +1336,13 @@ def test_ray_task_result_poller_shutdown_is_terminal_and_idempotent():
     )
 
 
-def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path):
-    result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path))
+@pytest.mark.parametrize("remote_reader", [False, True])
+def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path, remote_reader):
+    if remote_reader:
+        # With the attempt and partition subdirectories, the Windows path exceeds MAX_PATH.
+        tmp_path = tmp_path / ("flight-" * 22)
+        tmp_path.mkdir()
+    result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path), remote_reader)
 
     assert result["handle_attempts"] == [1]
     assert result["handle_paths"] == [result["selected_output_location"]]

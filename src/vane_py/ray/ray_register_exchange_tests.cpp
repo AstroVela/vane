@@ -55,7 +55,7 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 
 	m.def(
 	    "flight_exchange_selected_attempt_dataplane_for_test",
-	    [](const std::string &local_dir) {
+	    [](const std::string &local_dir, bool remote_reader) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
@@ -111,7 +111,12 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    auto handles = exchange->GetSourceHandles();
 
 		    auto read_values = [&](const std::vector<ExchangeSourceHandle> &source_handles) {
-			    auto source = mgr.CreateSource();
+			    auto reader_config = config;
+			    if (remote_reader) {
+				    reader_config.node_id = "remote-reader";
+			    }
+			    FlightExchangeManager reader(reader_config, &context);
+			    auto source = reader.CreateSource();
 			    auto copied_handles = source_handles;
 			    source->AddSourceHandles(std::move(copied_handles));
 			    DataChunk output;
@@ -171,7 +176,8 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    }
 		    return out;
 	    },
-	    py::arg("local_dir"), "Verify FlightExchangeSource reads only the selected retry attempt data.");
+	    py::arg("local_dir"), py::arg("remote_reader") = false,
+	    "Verify FlightExchangeSource reads only the selected retry attempt data.");
 
 	m.def(
 	    "flight_exchange_local_dirs_from_env_for_test",

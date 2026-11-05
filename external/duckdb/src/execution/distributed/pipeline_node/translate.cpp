@@ -74,6 +74,21 @@ vector<reference<PhysicalOperator>> TranslationChildren(PhysicalOperator &op) {
 	return op.GetInputChildren();
 }
 
+void ValidateOwnedCTESubtree(const PhysicalOperator &op, std::unordered_set<const PhysicalOperator *> &visited) {
+	if (!visited.insert(&op).second) {
+		return;
+	}
+	if (op.type == PhysicalOperatorType::CTE || op.type == PhysicalOperatorType::CTE_SCAN ||
+	    op.type == PhysicalOperatorType::RECURSIVE_CTE || op.type == PhysicalOperatorType::RECURSIVE_KEY_CTE ||
+	    op.type == PhysicalOperatorType::RECURSIVE_CTE_SCAN ||
+	    op.type == PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN) {
+		throw NotImplementedException("Distributed CTE producer or reader inside an unsupported native subtree");
+	}
+	for (auto &child : op.GetChildren()) {
+		ValidateOwnedCTESubtree(child.get(), visited);
+	}
+}
+
 void ValidateResolvedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                         const DistributedExtensionWritePlan &plan) {
 	info.Validate();
@@ -289,7 +304,6 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			}
 			throw InvalidInputException("Distributed CTE scan has no producer for binding %llu", scan.cte_index);
 		}
-		translated_cte_scans_.insert(&scan);
 		node_stack_.push_back(
 		    MakeMaterializedCTEScan(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
 		                                                    get_next_pipeline_node_id(), "CTEScan"),
@@ -297,6 +311,18 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		return;
 	}
 	auto physical_children = TranslationChildren(op);
+	auto owned_children = op.GetChildren();
+	for (idx_t i = 0; i < owned_children.size(); ++i) {
+		auto &child = owned_children[i].get();
+		if (i < physical_children.size() && &physical_children[i].get() == &child) {
+			continue;
+		}
+		if (std::none_of(physical_children.begin(), physical_children.end(),
+		                 [&](const auto &entry) { return &entry.get() == &child; })) {
+			std::unordered_set<const PhysicalOperator *> visited;
+			ValidateOwnedCTESubtree(child, visited);
+		}
+	}
 	for (auto &child : physical_children) {
 		VisitOperator(child.get());
 	}
