@@ -26,7 +26,8 @@ namespace distributed {
 struct ExchangeContext {
 	ExchangeContext() = default;
 	ExchangeContext(std::string query_id_p, std::string exchange_id_p = std::string(), bool partition_by_task_p = false)
-	    : query_id(std::move(query_id_p)), exchange_id(std::move(exchange_id_p)), partition_by_task(partition_by_task_p) {
+	    : query_id(std::move(query_id_p)), exchange_id(std::move(exchange_id_p)),
+	      partition_by_task(partition_by_task_p) {
 	}
 
 	std::string query_id;
