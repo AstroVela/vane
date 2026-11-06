@@ -45,6 +45,8 @@ def test_cte_fragment_registration_requires_worker_capability():
     assert legacy._fragment_registration_method([plain]) is legacy.actor_handle.register_fragments
     with pytest.raises(RuntimeError, match="worker lacks materialized CTE exchange support"):
         legacy._fragment_registration_method([plain, writer])
+    with pytest.raises(RuntimeError, match="worker lacks materialized CTE exchange support"):
+        legacy._fragment_registration_method([object()], requires_cte_exchange=True)
     assert current._fragment_registration_method([writer]) is current.actor_handle.register_materialized_cte_fragments
 
 

@@ -143,8 +143,8 @@ class FteWorkerLifecycleMixin:
             stats[str(key)] = int(value)
         return stats
 
-    def _fragment_registration_method(self, plans: Iterable[Any]) -> Any:
-        if any(getattr(plan, "_requires_cte_exchange", False) is True for plan in plans):
+    def _fragment_registration_method(self, plans: Iterable[Any], *, requires_cte_exchange: bool = False) -> Any:
+        if requires_cte_exchange or any(getattr(plan, "_requires_cte_exchange", False) is True for plan in plans):
             method = getattr(self.actor_handle, "register_materialized_cte_fragments", None)
             if method is None:
                 raise RuntimeError(
@@ -153,7 +153,9 @@ class FteWorkerLifecycleMixin:
             return method
         return self.actor_handle.register_fragments
 
-    def ensure_fragment_registered(self, query_id: str, fragment_id: str, fragment_plan: Any) -> Any | None:
+    def ensure_fragment_registered(
+        self, query_id: str, fragment_id: str, fragment_plan: Any, *, requires_cte_exchange: bool = False
+    ) -> Any | None:
         fragment_id = str(fragment_id or "").strip()
         if not fragment_id:
             return None
@@ -204,7 +206,10 @@ class FteWorkerLifecycleMixin:
                             ),
                             "query_id": query_id,
                         }
-                        registration_ref = self._fragment_registration_method([fragment_plan]).remote([payload])
+                        method = self._fragment_registration_method(
+                            [fragment_plan], requires_cte_exchange=requires_cte_exchange
+                        )
+                        registration_ref = method.remote([payload])
                         self._registered_fragment_ids.add(fragment_id)
                         self._fragment_registration_refs[fragment_id] = registration_ref
                         self._fragment_query_ids[fragment_id] = query_id

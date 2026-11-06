@@ -22,6 +22,7 @@
  *   - Source streams selected ShuffleCache partition files batch by batch
  */
 
+#include "duckdb/common/extra_type_info.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
@@ -234,6 +235,33 @@ DuckDBError FlightExchangeArrowToError(const arrow::Status &status, const std::s
 	return DuckDBError::external_error(context + ": " + status.ToString());
 }
 
+// Modify only ENUM leaves of a private schema copy, preserving all sibling aliases and extension metadata.
+void UseArrowEnumLabels(LogicalType &type) {
+	if (type.id() == LogicalTypeId::ENUM) {
+		type = LogicalType::VARCHAR;
+		return;
+	}
+	auto info = type.AuxInfo();
+	if (!info) {
+		return;
+	}
+	switch (info->type) {
+	case ExtraTypeInfoType::STRUCT_TYPE_INFO:
+		for (auto &child : info->Cast<StructTypeInfo>().child_types) {
+			UseArrowEnumLabels(child.second);
+		}
+		break;
+	case ExtraTypeInfoType::LIST_TYPE_INFO:
+		UseArrowEnumLabels(info->Cast<ListTypeInfo>().child_type);
+		break;
+	case ExtraTypeInfoType::ARRAY_TYPE_INFO:
+		UseArrowEnumLabels(info->Cast<ArrayTypeInfo>().child_type);
+		break;
+	default:
+		break;
+	}
+}
+
 bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const LogicalType &expected_type) {
 	if (arrow_type == expected_type) {
 		return true;
@@ -243,16 +271,10 @@ bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const Lo
 	}
 	// Arrow decodes an ENUM dictionary to its labels, including inside lists and structs.
 	// Check the complete wire type before casting labels back through the producer's ENUM.
-	if (TypeVisitor::Contains(expected_type, LogicalTypeId::ENUM) &&
-	    !TypeVisitor::Contains(expected_type, [](const LogicalType &type) {
-		    return type.HasAlias() && type.id() != LogicalTypeId::ENUM && !GovernedLogicalType::IsGoverned(type);
-	    })) {
-		auto label_type = TypeVisitor::VisitReplace(expected_type, [](const LogicalType &type) -> LogicalType {
-			return type.id() == LogicalTypeId::ENUM ? LogicalType::VARCHAR : type;
-		});
-		if (arrow_type == label_type) {
-			return true;
-		}
+	if (TypeVisitor::Contains(expected_type, LogicalTypeId::ENUM)) {
+		auto labels = expected_type.DeepCopy();
+		UseArrowEnumLabels(labels);
+		return GovernedLogicalType::IsCanonicalStorageType(arrow_type, labels);
 	}
 	return TypeVisitor::Contains(expected_type, GovernedLogicalType::IsGoverned) &&
 	       GovernedLogicalType::IsCanonicalStorageType(arrow_type, expected_type);

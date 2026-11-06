@@ -1067,13 +1067,7 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 			    DuckDBError::value_error("shuffle attempt manifest partition id out of range"));
 		}
 	}
-	std::sort(manifest.files.begin(), manifest.files.end(),
-	          [](const ShuffleManifestPartitionFile &lhs, const ShuffleManifestPartitionFile &rhs) {
-		          if (lhs.partition_id != rhs.partition_id) {
-			          return lhs.partition_id < rhs.partition_id;
-		          }
-		          return lhs.file.path < rhs.file.path;
-	          });
+	// Keep the per-partition order recorded by the writer, including older, unpadded spill names.
 	return DuckDBResult<ShuffleAttemptManifest>::ok(std::move(manifest));
 }
 
@@ -1092,8 +1086,6 @@ DuckDBResult<ShufflePartitionFiles> ShuffleCache::GetPartitionFilesFromManifest(
 		files.total_bytes += entry.file.bytes;
 		files.files.push_back(entry.file);
 	}
-	std::sort(files.files.begin(), files.files.end(),
-	          [](const ShufflePartitionFile &lhs, const ShufflePartitionFile &rhs) { return lhs.path < rhs.path; });
 	return DuckDBResult<ShufflePartitionFiles>::ok(std::move(files));
 }
 

@@ -92,6 +92,11 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
             SELECT x.v::VARCHAR[] FROM c""",
             [(["z", None],)],
         ),
+        (
+            """WITH c AS MATERIALIZED (SELECT {'j':'{}'::JSON,'e':'z'::ENUM('z','b')} AS x)
+            SELECT x.j::VARCHAR, x.e::VARCHAR FROM c""",
+            [("{}", "z")],
+        ),
     ]
     for sql, expected in cases:
         assert ray_con.sql(sql).fetchall() == expected, sql
@@ -152,6 +157,11 @@ def test_ray_cte_preserves_file_splits_and_optimizer_generated_cte(ray_con, tmp_
     assert ray_con.sql(
         f"WITH c(x) AS MATERIALIZED (VALUES (-1)) SELECT x FROM (SELECT x FROM c UNION ALL SELECT x FROM {source}) ORDER BY x"
     ).fetchall() == [(x,) for x in range(-1, 12)]
+    for index in range(4, 70):
+        (tmp_path / f"{index}.parquet").write_bytes((tmp_path / "0.parquet").read_bytes())
+    wide = _physical_plan(ray_con, explicit).collect_query_resource_graph_metadata(conn=ray_con)["nodes"]
+    assert [node["num_partitions"] for node in wide if node["node_name"] == "ScanSource"] == [70]
+    assert [node["num_partitions"] for node in wide if node["node_name"] == "CTEInput"] == [64]
 
 
 def test_ray_cte_planning_rejects_hidden_reader_and_prints_shared_nodes_once(ray_con, monkeypatch):

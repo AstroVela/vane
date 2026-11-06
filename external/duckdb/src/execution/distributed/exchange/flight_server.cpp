@@ -259,7 +259,7 @@ public:
 		for (const auto &file : files_res.value().files) {
 			files.push_back(file.path);
 		}
-		std::sort(files.begin(), files.end());
+		// The catalog and committed manifest record spill order. Filename order puts batch_10 before batch_2.
 
 		if (files.empty()) {
 			// Return empty stream with schema only

@@ -20,6 +20,10 @@ struct MaterializedCTEOutput {
 	std::vector<std::vector<ExchangeSourceHandle>> partitions;
 };
 
+// Every active writer owns per-bucket shuffle metadata. Bound the bucket count independently
+// of the number of input tasks; a scan with thousands of files still schedules all of them.
+static constexpr size_t MAX_CTE_OUTPUT_PARTITIONS = 64;
+
 // The scope drives the definition's complete task stream through this barrier before it opens its body.
 // Both the scope and all its CTE scans reference this same node in the resource graph.
 class MaterializedCTEInput : public PipelineNodeImpl, public std::enable_shared_from_this<MaterializedCTEInput> {
@@ -28,7 +32,8 @@ public:
 	    : context_(std::move(context)), definition_(std::move(definition)),
 	      flight_config_(ResolveFlightExchangeConfigFromEnv()), preserve_order_(preserve_order),
 	      config_(definition_->config().schema(), definition_->config().execution_config(),
-	              ClusteringSpec::unknown_with_num_partitions(preserve_order_ ? 1 : definition_->num_partitions())) {
+	              ClusteringSpec::unknown_with_num_partitions(
+	                  preserve_order_ ? 1 : std::min(MAX_CTE_OUTPUT_PARTITIONS, definition_->num_partitions()))) {
 	}
 
 	const PipelineNodeContext &context() const override {

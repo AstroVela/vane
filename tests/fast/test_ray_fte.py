@@ -5311,14 +5311,24 @@ def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output
     assert Path(retry.sink_instance.attempt_path).exists()
 
 
-def test_fte_fragment_execution_retries_scheduler_owned_remote_exchange_sink():
-    worker0 = _FakeLiveWorker("worker-a")
-    worker1 = _FakeLiveWorker("worker-b")
+@pytest.mark.parametrize("partition_by_task", [False, True])
+def test_fte_fragment_execution_retries_scheduler_owned_remote_exchange_sink(partition_by_task):
+    registrations = []
+    plan_ref = object()  # Opaque on the rescheduled worker.
+
+    class Worker(_FakeLiveWorker):
+        def ensure_fragment_registered(self, query_id, fragment_id, plan, *, requires_cte_exchange=False):
+            registrations.append((self.worker_id, plan, requires_cte_exchange))
+            return super().ensure_fragment_registered(query_id, fragment_id, plan)
+
+    worker0 = Worker("worker-a")
+    worker1 = Worker("worker-b")
     registered_identities = []
     sink_config = {
         "query_id": "q",
         "output_partition_count": 4,
         "output_location_prefix": "55f8c578-9c57-4b9d-bdc2-ef62d1dfc323",
+        "partition_by_task": partition_by_task,
     }
 
     def select_worker(partition):
@@ -5329,6 +5339,7 @@ def test_fte_fragment_execution_retries_scheduler_owned_remote_exchange_sink():
         11,
         fragment_id="q:node:shuffle",
         logical_fragment_identity="q:node:shuffle",
+        fragment_plan=plan_ref,
         stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
             (stable_task_identity, identity_key)
         ),
@@ -5365,6 +5376,7 @@ def test_fte_fragment_execution_retries_scheduler_owned_remote_exchange_sink():
         != retry.request["exchange_sink_instance"]["output_location"]
     )
     assert retry.request["exchange_sink_instance"]["output_location"].endswith("__attempt_1")
+    assert registrations == [("worker-a", plan_ref, partition_by_task), ("worker-b", plan_ref, partition_by_task)]
     assert retry.request["exchange_sink_instance"]["output_partition_count"] == 4
     assert retry.request["exchange_sink_instance"]["query_id"] == "q"
     assert retry_request["exchange_sink_instance"] == retry.request["exchange_sink_instance"]

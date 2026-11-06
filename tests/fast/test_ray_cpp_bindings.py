@@ -1337,19 +1337,21 @@ def test_ray_task_result_poller_shutdown_is_terminal_and_idempotent():
 
 
 @pytest.mark.parametrize("remote_reader", [False, True])
-def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path, remote_reader):
+def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path, remote_reader, monkeypatch):
     if remote_reader:
         # With the attempt and partition subdirectories, the Windows path exceeds MAX_PATH.
         tmp_path = tmp_path / ("flight-" * 22)
         tmp_path.mkdir()
+        monkeypatch.setenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", "1")
     result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path), remote_reader)
 
     assert result["handle_attempts"] == [1]
     assert result["handle_paths"] == [result["selected_output_location"]]
     assert result["handle_node_ids"] == [result["selected_node_id"]]
     assert result["lost_output_location"] != result["selected_output_location"]
-    assert result["selected_values_before_late_loser"] == [201, 202]
-    assert result["selected_values_after_late_loser"] == [201, 202]
+    expected = list(range(201, 214)) if remote_reader else [201, 202]
+    assert result["selected_values_before_late_loser"] == expected
+    assert result["selected_values_after_late_loser"] == expected
     assert result["lost_manifest_exists_after_late_loser"] is False
     assert result["selected_manifest_exists_after_late_loser"] is True
 
