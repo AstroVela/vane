@@ -489,7 +489,7 @@ def test_successful_submission_releases_captured_input_ownership_immediately():
     assert large_input_ref() is None
 
 
-@pytest.mark.parametrize("outcome", ["completed", "timeout", "observer_failure"])
+@pytest.mark.parametrize("outcome", ["completed", "timeout", "probe_failure", "expired_budget"])
 def test_windows_generator_cancel_observes_completion_before_escalating(monkeypatch, outcome):
     from vane.execution import ray_stream_adapter as streams
 
@@ -497,16 +497,15 @@ def test_windows_generator_cancel_observes_completion_before_escalating(monkeypa
     lease = _lease()
     driver = _driver({"granted": True, "lease": lease})
     generator = _Generator([])
-    observers = []
-    stopped = []
+    ready = []
 
-    def observe(callback):
-        if outcome == "observer_failure":
-            raise RuntimeError("observer disconnected")
-        observers.append(callback)
-        return lambda: stopped.append(True)
+    def wait(refs, *, num_returns, timeout, fetch_local):
+        assert refs == [generator.completion] and num_returns == 1 and timeout == 0 and not fetch_local
+        if outcome == "probe_failure":
+            raise RuntimeError("readiness unavailable")
+        return ready, []
 
-    generator.completion._on_ready = observe
+    fake_ray.wait = wait
     source = TaskLeaseObjectRefGenerator(
         admission=_admission(driver, "request-grace", lease=lease),
         submitter=lambda _lease: generator,
@@ -516,25 +515,18 @@ def test_windows_generator_cancel_observes_completion_before_escalating(monkeypa
     now = [0.0]
     monkeypatch.setattr(streams, "_WINDOWS_TASK_CANCEL_GRACE_S", 2.0)
     monkeypatch.setattr(streams, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    cancel = adapter.cancel_operations()[0].operation
-    if outcome == "observer_failure":
-        assert cancel() is True
-        assert cancel() is True
-        assert fake_ray.cancel_calls == [(generator, {"force": True, "recursive": True})]
-        return
-    assert cancel() is False
-    assert cancel() is False
-    assert fake_ray.cancel_calls == [(generator, {"force": False, "recursive": True})]
-    if outcome == "completed":
-        observers[0](None)
-    else:
-        now[0] = 3.0
+    cancel = adapter.cancel_operations(grace_deadline=0.0 if outcome == "expired_budget" else 5.0)[0].operation
+    if outcome in {"timeout", "completed"}:
+        assert cancel() is False
+        assert cancel() is False
+        assert fake_ray.cancel_calls == []
+        if outcome == "completed":
+            ready.append(generator.completion)
+        else:
+            now[0] = 3.0
     assert cancel() is True
     assert cancel() is True
-    assert [kwargs["force"] for _, kwargs in fake_ray.cancel_calls] == (
-        [False] if outcome == "completed" else [False, True]
-    )
-    assert stopped == [True]
+    assert fake_ray.cancel_calls == [(generator, {"force": outcome != "completed", "recursive": True})]
 
 
 @pytest.mark.parametrize(

@@ -122,12 +122,12 @@ def _bounded_diagnostic_text(value: str) -> str:
 def _safe_exception_summary(error: BaseException) -> str:
     error_type = safe_exception_type_name(error, _ERROR_TYPE_NAME_MAX_BYTES)
     message = exception_message_from_args(error)
-    if message is None and isinstance(error, ray.exceptions.RayTaskError):
+    if message is None and issubclass(type(error), ray.exceptions.RayTaskError):
         # RayTaskError carries several constructor arguments. Preserve a plain-text
         # remote cause without invoking user exception formatting during teardown.
         state = BaseException.__dict__["__dict__"].__get__(error)
         cause = dict.get(state, "cause")
-        if isinstance(cause, BaseException):
+        if issubclass(type(cause), BaseException):
             message = exception_message_from_args(cause)
     if message is None:
         message = "<error message unavailable>"

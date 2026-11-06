@@ -771,6 +771,28 @@ def test_discarded_submitted_stream_enters_terminal_cleanup_ledger():
         collector.shutdown()
 
 
+def test_windows_slot_cancel_escalates_within_a_short_cleanup_budget(monkeypatch):
+    from vane.execution import ray_stream_adapter
+
+    monkeypatch.setattr(ray_stream_adapter, "_WINDOWS_TASK_CANCEL_GRACE_S", 2.0)
+    monkeypatch.setenv("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S", "0.2")
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    generator = _Generator([], completed=False)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
+    try:
+        collector.track_generator_ref(
+            9, 1, _source(fake_ray, driver, request_id="short-cancel", submitter=lambda _lease: generator)
+        )
+        collector.cancel_slot(9)
+        _wait_until(lambda: not collector.slot_has_pending(9))
+        assert collector.retire_slot(9) is None
+        assert fake_ray.cancel_calls == [(generator, {"force": True, "recursive": True})]
+        assert generator.deleted_streams == [generator.completion_ref]
+    finally:
+        collector.shutdown()
+
+
 def test_slot_cancel_is_nonblocking_and_cleanup_completion_wakes_dispatcher():
     fake_ray = _FakeRay()
     driver = _Driver()
@@ -3155,9 +3177,7 @@ def test_failed_completion_retires_without_cancelling_terminal_remote_work():
             )
         ]
         assert fake_ray.cancel_calls == []
-        deadline = time.monotonic() + 1
-        while not driver.release_query_task_lease_after_completion.calls and time.monotonic() < deadline:
-            time.sleep(0.005)
+        _wait_until(lambda: not collector.slot_has_pending(record.slot_id))
         assert len(driver.release_query_task_lease_after_completion.calls) == 1
         assert generator.deleted_streams == [generator.completion_ref]
     finally:
@@ -3351,7 +3371,7 @@ def test_malformed_metadata_fails_only_its_stream_without_output_admission():
     driver = _Driver()
 
     def submitter(_lease):
-        return _Generator([_Ref("block", is_block=True), _Ref({"size_bytes": 1})])
+        return _Generator([_Ref("block", is_block=True), _Ref({"size_bytes": 1})], completed=False)
 
     collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(

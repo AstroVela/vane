@@ -20,11 +20,21 @@ def test_cleanup_diagnostics_keep_ray_task_cause_without_formatting_it():
     from ray.exceptions import RayTaskError
 
     class Failure(RuntimeError):
+        @property
+        def args(self):
+            raise AssertionError("unsafe args lookup")
+
+        @property
+        def __class__(self):
+            raise AssertionError("unsafe class lookup")
+
         def __str__(self):
             raise AssertionError("unsafe exception formatting")
 
-    error = RayTaskError("test", "remote traceback", Failure("cte-producer-failed"))
+    error = RayTaskError("test", "remote traceback", ValueError("original cause"))
+    error.cause = Failure("cte-producer-failed")
     assert "cte-producer-failed" in driver._safe_exception_summary(error)
+    assert "<error message unavailable>" in driver._safe_exception_summary(Failure())
 
 
 def _chained_error(label: str) -> RuntimeError:
