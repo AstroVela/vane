@@ -97,6 +97,11 @@ def test_ray_cte_types_empty_aggregate_and_binding_scopes(ray_con):
             SELECT x.j::VARCHAR, x.e::VARCHAR FROM c""",
             [("{}", "z")],
         ),
+        (
+            """WITH c AS MATERIALIZED (SELECT {'t':[1.,2.]::TENSOR(FLOAT,[2]),'e':'z'::ENUM('z','b')} AS x)
+            SELECT typeof(x.t), array_extract(x.t::FLOAT[2],2), x.e::VARCHAR FROM c""",
+            [("TENSOR(FLOAT, [2])", 2.0, "z")],
+        ),
     ]
     for sql, expected in cases:
         assert ray_con.sql(sql).fetchall() == expected, sql

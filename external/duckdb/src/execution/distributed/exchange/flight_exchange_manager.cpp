@@ -235,16 +235,17 @@ DuckDBError FlightExchangeArrowToError(const arrow::Status &status, const std::s
 	return DuckDBError::external_error(context + ": " + status.ToString());
 }
 
-// Modify only ENUM leaves of a private schema copy, preserving all sibling aliases and extension metadata.
+// Copy only the containers on a path to an ENUM. Unchanged siblings keep their exact extension metadata.
 void UseArrowEnumLabels(LogicalType &type) {
 	if (type.id() == LogicalTypeId::ENUM) {
 		type = LogicalType::VARCHAR;
 		return;
 	}
-	auto info = type.AuxInfo();
-	if (!info) {
+	if (!TypeVisitor::Contains(type, LogicalTypeId::ENUM)) {
 		return;
 	}
+	type = type.Copy();
+	auto info = type.AuxInfo();
 	switch (info->type) {
 	case ExtraTypeInfoType::STRUCT_TYPE_INFO:
 		for (auto &child : info->Cast<StructTypeInfo>().child_types) {
@@ -272,7 +273,7 @@ bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const Lo
 	// Arrow decodes an ENUM dictionary to its labels, including inside lists and structs.
 	// Check the complete wire type before casting labels back through the producer's ENUM.
 	if (TypeVisitor::Contains(expected_type, LogicalTypeId::ENUM)) {
-		auto labels = expected_type.DeepCopy();
+		auto labels = expected_type;
 		UseArrowEnumLabels(labels);
 		return GovernedLogicalType::IsCanonicalStorageType(arrow_type, labels);
 	}
