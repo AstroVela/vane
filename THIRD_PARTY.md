@@ -49,7 +49,9 @@ The direct native build dependencies are Apache Arrow (including Flight), cURL, 
 ## Optional Iceberg qualification providers
 
 The source-pinned Iceberg and Avro qualification builds use the MIT-licensed
-`duckdb/duckdb-iceberg` and `duckdb/duckdb-avro` projects. Their unchanged
+`AstroVela/duckdb-iceberg` fork and `duckdb/duckdb-avro` project. Iceberg's
+native compatibility changes are maintained in its source repository, and
+Vane builds the pinned commit directly. Their unchanged
 notices are retained in `LICENSES/Iceberg-MIT.txt` and
 `LICENSES/Avro-extension-MIT.txt`; exact revisions are recorded in
 [source provenance](SOURCE_PROVENANCE.md).

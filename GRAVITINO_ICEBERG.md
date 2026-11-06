@@ -11,11 +11,11 @@ M3's general Iceberg capability flags.
 
 | Input | Revision/version |
 | --- | --- |
-| Vane base | `f54912b6993d8c19c65e2d26e3965e5e24dcfb2e` |
+| Vane core base | `main@47a10467cd0167329e767d297e2b4a04359f553e` plus this qualification change |
 | DuckDB official release line | `v1.5.5` |
-| Engine tree SourceID | `830d7bf6485ea8da211a2342a4b3f86684054db5` |
-| Engine fork revision | `493f565f68d73a86c089bf758708d14dbce86d6e` |
-| Iceberg source | `duckdb/duckdb-iceberg@45163a28e0ed6a2071a82a1bf1dd432d0216cf9c` plus Vane's compatibility patch |
+| Engine identity | Generated from the exact Vane checkout; base and provider descriptors must match |
+| Iceberg source | `AstroVela/duckdb-iceberg@f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c` |
+| Iceberg build mode | `ICEBERG_VANE_NATIVE=ON`, `ICEBERG_VANE_DISTRIBUTED=OFF`, `ICEBERG_ENABLE_VORTEX=OFF` |
 | Avro provider source | `duckdb/duckdb-avro@f9d590297485f0318f480372c70bdd852826e258` |
 | Native SDK | [separate profile](packages/vane-iceberg-provider/vcpkg.json), builtin baseline `44819aa2a6c10e56065e2b0330e7d6c89d1d2574` |
 | Avro C registry | `duckdb/vcpkg-duckdb-ports@f13de79b66345fe31d3f9c119517613023d194a8` |
@@ -24,10 +24,11 @@ M3's general Iceberg capability flags.
 | Independent fixture client | PyIceberg 0.12.0, pyiceberg-core 0.10.1, PyArrow 25.0.0 |
 
 The extension source revisions are already pinned in the engine's extension
-configuration. Vane carries its own compatibility patch; qualification and
-later distributed support do not depend on an upstream merge.
-The patch SHA-256 is
-`5c4b4911c6a4024b407f0b7d39ad0b261fc9f63298f0d803d5a69248bd199f2b`.
+configuration. Iceberg engine adaptations are normal commits and pull requests
+in `AstroVela/duckdb-iceberg`; Vane builds that fixed source without applying
+patches. Keep the source PR reviewed and merged before advancing this pin into
+Vane's main branch. Base/provider versions and engine identities are recorded
+with each qualification build.
 
 ## Qualification scope
 
@@ -69,8 +70,8 @@ imply that this particular Python factory raises that native exception class.
 Follow [DEVELOPMENT.md](DEVELOPMENT.md) for the base SDK, noneditable Python
 environment, and incremental Release build. Prepare the additional SDK with
 the [qualification profile instructions](packages/vane-iceberg-provider/README.md).
-Check out the fixed Iceberg and Avro sources separately, then apply
-`packages/vane-iceberg-provider/patches/iceberg-vane-local.patch` to Iceberg.
+Check out the fixed Iceberg fork and Avro sources separately when using source
+overrides. The Iceberg checkout must be clean and at the pinned commit.
 
 Export these source overrides for **every** configure/build command, including
 CMake's automatic regeneration. `CMAKE_PREFIX_PATH` identifies the extra SDK;
@@ -78,13 +79,15 @@ the base SDK continues to follow the development guide's `VCPKG_INSTALLED_DIR`
 and triplet selection.
 
 ```bash
-export DUCKDB_ICEBERG_DIRECTORY=/absolute/path/to/patched-iceberg
+export DUCKDB_ICEBERG_DIRECTORY=/absolute/path/to/pinned-iceberg
 export DUCKDB_AVRO_DIRECTORY=/absolute/path/to/pinned-avro
 export CMAKE_PREFIX_PATH="$PWD/build/iceberg-sdk/x64-linux-release${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export SKBUILD_BUILD_DIR="$PWD/build/python-release"
 export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation \
   '-Ccmake.define.VANE_LOADABLE_EXTENSIONS=avro;iceberg' \
+  '-Ccmake.define.ICEBERG_VANE_DISTRIBUTED=OFF' \
+  '-Ccmake.define.ICEBERG_ENABLE_VORTEX=OFF' \
   '-Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON'
 cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
 ```
@@ -126,9 +129,9 @@ This fixture configuration does not add a Vane authentication method.
 
 ## Compatibility changes and next milestones
 
-The pristine Iceberg build fails in its MERGE planner because Vane's logical
-INSERT/UPDATE/DELETE constructors require `ClientContext`. The compatibility
-patch passes the context already owned by that planner. Successful compilation
+Vane's logical INSERT/UPDATE/DELETE constructors require `ClientContext`.
+The pinned Iceberg fork's native compatibility mode passes the context already
+owned by its MERGE planner. Successful compilation
 does not qualify any write operation; acceptance attaches READ_ONLY.
 
 Upstream `IcebergScanSerialize` and `IcebergScanDeserialize` explicitly throw
@@ -140,8 +143,9 @@ M4b should qualify the stable local read interface and its feature matrix,
 including time travel, partitions, schema evolution and delete files. M5 must
 freeze a snapshot per execution, serialize the relevant Iceberg state, assign
 scan splits, and preserve field IDs and deletion semantics on workers. Each
-unsupported feature must fail explicitly. Vane can implement these adapters
-against the fixed source without waiting for upstream changes.
+unsupported feature must fail explicitly. Required Iceberg adaptations belong
+in separate source PRs in `AstroVela/duckdb-iceberg`; Vane then advances its
+immutable source pin and runs the corresponding acceptance tests.
 
 This fixture does not qualify v1/v3 tables, production object stores, distributed
 reads, catalog writes, authentication extensions, credential vending or refresh.

@@ -13,17 +13,18 @@ only AWS SDK core/SSO/STS instead of its default service set. These are build
 dependencies of the upstream provider; this qualification uses anonymous REST
 and local files.
 
-The Iceberg checkout must receive the Vane-owned
-`patches/iceberg-vane-local.patch` before compilation. It targets exactly
-`45163a28e0ed6a2071a82a1bf1dd432d0216cf9c`, including Vane's logical-write
-constructor API. Carrying this patch does not depend on an upstream merge or
-qualify MERGE/INSERT/UPDATE/DELETE behavior. Apply it once to a clean checkout:
+The engine's extension configuration pins Iceberg to
+[`AstroVela/duckdb-iceberg@f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c`](https://github.com/AstroVela/duckdb-iceberg/tree/f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c).
+Native engine compatibility is maintained in that repository and selected by
+`ICEBERG_VANE_NATIVE=ON`. This qualification keeps
+`ICEBERG_VANE_DISTRIBUTED=OFF`. It does not qualify write operations or Ray scans.
+Vane fetches the pinned source directly; no compatibility patch is applied.
+For an explicit source override, prepare a clean checkout of that commit:
 
 ```bash
-git -C "$DUCKDB_ICEBERG_DIRECTORY" apply --check \
-  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-local.patch"
-git -C "$DUCKDB_ICEBERG_DIRECTORY" apply \
-  "$PWD/packages/vane-iceberg-provider/patches/iceberg-vane-local.patch"
+git clone --no-checkout https://github.com/AstroVela/duckdb-iceberg.git /absolute/path/to/pinned-iceberg
+git -C /absolute/path/to/pinned-iceberg checkout --detach f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c
+export DUCKDB_ICEBERG_DIRECTORY=/absolute/path/to/pinned-iceberg
 ```
 
 From the repository root, using the baseline-matched vcpkg tool checkout:
