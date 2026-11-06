@@ -383,34 +383,86 @@ def test_sdist_requires_one_native_media_release_configuration(paths):
 @pytest.mark.parametrize("extension", ["avro", "iceberg"])
 @pytest.mark.parametrize("mutation", ["missing", "misplaced", "duplicate"])
 def test_iceberg_sdist_requires_exact_provider_source_configurations(extension, mutation):
-    root = TEST_LAYOUT.archive_root
-    expected = f"{root}/external/duckdb/.github/config/extensions/{extension}.cmake"
-    names = [
-        f"{root}/packages/vane-iceberg-provider/vcpkg.json",
-        f"{root}/external/duckdb/.github/config/extensions/avro.cmake",
-        f"{root}/external/duckdb/.github/config/extensions/iceberg.cmake",
-    ]
-    names.remove(expected)
+    expected = f"external/duckdb/.github/config/extensions/{extension}.cmake"
+    members = {
+        "packages/vane-iceberg-provider/vcpkg.json": b"{}",
+        "external/duckdb/.github/config/extensions/avro.cmake": b"",
+        "external/duckdb/.github/config/extensions/iceberg.cmake": b"",
+    }
+    del members[expected]
     if mutation == "misplaced":
-        names.append(expected.replace("/external/", "/decoy/external/"))
-    elif mutation == "duplicate":
-        names.extend([expected, expected])
+        members["decoy/" + expected] = b""
+    artifact = _iceberg_sdist_artifact(members)
+    if mutation == "duplicate":
+        root = TEST_LAYOUT.archive_root
+        artifact._names.extend([f"{root}/{expected}", f"{root}/{expected}"])
 
     with pytest.raises(ValueError, match="expected one project file"):
-        check_release_artifacts._check_sdist_iceberg_configuration(_NamesOnlyArtifact(names))
+        check_release_artifacts._check_sdist_iceberg_configuration(artifact)
+
+
+def _iceberg_sdist_artifact(members, include_patterns=()):
+    root = TEST_LAYOUT.archive_root
+    configuration = "[tool.scikit-build.sdist]\ninclude = " + json.dumps(list(include_patterns)) + "\n"
+    contents = {f"{root}/pyproject.toml": configuration.encode()}
+    contents.update({f"{root}/{name}": data for name, data in members.items()})
+    return _MemoryWheelArtifact(contents)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["/packages/vane-iceberg-provider/**", "packages/vane-iceberg-provider/**"],
+)
+@pytest.mark.parametrize("keep_readme", [False, True])
+def test_iceberg_sdist_rejects_omitted_manifest_and_both_source_configurations(declaration, keep_readme):
+    members = {}
+    if keep_readme:
+        members["packages/vane-iceberg-provider/README.md"] = b"Build the declared native SDK."
+    artifact = _iceberg_sdist_artifact(members, [declaration])
+
+    with pytest.raises(ValueError, match="packages/vane-iceberg-provider/vcpkg.json"):
+        check_release_artifacts._check_sdist_iceberg_configuration(artifact)
+
+
+def test_iceberg_sdist_rejects_omitted_manifest_in_a_partial_legacy_sdk():
+    artifact = _iceberg_sdist_artifact({"packages/vane-iceberg-provider/README.md": b"Native SDK"})
+    with pytest.raises(ValueError, match="packages/vane-iceberg-provider/vcpkg.json"):
+        check_release_artifacts._check_sdist_iceberg_configuration(artifact)
 
 
 @pytest.mark.parametrize("include_profile", [False, True])
 def test_iceberg_source_configuration_gate_preserves_other_sdist_profiles(include_profile):
-    root = TEST_LAYOUT.archive_root
-    names = []
+    members = {}
+    includes = ["/packages/vane-media-runtime/**"]
     if include_profile:
-        names = [
-            f"{root}/packages/vane-iceberg-provider/vcpkg.json",
-            f"{root}/external/duckdb/.github/config/extensions/avro.cmake",
-            f"{root}/external/duckdb/.github/config/extensions/iceberg.cmake",
-        ]
-    check_release_artifacts._check_sdist_iceberg_configuration(_NamesOnlyArtifact(names))
+        includes.append("/packages/vane-iceberg-provider/**")
+        members = {
+            "packages/vane-iceberg-provider/vcpkg.json": b"{}",
+            "external/duckdb/.github/config/extensions/avro.cmake": b"",
+            "external/duckdb/.github/config/extensions/iceberg.cmake": b"",
+        }
+    check_release_artifacts._check_sdist_iceberg_configuration(_iceberg_sdist_artifact(members, includes))
+
+
+@pytest.mark.parametrize("includes", [[], ["/packages/vane-media-runtime/**"], ["/packages/**"]])
+def test_iceberg_source_configuration_gate_accepts_legacy_base_only_declarations(includes):
+    check_release_artifacts._check_sdist_iceberg_configuration(_iceberg_sdist_artifact({}, includes))
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [b"\xff", b"[tool", b"tool = 1", b'[tool.scikit-build.sdist]\ninclude = "not-an-array"'],
+)
+def test_iceberg_source_configuration_gate_rejects_invalid_build_declarations(contents):
+    artifact = _iceberg_sdist_artifact({"pyproject.toml": contents})
+    with pytest.raises(ValueError, match="pyproject.toml|build configuration|array of strings"):
+        check_release_artifacts._check_sdist_iceberg_configuration(artifact)
+
+
+def test_iceberg_source_configuration_gate_bounds_build_declaration_size():
+    artifact = _iceberg_sdist_artifact({"pyproject.toml": b"#" * (check_release_artifacts.MAX_CORE_METADATA_BYTES + 1)})
+    with pytest.raises(ValueError, match="metadata size limit"):
+        check_release_artifacts._check_sdist_iceberg_configuration(artifact)
 
 
 @pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
