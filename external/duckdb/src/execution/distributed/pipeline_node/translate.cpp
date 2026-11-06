@@ -318,7 +318,7 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			continue;
 		}
 		if (std::none_of(physical_children.begin(), physical_children.end(),
-		                 [&](const auto &entry) { return &entry.get() == &child; })) {
+		                 [&](const reference<PhysicalOperator> &entry) { return &entry.get() == &child; })) {
 			std::unordered_set<const PhysicalOperator *> visited;
 			ValidateOwnedCTESubtree(child, visited);
 		}
