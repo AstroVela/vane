@@ -380,6 +380,39 @@ def test_sdist_requires_one_native_media_release_configuration(paths):
         check_release_artifacts._check_sdist(artifact, TEST_LAYOUT)
 
 
+@pytest.mark.parametrize("extension", ["avro", "iceberg"])
+@pytest.mark.parametrize("mutation", ["missing", "misplaced", "duplicate"])
+def test_iceberg_sdist_requires_exact_provider_source_configurations(extension, mutation):
+    root = TEST_LAYOUT.archive_root
+    expected = f"{root}/external/duckdb/.github/config/extensions/{extension}.cmake"
+    names = [
+        f"{root}/packages/vane-iceberg-provider/vcpkg.json",
+        f"{root}/external/duckdb/.github/config/extensions/avro.cmake",
+        f"{root}/external/duckdb/.github/config/extensions/iceberg.cmake",
+    ]
+    names.remove(expected)
+    if mutation == "misplaced":
+        names.append(expected.replace("/external/", "/decoy/external/"))
+    elif mutation == "duplicate":
+        names.extend([expected, expected])
+
+    with pytest.raises(ValueError, match="expected one project file"):
+        check_release_artifacts._check_sdist_iceberg_configuration(_NamesOnlyArtifact(names))
+
+
+@pytest.mark.parametrize("include_profile", [False, True])
+def test_iceberg_source_configuration_gate_preserves_other_sdist_profiles(include_profile):
+    root = TEST_LAYOUT.archive_root
+    names = []
+    if include_profile:
+        names = [
+            f"{root}/packages/vane-iceberg-provider/vcpkg.json",
+            f"{root}/external/duckdb/.github/config/extensions/avro.cmake",
+            f"{root}/external/duckdb/.github/config/extensions/iceberg.cmake",
+        ]
+    check_release_artifacts._check_sdist_iceberg_configuration(_NamesOnlyArtifact(names))
+
+
 @pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
 @pytest.mark.parametrize(
     "selector",

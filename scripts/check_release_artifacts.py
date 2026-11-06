@@ -781,6 +781,16 @@ def _check_wheel_license_files(
             )
 
 
+def _check_sdist_iceberg_configuration(artifact: SdistArtifact) -> None:
+    names = artifact.names()
+    profile = "packages/vane-iceberg-provider/vcpkg.json"
+    if not any(name.endswith("/" + profile) for name in names):
+        return
+    _require_sdist_path(names, profile, artifact.path)
+    for extension in ("avro", "iceberg"):
+        _require_sdist_path(names, f"external/duckdb/.github/config/extensions/{extension}.cmake", artifact.path)
+
+
 def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     names = artifact.names()
     for name in names:
@@ -863,6 +873,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
 
+    _check_sdist_iceberg_configuration(artifact)
     _check_sdist_release_tests(artifact)
 
     # Optional codecs stay outside the base wheel, but their sources must be

@@ -514,7 +514,9 @@ include = [
     # Can't avoid including a small subset of ./tools and ./.github
     "external/duckdb/tools/CMakeLists.txt",
     "external/duckdb/tools/utils/test_platform.cpp",
+    "external/duckdb/.github/config/extensions/avro.cmake",
     "external/duckdb/.github/config/extensions/httpfs.cmake",
+    "external/duckdb/.github/config/extensions/iceberg.cmake",
     "external/duckdb/scripts/append_metadata.cmake",
     "external/duckdb/scripts/null.txt",
 
