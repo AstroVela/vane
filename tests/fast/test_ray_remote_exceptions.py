@@ -16,6 +16,17 @@ from vane.runners.ray import driver
 from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 
+def test_cleanup_diagnostics_keep_ray_task_cause_without_formatting_it():
+    from ray.exceptions import RayTaskError
+
+    class Failure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("unsafe exception formatting")
+
+    error = RayTaskError("test", "remote traceback", Failure("cte-producer-failed"))
+    assert "cte-producer-failed" in driver._safe_exception_summary(error)
+
+
 def _chained_error(label: str) -> RuntimeError:
     try:
         raise vane.NotImplementedException(f"{label} original")

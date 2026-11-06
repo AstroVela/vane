@@ -489,6 +489,54 @@ def test_successful_submission_releases_captured_input_ownership_immediately():
     assert large_input_ref() is None
 
 
+@pytest.mark.parametrize("outcome", ["completed", "timeout", "observer_failure"])
+def test_windows_generator_cancel_observes_completion_before_escalating(monkeypatch, outcome):
+    from vane.execution import ray_stream_adapter as streams
+
+    fake_ray = _FakeRay()
+    lease = _lease()
+    driver = _driver({"granted": True, "lease": lease})
+    generator = _Generator([])
+    observers = []
+    stopped = []
+
+    def observe(callback):
+        if outcome == "observer_failure":
+            raise RuntimeError("observer disconnected")
+        observers.append(callback)
+        return lambda: stopped.append(True)
+
+    generator.completion._on_ready = observe
+    source = TaskLeaseObjectRefGenerator(
+        admission=_admission(driver, "request-grace", lease=lease),
+        submitter=lambda _lease: generator,
+        ray_module=fake_ray,
+    )
+    adapter = RayStreamAdapter(source, ray_module=fake_ray)
+    now = [0.0]
+    monkeypatch.setattr(streams, "_WINDOWS_TASK_CANCEL_GRACE_S", 2.0)
+    monkeypatch.setattr(streams, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    cancel = adapter.cancel_operations()[0].operation
+    if outcome == "observer_failure":
+        assert cancel() is True
+        assert cancel() is True
+        assert fake_ray.cancel_calls == [(generator, {"force": True, "recursive": True})]
+        return
+    assert cancel() is False
+    assert cancel() is False
+    assert fake_ray.cancel_calls == [(generator, {"force": False, "recursive": True})]
+    if outcome == "completed":
+        observers[0](None)
+    else:
+        now[0] = 3.0
+    assert cancel() is True
+    assert cancel() is True
+    assert [kwargs["force"] for _, kwargs in fake_ray.cancel_calls] == (
+        [False] if outcome == "completed" else [False, True]
+    )
+    assert stopped == [True]
+
+
 @pytest.mark.parametrize(
     ("execution_backend", "force"),
     [("ray_task", True), ("ray_actor", False)],

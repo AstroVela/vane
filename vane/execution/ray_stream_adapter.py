@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+_WINDOWS_TASK_CANCEL_GRACE_S = 2.0 if sys.platform == "win32" else 0.0
 _REQUIRED_GENERATOR_METHODS = ("__anext__", "completed")
 _REQUIRED_RAY_METHODS = ("wait",)
 _REQUIRED_CORE_WORKER_METHODS = (
@@ -130,6 +133,9 @@ class TaskLeaseObjectRefGenerator:
         self._execution_backend = "ray_actor" if lease.get("actor_index") is not None else "ray_task"
         self._generator: Any | None = None
         self._completion_ref: Any | None = None
+        self._cancel_grace: tuple[float, threading.Event, Callable[[], None]] | None = None
+        self._cancel_completion_ref: Any | None = None
+        self._cancel_submitting = False
         self._lease: dict[str, Any] | None = lease
         self._lease_identity = dict(lease)
         self._released = False
@@ -225,6 +231,7 @@ class TaskLeaseObjectRefGenerator:
                 self._cancelled = True
                 if cancel_generator:
                     self._cancel_generator = self._generator
+                    self._cancel_completion_ref = self._completion_ref
                     if self._cancel_generator is None:
                         self._generator_cancel_submitted = True
                 self._generator = None
@@ -233,17 +240,53 @@ class TaskLeaseObjectRefGenerator:
         with self._lock:
             if self._cancel_generator is None:
                 return self._generator_cancel_submitted or not self._cancelled
+            if self._cancel_submitting:
+                return False
+            self._cancel_submitting = True
             generator = self._cancel_generator
-            ray_module = self._ray
-            force = self._execution_backend == "ray_task"
         try:
-            ray_module.cancel(generator, force=force, recursive=True)
-        except BaseException:
-            raise
-        with self._lock:
-            self._generator_cancel_submitted = True
-            if self._cancel_generator is generator:
+            if not self._cancel_remote_generator(generator):
+                return False
+            with self._lock:
+                self._cancel_grace = None
+                self._cancel_completion_ref = None
+                self._generator_cancel_submitted = True
                 self._cancel_generator = None
+            return True
+        finally:
+            with self._lock:
+                self._cancel_submitting = False
+
+    def _cancel_remote_generator(self, generator: Any) -> bool:
+        force = self._execution_backend == "ray_task"
+        grace = self._cancel_grace
+        # A hard kill can strand a generator's completion ObjectRef on Windows. Give
+        # cooperative cancellation a bounded chance to publish that terminal proof.
+        observe = getattr(self._cancel_completion_ref, "_on_ready", None)
+        if grace is None and _WINDOWS_TASK_CANCEL_GRACE_S and force and callable(observe):
+            terminal = threading.Event()
+            try:
+                stop = observe(lambda error: terminal.set() if error is None else None)
+            except Exception:
+                # A disconnected observer must not prevent cancellation from being submitted.
+                self._ray.cancel(generator, force=True, recursive=True)
+                return True
+            try:
+                self._ray.cancel(generator, force=False, recursive=True)
+            except BaseException:
+                stop()
+                raise
+            grace = (time.monotonic() + _WINDOWS_TASK_CANCEL_GRACE_S, terminal, stop)
+            self._cancel_grace = grace
+        if grace is not None:
+            deadline, terminal, stop = grace
+            if not terminal.is_set() and time.monotonic() < deadline:
+                return False  # The cleanup ledger retries while retaining the generator and lease.
+            if not terminal.is_set():
+                self._ray.cancel(generator, force=True, recursive=True)
+            stop()
+        else:
+            self._ray.cancel(generator, force=force, recursive=True)
         return True
 
     def _handoff_task_completion(self) -> bool | RayStreamCleanupWait:
