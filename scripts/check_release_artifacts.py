@@ -781,6 +781,44 @@ def _check_wheel_license_files(
             )
 
 
+def _check_sdist_iceberg_configuration(artifact: SdistArtifact) -> None:
+    names = artifact.names()
+    profile = "packages/vane-iceberg-provider/vcpkg.json"
+    sdk_root = PurePosixPath(profile).parent
+    project_path = _require_sdist_path(names, "pyproject.toml", artifact.path)
+    contents = artifact.read(project_path)
+    if len(contents) > MAX_CORE_METADATA_BYTES:
+        raise ValueError(f"{artifact.path}: pyproject.toml exceeds the metadata size limit")
+    try:
+        configuration = tomllib.loads(contents.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        raise ValueError(f"{artifact.path}: pyproject.toml is not valid UTF-8 TOML") from None
+    for key in ("tool", "scikit-build", "sdist"):
+        configuration = configuration.get(key, {})
+        if not isinstance(configuration, dict):
+            raise ValueError(f"{artifact.path}: invalid sdist build configuration")
+    includes = configuration.get("include", [])
+    if not isinstance(includes, list) or any(not isinstance(pattern, str) for pattern in includes):
+        raise ValueError(f"{artifact.path}: sdist include must be an array of strings")
+    # A declaration remains binding even when every SDK file is accidentally
+    # omitted. Existing SDK content also identifies older source profiles.
+    sdk_prefix = str(sdk_root)
+    declared = any(
+        not pattern.startswith("!")
+        and (
+            (normalized := pattern.removeprefix("./").lstrip("/")) == sdk_prefix
+            or normalized.startswith(sdk_prefix + "/")
+        )
+        for pattern in includes
+    )
+    present = any(PurePosixPath(name).parts[1:3] == sdk_root.parts for name in names)
+    if not declared and not present:
+        return
+    _require_sdist_path(names, profile, artifact.path)
+    for extension in ("avro", "iceberg"):
+        _require_sdist_path(names, f"external/duckdb/.github/config/extensions/{extension}.cmake", artifact.path)
+
+
 def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     names = artifact.names()
     for name in names:
@@ -863,6 +901,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
 
+    _check_sdist_iceberg_configuration(artifact)
     _check_sdist_release_tests(artifact)
 
     # Optional codecs stay outside the base wheel, but their sources must be
