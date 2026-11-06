@@ -7,7 +7,9 @@ import asyncio
 import io
 import json
 import pickle
+import threading
 import wave
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import numpy as np
@@ -65,6 +67,39 @@ def sdk(monkeypatch):
     )
     monkeypatch.setattr(google, "create_google_client", lambda *args: client)
     return calls, state, client
+
+
+@pytest.fixture
+def google_http_server(vertex):
+    pytest.importorskip("google.genai")
+    bodies = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.connection.settimeout(10)
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            bodies.append(body)
+            vector = {"values": [float(len(bodies))] * 128}
+            result = {"embedding": vector} if vertex else {"embeddings": [vector]}
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}", bodies
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("kind", ["video", "audio", "image"])
@@ -252,40 +287,23 @@ def test_invalid_vectors_abort_joint_encoding(sdk, values):
 
 
 @pytest.mark.parametrize("vertex", [False, True])
-def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow, vertex):
-    httpx = pytest.importorskip("httpx")
+def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow, google_http_server, vertex):
+    from google.genai import types
 
-    pytest.importorskip("google.genai")
     from vane.ai.providers import google
 
-    bodies = []
-
-    def handle(request):
-        body = json.loads(request.content)
-        bodies.append(body)
-        entries = body.get("requests", [body])
-        assert len(entries) == 1
-        assert entries[0]["content"]["parts"]
-        from google.genai import types
-
-        parts = types.Content.model_validate(entries[0]["content"]).parts
-        assert sum(bool(part.inline_data and part.inline_data.mime_type == "audio/wav") for part in parts) <= 1
-        vector = {"values": [float(len(bodies))] * 128}
-        if vertex:
-            assert body["embedContentConfig"]["autoTruncate"] is False
-            assert body["embedContentConfig"]["outputDimensionality"] == 128
-        return httpx.Response(200, json={"embedding": vector} if vertex else {"embeddings": [vector]})
-
-    transport = httpx.MockTransport(handle)
+    base_url, bodies = google_http_server
+    monkeypatch.delenv("GOOGLE_GENAI_HTTP_CLIENT", raising=False)
 
     def client(factory, types, snapshot):
         return factory(
             api_key="fixture-key",
             vertexai=vertex,
             http_options=types.HttpOptions(
-                base_url="http://fixture.invalid",
-                client_args={"transport": transport},
-                async_client_args={"transport": transport},
+                base_url=base_url,
+                timeout=10_000,
+                client_args={"trust_env": False},
+                async_client_args={"trust_env": False},
                 retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
@@ -298,7 +316,10 @@ def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow
             ("video", [clip()] * 2),
             ("image", [clip().frames[0]] * 2),
         ]:
-            encoder = getattr(GoogleProvider(), f"get_{kind}_embedder")(dimensions=128).instantiate()
+            # Serialize requests so response ordinals also verify row order.
+            encoder = getattr(GoogleProvider(), f"get_{kind}_embedder")(
+                dimensions=128, options={"max_concurrency_per_actor": 1}
+            ).instantiate()
             try:
                 result = await getattr(encoder, f"embed_{kind}")(inputs)
                 assert len(result) == 2 and result[1][0] == result[0][0] + 1
@@ -312,7 +333,16 @@ def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow
 
     asyncio.run(run())
     assert len(bodies) == 7
-    from google.genai import types
+
+    for body in bodies:
+        entries = body.get("requests", [body])
+        assert len(entries) == 1
+        assert entries[0]["content"]["parts"]
+        parts = types.Content.model_validate(entries[0]["content"]).parts
+        assert sum(bool(part.inline_data and part.inline_data.mime_type == "audio/wav") for part in parts) <= 1
+        if vertex:
+            assert body["embedContentConfig"]["autoTruncate"] is False
+            assert body["embedContentConfig"]["outputDimensionality"] == 128
 
     content = bodies[-1].get("requests", [bodies[-1]])[0]["content"]
     parts = types.Content.model_validate(content).parts
