@@ -883,24 +883,46 @@ indent-style = "space"
 # (to some extent).
 ######################################################################################################
 [tool.cibuildwheel]
-archs = ["x86_64"]
-build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
 build-frontend = "build[uv]"
 build-verbosity = 1
-manylinux-x86_64-image = "manylinux_2_28"
 skip = "*-musllinux*"
-test-command = "env -u VANE_RUNNER python {project}/scripts/verify_base_install.py"
+# cibuildwheel installs these through the platform shell. Windows parses the
+# command with cmd.exe, which treats `<` and `>` as redirection, so the version
+# constraints use the compatible-release operator instead of `>=`/`<` pairs.
 test-requires = [
-    "cloudpickle>=3.1.2,<4",
+    "cloudpickle~=3.1",
     "numpy",
     "pyarrow",
-    "ray>=2.58.0,<3",
+    "ray~=2.58",
 ]
 
+# Every supported platform builds the same CPython matrix from the same sdist.
+# The release workflow asserts the resulting counts per platform.
 [tool.cibuildwheel.linux]
+archs = ["x86_64"]
+build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
+# Pinned so the dependency job and the wheel jobs use the identical image. This
+# is the digest cibuildwheel 4.2.0 resolves for manylinux_2_28; the release
+# workflow verifies that the three values still agree.
+manylinux-x86_64-image = "quay.io/pypa/manylinux_2_28_x86_64@sha256:012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be"
+test-command = "env -u VANE_RUNNER python {project}/scripts/verify_base_install.py"
 before-all = [
     "yum install -y autoconf automake bison ccache curl flex git libtool make perl pkgconfig tar unzip which zip",
     # AlmaLinux 8 ships Bison 3.0.4, while Thrift 0.23 requires --file-prefix-map.
     "bash {package}/scripts/bootstrap_manylinux_bison.sh",
     "bash {package}/scripts/bootstrap_vcpkg.sh {package}",
 ]
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+build = "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
+test-command = "env -u VANE_RUNNER python {project}/scripts/verify_base_install.py"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+build = "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64 cp313-win_amd64 cp314-win_amd64"
+# cibuildwheel runs test commands through cmd.exe on Windows, so this command
+# must not rely on POSIX `env -u`. The isolated test environment never sets
+# VANE_RUNNER, and `-X utf8` keeps the smoke test's table output printable on
+# consoles whose code page is not UTF-8.
+test-command = "python -X utf8 {project}/scripts/verify_base_install.py"

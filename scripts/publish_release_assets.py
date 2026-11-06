@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SUPPLEMENTAL = {"SHA256SUMS", "vane-ai-sbom.cdx.json", "vane-ai-build-provenance.sigstore.json"}
-# Keep the base release contract aligned with release.yml's assemble job.
-WHEEL_COUNT = 5
+# Keep the base release contract aligned with release.yml's assemble job: five
+# CPython versions for each of manylinux x86-64, macOS arm64 and Windows x64.
+WHEEL_COUNT = 15
 
 
 @dataclass(frozen=True)

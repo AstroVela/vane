@@ -19,7 +19,12 @@ ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "AstroVela/vane"
 TAG = "v0.2.0"
 SDIST = "vane_ai-0.2.0.tar.gz"
-WHEELS = {f"vane_ai-0.2.0-cp3{minor}-cp3{minor}-manylinux_2_28_x86_64.whl" for minor in range(10, 15)}
+PLATFORM_TAGS = ("manylinux_2_28_x86_64", "macosx_11_0_arm64", "win_amd64")
+WHEELS = {
+    f"vane_ai-0.2.0-cp3{minor}-cp3{minor}-{platform}.whl" for minor in range(10, 15) for platform in PLATFORM_TAGS
+}
+DISTRIBUTIONS = WHEELS | {SDIST}
+ASSET_COUNT = len(DISTRIBUTIONS) * 2 + len(publishing.SUPPLEMENTAL)
 
 
 @pytest.fixture
@@ -106,11 +111,11 @@ def github(monkeypatch):
     return state, calls, uploads, after_upload
 
 
-def test_nested_artifacts_upload_all_fifteen_files(asset_tree, github):
+def test_nested_artifacts_upload_the_complete_platform_matrix(asset_tree, github):
     state, _, uploads, _ = github
     assert any(path.is_dir() for path in asset_tree.glob("*"))  # The old upload glob includes these directories.
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
     assert {path.name for path in uploads} == (
         WHEELS | {SDIST} | {f"{name}.sigstore.json" for name in WHEELS | {SDIST}} | publishing.SUPPLEMENTAL
     )
@@ -189,14 +194,14 @@ def test_existing_conflicts_stop_without_overwriting(asset_tree, github, damage)
     assert not uploads
 
 
-@pytest.mark.parametrize("present", [3, 15])
+@pytest.mark.parametrize("present", [3, ASSET_COUNT])
 def test_retry_uploads_only_missing_matching_assets(asset_tree, github, present):
     state, _, uploads, _ = github
     paths = [path for path in asset_tree.rglob("*") if path.is_file()]
     state["assets"] = [remote_asset(path) for path in paths[:present]]
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15 - present
-    assert len(uploads) == 15 - present
-    assert len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - present
+    assert len(uploads) == ASSET_COUNT - present
+    assert len(state["assets"]) == ASSET_COUNT
 
 
 def test_interrupted_upload_resumes_the_original_bytes(asset_tree, github):
@@ -210,8 +215,8 @@ def test_interrupted_upload_resumes_the_original_bytes(asset_tree, github):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert len(state["assets"]) == 1
     callbacks.clear()
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 14
-    assert len(uploads) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - 1
+    assert len(uploads) == ASSET_COUNT
 
 
 def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asset_tree, github):
@@ -227,8 +232,8 @@ def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asse
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     completed, failed = copy.deepcopy(state["assets"])
     callbacks.clear()
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 14
-    assert len(uploads) == 16 and len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - 1
+    assert len(uploads) == ASSET_COUNT + 1 and len(state["assets"]) == ASSET_COUNT
     assert completed in state["assets"] and failed not in state["assets"]
     assert [call for call in calls if "DELETE" in call] == [
         ("api", "--method", "DELETE", f"repos/{REPOSITORY}/releases/assets/{failed['id']}")
@@ -239,8 +244,8 @@ def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asse
 def test_multiple_empty_starters_are_recovered(asset_tree, github):
     state, calls, uploads, _ = github
     state["assets"] = [starter_asset(SDIST), starter_asset("SHA256SUMS", 102)]
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
     assert len([call for call in calls if "DELETE" in call]) == 2
 
 
@@ -324,8 +329,8 @@ def test_failed_starter_cleanup_can_be_retried(asset_tree, github, monkeypatch, 
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert not uploads and state["draft"]
     monkeypatch.setattr(publishing.subprocess, "run", run)
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
 
 
 @pytest.mark.parametrize(
@@ -335,7 +340,7 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
     state, calls, uploads, callbacks = github
 
     def damage_last_upload(path, release):
-        if len(uploads) != 15:
+        if len(uploads) != ASSET_COUNT:
             return
         if damage == "truncated":
             release["assets"][-1]["size"] -= 1
@@ -355,7 +360,7 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
     callbacks.append(damage_last_upload)
     with pytest.raises(ValueError):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
-    assert len(uploads) == 15
+    assert len(uploads) == ASSET_COUNT
     assert not any("DELETE" in call for call in calls)
 
 
@@ -406,5 +411,5 @@ def test_build_only_checks_the_real_download_layout_before_index_upload(asset_tr
         cwd=asset_tree.parent,
         env={**os.environ, "PATH": ""},
     )
-    assert '"assets": 15' in result.stdout
+    assert f'"assets": {ASSET_COUNT}' in result.stdout
     assert '"verified": true' in result.stdout
