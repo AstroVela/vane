@@ -5,6 +5,8 @@
 
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/common/dl.hpp"
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
@@ -21,6 +23,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 
 using namespace duckdb;
 
@@ -516,6 +519,73 @@ static void VerifyStreamingBackpressure(idx_t threads) {
 }
 
 } // namespace
+
+namespace {
+struct ScalarAllocationData : public PrivateAllocatorData {
+	explicit ScalarAllocationData(shared_ptr<Allocator> parent_p) : parent(std::move(parent_p)), largest(0) {
+	}
+	shared_ptr<Allocator> parent;
+	atomic<idx_t> largest;
+};
+
+class ScalarAllocationGuard {
+public:
+	ScalarAllocationGuard() : original(Allocator::DefaultAllocatorReference()) {
+		auto state = make_uniq<ScalarAllocationData>(original);
+		data = state.get();
+		bounded = make_shared_ptr<Allocator>(Allocate, Free, Reallocate, std::move(state));
+		Allocator::DefaultAllocatorReference() = bounded;
+	}
+	~ScalarAllocationGuard() {
+		Allocator::DefaultAllocatorReference() = original;
+	}
+	idx_t LargestAllocation() const {
+		return data->largest.load();
+	}
+
+private:
+	static void Check(ScalarAllocationData &data, idx_t size) {
+		auto largest = data.largest.load();
+		while (size > largest && !data.largest.compare_exchange_weak(largest, size)) {
+		}
+		if (size > 64 * 1024 * 1024) {
+			throw OutOfMemoryException("Scalar folding requested a dense allocation of %llu bytes", size);
+		}
+	}
+	static data_ptr_t Allocate(PrivateAllocatorData *state, idx_t size) {
+		auto &data = state->Cast<ScalarAllocationData>();
+		Check(data, size);
+		return data.parent->AllocateData(size);
+	}
+	static void Free(PrivateAllocatorData *state, data_ptr_t pointer, idx_t size) {
+		state->Cast<ScalarAllocationData>().parent->FreeData(pointer, size);
+	}
+	static data_ptr_t Reallocate(PrivateAllocatorData *state, data_ptr_t pointer, idx_t old_size, idx_t size) {
+		auto &data = state->Cast<ScalarAllocationData>();
+		Check(data, size);
+		return data.parent->ReallocateData(pointer, old_size, size);
+	}
+	shared_ptr<Allocator> original;
+	shared_ptr<Allocator> bounded;
+	ScalarAllocationData *data;
+};
+} // namespace
+
+TEST_CASE("Scalar folding allocates one nested result instead of a full vector", "[execution_batch][expression]") {
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto type = LogicalType::ARRAY(LogicalType::ARRAY(LogicalType::FLOAT, 1024), 1024);
+	BoundConstantExpression expression {Value(type)};
+	// No query work is scheduled while this direct scalar call observes the
+	// default allocator. Reject a regression before it can commit 8 GiB.
+	ScalarAllocationGuard guard;
+	auto result = ExpressionExecutor::EvaluateScalar(*con.context, expression);
+	REQUIRE(result.IsNull());
+	REQUIRE(result.type() == type);
+	REQUIRE(guard.LargestAllocation() <= 64 * 1024 * 1024);
+}
 
 TEST_CASE("Schema-only pipelines preserve empty nested results without dense buffers", "[execution_batch][pipeline]") {
 	DuckDB db(nullptr);

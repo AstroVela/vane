@@ -30,6 +30,7 @@ from vane.execution.ref_bundle import (
     _create_shm,
     _open_existing_shm,
     _require_shm_buffer,
+    _unlink_shm,
     make_pooled_shm_descriptor,
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
@@ -225,6 +226,17 @@ def _write_ipc_to_shm(shm: shared_memory.SharedMemory, ipc_bytes: bytes) -> int:
     return required
 
 
+def _finish_shm_replacement(
+    shm: shared_memory.SharedMemory, replacement: shared_memory.SharedMemory
+) -> shared_memory.SharedMemory:
+    try:
+        shm.close()
+    except BaseException:
+        replacement.close()
+        raise
+    return replacement
+
+
 def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory.SharedMemory:
     capacity = len(_require_shm_buffer(shm))
     if required <= capacity:
@@ -234,12 +246,16 @@ def _resize_shm(shm: shared_memory.SharedMemory, required: int) -> shared_memory
         # Named Windows mappings cannot grow while either process holds one.
         # Keep the replacement alive until the parent adopts its new name.
         replacement = _create_shm(new_size, track=False)
-        try:
-            shm.close()
-        except BaseException:
-            replacement.close()
-            raise
-        return replacement
+        return _finish_shm_replacement(shm, replacement)
+    elif sys.platform == "darwin":
+        # Darwin permits only one ftruncate per POSIX shared-memory object.
+        # Recreate the same parent-owned name: even if the worker dies before
+        # announcing its result, the parent still knows what it must unlink.
+        # Existing readers keep the old object until they remap the result.
+        name = shm.name
+        _unlink_shm(shm, track=False)
+        replacement = _create_shm(new_size, track=False, name=name)
+        return _finish_shm_replacement(shm, replacement)
     else:
         name = shm.name
         path = f"/dev/shm/{name}"

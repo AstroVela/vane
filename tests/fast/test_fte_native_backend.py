@@ -10,6 +10,7 @@ import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -574,6 +575,34 @@ def test_native_worker_manager_logs_submit_tasks_when_enabled(monkeypatch, capsy
     assert "task_id=query-submit-log.0.1.0" in captured
     assert "worker_id=native-worker-0" in captured
     assert "worker_max_running=2" in captured
+
+
+@pytest.mark.parametrize("probe", ["missing", "error", "zero"])
+def test_native_memory_capacity_falls_back_without_usable_sysconf(monkeypatch, probe):
+    def sysconf(_name):
+        if probe == "error":
+            raise OSError("sysconf unavailable")
+        return 0
+
+    platform_os = SimpleNamespace() if probe == "missing" else SimpleNamespace(sysconf=sysconf)
+    monkeypatch.setattr(native_backend_mod, "os", platform_os)
+    monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(total=8192, available=1))
+
+    assert native_backend_mod._native_total_memory_bytes() == 8192
+
+
+def test_native_memory_capacity_preserves_usable_sysconf(monkeypatch):
+    monkeypatch.setattr(
+        native_backend_mod,
+        "os",
+        SimpleNamespace(sysconf=lambda name: {"SC_PHYS_PAGES": 1024, "SC_PAGE_SIZE": 4096}[name]),
+    )
+
+    def unexpected_fallback():
+        raise AssertionError("the POSIX capacity probe should take precedence")
+
+    monkeypatch.setattr("psutil.virtual_memory", unexpected_fallback)
+    assert native_backend_mod._native_total_memory_bytes() == 1024 * 4096
 
 
 def test_native_worker_snapshots_report_resource_capacity():

@@ -21,6 +21,8 @@ class WindowsUtil {
 public:
 	//! Windows helper functions
 	static std::wstring UTF8ToUnicode(const char *input);
+	//! Use Win32 extended-length syntax for long local/UNC filesystem paths.
+	static std::wstring UTF8ToUnicodePath(const char *input);
 	static string UnicodeToUTF8(LPCWSTR input);
 	static string UTF8ToMBCS(const char *input, bool use_ansi = false);
 };

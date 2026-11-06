@@ -372,8 +372,10 @@ def test_failed_input_creation_returns_the_bridge_allowance(monkeypatch):
 
     try:
         monkeypatch.setattr(refs, "_create_shm", fail)
-        with pytest.raises(OSError, match="input allocation failed"):
+        with pytest.raises(MemoryError, match="local shared-memory arena allocation failed") as failure:
             refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")
+        assert isinstance(failure.value.__cause__, OSError)
+        assert str(failure.value.__cause__) == "input allocation failed"
         assert manager._owned_input_allocations == {}
         monkeypatch.setattr(refs, "_create_shm", create)
         result = refs.make_local_shm_ref_bundle_result(pa.table({"x": [1]}), input_owner_id="source")

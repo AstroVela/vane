@@ -10,14 +10,27 @@ import json
 import multiprocessing
 import os
 import pickle
+import socket
 import time
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit
 
 import pytest
-from gravitino_helpers import serve_gravitino
+from gravitino_helpers import GravitinoHTTPServer, serve_gravitino
 
 import vane
 from vane.catalog import GravitinoCatalog
+
+
+def test_gravitino_http_fixture_starts_without_reverse_dns(monkeypatch):
+    def forbid_resolution(*_args, **_kwargs):
+        raise AssertionError("loopback HTTP fixtures must not wait for reverse DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", forbid_resolution)
+    with GravitinoHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler) as server:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port > 0
 
 
 @pytest.fixture
@@ -54,6 +67,21 @@ def gravitino_http(tmp_path):
             if server.is_alive():
                 server.kill()
                 server.join(timeout=5)
+
+
+def test_gravitino_http_fixture_serves_loopback_requests(gravitino_http):
+    state, endpoint, _ = gravitino_http
+    url = urlsplit(endpoint)
+    connection = HTTPConnection(url.hostname, url.port, timeout=5)
+    try:
+        path = url.path + "/api/metalakes/lake/catalogs/media"
+        connection.request("GET", path, headers={"Authorization": "Bearer fixture-token"})
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["catalog"]["name"] == "media"
+        assert list(state["requests"]) == [("GET", path, None)]
+    finally:
+        connection.close()
 
 
 def load_gravitino(connection):

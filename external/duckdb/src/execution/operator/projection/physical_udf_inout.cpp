@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/process_id.hpp"
@@ -47,7 +48,8 @@ namespace duckdb {
 namespace {
 
 static bool DebugEnvFlagEnabled(const char *name) {
-	const char *value = std::getenv(name);
+	const duckdb::EnvironmentVariable value_env(name);
+	const char *value = value_env.GetValue();
 	if (!value || !*value) {
 		return false;
 	}
@@ -3600,7 +3602,8 @@ static string UDFTableFunctionSerializationTestCorruption() {
 	if (!DebugEnvFlagEnabled("VANE_ENABLE_UDF_TEST_HOOKS")) {
 		return {};
 	}
-	const char *corruption = std::getenv("VANE_TEST_CORRUPT_UDF_PHYSICAL_PAYLOAD");
+	const duckdb::EnvironmentVariable corruption_env("VANE_TEST_CORRUPT_UDF_PHYSICAL_PAYLOAD");
+	const char *corruption = corruption_env.GetValue();
 	return corruption ? string(corruption) : string();
 }
 

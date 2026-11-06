@@ -1042,7 +1042,15 @@ string QuoteSQLStringLiteral(const string &value) {
 }
 
 duckdb::unique_ptr<duckdb::MaterializedQueryResult> ExecuteSnapshotQuery(duckdb::Connection &conn, const string &sql) {
-	auto result = conn.Query(sql);
+	// Internal snapshot work must not borrow the caller's result collector.
+	PendingQueryParameters parameters;
+	parameters.get_result_collector = PhysicalResultCollector::GetResultCollector;
+	auto pending = conn.context->PendingQuery(sql, parameters);
+	if (!pending) {
+		throw duckdb::InternalException("Connection snapshot query returned a null result");
+	}
+	auto result = pending->HasError() ? make_uniq<MaterializedQueryResult>(pending->GetErrorObject())
+	                                  : unique_ptr_cast<QueryResult, MaterializedQueryResult>(pending->Execute());
 	if (!result) {
 		throw duckdb::InternalException("Connection snapshot query returned a null result");
 	}

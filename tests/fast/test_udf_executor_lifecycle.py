@@ -2172,11 +2172,14 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
     try:
         assert len(created) == 4
         assert created_args[0][1] == 3
-        assert isinstance(created[2], LocalTaskProgress)
+        progress = next(owner for owner in created if isinstance(owner, LocalTaskProgress))
+        pool = next(owner for owner in created if isinstance(owner, FakeLocalActorPool))
+        arena = next(owner for owner in created if isinstance(owner, subprocess_exec.LocalQueryShmStore))
+        assert created.index(arena) < created.index(pool) < created.index(progress)
         assert set(handles_map) == {"7", "8"}
-        assert handles_map["7"]["local_actor_pool"] is created[1]
+        assert handles_map["7"]["local_actor_pool"] is pool
         binding = handles_map["8"]["local_task_progress"]
-        assert binding.query is created[2]
+        assert binding.query is progress
         assert binding.node_id == "8"
         assert plan.set_calls == [(handles_map, "conn")]
     finally:
@@ -2246,16 +2249,19 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
         assert created_args[0][1] == 2
         assert created_args[0][2] == "local-subprocess-actor-direct-plan-4"
         assert created_args[0][3] == {"AWS_ACCESS_KEY_ID": "session-key"}
-        assert isinstance(created[2], LocalTaskProgress)
+        progress = next(owner for owner in created if isinstance(owner, LocalTaskProgress))
+        pool = next(owner for owner in created if isinstance(owner, FakeLocalActorPool))
+        arena = next(owner for owner in created if isinstance(owner, subprocess_exec.LocalQueryShmStore))
+        assert created.index(arena) < created.index(pool) < created.index(progress)
         assert set(handles_map) == {"4", "5"}
         assert handles_map["4"] == {
-            "local_actor_pool": created[1],
+            "local_actor_pool": pool,
             "session_config": {"AWS_ACCESS_KEY_ID": "session-key"},
             "local_query_admission": handles_map["4"]["local_query_admission"],
-            "local_transport_input_target_bytes": created[-1].store.capacity // 2,
+            "local_transport_input_target_bytes": arena.store.capacity // 2,
         }
         binding = handles_map["5"]["local_task_progress"]
-        assert binding.query is created[2]
+        assert binding.query is progress
         assert binding.node_id == "5"
         assert injected == [handles_map]
     finally:
@@ -3583,6 +3589,104 @@ def test_subprocess_resizes_shared_memory_for_large_output(backend):
         executor.close()
 
 
+def test_subprocess_owns_actual_worker_pid_and_preserves_python_environment():
+    from vane.execution.udf_subprocess import _SingleSubprocessExecutor
+
+    def identity(_table):
+        return pa.table({"pid": [os.getpid()], "prefix": [sys.prefix], "executable": [sys.executable]})
+
+    worker = _SingleSubprocessExecutor(_subprocess_map_payload(identity))
+    try:
+        worker.submit(pa.table({"x": [1]}))
+        output = _wait_for_results(worker, 1, timeout_s=10)[0].to_pylist()[0]
+        assert output["pid"] == worker._proc.pid
+        assert output["prefix"] == sys.prefix
+        assert output["executable"] == sys.executable
+    finally:
+        worker.close(kill=True)
+
+
+def test_darwin_ipc_growth_recreates_the_parent_owned_name(monkeypatch):
+    import vane.execution.udf_subprocess_worker as worker
+
+    class Mapping:
+        name = "psm_parent_owned"
+
+        def __init__(self, size):
+            self.buf = bytearray(size)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    original = Mapping(16)
+    replacement = Mapping(128)
+    events = []
+
+    def unlink(mapping, *, track):
+        assert mapping is original and track is False
+        events.append("unlink")
+
+    def create(size, *, name, track):
+        assert size == 128 and name == original.name and track is False
+        assert not original.closed
+        events.append("create")
+        return replacement
+
+    monkeypatch.setattr(worker, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(worker, "_DEFAULT_SHM_SIZE", 32)
+    monkeypatch.setattr(worker, "_unlink_shm", unlink, raising=False)
+    monkeypatch.setattr(worker, "_create_shm", create)
+    assert worker._resize_shm(original, 128) is replacement
+    assert events == ["unlink", "create"]
+    assert original.closed and not replacement.closed
+    assert worker._resize_shm(replacement, 64) is replacement
+    assert events == ["unlink", "create"]
+
+
+def test_cancelled_darwin_ipc_growth_remaps_before_worker_reuse(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class Mapping:
+        name = "psm_parent_owned"
+
+        def __init__(self, size):
+            self.buf = bytearray(size)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    original, replacement = Mapping(64), Mapping(256)
+    replacement.buf[:4] = b"next"
+    scope = subprocess_exec.ExecutionCancellationScope("darwin-ipc", 1)
+    scope.cancel("discard grown result")
+    worker = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+    worker._data_shm = original
+    worker._shm_peer = None
+    worker._broken_error = None
+    worker._ref_bundle_output = False
+    worker._current_execution_scope = lambda: scope
+    worker._recv_expected = lambda _: (subprocess_exec._MSG_OK, struct.pack("<Q", 128))
+    worker._decode_ipc_result = lambda _: pytest.fail("cancelled IPC must not be decoded")
+
+    def open_mapping(name, *, track):
+        assert name == original.name and track is False
+        return replacement
+
+    monkeypatch.setattr(subprocess_exec, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(subprocess_exec, "_open_existing_shm", open_mapping)
+    with pytest.raises(subprocess_exec.ExecutionCancelledError, match="discard grown result"):
+        worker._recv_submit_result()
+    assert worker._data_shm is replacement
+    assert original.closed and not replacement.closed
+    scope = subprocess_exec.ExecutionCancellationScope("darwin-ipc", 2)
+    worker._recv_expected = lambda _: (subprocess_exec._MSG_OK, struct.pack("<Q", 32))
+    worker._decode_ipc_result = lambda _: bytes(worker._data_shm.buf[:4])
+    worker._wrap_output = lambda result: result
+    assert worker._recv_submit_result() == b"next"
+
+
 @pytest.mark.parametrize("mapping_failure", [None, "open", "close"])
 def test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker(monkeypatch, mapping_failure):
     import vane.execution.udf_subprocess as subprocess_exec
@@ -3811,6 +3915,7 @@ def test_local_shm_multi_block_adoption_rolls_back_on_invalid_last_mapping():
 
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("ipc_metadata", ["declared", "missing", "none"])
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux shared-memory in-place growth")
 def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty, ipc_metadata):
     import os
 
@@ -3959,40 +4064,6 @@ def test_local_shm_ref_bundle_arrow_column_outlives_materialized_table():
         refs[0].release()
 
 
-def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
-    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 100 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 80 * ref_bundle._GIB)
-
-    expected_capacity = min(
-        int(100 * ref_bundle._GIB * ref_bundle._RAY_LIKE_OBJECT_STORE_MEMORY_FRACTION),
-        int(80 * ref_bundle._GIB * ref_bundle._RAY_LIKE_SHM_MEMORY_FRACTION),
-        ref_bundle._RAY_LIKE_OBJECT_STORE_MAX_BYTES,
-    )
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(expected_capacity * 0.5)
-
-
-def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monkeypatch):
-    from vane.execution import ref_bundle
-
-    shm_capacity = 256 * ref_bundle._MIB
-    monkeypatch.delenv("VANE_LOCAL_SHM_STORE_BYTES", raising=False)
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 80 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: shm_capacity)
-
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == int(shm_capacity * 0.95) // 2
-
-
-def test_local_shm_auto_budget_respects_explicit_small_arena(monkeypatch):
-    from vane.execution import ref_bundle
-
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "64m")
-    assert ref_bundle._auto_local_shm_ref_budget_bytes() == 32 * ref_bundle._MIB
-
-
 def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypatch):
     from vane.execution import ref_bundle
     from vane.execution.udf_shm_store import LocalShmStore
@@ -4018,24 +4089,6 @@ def test_local_shm_ref_bundle_acquires_budget_before_allocating_storage(monkeypa
     finally:
         for ref in refs:
             ref.release()
-
-
-def test_local_shm_budget_manager_auto_limit_does_not_shrink_after_first_resolution(monkeypatch):
-    import vane.execution.ref_bundle as ref_bundle
-
-    monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
-    available_system = [100 * ref_bundle._GIB]
-    available_shm = [80 * ref_bundle._GIB]
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: available_system[0])
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: available_shm[0])
-
-    manager = ref_bundle.LocalShmBudgetManager()
-    first_limit = manager.snapshot()["limit_bytes"]
-
-    available_system[0] = 16 * ref_bundle._GIB
-    available_shm[0] = 8 * ref_bundle._GIB
-
-    assert manager.snapshot()["limit_bytes"] == first_limit
 
 
 def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(monkeypatch):
@@ -8695,16 +8748,6 @@ def test_local_shm_budget_invalid_env_raises_without_fallback(monkeypatch, raw):
         unregister()
 
 
-def test_local_shm_auto_budget_rejects_missing_capacity_instead_of_ignoring_it(monkeypatch):
-    from vane.execution import ref_bundle
-
-    monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 16 * ref_bundle._GIB)
-    monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 0)
-
-    with pytest.raises(RuntimeError, match="/dev/shm has no available capacity"):
-        ref_bundle._auto_local_shm_ref_budget_bytes()
-
-
 def test_local_ref_bundle_worker_payload_carries_input_lease_id():
     from vane.execution.ref_bundle import make_local_ref_bundle_worker_payload, make_local_shm_ref_bundle_result
 
@@ -9519,9 +9562,9 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch, pool
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
 
 
-@pytest.mark.parametrize("collect_unrelated_worker", [False, True])
+@pytest.mark.parametrize("collect_other_executor", [False, True])
 def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(
-    monkeypatch, collect_unrelated_worker
+    monkeypatch, collect_other_executor
 ):
     import vane.execution.udf_subprocess as subprocess_exec
 
@@ -9540,20 +9583,8 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
         4: stale_scope,
     }
 
-    pending_workers = []
-    unrelated_worker_ref = None
-    if collect_unrelated_worker:
-        unrelated_worker = _bare_shutdown_executor(subprocess_exec, _FakeControlSocket(), None)
-        unrelated_worker._test_cycle = unrelated_worker
-        unrelated_worker_ref = weakref.ref(unrelated_worker)
-        pending_workers.append(unrelated_worker)
-        del unrelated_worker
-
     def cancel_input_lease(lease_id, *, name):
         events.append(f"lease:{lease_id}:{name}")
-        if pending_workers:
-            pending_workers.clear()
-            gc.collect()
         if lease_id == 1 and "lease" not in failed_once:
             failed_once.add("lease")
             raise RuntimeError("planned input lease failure")
@@ -9567,30 +9598,22 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
         return 0
 
     def wake_budget():
-        events.append("wake")
-        if "wake" not in failed_once:
-            failed_once.add("wake")
-            raise RuntimeError("planned budget wakeup failure")
+        # Unrelated finalizers must not consume a one-shot wakeup failure.
+        raise RuntimeError("planned budget wakeup failure")
 
-    # Keep the real cleanup methods, but inject failures only for this worker.
-    # Module-wide mocks can also be reached by unrelated workers' __del__.
-    cleanup_globals = dict(
-        vars(subprocess_exec),
-        cancel_local_shm_input_lease=cancel_input_lease,
-        release_local_shm_output_grant=release_output_grant,
-        wake_local_shm_ref_budget_waiters=wake_budget,
-    )
-    for method_name in ("_cancel_active_input_leases", "_release_active_output_grants", "_cancel_scope_resources"):
-        method = getattr(type(executor), method_name)
-        isolated_method = types.FunctionType(
-            method.__code__,
-            cleanup_globals,
-            method.__name__,
-            method.__defaults__,
-            method.__closure__,
-        )
-        isolated_method.__kwdefaults__ = method.__kwdefaults__
-        monkeypatch.setattr(executor, method_name, types.MethodType(isolated_method, executor))
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
+    monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_output_grant)
+    monkeypatch.setattr(subprocess_exec, "wake_local_shm_ref_budget_waiters", wake_budget)
+
+    if collect_other_executor:
+        other_sock = _FakeControlSocket()
+        other_executor = _bare_shutdown_executor(subprocess_exec, other_sock, None)
+        other_ref = weakref.ref(other_executor)
+        other_executor._test_cycle = other_executor
+        del other_executor
+        gc.collect()
+        assert other_ref() is None
+        assert other_sock.closed
 
     with pytest.raises(
         RuntimeError,
@@ -9601,7 +9624,6 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
     assert events == [
         "lease:1:udf-input-close",
         "grant:3:udf-output-cancel",
-        "wake",
         "lease:1:udf-input-close",
         "lease:2:udf-input-close",
         "grant:3:udf-output-close",
@@ -9613,12 +9635,10 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
     assert sock.closed
     assert executor._sock is None
     assert executor._proc is None
-    if unrelated_worker_ref is not None:
-        assert unrelated_worker_ref() is None
 
     executor.close(kill=True)
 
-    assert len(events) == 7
+    assert len(events) == 6
     assert executor._active_input_leases == {}
     assert executor._active_output_grants == {}
     assert executor._cleanup_finished
@@ -11278,23 +11298,40 @@ def test_materialized_actor_prefetch_overlaps_compute_and_owns_cleanup(monkeypat
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
 
 
+@pytest.fixture
+def prefetch_store(monkeypatch):
+    from vane.execution import udf_shm_store
+
+    # Use the normal arena acquisition path so the transport budget and the
+    # physical store share one capacity decision, independent of earlier tests.
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
+    monkeypatch.setattr(udf_shm_store, "_current_store", None)
+    monkeypatch.setattr(udf_shm_store, "_stores", {})
+    monkeypatch.setattr(udf_shm_store, "_capacity_bytes", None)
+    monkeypatch.setattr(udf_shm_store, "_capacity_pending", None)
+    store = udf_shm_store.current_store("prefetch-test")
+    try:
+        yield store
+    finally:
+        store.remove_client("prefetch-test")
+        snapshot = store.snapshot()
+        assert snapshot["clients"] == snapshot["live_allocations"] == snapshot["mapped_capacity_bytes"] == 0
+
+
 @pytest.mark.parametrize("budget", ["auto", "0"])
 @pytest.mark.parametrize("input_kib,output_kib,cancel_prefetch", [(32, 32, False), (8, 64, False), (32, 32, True)])
 def test_prefetch_preserves_running_calls_output_capacity(
-    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch
+    monkeypatch, tmp_path, budget, input_kib, output_kib, cancel_prefetch, prefetch_store
 ):
     import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", budget)
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     # Auto limits are cached per manager. Use a new query budget so preceding
     # tests cannot leave this case using a much larger arena's cached limit.
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("prefetch-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
     entered, release = tmp_path / "entered", tmp_path / "release"
 
     class Actor:
@@ -11379,24 +11416,20 @@ def test_prefetch_preserves_running_calls_output_capacity(
         second.close(kill=True)
         first.close(kill=True)
         pool.shutdown(kill=True)
-        store.remove_client("prefetch-test")
     assert all(ref._closed for ref in captured)
     assert store.snapshot()["live_allocations"] == 0
     assert ref_bundle.local_shm_budget_manager().snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
 
 
-def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path):
+def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(monkeypatch, tmp_path, prefetch_store):
     import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("reclaim-race-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
     entered, release = tmp_path / "entered", tmp_path / "release"
 
     class Actor:
@@ -11478,24 +11511,22 @@ def test_materialized_input_capacity_wait_does_not_block_snapshotted_reclaimer(m
             executor.close(kill=True)
         for pool in pools:
             pool.shutdown(kill=True)
-        store.remove_client("reclaim-race-test")
     assert store.snapshot()["live_allocations"] == 0
     assert manager.snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
 
 
 @pytest.mark.parametrize("reclaim_first", [False, True])
-def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeypatch, tmp_path, reclaim_first):
+def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(
+    monkeypatch, tmp_path, reclaim_first, prefetch_store
+):
     import vane.execution.udf_subprocess as local
-    from vane.execution import ref_bundle, udf_shm_store
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto")
-    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", str(80 * 1024))
     manager = ref_bundle.LocalShmBudgetManager()
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
-    store = udf_shm_store.LocalShmStore(80 * 1024)
-    store.add_client("inflight-reclaim-test")
-    monkeypatch.setattr(udf_shm_store, "_current_store", store)
+    store = prefetch_store
 
     def wait_for(path):
         deadline = time.monotonic() + 15
@@ -11596,7 +11627,6 @@ def test_actor_output_waits_for_another_actors_inflight_prefetch_reclaim(monkeyp
             executor.close(kill=True)
         for pool in pools:
             pool.shutdown(kill=True)
-        store.remove_client("inflight-reclaim-test")
     assert store.snapshot()["live_allocations"] == 0
     assert manager.snapshot()["active_input_leases"] == 0
     assert manager.snapshot()["usage_bytes"] == 0

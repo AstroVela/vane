@@ -543,7 +543,7 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 
 	m.def(
 	    "shuffle_cache_duckdb_filesystem_storage_roundtrip_for_test",
-	    [](const std::string &local_dir) {
+	    [](const std::string &local_dir, const std::string &node_id) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
@@ -557,7 +557,7 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    vector<string> names = {"value"};
 		    ShuffleCacheConfig config;
 		    config.exchange_id = "shuffle_cache_duckdb_fs_storage_test__sink_0__attempt_1";
-		    config.node_id = "node-a";
+		    config.node_id = node_id;
 		    config.num_partitions = 1;
 		    config.local_dirs = {local_dir};
 
@@ -610,9 +610,11 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    out["values"] = values;
 		    out["manifest_tmp_exists"] = fs.FileExists(reader->ManifestFilePath() + ".tmp");
 		    out["marker_tmp_exists"] = fs.FileExists(reader->CommittedMarkerPath() + ".tmp");
+		    out["manifest_path"] = reader->ManifestFilePath();
 		    return out;
 	    },
-	    py::arg("local_dir"), "Exercise ShuffleCache roundtrip through the DuckDB FileSystem backed storage backend.");
+	    py::arg("local_dir"), py::arg("node_id") = "node-a",
+	    "Exercise ShuffleCache roundtrip through the DuckDB FileSystem backed storage backend.");
 }
 } // namespace ray_bindings
 } // namespace duckdb

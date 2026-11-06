@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from vane_packaging.archive_safety import open_zip_snapshot, snapshot_archive
 from vane_packaging.artifact_limits import MAX_EXTENSION_ARTIFACT_BYTES
+from vane_packaging.media_downloads import prefetch_media_sources
 from vane_packaging.media_release import prepare_release
 from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_sources import export_sdist, read_source_archive, read_source_file
@@ -55,6 +56,8 @@ def prepare_runtime(vcpkg: Path, directory: Path, source_url: str) -> None:
     environment["VCPKG_BINARY_SOURCES"] = "clear"
     for name in ("VCPKG_OVERLAY_PORTS", "VCPKG_OVERLAY_TRIPLETS"):
         environment.pop(name, None)
+    downloads = Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads")))
+    prefetch_media_sources(project, downloads)
     subprocess.run(
         [
             str(vcpkg / "vcpkg"),
@@ -73,7 +76,7 @@ def prepare_runtime(vcpkg: Path, directory: Path, source_url: str) -> None:
         project,
         vcpkg,
         directory / "vcpkg/installed",
-        Path(environment.get("VCPKG_DOWNLOADS", str(vcpkg / "downloads"))),
+        downloads,
         directory / "inputs",
     )
     files = read_source_archive(read_source_file(archive), archive.name)

@@ -2661,12 +2661,14 @@ class RayWorkerActor:
                 for cursor, cursor_query_id in self._native_cursor_query_ids.items()
                 if cursor_query_id == query_id
             ]
-        errors: list[str] = []
-        for cursor in cursors:
-            try:
-                cursor.interrupt()
-            except Exception as exc:
-                errors.append(str(exc))
+            # Keep each cursor registered until its interrupt returns. Native
+            # execution unregisters under this condition before closing it.
+            errors: list[str] = []
+            for cursor in cursors:
+                try:
+                    cursor.interrupt()
+                except Exception as exc:
+                    errors.append(str(exc))
         return errors
 
     def _close_worker_native_task(self, task_id: str) -> list[str]:
@@ -2685,12 +2687,12 @@ class RayWorkerActor:
             cursors = [
                 cursor for cursor, cursor_task_id in self._native_cursor_task_ids.items() if cursor_task_id == task_id
             ]
-        errors: list[str] = []
-        for cursor in cursors:
-            try:
-                cursor.interrupt()
-            except Exception as exc:
-                errors.append(str(exc))
+            errors: list[str] = []
+            for cursor in cursors:
+                try:
+                    cursor.interrupt()
+                except Exception as exc:
+                    errors.append(str(exc))
         return errors
 
     def _retire_worker_native_task(self, task_id: str) -> None:
@@ -3057,13 +3059,15 @@ class RayWorkerActor:
             )
             raise
         finally:
-            if cursor is not None:
-                try:
-                    self._close_snapshot_execution_cursor(cursor)
-                except Exception:
-                    pass
-            if cursor_registered:
-                self._unregister_native_cursor(cursor)
+            try:
+                if cursor_registered:
+                    self._unregister_native_cursor(cursor)
+            finally:
+                if cursor is not None:
+                    try:
+                        self._close_snapshot_execution_cursor(cursor)
+                    except Exception:
+                        pass
 
     @staticmethod
     async def _await_fragment_registration(registration_result: Any | None) -> None:

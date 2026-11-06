@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/environment.hpp"
 #include "vane_python/udf_executor.hpp"
 
 #include "duckdb/common/arrow/arrow.hpp"
@@ -69,7 +70,8 @@ static bool PythonRuntimeUsableForUDFTeardown() {
 
 static bool UDFDebugEnabled() {
 	static const bool enabled = [] {
-		const char *value = std::getenv("DUCKDB_DISTRIBUTED_DEBUG");
+		const duckdb::EnvironmentVariable value_env("DUCKDB_DISTRIBUTED_DEBUG");
+		const char *value = value_env.GetValue();
 		if (!value || !*value) {
 			return false;
 		}
@@ -100,7 +102,8 @@ static thread_local bool g_on_udf_dispatcher_thread = false;
 
 static std::chrono::milliseconds UDFUnregisterTimeout() {
 	constexpr long DEFAULT_TIMEOUT_MS = 5000;
-	const char *value = std::getenv("VANE_UDF_UNREGISTER_TIMEOUT_MS");
+	const duckdb::EnvironmentVariable value_env("VANE_UDF_UNREGISTER_TIMEOUT_MS");
+	const char *value = value_env.GetValue();
 	if (!value || !*value) {
 		return std::chrono::milliseconds(DEFAULT_TIMEOUT_MS);
 	}
@@ -4161,7 +4164,8 @@ void ShutdownUDFExecutorDispatcher() {
 }
 
 void WakeUDFExecutorSlotsForTesting() {
-	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	const duckdb::EnvironmentVariable test_hooks_env("VANE_ENABLE_UDF_TEST_HOOKS");
+	const char *test_hooks = test_hooks_env.GetValue();
 	if (!test_hooks || string(test_hooks) != "1") {
 		throw InvalidInputException("_wake_udf_executor_slots_for_testing requires VANE_ENABLE_UDF_TEST_HOOKS=1");
 	}
@@ -4169,7 +4173,8 @@ void WakeUDFExecutorSlotsForTesting() {
 }
 
 void PauseUDFDispatcherWaitForTesting() {
-	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	const duckdb::EnvironmentVariable test_hooks_env("VANE_ENABLE_UDF_TEST_HOOKS");
+	const char *test_hooks = test_hooks_env.GetValue();
 	if (!test_hooks || string(test_hooks) != "1") {
 		throw InvalidInputException("_pause_udf_dispatcher_wait_for_testing requires VANE_ENABLE_UDF_TEST_HOOKS=1");
 	}

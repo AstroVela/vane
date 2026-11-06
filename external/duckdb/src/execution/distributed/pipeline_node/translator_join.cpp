@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 
 #include <algorithm>
@@ -206,7 +207,8 @@ idx_t EstimateDataSizeBytes(idx_t cardinality, const duckdb::vector<LogicalType>
 
 idx_t GetAutoBroadcastThresholdBytes() {
 	constexpr idx_t DEFAULT_THRESHOLD_BYTES = 10ULL * 1024 * 1024;
-	const char *env = std::getenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return DEFAULT_THRESHOLD_BYTES;
 	}
@@ -228,7 +230,8 @@ idx_t GetAutoBroadcastThresholdBytes() {
 enum class DistributedJoinStrategyOverride { kDefault, kHash, kBroadcast, kBroadcastLeft, kBroadcastRight };
 
 DistributedJoinStrategyOverride GetJoinStrategyOverride() {
-	const char *env = std::getenv("VANE_DISTRIBUTED_JOIN_STRATEGY");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_JOIN_STRATEGY");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return DistributedJoinStrategyOverride::kDefault;
 	}
@@ -251,7 +254,8 @@ DistributedJoinStrategyOverride GetJoinStrategyOverride() {
 }
 
 Optional<bool> BroadcastReceiverRepartitionOverride() {
-	const char *env = std::getenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return Optional<bool> {};
 	}

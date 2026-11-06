@@ -10,9 +10,7 @@ build_loadable_extension_directory(
   loadable_extension_demo.cpp)
 
 # Exercise a private, self-contained engine just like production C++ providers.
-if(ENABLE_UNITTEST_CPP_TESTS
-   AND EXTENSION_STATIC_BUILD
-   AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(ENABLE_UNITTEST_CPP_TESTS AND EXTENSION_STATIC_BUILD)
   build_loadable_extension_directory(
     loadable_extension_batch_demo
     "CPP"
@@ -21,8 +19,18 @@ if(ENABLE_UNITTEST_CPP_TESTS
     ""
     ${PARAMETERS}
     loadable_extension_batch_demo.cpp)
-  target_link_options(loadable_extension_batch_demo_loadable_extension PRIVATE
-                      -Wl,-Bsymbolic -Wl,-z,defs)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(loadable_extension_batch_demo_loadable_extension
+                        PRIVATE -Wl,-Bsymbolic -Wl,-z,defs)
+  elseif(APPLE)
+    # Mach-O's two-level namespace already keeps the private engine local. The
+    # extension builder exports only its entry point unless asked for the two
+    # additional test factories used by the native adapter regression.
+    target_link_options(
+      loadable_extension_batch_demo_loadable_extension PRIVATE
+      -Wl,-exported_symbol,_batch_demo_has_private_reader
+      -Wl,-exported_symbol,_batch_demo_make_operator)
+  endif()
   target_compile_definitions(
     test_execution
     PRIVATE

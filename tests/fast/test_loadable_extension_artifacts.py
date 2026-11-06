@@ -3,6 +3,7 @@
 
 import importlib
 import os
+import shutil
 from collections import deque
 from pathlib import Path
 
@@ -54,6 +55,23 @@ def private_extension_connection(monkeypatch, request):
     with vane.connect(config={"autoinstall_known_extensions": "false", "autoload_known_extensions": "false"}) as con:
         con.load_extension(str(artifact))
         yield con
+
+
+def test_private_extension_loads_from_a_long_path(tmp_path):
+    from vane._native_runtime_format import filesystem_path
+
+    artifact = _configured_artifact_path("VANE_TEST_LOADABLE_BATCH_DEMO_PATH")
+    directory = tmp_path
+    while len(str(directory)) < 280:
+        directory /= "long-extension-path-component"
+    filesystem_path(directory).mkdir(parents=True)
+    target = directory / artifact.name
+    shutil.copyfile(artifact, filesystem_path(target))
+    with vane.connect(config={"autoinstall_known_extensions": False, "autoload_known_extensions": False}) as con:
+        # Pass the ordinary absolute path to the engine: the native loader,
+        # rather than its caller, must handle Windows MAX_PATH conversion.
+        con.load_extension(str(target))
+        assert con.execute("SELECT * FROM batch_demo_query('SELECT 42')").fetchall() == [(42,)]
 
 
 def _copy_query(sql):

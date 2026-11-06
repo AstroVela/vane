@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sort.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
@@ -219,9 +220,11 @@ static idx_t ResolveOrderBySourceTaskCount(idx_t num_partitions, const DuckDBExe
 			target_tasks = std::min(num_partitions, worker_slots);
 		}
 	}
-	const char *env_val = std::getenv("VANE_ORDER_BY_SOURCE_TASKS");
+	const duckdb::EnvironmentVariable env_val_env("VANE_ORDER_BY_SOURCE_TASKS");
+	const char *env_val = env_val_env.GetValue();
+	const duckdb::EnvironmentVariable fallback_env("VANE_EXCHANGE_SOURCE_TASKS");
 	if (!env_val || !env_val[0]) {
-		env_val = std::getenv("VANE_EXCHANGE_SOURCE_TASKS");
+		env_val = fallback_env.GetValue();
 	}
 	if (env_val && env_val[0]) {
 		try {
@@ -237,7 +240,8 @@ static idx_t ResolveOrderBySourceTaskCount(idx_t num_partitions, const DuckDBExe
 
 static idx_t ResolveOrderBySampleRows(idx_t num_partitions) {
 	idx_t sample_rows = std::max<idx_t>(8192, num_partitions * 256);
-	const char *env_val = std::getenv("VANE_ORDER_BY_RANGE_SAMPLE_ROWS");
+	const duckdb::EnvironmentVariable env_val_env("VANE_ORDER_BY_RANGE_SAMPLE_ROWS");
+	const char *env_val = env_val_env.GetValue();
 	if (env_val && env_val[0]) {
 		try {
 			auto parsed = static_cast<idx_t>(std::stoull(env_val));
@@ -273,7 +277,8 @@ static idx_t EstimateRowsFromHandles(const std::vector<ExchangeSourceHandle> &ha
 }
 
 static bool OrderByDebugEnabled() {
-	const char *value = std::getenv("DUCKDB_DISTRIBUTED_DEBUG");
+	const duckdb::EnvironmentVariable value_env("DUCKDB_DISTRIBUTED_DEBUG");
+	const char *value = value_env.GetValue();
 	return value && value[0] != '\0' && value[0] != '0';
 }
 

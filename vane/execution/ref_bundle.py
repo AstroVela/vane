@@ -52,9 +52,6 @@ _IPC_HEADER_SIZE = 8
 _MIB = 1 << 20
 _GIB = 1 << 30
 _TRUTHY_FALSE_VALUES = ("", "0", "false", "no", "off")
-_RAY_LIKE_OBJECT_STORE_MEMORY_FRACTION = 0.3
-_RAY_LIKE_SHM_MEMORY_FRACTION = 0.95
-_RAY_LIKE_OBJECT_STORE_MAX_BYTES = 200 * _GIB
 _deferred_shm_close_lock = threading.Lock()
 _deferred_shm_closes: list[tuple[shared_memory.SharedMemory, ForkableOutputLease | None]] = []
 _descriptor_shm_lock = threading.Lock()
@@ -171,52 +168,16 @@ def _parse_byte_size(value: str) -> int:
     return parsed
 
 
-def _available_system_memory_bytes() -> int:
-    if sys.platform in {"darwin", "win32"}:
-        import psutil
-
-        return int(psutil.virtual_memory().available)
-    with open("/proc/meminfo", encoding="utf-8") as meminfo:
-        for line in meminfo:
-            if not line.startswith("MemAvailable:"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                break
-            available = int(parts[1]) * 1024
-            if available <= 0:
-                raise RuntimeError("/proc/meminfo reports no available memory")
-            return available
-    raise RuntimeError("/proc/meminfo is missing MemAvailable")
-
-
-def _available_local_shm_bytes() -> int:
-    if sys.platform in {"darwin", "win32"}:
-        # Darwin and Windows shared memory draw from VM, without /dev/shm.
-        return _available_system_memory_bytes()
-    stat = os.statvfs("/dev/shm")
-    return int(stat.f_frsize) * int(stat.f_bavail)
-
-
 def _auto_local_shm_store_capacity_bytes() -> int:
-    available_memory = _available_system_memory_bytes()
-    if available_memory <= 0:
-        raise RuntimeError("system has no available memory for local shared-memory UDF output")
-    available_shm = _available_local_shm_bytes()
-    if available_shm <= 0:
-        raise RuntimeError("/dev/shm has no available capacity for local shared-memory UDF output")
-    candidates = [
-        _RAY_LIKE_OBJECT_STORE_MAX_BYTES,
-        int(available_memory * _RAY_LIKE_OBJECT_STORE_MEMORY_FRACTION),
-        int(available_shm * _RAY_LIKE_SHM_MEMORY_FRACTION),
-    ]
-    return min(candidates)
+    from vane.execution.local_shm_capacity import resolve_capacity
+
+    return resolve_capacity().capacity
 
 
 def _auto_local_shm_ref_budget_bytes() -> int:
-    raw = os.environ.get("VANE_LOCAL_SHM_STORE_BYTES", "auto").strip().lower()
-    capacity = _auto_local_shm_store_capacity_bytes() if raw == "auto" else _parse_byte_size(raw)
-    return max(1, capacity // 2)
+    from vane.execution.udf_shm_store import current_store_capacity
+
+    return max(1, current_store_capacity() // 2)
 
 
 def _local_shm_ref_budget_limit_bytes() -> int:
@@ -232,22 +193,12 @@ def _local_shm_ref_budget_limit_bytes() -> int:
 
 
 def _make_local_shm_ref_budget_limit_factory() -> Callable[[], int]:
-    auto_limit_bytes: int | None = None
-    auto_limit_lock = threading.Lock()
-
-    def resolve_auto_once() -> int:
-        nonlocal auto_limit_bytes
-        with auto_limit_lock:
-            if auto_limit_bytes is None:
-                auto_limit_bytes = _auto_local_shm_ref_budget_bytes()
-            return auto_limit_bytes
-
     def limit_bytes() -> int:
         raw = os.getenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "auto").strip().lower()
         if raw in _TRUTHY_FALSE_VALUES or raw in {"none", "unbounded", "unlimited"}:
             return 0
         if raw == "auto":
-            return resolve_auto_once()
+            return _auto_local_shm_ref_budget_bytes()
         try:
             return _parse_byte_size(raw)
         except Exception as exc:
@@ -1567,8 +1518,8 @@ def _untrack_shm(shm: shared_memory.SharedMemory) -> shared_memory.SharedMemory:
     return shm
 
 
-def _create_shm(size: int, *, track: bool) -> shared_memory.SharedMemory:
-    shm = shared_memory.SharedMemory(create=True, size=size)
+def _create_shm(size: int, *, track: bool, name: str | None = None) -> shared_memory.SharedMemory:
+    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
     return shm if track else _untrack_shm(shm)
 
 

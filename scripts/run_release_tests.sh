@@ -61,6 +61,7 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_windows_udf_transport.py"
+  "$project_root/tests/fast/test_header_linkage.py"
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_mlx_provider.py"
   "$project_root/tests/fast/test_mlx_image_provider.py"
@@ -72,6 +73,7 @@ release_tests=(
   "$project_root/tests/fast/test_litert_provider.py"
   "$project_root/tests/fast/test_litert_service.py"
   "$project_root/tests/fast/test_onnx_provider.py"
+  "$project_root/tests/fast/test_onnx_cuda_memory.py"
   "$project_root/tests/fast/test_onnx_service.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"
@@ -108,14 +110,17 @@ release_tests=(
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_subprocess_resizes_shared_memory_for_large_output"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_subprocess_owns_actual_worker_pid_and_preserves_python_environment"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_darwin_ipc_growth_recreates_the_parent_owned_name"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_cancelled_darwin_ipc_growth_remaps_before_worker_reuse"
+  "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_cancelled_named_ipc_result_adopts_mapping_or_breaks_worker"
   "$project_root/tests/fast/test_udf_executor_lifecycle.py::test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_monkeypatch"
   "$project_root/tests/fast/test_local_query_models.py::test_sql_and_rebuilt_relations_reuse_explicit_model"
   "$project_root/tests/fast/test_local_query_models.py::test_model_releases_output_before_completion_callback_returns"
   "$project_root/tests/fast/test_local_task_scheduling.py"
   "$project_root/tests/fast/test_local_shm_credit_progress.py"
   "$project_root/tests/fast/test_local_shm_store_capacity.py::test_capacity_wait_distinguishes_queued_refs_from_fork_only_holds"
-  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_darwin_auto_capacity_uses_available_vm_without_linux_paths"
-  "$project_root/tests/fast/test_local_shm_store_capacity.py::test_darwin_auto_capacity_rejects_exhausted_vm"
+  "$project_root/tests/fast/test_local_shm_capacity.py"
   "$project_root/tests/fast/test_local_shm_store_capacity.py::test_arena_without_madv_remove_preserves_live_views_and_closes"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_actor_retaining_previous_input_can_receive_the_next_batch[generator-subprocess_task-16MiB-False-False-2]"
   "$project_root/tests/fast/test_udf_stream_backpressure_native.py::test_output_capacity_includes_inputs_queued_behind_the_current_call[auto-2-192KiB-False]"

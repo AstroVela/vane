@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/process_id.hpp"
 
@@ -19,6 +20,10 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/storage/temporary_memory_manager.hpp"
+#ifdef _WIN32
+#include "mbedtls_wrapper.hpp"
+#include "duckdb/common/windows_util.hpp"
+#endif
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
@@ -40,7 +45,23 @@ namespace distributed {
 
 namespace {
 
-std::string ShuffleCacheSanitizePathComponent(const std::string &value) {
+std::string ShuffleCacheSanitizePathComponent(const std::string &value, bool local_path) {
+#ifdef _WIN32
+	// Ray worker IDs contain colons. Keep ordinary lowercase identifiers for
+	// existing local layouts, and map unsafe/long identifiers to bounded names.
+	// The reserved prefix and SHA-256 also avoid case-folding and escape aliases.
+	if (local_path && (value.size() > 120 ||
+	                   value.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-.") != std::string::npos ||
+	                   (!value.empty() && value.back() == '.'))) {
+		duckdb_mbedtls::MbedTlsWrapper::SHA256State hash;
+		hash.AddString(value);
+		std::string digest(duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT, '\0');
+		hash.FinishHex(&digest[0]);
+		return "~" + digest;
+	}
+#else
+	(void)local_path;
+#endif
 	std::string out = value;
 	for (auto &ch : out) {
 		if (ch == '/' || ch == '\\') {
@@ -66,7 +87,13 @@ DuckDBError ShuffleCacheArrowToError(const arrow::Status &status, const std::str
 }
 
 DuckDBResult<std::shared_ptr<arrow::io::OutputStream>> OpenPosixArrowOutput(const std::string &path) {
-	auto out_res = arrow::io::FileOutputStream::Open(path);
+#ifdef _WIN32
+	auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
+	auto output_path = WindowsUtil::UnicodeToUTF8(native_path.c_str());
+#else
+	const auto &output_path = path;
+#endif
+	auto out_res = arrow::io::FileOutputStream::Open(output_path);
 	if (!out_res.ok()) {
 		return DuckDBResult<std::shared_ptr<arrow::io::OutputStream>>::err(
 		    ShuffleCacheArrowToError(out_res.status(), "open shuffle output"));
@@ -75,7 +102,13 @@ DuckDBResult<std::shared_ptr<arrow::io::OutputStream>> OpenPosixArrowOutput(cons
 }
 
 DuckDBResult<std::shared_ptr<arrow::io::InputStream>> OpenPosixArrowInput(const std::string &path) {
-	auto in_res = arrow::io::ReadableFile::Open(path);
+#ifdef _WIN32
+	auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
+	auto input_path = WindowsUtil::UnicodeToUTF8(native_path.c_str());
+#else
+	const auto &input_path = path;
+#endif
+	auto in_res = arrow::io::ReadableFile::Open(input_path);
 	if (!in_res.ok()) {
 		return DuckDBResult<std::shared_ptr<arrow::io::InputStream>>::err(
 		    ShuffleCacheArrowToError(in_res.status(), "open shuffle input"));
@@ -103,6 +136,15 @@ bool IsAggregateStateType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::AGGREGATE_STATE;
 }
 
+// Shuffle files are an internal transport between Vane workers. UUID, JSON,
+// HUGEINT, UHUGEINT, and BIT have no native Arrow type, so they must keep their
+// logical types across the shuffle regardless of the user's Arrow output settings.
+ClientProperties ShuffleArrowClientProperties(ClientContext &context) {
+	auto properties = context.GetClientProperties();
+	properties.arrow_lossless_conversion = true;
+	return properties;
+}
+
 vector<LogicalType> ToArrowTypes(const vector<LogicalType> &types) {
 	vector<LogicalType> result;
 	result.reserve(types.size());
@@ -127,7 +169,8 @@ unsigned long long ParsePositiveByteCount(const char *name, const char *raw) {
 }
 
 idx_t ResolveShuffleCacheFlushThresholdBytes() {
-	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
+	const duckdb::EnvironmentVariable raw_env("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES");
+	const char *raw = raw_env.GetValue();
 	if (!raw || !*raw) {
 		return ShuffleCache::DEFAULT_FLUSH_THRESHOLD_BYTES;
 	}
@@ -140,7 +183,8 @@ idx_t ResolveShuffleCacheFlushThresholdBytes() {
 }
 
 optional_idx ResolveShuffleCacheMaxBufferedBytes() {
-	const char *raw = std::getenv("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES");
+	const duckdb::EnvironmentVariable raw_env("VANE_SHUFFLE_CACHE_MAX_BUFFERED_BYTES");
+	const char *raw = raw_env.GetValue();
 	if (!raw || !*raw) {
 		return optional_idx();
 	}
@@ -241,7 +285,12 @@ public:
 	DuckDBResult<void> WriteTextFileAtomically(const std::string &path, const std::string &contents) const override {
 		auto tmp_path = path + ".tmp";
 		{
+#ifdef _WIN32
+			auto native_path = WindowsUtil::UTF8ToUnicodePath(tmp_path.c_str());
+			std::ofstream output(native_path.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
+#else
 			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
+#endif
 			if (!output) {
 				return DuckDBResult<void>::err(DuckDBError::io_error("failed to open shuffle text file: " + tmp_path));
 			}
@@ -264,7 +313,12 @@ public:
 	}
 
 	DuckDBResult<std::string> ReadTextFile(const std::string &path) const override {
+#ifdef _WIN32
+		auto native_path = WindowsUtil::UTF8ToUnicodePath(path.c_str());
+		std::ifstream input(native_path.c_str(), std::ios::in | std::ios::binary);
+#else
 		std::ifstream input(path, std::ios::in | std::ios::binary);
+#endif
 		if (!input.good()) {
 			return DuckDBResult<std::string>::err(DuckDBError::io_error("failed to open shuffle text file: " + path));
 		}
@@ -756,8 +810,9 @@ DuckDBResult<void> ShuffleCache::EnsurePartitionDirectory(idx_t partition_idx) c
 
 std::string ShuffleCache::NodeDirectory() const {
 	auto base_dir = config_.local_dirs.empty() ? std::string() : config_.local_dirs[0];
-	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id);
-	auto node = ShuffleCacheSanitizePathComponent(config_.node_id);
+	auto local_path = !ShuffleCacheLooksLikeUnsupportedObjectPath(base_dir);
+	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id, local_path);
+	auto node = ShuffleCacheSanitizePathComponent(config_.node_id, local_path);
 	std::ostringstream ss;
 	ss << base_dir << "/shuffle_" << exchange << "/node_" << node;
 	return ss.str();
@@ -765,8 +820,9 @@ std::string ShuffleCache::NodeDirectory() const {
 
 std::string ShuffleCache::PartitionDirectory(idx_t partition_idx) const {
 	auto base_dir = config_.local_dirs[partition_idx % config_.local_dirs.size()];
-	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id);
-	auto node = ShuffleCacheSanitizePathComponent(config_.node_id);
+	auto local_path = !ShuffleCacheLooksLikeUnsupportedObjectPath(base_dir);
+	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id, local_path);
+	auto node = ShuffleCacheSanitizePathComponent(config_.node_id, local_path);
 	std::ostringstream ss;
 	ss << base_dir << "/shuffle_" << exchange << "/node_" << node << "/partition_" << partition_idx;
 	return ss.str();
@@ -1084,14 +1140,15 @@ DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config
 		return DuckDBResult<idx_t>::ok(0);
 	}
 
-	auto exchange = ShuffleCacheSanitizePathComponent(config.exchange_id);
-	auto node = ShuffleCacheSanitizePathComponent(config.node_id);
 	std::unordered_set<std::string> seen_attempt_dirs;
 	idx_t removed_total = 0;
 	for (const auto &base_dir : config.local_dirs) {
 		if (base_dir.empty()) {
 			continue;
 		}
+		auto local_path = !ShuffleCacheLooksLikeUnsupportedObjectPath(base_dir);
+		auto exchange = ShuffleCacheSanitizePathComponent(config.exchange_id, local_path);
+		auto node = ShuffleCacheSanitizePathComponent(config.node_id, local_path);
 		std::ostringstream ss;
 		ss << base_dir << "/shuffle_" << exchange << "/node_" << node;
 		auto attempt_dir = ss.str();
@@ -1137,7 +1194,7 @@ DuckDBResult<void> ShuffleCache::EnsureSchemaFile(ClientContext &context, const 
 
 	ArrowSchema schema;
 	schema.Init();
-	auto client_properties = context.GetClientProperties();
+	auto client_properties = ShuffleArrowClientProperties(context);
 	ArrowConverter::ToArrowSchema(&schema, types, names, client_properties);
 
 	auto schema_res = arrow::ImportSchema(&schema);
@@ -1440,7 +1497,7 @@ DuckDBResult<ShufflePartitionFile> ShuffleCache::WriteCollectionToFile(ClientCon
 	auto output = std::move(output_res.value());
 
 	// Create writer — we'll write multiple record batches from the collection's chunks.
-	auto client_properties = context.GetClientProperties();
+	auto client_properties = ShuffleArrowClientProperties(context);
 	std::shared_ptr<arrow::Schema> record_schema;
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> writer;
 	bool writer_initialized = false;

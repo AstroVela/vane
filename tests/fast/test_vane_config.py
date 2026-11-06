@@ -72,6 +72,78 @@ def test_configure_normalizes_empty_runner_to_ray(monkeypatch):
     assert os.environ["VANE_RUNNER"] == "ray"
 
 
+def test_native_runner_observes_environment_changes_after_import():
+    script = r"""
+import os
+import vane
+
+assert vane.get_or_infer_runner_type() == "local"
+for value, expected in [("ray", "ray"), ("  LOCAL-FAST  ", "local"), ("", "ray"), ("local", "local")]:
+    os.environ["VANE_RUNNER"] = value
+    assert vane.get_or_infer_runner_type() == expected
+os.environ.pop("VANE_RUNNER")
+assert vane.get_or_infer_runner_type() == "ray"
+
+# Exercise UTF-16/UTF-8 conversion and values larger than the initial buffer.
+invalid = "invalid_\u6d4b\u8bd5_" * 100
+os.environ["VANE_RUNNER"] = invalid
+try:
+    vane.get_or_infer_runner_type()
+except vane.InvalidInputException as exc:
+    assert invalid in str(exc)
+else:
+    raise AssertionError("expected the current invalid runner value")
+"""
+    subprocess.run(
+        [sys.executable, "-c", script], env={**os.environ, "VANE_RUNNER": "local-fast"}, check=True, timeout=20
+    )
+
+
+def test_ray_runner_options_observe_environment_changes(monkeypatch):
+    import vane
+    import vane.runners.ray.runner as ray_module
+
+    class CapturingRayRunner:
+        def __init__(self, address, max_task_backlog):
+            self.options = (address, max_task_backlog)
+
+    vane.teardown_runner()
+    monkeypatch.setattr(ray_module, "RayRunner", CapturingRayRunner)
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    try:
+        for address, backlog in [("ray://\u6d4b\u8bd5/" + "a" * 512, 17), ("", 23), (None, None)]:
+            for name, value in [("RAY_ADDRESS", address), ("VANE_RAY_MAX_TASK_BACKLOG", backlog)]:
+                if value is None:
+                    monkeypatch.delenv(name, raising=False)
+                else:
+                    monkeypatch.setenv(name, str(value))
+            runner = vane.get_or_create_runner()
+            # CPython's Windows putenv removes the process variable for "".
+            expected_address = None if os.name == "nt" and address == "" else address
+            assert runner.options == (expected_address, backlog)
+            vane.teardown_runner()
+    finally:
+        vane.teardown_runner()
+
+
+def test_native_ray_options_preserve_inherited_empty_address():
+    script = r"""
+import vane
+import vane.runners.ray.runner as ray_module
+
+class CapturingRayRunner:
+    def __init__(self, address, max_task_backlog):
+        self.options = (address, max_task_backlog)
+
+ray_module.RayRunner = CapturingRayRunner
+assert vane.get_or_create_runner().options == ("", None)
+vane.teardown_runner()
+"""
+    environ = {**os.environ, "VANE_RUNNER": "ray", "RAY_ADDRESS": ""}
+    environ.pop("VANE_RAY_MAX_TASK_BACKLOG", None)
+    subprocess.run([sys.executable, "-c", script], env=environ, check=True, timeout=20)
+
+
 @pytest.mark.parametrize("runner", ["local", "local-fast"])
 def test_native_local_execution_does_not_create_runner(monkeypatch, runner):
     import vane

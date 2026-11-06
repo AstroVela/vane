@@ -72,14 +72,20 @@ class EmbeddingService:
         family: str,
         model: str,
         dimensions: int,
+        endpoint: str | None = None,
         options: dict[str, Any] | None = None,
         max_bytes: int = 256 * 1024**2,
         max_inflight: int = 8,
         max_connections: int = 128,
         publication_timeout: float = 30,
     ):
+        from vane.ai._embedding_zmq import validate_endpoint
         from vane.ai.providers._embedding_service import ServiceMultimodalDescriptor
         from vane.ai.providers._embedding_service_backend import create_service_backend
+
+        if endpoint is not None:
+            validate_endpoint(endpoint)
+        self.endpoint = endpoint
 
         for name, value, maximum in (
             ("max_bytes", max_bytes, 2**40),

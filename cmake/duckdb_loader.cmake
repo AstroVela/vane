@@ -793,9 +793,20 @@ function(duckdb_link_extensions target_name)
   target_link_libraries(
     ${target_name}
     PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,duckdb_generated_extension_loader>")
-  set(_VANE_STATIC_EXTENSIONS ${BUILD_EXTENSIONS})
-  foreach(_VANE_LOADABLE_EXTENSION_NAME IN LISTS VANE_LOADABLE_EXTENSION_NAMES)
-    list(REMOVE_ITEM _VANE_STATIC_EXTENSIONS "${_VANE_LOADABLE_EXTENSION_NAME}")
+  # External configs are resolved in DuckDB's directory scope.
+  get_directory_property(
+    _VANE_CONFIGURED_EXTENSIONS DIRECTORY "${DUCKDB_SOURCE_PATH}" DEFINITION
+                                          DUCKDB_EXTENSION_NAMES)
+  set(_VANE_STATIC_EXTENSIONS)
+  foreach(ext IN LISTS _VANE_CONFIGURED_EXTENSIONS)
+    string(TOUPPER "${ext}" _VANE_EXTENSION_UPPERCASE)
+    get_directory_property(
+      _VANE_SHOULD_LINK
+      DIRECTORY "${DUCKDB_SOURCE_PATH}" DEFINITION
+                "DUCKDB_EXTENSION_${_VANE_EXTENSION_UPPERCASE}_SHOULD_LINK")
+    if(_VANE_SHOULD_LINK)
+      list(APPEND _VANE_STATIC_EXTENSIONS "${ext}")
+    endif()
   endforeach()
   if(_VANE_STATIC_EXTENSIONS)
     message(STATUS "Linking DuckDB extensions:")
@@ -857,12 +868,15 @@ function(duckdb_stage_loadable_extensions)
         COMMAND
         ${CMAKE_COMMAND}
         -E
-        copy_directory
+        copy_directory_if_different
         "${_VANE_RUNTIME_DIRECTORY}"
         "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs")
     endif()
-    add_custom_command(
-      OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_STAGED_RUNTIME_FILES}
+    # Check content on every staging request: Make can miss same-second updates,
+    # and replacement runtime libraries can retain their timestamps.
+    # copy_if_different keeps unchanged outputs stable without relinking.
+    add_custom_target(
+      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
       COMMAND ${CMAKE_COMMAND} -E make_directory
               "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
       COMMAND
@@ -870,13 +884,10 @@ function(duckdb_stage_loadable_extensions)
         "$<TARGET_FILE:${_VANE_LOADABLE_EXTENSION_TARGET}>"
         "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_RUNTIME_COMMANDS}
       DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}" ${_VANE_RUNTIME_INPUTS}
+      BYPRODUCTS "${_VANE_STAGED_LOADABLE_EXTENSION}"
+                 ${_VANE_STAGED_RUNTIME_FILES}
       COMMENT "Staging Vane loadable extension ${_VANE_LOADABLE_EXTENSION_NAME}"
       VERBATIM)
-
-    add_custom_target(
-      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
-      DEPENDS "${_VANE_STAGED_LOADABLE_EXTENSION}"
-              ${_VANE_STAGED_RUNTIME_FILES})
     add_dependencies(vane_loadable_extensions
                      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}")
   endforeach()

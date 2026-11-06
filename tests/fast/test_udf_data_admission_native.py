@@ -986,12 +986,16 @@ def test_subprocess_failure_returns_input_output_and_execution_reservations(
 
 @pytest.mark.parametrize("failure", ["schedule", "spawn", "input_allocate", "output_wrap", "grant_response"])
 def test_failed_task_submission_returns_all_byte_reservations(strict_transport, monkeypatch, failure):
+    from vane.execution import udf_shm_store
     from vane.execution import udf_subprocess as local
 
     def identity(table):
         return table
 
+    failures = []
+
     def fail(*args, **kwargs):
+        failures.append(failure)
         raise RuntimeError("planned scheduler failure")
 
     payload = dict(
@@ -1021,7 +1025,9 @@ def test_failed_task_submission_returns_all_byte_reservations(strict_transport, 
                 if failure == "spawn":
                     patch.setattr(executor._task_pool, "_spawn_worker", fail)
                 elif failure == "input_allocate":
-                    patch.setattr(ref_bundle, "_create_shm", fail)
+                    # Preparation has already mapped the arena. Fail the input
+                    # suballocation, not the earlier OS mapping operation.
+                    patch.setattr(udf_shm_store.LocalShmStore, "allocate", fail)
                 elif failure == "output_wrap":
                     patch.setattr(local, "make_local_shm_ref_bundle_result_from_descriptor", fail)
                 else:
@@ -1035,6 +1041,7 @@ def test_failed_task_submission_returns_all_byte_reservations(strict_transport, 
                     patch.setattr(local, "_send_message", fail_output_grant)
                 executor.submit(pa.table({"x": [1]}))
                 assert isinstance(_wait_result(executor), BaseException)
+            assert failures == [failure]
     finally:
         executor.close(kill=True)
         for resource in resources:

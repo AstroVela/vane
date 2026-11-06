@@ -969,3 +969,19 @@ Context milestone 3 uses this row selection in a linear plan. The current
 Ray translator treats materialized CTE subtrees as native scan sources, so a
 CTE containing distributed UDFs fails resource registration. This change adds
 no CTE fallback or native planner bypass.
+
+## Explicit local service endpoint
+
+`EmbeddingService` and its JSON configuration accept an optional `endpoint`,
+for example `tcp://127.0.0.1:18767`. An explicit endpoint must use IPv4 loopback
+and a port from 1 to 65535; the protocol still requires same-host shared memory.
+The service binds that exact address before initializing the model. A busy
+address fails startup and cleans up the contender's rendezvous and socket; it
+never retries another port or rewrites the existing owner's rendezvous. Omitting
+`endpoint` requests an ephemeral loopback port. Clients still read the private
+authenticated rendezvous; an address alone is not a client credential.
+
+After two clean source reviews, run `test_embedding_service_endpoint.py` through
+the installed pytest launcher plus the affected service startup/shutdown tests.
+These checks use real local RPC and CPU SDK fixtures, not downloaded models.
+No native rebuild, full suite, Ray or GPU check is required for this change.

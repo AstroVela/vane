@@ -232,7 +232,7 @@ def test_cohere_rejects_oversize_before_network(monkeypatch, pillow):
         models.CohereJointEmbedder(max_request_bytes=1).embed_joint(video()[0].value, "text")
 
 
-def test_qwen_joint_adapter_keeps_absolute_times_and_closes_runtime(monkeypatch, pillow):
+def test_qwen_joint_adapter_keeps_absolute_times_and_closes_runtime(tmp_path, monkeypatch, pillow):
     import vane.ai.providers.qwen3_vl as qwen
 
     calls = []
@@ -251,12 +251,13 @@ def test_qwen_joint_adapter_keeps_absolute_times_and_closes_runtime(monkeypatch,
             calls.append("closed")
 
     monkeypatch.setattr(qwen, "Qwen3VLEmbedder", Encoder)
-    adapter = models.Qwen3VLJointEmbedder("/models/qwen")
+    model_path = str(tmp_path / "qwen")
+    adapter = models.Qwen3VLJointEmbedder(model_path)
     selected = {"visual": video(), "ocr": [TimedContent(10.1, 10.1, "hello")]}
     adapter.embed_joint(selected["visual"][0].value, json.dumps({"text": [{"text": "hello", "start_sec": 10.2}]}))
     adapter.embed_joint(selected["visual"][0].value, json.dumps({"text": [{"text": "hello", "start_sec": 10.2}]}))
     adapter.close()
-    assert calls == ["/models/qwen", "closed"]
+    assert calls == [model_path, "closed"]
 
 
 def test_http_errors_are_bounded_and_not_retried(monkeypatch):

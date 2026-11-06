@@ -45,26 +45,64 @@ def install_sdk(monkeypatch):
         release=None,
         active=0,
         returned_provider=None,
+        automatic_provider="CPUExecutionProvider",
+        registration_failure=None,
+        external_cuda_registered=False,
+        provider_options=[],
+        run_options=[],
+        cuda_queries=[],
     )
     ort = ModuleType("onnxruntime")
     ort.__version__ = "1.26.0"
+    ort.cuda_version = "12.8"
+    ort.__file__ = str(Path("fixture-sdk") / "onnxruntime" / "__init__.py")
     ort.get_available_providers = lambda: list(sdk.available)
     ort.preload_dlls = lambda **kwargs: sdk.events.append(("preload_cuda", kwargs))
+    ort.OrtExecutionProviderDevicePolicy = SimpleNamespace(PREFER_GPU="native-prefer-gpu")
+
+    def register_library(name, path):
+        sdk.events.append(("register_native_ep", name, path))
+        if sdk.registration_failure is not None:
+            raise sdk.registration_failure
+
+    ort.register_execution_provider_library = register_library
 
     class Settings:
         def __init__(self):
             self.entries = {}
+            self.selection_policy = None
+
+        def set_provider_selection_policy(self, policy):
+            self.selection_policy = policy
+            sdk.events.append(("native_selection_policy", policy))
 
         def add_session_config_entry(self, key, value):
             self.entries[key] = value
 
     ort.SessionOptions = Settings
 
+    class RunSettings:
+        def __init__(self):
+            self.entries = {}
+
+        def add_run_config_entry(self, key, value):
+            self.entries[key] = value
+
+    ort.RunOptions = RunSettings
+
     class Session:
-        def __init__(self, path, *, sess_options, providers, enable_fallback):
+        def __init__(self, path, *, sess_options, enable_fallback, providers=None):
             self.tower = Path(path).stem
-            self.selected = providers[0][0]
+            if providers is None:
+                assert sess_options.selection_policy == ort.OrtExecutionProviderDevicePolicy.PREFER_GPU
+                self.selected = sdk.automatic_provider
+                if self.selected == "CUDAExecutionProvider":
+                    assert sdk.external_cuda_registered or any(event[0] == "register_native_ep" for event in sdk.events)
+                sdk.events.append(("automatic_load", self.tower))
+            else:
+                self.selected = providers[0][0]
             self.live = False
+            sdk.provider_options.append((self.tower, {} if providers is None else dict(providers[0][1])))
             sdk.events.append(
                 ("load", self.tower, threading.get_ident(), self.selected, enable_fallback, sess_options.entries.copy())
             )
@@ -105,7 +143,8 @@ def install_sdk(monkeypatch):
                 )
             ]
 
-        def run(self, output_names, feed):
+        def run(self, output_names, feed, run_options=None):
+            sdk.run_options.append((self.tower, None if run_options is None else run_options.entries.copy()))
             sdk.events.append(
                 ("run", self.tower, threading.get_ident(), {name: value.copy() for name, value in feed.items()})
             )
@@ -194,7 +233,13 @@ def install_sdk(monkeypatch):
     processor_module.AutoProcessor = Processor
     for name, module in (("onnxruntime", ort), ("onnx", graph), ("transformers", processor_module)):
         monkeypatch.setitem(__import__("sys").modules, name, module)
-    from vane.ai.providers import _onnx_model
+    from vane.ai.providers import _onnx_cuda, _onnx_model
+
+    def cuda_limit():
+        sdk.cuda_queries.append(threading.get_ident())
+        return 8 * 1024**3
+
+    monkeypatch.setitem(_onnx_cuda.__dict__, "cuda_arena_limit", cuda_limit)
 
     monkeypatch.setitem(_onnx_model.__dict__, "processor_versions", lambda: dict(_onnx_model.PROCESSOR_VERSIONS))
     return sdk

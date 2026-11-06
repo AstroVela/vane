@@ -25,6 +25,12 @@ def _last_error() -> OSError:
     raise RuntimeError("Windows job objects require Windows")
 
 
+def _last_error_code() -> int:
+    if sys.platform == "win32":
+        return ctypes.get_last_error()
+    raise RuntimeError("Windows job objects require Windows")
+
+
 class _BasicLimits(ctypes.Structure):
     _fields_ = [
         ("process_time", ctypes.c_int64),
@@ -77,6 +83,7 @@ class WindowsWorkerJob:
                 wintypes.BOOL,
             ),
             "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "IsProcessInJob": ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
         }
         for name, (args, result) in signatures.items():
             function = getattr(self._api, name)
@@ -103,6 +110,41 @@ class WindowsWorkerJob:
         except BaseException:
             self._finalizer()
             raise
+
+    def process_ids(self) -> list[int]:
+        capacity = 64
+        while True:
+
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [
+                    ("assigned", wintypes.DWORD),
+                    ("count", wintypes.DWORD),
+                    ("ids", ctypes.c_size_t * capacity),
+                ]
+
+            result = ProcessIds()
+            complete = self._api.QueryInformationJobObject(
+                self._handle, 3, ctypes.byref(result), ctypes.sizeof(result), None
+            )
+            if complete and result.count == result.assigned:
+                return list(result.ids[: result.count])
+            if not complete and _last_error_code() != 234:  # ERROR_MORE_DATA
+                raise _last_error()
+            capacity = max(capacity * 2, result.assigned)
+
+    def contains(self, pid: int) -> bool:
+        process = self._api.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            if _last_error_code() == 87:  # ERROR_INVALID_PARAMETER: process exited
+                return False
+            raise _last_error()
+        try:
+            contained = wintypes.BOOL()
+            if not self._api.IsProcessInJob(process, self._handle, ctypes.byref(contained)):
+                raise _last_error()
+            return bool(contained.value)
+        finally:
+            self._api.CloseHandle(process)
 
     def close(self, timeout: float) -> None:
         if not self._finalizer.alive:

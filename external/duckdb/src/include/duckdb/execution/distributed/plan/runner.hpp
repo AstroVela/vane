@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -52,7 +53,8 @@ namespace duckdb {
 namespace distributed {
 
 inline size_t FteEventBurstLimit() {
-	const char *env = std::getenv("VANE_FTE_EVENT_BURST_LIMIT");
+	const duckdb::EnvironmentVariable env_env("VANE_FTE_EVENT_BURST_LIMIT");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return 64;
 	}
@@ -66,7 +68,8 @@ inline size_t FteEventBurstLimit() {
 }
 
 inline std::chrono::microseconds FteEventCoalesceDelay() {
-	const char *env = std::getenv("VANE_FTE_EVENT_COALESCE_US");
+	const duckdb::EnvironmentVariable env_env("VANE_FTE_EVENT_COALESCE_US");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return std::chrono::microseconds(1000);
 	}
@@ -80,7 +83,8 @@ inline std::chrono::microseconds FteEventCoalesceDelay() {
 }
 
 inline double FteQueryWaitTimeoutSeconds() {
-	const char *env = std::getenv("VANE_FTE_QUERY_WAIT_TIMEOUT_S");
+	const duckdb::EnvironmentVariable env_env("VANE_FTE_QUERY_WAIT_TIMEOUT_S");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return 0.0;
 	}
@@ -95,7 +99,8 @@ inline double FteQueryWaitTimeoutSeconds() {
 
 inline bool FteRunnerDebugEnabled() {
 	for (const char *name : {"VANE_FTE_ADMISSION_DEBUG", "DUCKDB_DISTRIBUTED_DEBUG"}) {
-		const char *value = std::getenv(name);
+		const duckdb::EnvironmentVariable value_env(name);
+		const char *value = value_env.GetValue();
 		if (!value || !*value) {
 			continue;
 		}

@@ -17,8 +17,8 @@ TestPyPI to PyPI.
   exactly `v<version>` and points to the reviewed commit tested for release.
 - An `X.Y.0` release, including its prereleases, comes from `main`. Patch
   releases and post releases come from the matching `release/X.Y` branch.
-- One workflow run builds the sdist and all wheels once. The exact same files
-  are promoted through TestPyPI, PyPI, and the GitHub Release.
+- One workflow run builds the sdist and every platform wheel once. The exact
+  same files are promoted through TestPyPI, PyPI, and the GitHub Release.
 - A GitHub Release remains a draft until PyPI publication succeeds and all
   checksums, signatures, the SBOM, and provenance are attached.
 - A release tag cannot be updated or deleted from the moment it is created,
@@ -218,7 +218,8 @@ Release automation must:
   `DUCKDB_SOURCE_ID` and `DUCKDB_FORK_REVISION`;
 - validate it with `scripts/check_release_artifacts.py` and the private content
   rules;
-- build all manylinux wheels from that exact sdist in clean environments;
+- build every platform wheel (manylinux x86-64, macOS arm64, Windows x64) from
+  that exact sdist in clean environments;
 - validate wheel metadata, contents, `RECORD`, license files, and coexistence
   with the official DuckDB package;
 - install each wheel in a fresh environment and run the Quickstart smoke test;
@@ -233,8 +234,9 @@ Release automation must:
 - publish the same distributions to PyPI, attach all artifacts to the draft
   GitHub Release, and only then publish the draft.
 
-The GitHub asset check also runs during `build-only`. It requires the source
-archive, five wheels, their six Sigstore bundles, checksums, SBOM and provenance.
+The GitHub asset check also runs during `build-only`. It requires one source
+archive, fifteen wheels (CPython 3.10-3.14 for manylinux x86-64, macOS arm64 and
+Windows x64), their sixteen Sigstore bundles, checksums, SBOM and provenance.
 Uploads recursively collect regular files and reject basename collisions and
 symbolic links. Rerunning the failed GitHub publication job keeps existing
 assets only when their sizes and SHA-256 digests match, uploads the missing

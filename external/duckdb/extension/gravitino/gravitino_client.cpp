@@ -424,15 +424,32 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	} else if (!FileSystem::GetFileSystem(context).IsPathAbsolute(location)) {
 		throw NotImplementedException("Gravitino Fileset reads currently support absolute local paths and S3");
 	}
+#ifdef _WIN32
+	const bool local_path = !StringUtil::StartsWith(location, "s3://");
+	if (local_path) {
+		location = FileSystem::GetFileSystem(context).ConvertSeparators(location);
+	}
+#endif
 	if (root) {
 		*root = location;
 	}
 	if (!path.empty()) {
-		if (location.back() != '/') {
-			location += '/';
+		auto separator = '/';
+#ifdef _WIN32
+		if (local_path) {
+			separator = '\\';
+		}
+#endif
+		if (location.back() != separator) {
+			location += separator;
 		}
 		location += path;
 	}
+#ifdef _WIN32
+	if (local_path) {
+		location = FileSystem::GetFileSystem(context).ConvertSeparators(location);
+	}
+#endif
 	return location;
 }
 
@@ -440,11 +457,13 @@ vector<OpenFileInfo> GravitinoClient::Glob(ClientContext &context, const string 
                                            const string &path) const {
 	string root;
 	auto resolved = Resolve(context, schema, fileset, path, &root);
+#ifndef _WIN32
 	if (root.find('\\') != string::npos) {
 		// DuckDB's local glob parser treats backslashes as separators even on
 		// POSIX. Do not silently glob another directory for a literal backslash.
 		throw NotImplementedException("Fileset globbing does not support backslashes in storage locations");
 	}
+#endif
 	// Escape only the registered root. The caller's relative path retains its
 	// glob syntax, including bracket expressions and recursive ** components.
 	string pattern;
@@ -496,6 +515,11 @@ vector<OpenFileInfo> GravitinoClient::Glob(ClientContext &context, const string 
 		}
 #endif
 		if (matches_root) {
+#ifdef _WIN32
+			if (!StringUtil::StartsWith(root, "s3://")) {
+				file.path = std::move(normalized_path);
+			}
+#endif
 			result.push_back(std::move(file));
 		}
 	}

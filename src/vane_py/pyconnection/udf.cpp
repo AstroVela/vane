@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/environment.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
@@ -414,11 +415,13 @@ static void RegisteredVaneUDFExecute(DataChunk &, ExpressionState &, Vector &) {
 }
 
 static bool InjectVaneCatalogRegistrationFailureForTesting(const string &name) {
-	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	const duckdb::EnvironmentVariable test_hooks_env("VANE_ENABLE_UDF_TEST_HOOKS");
+	const char *test_hooks = test_hooks_env.GetValue();
 	if (!test_hooks || string(test_hooks) != "1") {
 		return false;
 	}
-	const char *target_alias = std::getenv("VANE_TEST_FAIL_UDF_CATALOG_REGISTRATION");
+	const duckdb::EnvironmentVariable target_alias_env("VANE_TEST_FAIL_UDF_CATALOG_REGISTRATION");
+	const char *target_alias = target_alias_env.GetValue();
 	return target_alias && name == string(target_alias);
 }
 

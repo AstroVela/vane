@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -75,7 +76,8 @@ inline string NormalizeRunnerType(string runner_type) {
 }
 
 inline string ResolveRunnerTypeFromEnvironment() {
-	const char *env = std::getenv("VANE_RUNNER");
+	const duckdb::EnvironmentVariable env_env("VANE_RUNNER");
+	const char *env = env_env.GetValue();
 	if (env) {
 		auto runner_type = NormalizeRunnerType(string(env));
 		if (runner_type.empty()) {

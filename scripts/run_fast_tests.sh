@@ -141,11 +141,12 @@ run_reported_pytest() {
   local report_name="$1"
   shift
 
-  local report_args=()
   if [[ -n "$junit_dir" ]]; then
-    report_args+=("--junitxml=$junit_dir/$report_name.xml")
+    run_pytest "--junitxml=$junit_dir/$report_name.xml" "$@"
+  else
+    # macOS ships Bash 3.2, where an empty array is unset under nounset.
+    run_pytest "$@"
   fi
-  run_pytest "${report_args[@]}" "$@"
 }
 
 run_ray_pytest() {

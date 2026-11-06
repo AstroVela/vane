@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "vane_python/python_udf_utils.hpp"
+#include "duckdb/common/environment.hpp"
 #include "vane_python/python_input_callback.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -123,7 +124,8 @@ static idx_t ResolveTargetMaxBatchBytes(const std::pair<bool, idx_t> &target_max
 	if (target_max_batch_bytes_value.first) {
 		return target_max_batch_bytes_value.second;
 	}
-	auto env_value = ParsePositiveEnvIdx(std::getenv(UDF_TARGET_MAX_BATCH_BYTES_ENV), UDF_TARGET_MAX_BATCH_BYTES_ENV);
+	const EnvironmentVariable target_bytes_env(UDF_TARGET_MAX_BATCH_BYTES_ENV);
+	auto env_value = ParsePositiveEnvIdx(target_bytes_env.GetValue(), UDF_TARGET_MAX_BATCH_BYTES_ENV);
 	if (env_value > 0) {
 		return env_value;
 	}

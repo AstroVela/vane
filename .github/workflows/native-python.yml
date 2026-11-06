@@ -1,0 +1,484 @@
+name: Native Python build and tests
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+      timeout-minutes:
+        type: number
+        default: 180
+      vcpkg-triplet:
+        type: string
+        default: x64-linux-release
+      artifact-suffix:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Python ${{ inputs.python-version }} runtime
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        shell: python scripts/run_ci_step.py {0}
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      PYTHONFAULTHANDLER: "1"
+      VANE_TEST_DIAGNOSTICS_DIR: ${{ github.workspace }}/test-results/local-runtime
+      VCPKG_TARGET_TRIPLET: ${{ inputs.vcpkg-triplet }}
+      VCPKG_HOST_TRIPLET: ${{ inputs.vcpkg-triplet }}
+    steps:
+      - name: Preserve source bytes on Windows checkout
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            libtool \
+            nasm \
+            ninja-build \
+            openssl \
+            pkg-config \
+            tar \
+            unzip \
+            zip
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install bison ccache coreutils ffmpeg ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Configure Windows native builds
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @'
+          CMAKE_GENERATOR=Visual Studio 17 2022
+          CMAKE_GENERATOR_PLATFORM=x64
+          VANE_NATIVE_CMAKE_GENERATOR=Visual Studio 17 2022
+          VANE_NATIVE_CMAKE_GENERATOR_PLATFORM=x64
+          MSBUILDDISABLENODEREUSE=1
+          PreferredToolArchitecture=x64
+          '@ | Add-Content -LiteralPath $env:GITHUB_ENV
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --yes --no-progress --limit-output
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.vcpkg-triplet }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Create a short Windows Python environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Provider wheels contain namespaced codec DLLs. Keep their installed
+          # paths below MAX_PATH without depending on the host registry setting.
+          $testEnvironment = Join-Path $env:GITHUB_WORKSPACE 'build/py'
+          python -m venv $testEnvironment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $testEnvironment 'Scripts' | Add-Content -LiteralPath $env:GITHUB_PATH
+          $pythonExecutable = Join-Path $testEnvironment 'Scripts/python.exe'
+          "VANE_NATIVE_PYTHON=$pythonExecutable" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "VANE_BOOTSTRAP_PYTHON=$pythonExecutable" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Install Python build and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0" \
+            mypy \
+            packaging \
+            "pydantic>=2" \
+            "psutil>=5.9" \
+            "pyelftools>=0.33" \
+            "lief>=0.17.6,<0.18; sys_platform == 'win32'" \
+            pytest
+
+      - name: Install pinned native dependencies
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Install the media test encoder
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install signed extension wheel repair tooling
+        if: inputs.python-version == '3.12' && runner.os == 'Linux'
+        run: python -m pip install "auditwheel>=6.4" "patchelf>=0.17.2"
+
+      - name: Install macOS wheel repair tooling
+        if: runner.os == 'macOS'
+        run: python -m pip install "delocate>=0.13"
+
+      - name: Rebuild the dynamic media runtime from its source distribution
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            python -m pip install "patchelf>=0.17.2"
+          fi
+          platform_tag="$(python scripts/ci_native_platform.py platform-tag)"
+          python scripts/build_media_runtime_fixture.py \
+            --vcpkg-root "$VCPKG_ROOT" \
+            --build-directory "$GITHUB_WORKSPACE/build/media-fixture" \
+            --platform-tag "$platform_tag"
+          python -m pip install build/media-fixture/dist/*.whl
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          paths = json.loads(Path('build/media-fixture/paths.json').read_text())
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key, value in paths.items():
+                  stream.write(f'VANE_MEDIA_{key.upper()}={Path(value).as_posix()}\n')
+          PYTHON
+
+      - name: Build and run DuckDB unit tests
+        if: inputs.python-version == '3.12'
+        run: scripts/run_native_tests.sh
+
+      - name: Sign the real-Ray dynamic extension fixture
+        if: inputs.python-version == '3.12'
+        run: |
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            "$(python scripts/ci_native_platform.py artifact build/native-cxx20 loadable_extension_demo.duckdb_extension)" \
+            "$RUNNER_TEMP/test-dynamic-extension/loadable_extension_demo.duckdb_extension"
+
+      - name: Build release artifacts
+        env:
+          SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+        run: python scripts/ci_native_platform.py build-release
+
+      - name: Validate release artifacts
+        run: python scripts/check_release_artifacts.py dist/*.tar.gz dist/*.whl
+
+      - name: Apply private content rules to release artifacts
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+        env:
+          RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
+        run: |
+          test -n "$RELEASE_ARTIFACT_CONTENT_RULES"
+          printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
+            python scripts/check_release_artifacts.py \
+              --content-rules-manifest - \
+              dist/*.tar.gz dist/*.whl
+
+      - name: Install the built wheel
+        run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Verify memory protection and Windows cache permissions
+        if: inputs.python-version == '3.12'
+        run: scripts/run_installed_pytest.sh tests/fast/test_memory_guard.py tests/fast/test_windows_extension_cache.py
+
+      - name: Exercise private extension runtime callbacks
+        if: inputs.python-version == '3.12'
+        run: |
+          export VANE_TEST_LOADABLE_BATCH_DEMO_PATH="$(python scripts/ci_native_platform.py artifact build/native-cxx20 loadable_extension_batch_demo.duckdb_extension)"
+          scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py -k private_extension
+
+      - name: Exercise the native Gravitino provider
+        if: inputs.python-version == '3.12'
+        env:
+          VANE_TEST_GRAVITINO: provider
+        run: |
+          cmake --build build --config Release --target gravitino_loadable_extension --parallel
+          artifact_dir=build/duckdb/extension/gravitino
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            artifact_dir=build/extension/gravitino
+          fi
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            "$(python scripts/ci_native_platform.py artifact "$artifact_dir" gravitino.duckdb_extension)" \
+            "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension"
+          platform_tag="$(python scripts/ci_native_platform.py platform-tag)"
+          python -I scripts/build_extension_wheel.py --release-number 1 \
+            --artifact "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension" \
+            --extension-name gravitino --test-only \
+            --output-directory "$RUNNER_TEMP/gravitino/wheels" \
+            --platform-tag "$platform_tag" --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND curl AND BSD-3-Clause AND Zlib" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt
+          python -m pip install --no-deps "$RUNNER_TEMP"/gravitino/wheels/*.whl
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'not real_ray'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py tests/fast/test_gravitino_write.py tests/fast/test_gravitino_discovery.py -m 'real_ray and not ray_cluster_owner'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino_write.py -m 'real_ray and ray_cluster_owner'
+
+      - name: Upload the signed Gravitino test provider
+        if: inputs.python-version == '3.12'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-gravitino-provider-3.12${{ inputs.artifact-suffix }}
+          path: ${{ runner.temp }}/gravitino/wheels/*.whl
+          if-no-files-found: error
+
+      - name: Build and verify the signed test extension wheel
+        if: inputs.python-version == '3.12'
+        run: |
+          shopt -s nullglob
+          base_wheels=(dist/vane_ai-*.whl)
+          test "${#base_wheels[@]}" -eq 1
+          platform_tag="$(python scripts/ci_native_platform.py platform-tag)"
+          python scripts/ci_native_platform.py repair-base "${base_wheels[0]}" "$RUNNER_TEMP/test-base-wheels"
+          base_wheels=("$RUNNER_TEMP"/test-base-wheels/vane_ai-*.whl)
+          test "${#base_wheels[@]}" -eq 1
+          python -I scripts/build_extension_wheel.py --release-number 1 \
+            --artifact "$RUNNER_TEMP/test-dynamic-extension/loadable_extension_demo.duckdb_extension" \
+            --extension-name loadable_extension_demo \
+            --output-directory dist/extension-wheels \
+            --platform-tag "$platform_tag" \
+            --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT" \
+            --license-file LICENSE \
+            --license-file NOTICE \
+            --license-file external/duckdb/LICENSE
+          extension_wheels=(dist/extension-wheels/*.whl)
+          test "${#extension_wheels[@]}" -eq 1
+          python -I scripts/verify_extension_wheel.py \
+            --base-wheel "${base_wheels[0]}" \
+            --extension-wheel "${extension_wheels[0]}" \
+            --extension-name loadable_extension_demo \
+            --trust-identity vane-ci-test-key
+
+      - name: Apply private content rules to the signed test extension wheel
+        if: >-
+          inputs.python-version == '3.12' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        env:
+          RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
+        run: |
+          shopt -s nullglob
+          extension_wheels=(dist/extension-wheels/*.whl)
+          test "${#extension_wheels[@]}" -eq 1
+          test -n "$RELEASE_ARTIFACT_CONTENT_RULES"
+          printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
+            python scripts/check_release_artifacts.py \
+              --scan-contents-only \
+              --content-rules-manifest - \
+              "${extension_wheels[0]}"
+
+      - name: Exercise native image, audio, and video extensions
+        env:
+          VANE_TEST_NATIVE_MEDIA_EXTENSION: ${{ github.workspace }}/build/vane_extensions/native_media.duckdb_extension
+          VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
+          VANE_TEST_DYNAMIC_MEDIA_RUNTIME: "1"
+          VANE_TEST_NATIVE_RUNTIME_OVERRIDE: ${{ env.VANE_MEDIA_LOCAL_RUNTIME }}
+        run: |
+          python -m pip install "av>=17.1,<18" "pillow>=11" "tifffile>=2024.1.30" "imagecodecs>=2024.1.1" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
+          cmake --build build --config Release --target vane_loadable_extensions --parallel
+          platform_tag="$(python scripts/ci_native_platform.py platform-tag)"
+          python scripts/sync_vcpkg_licenses.py \
+            --share-dir "$VANE_MEDIA_SDK/share" \
+            --output "$RUNNER_TEMP/native-extension-notices.txt"
+          python -I scripts/check_copyleft.py --share-dir "$VANE_MEDIA_SDK/share" \
+            --manifest packages/vane-media-runtime/vcpkg.json
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/vane_extensions/native_media.duckdb_extension \
+            "$RUNNER_TEMP/native-media/native_media.duckdb_extension"
+          python -I scripts/build_extension_wheel.py --release-number 1 \
+            --artifact "$RUNNER_TEMP/native-media/native_media.duckdb_extension" \
+            --extension-name native_media \
+            --output-directory "$RUNNER_TEMP/native-media/wheels" \
+            --test-only \
+            --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
+            --platform-tag "$platform_tag" \
+            --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND BSL-1.0 AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/Bison-parser-notice.txt \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt \
+            --license-file "$RUNNER_TEMP/native-extension-notices.txt"
+          python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
+          scripts/run_installed_pytest.sh -m 'not real_ray' \
+            tests/fast/test_ci_native_platform.py \
+            tests/fast/test_media_version.py \
+            tests/fast/test_media_sources.py \
+            tests/fast/test_media_release.py \
+            tests/fast/test_media_platforms.py \
+            tests/fast/test_native_media_configuration.py \
+            tests/fast/test_native_runtime.py \
+            tests/fast/test_native_runtime_integration.py \
+            tests/fast/test_native_audio_parity.py \
+            tests/fast/test_native_media_extensions.py \
+            tests/fast/test_native_media_validation.py \
+            tests/fast/test_read_video_frames.py \
+            tests/fast/test_fixed_shape_image.py \
+            tests/fast/test_video_expressions.py \
+            tests/fast/test_video_index.py \
+            tests/fast/test_image_operators.py \
+            tests/fast/test_image_compute.py \
+            tests/fast/test_image_backend_parity.py \
+            tests/fast/test_image_modes.py \
+            tests/fast/test_image_transforms.py \
+            tests/fast/test_image_to_tensor.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py
+
+      # The optional package owns SQLite; the base wheel only consumes its
+      # versioned C reader interface. Exercise both installed wheels together.
+      - name: Exercise the optional native VaneFS reader
+        if: inputs.python-version == '3.12'
+        env:
+          SKBUILD_BUILD_DIR: ${{ github.workspace }}/vane_fs/build/python-release
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vane_fs/vcpkg_installed/${{ inputs.vcpkg-triplet }}
+        run: |
+          "$VCPKG_ROOT/vcpkg" install \
+            --x-manifest-root="$PWD/vane_fs" --x-install-root="$PWD/vane_fs/vcpkg_installed" \
+            --triplet="$VCPKG_TARGET_TRIPLET" --host-triplet="$VCPKG_HOST_TRIPLET" \
+            --clean-buildtrees-after-build --clean-packages-after-build
+          python scripts/ci_native_platform.py install-vanefs
+          python -I -c 'import vane, vane_fs, av, numpy, PIL; assert hasattr(vane.DuckDBPyConnection, "_register_vane_fs")'
+          scripts/run_installed_pytest.sh "$PWD/vane_fs/tests/test_vane.py" --rootdir="$PWD/vane_fs" --timeout=60
+          scripts/run_installed_pytest.sh tests/fast/test_vane_fs_ray.py -m 'not real_ray' --timeout=60
+          scripts/run_installed_pytest.sh tests/fast/test_vane_fs_ray.py -m real_ray --timeout=180
+
+      - name: Verify the installed native namespace typing contract
+        if: inputs.python-version == '3.10'
+        run: |
+          cp \
+            "$GITHUB_WORKSPACE/tests/typing/native_namespace.py" \
+            "$GITHUB_WORKSPACE/tests/typing/expression_udf_actor_number.py" \
+            "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/installed_mypy.ini" \
+            --no-incremental \
+            --python-version 3.10 \
+            --strict \
+            --disallow-any-expr \
+            native_namespace.py \
+            expression_udf_actor_number.py
+
+      - name: Verify the base installation is importable by mypy
+        if: inputs.python-version == '3.10'
+        run: |
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/base_import_mypy.ini" \
+            --no-incremental \
+            -c 'import vane'
+
+      - name: Verify the installed AI typing contract
+        if: inputs.python-version == '3.10'
+        run: |
+          cp \
+            "$GITHUB_WORKSPACE/tests/typing/ai_prompt.py" \
+            "$GITHUB_WORKSPACE/tests/typing/ai_embed.py" \
+            "$GITHUB_WORKSPACE/tests/typing/ai_jev.py" \
+            "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+            ai_prompt.py \
+            ai_embed.py \
+            ai_jev.py
+
+      - name: Verify the base installation Quickstart outside the checkout
+        run: |
+          cd "$RUNNER_TEMP"
+          env -u VANE_RUNNER python -X utf8 "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
+
+      # Give each process-isolated release phase its own deadline so the non-Ray
+      # suite cannot consume the Ray phases' budget. The common guarded shell
+      # also bounds teardown and terminates only processes owned by this step.
+      - name: Run the base-installation non-Ray release tests
+        timeout-minutes: 64
+        env:
+          VANE_CI_STEP_TIMEOUT_SECONDS: "3600"
+        run: scripts/run_release_tests.sh non-ray
+
+      - name: Run the base-installation shared-Ray release tests
+        timeout-minutes: 34
+        env:
+          VANE_CI_STEP_TIMEOUT_SECONDS: "1800"
+        run: scripts/run_release_tests.sh shared-ray
+
+      - name: Run the base-installation owner-Ray release tests
+        timeout-minutes: 14
+        env:
+          VANE_CI_STEP_TIMEOUT_SECONDS: "600"
+        run: scripts/run_release_tests.sh owner-ray
+
+      - name: Upload local runtime failure diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-runtime-diagnostics-${{ inputs.python-version }}${{ inputs.artifact-suffix }}
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Verify coexistence with the official DuckDB distribution
+        if: inputs.python-version == '3.12'
+        run: python scripts/verify_duckdb_coexistence.py dist/*.whl
+
+      - name: Upload validated artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-python-artifacts-${{ inputs.python-version }}${{ inputs.artifact-suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+            dist/extension-wheels/*.whl
+          if-no-files-found: error
+
+      - name: Upload Ray logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-ray-logs-${{ inputs.python-version }}${{ inputs.artifact-suffix }}
+          path: |
+            /tmp/ray/session_*/logs/
+            ${{ runner.temp }}/ray/session_*/logs/
+          if-no-files-found: ignore
+          retention-days: 7

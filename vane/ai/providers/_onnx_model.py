@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import threading
 from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from weakref import WeakSet
 
 import numpy as np
 
@@ -32,8 +34,24 @@ EXECUTION_PROVIDERS = {
     "cuda": "CUDAExecutionProvider",
     "coreml": "CoreMLExecutionProvider",
 }
+_NATIVE_EP_LOCK = threading.Lock()
+_CUDA_REGISTERED: WeakSet[Any] = WeakSet()
 
 PROCESSOR_VERSIONS = {"transformers": "5.21.0", "torch": "2.14.1", "torchvision": "0.29.1", "Pillow": "12.3.0"}
+
+
+def register_native_cuda(ort: Any) -> None:
+    if not ort.cuda_version:
+        return
+    with _NATIVE_EP_LOCK:
+        if ort in _CUDA_REGISTERED:
+            return
+        ort.preload_dlls(directory="")
+        library = "onnxruntime_providers_cuda.dll" if sys.platform == "win32" else "libonnxruntime_providers_cuda.so"
+        ort.register_execution_provider_library("vane-onnx-cuda", str(Path(ort.__file__).parent / "capi" / library))
+        # ORT owns this process-wide factory. Other model instances may still
+        # use it after this instance releases its sessions.
+        _CUDA_REGISTERED.add(ort)
 
 
 def processor_versions() -> dict[str, str]:
@@ -121,6 +139,8 @@ class ONNXEmbedder:
         self.options = dict(options)
         self.dimensions = dimensions
         self.sessions: dict[str, Any] = {}
+        self.cuda_arena_limit: int | None = None
+        self._run_options: Any = None
         self.processor: Any = None
         self.closed = False
         self.lock = threading.RLock()
@@ -154,13 +174,28 @@ class ONNXEmbedder:
         AutoProcessor = modules["transformers"].AutoProcessor
         validate_software_contract(ort)
 
-        selected = EXECUTION_PROVIDERS[self.options["backend"]]
-        if selected not in ort.get_available_providers():
+        automatic = self.options["backend"] == "auto"
+        if automatic:
+            register_native_cuda(ort)
+        selected = None if automatic else EXECUTION_PROVIDERS[self.options["backend"]]
+        if selected is not None and selected not in ort.get_available_providers():
             raise EmbeddingConfigurationError(f"ONNX execution provider {selected} is unavailable")
         if self.options["backend"] == "cuda":
+            from vane.ai.providers._onnx_cuda import cuda_arena_limit
+
             ort.preload_dlls(directory="")
+            self.cuda_arena_limit = cuda_arena_limit()
+            self._run_options = ort.RunOptions()
+            self._run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
         provider_options = (
-            {"device_id": 0, "use_tf32": 0}
+            {
+                "device_id": 0,
+                "use_tf32": 0,
+                "gpu_mem_limit": self.cuda_arena_limit,
+                # Paired with per-Run shrinkage: exact growth alone can retain
+                # more fragmented workspace than the default doubling policy.
+                "arena_extend_strategy": "kSameAsRequested",
+            }
             if self.options["backend"] == "cuda"
             else {"ModelFormat": "MLProgram"}
             if self.options["backend"] == "coreml"
@@ -174,13 +209,19 @@ class ONNXEmbedder:
             settings = ort.SessionOptions()
             settings.intra_op_num_threads = self.options["num_threads"]
             settings.inter_op_num_threads = 1
+            provider_arguments: dict[str, Any] = {}
+            if automatic:
+                settings.set_provider_selection_policy(ort.OrtExecutionProviderDevicePolicy.PREFER_GPU)
+                settings.add_session_config_entry("ep.cudaexecutionprovider.use_tf32", "0")
+            else:
+                provider_arguments["providers"] = [(selected, provider_options)]
             # ORT assigns shape/control nodes to CPU even with CUDA. Keep that
             # graph partitioning; enable_fallback=False forbids backend retries.
             self.sessions[tower] = ort.InferenceSession(
-                str(path), sess_options=settings, providers=[(selected, provider_options)], enable_fallback=False
+                str(path), sess_options=settings, enable_fallback=False, **provider_arguments
             )
             self.sessions[tower].disable_fallback()
-            if self.sessions[tower].get_providers()[0] != selected:
+            if selected is not None and self.sessions[tower].get_providers()[0] != selected:
                 raise EmbeddingConfigurationError("ONNX did not initialize the explicitly selected execution provider")
             expected_inputs = (
                 {"input_ids", "attention_mask", "image_features", "video_features", "audio_features"}
@@ -218,6 +259,13 @@ class ONNXEmbedder:
                 raise EmbeddingConfigurationError("ONNX graph input signature does not match the declared export")
             result[field.name] = np.ascontiguousarray(values[field.name], dtype=dtypes[field.type])
         return result
+
+    def _run_session(self, tower: str, output: str, values: dict[str, Any]) -> Any:
+        session = self.sessions[tower]
+        inputs = self._feed(session, values)
+        if self._run_options is None:
+            return session.run([output], inputs)[0]
+        return session.run([output], inputs, self._run_options)[0]
 
     def _one(self, parts: list[tuple[str, Any]], role: str) -> np.ndarray:
         text: list[str] = []
@@ -274,15 +322,13 @@ class ONNXEmbedder:
             if not media[kind]:
                 values = np.empty((0, 512), dtype=np.float32)
             elif kind == "audio":
-                session = self.sessions["audio_encoder"]
-                values = session.run(["audio_features"], self._feed(session, processed))[0]
+                values = self._run_session("audio_encoder", "audio_features", processed)
             else:
-                session = self.sessions["vision_encoder"]
                 inputs = {
                     "pixel_values": processed["pixel_values" if kind == "image" else "pixel_values_videos"],
                     "pixel_position_ids": processed["image_position_ids" if kind == "image" else "video_position_ids"],
                 }
-                values = session.run(["image_features"], self._feed(session, inputs))[0]
+                values = self._run_session("vision_encoder", "image_features", inputs)
             values = np.asarray(values)
             if (
                 values.ndim != 2
@@ -292,8 +338,7 @@ class ONNXEmbedder:
             ):
                 raise _ProviderResultError("ONNX media feature geometry or placeholder alignment is invalid")
             features[kind + "_features"] = values
-        session = self.sessions["model"]
-        value = np.asarray(session.run(["sentence_embedding"], self._feed(session, features))[0], dtype=np.float32)
+        value = np.asarray(self._run_session("model", "sentence_embedding", features), dtype=np.float32)
         if value.shape != (1, 768) or not np.isfinite(value).all():
             raise _ProviderResultError("ONNX must return one finite 768-dimensional sentence embedding")
         norm = np.linalg.norm(value.astype(np.float64))
@@ -349,6 +394,7 @@ class ONNXEmbedder:
     def close(self) -> None:
         with self.lock:
             self.sessions.clear()
+            self._run_options = None
             self.processor = None
             self.closed = True
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
 
+import vane
 from vane.runners.ray.fragment_worker_lifecycle import FteWorkerLifecycleMixin
 
 
@@ -172,6 +174,69 @@ def test_query_close_interrupts_only_owned_native_cursors():
     actor_class._unregister_native_cursor(actor, late_cursor)
     actor_class._retire_worker_native_query(actor, "query-a")
     assert actor_class._worker_native_query_is_closing(actor, "query-a") is False
+
+
+@pytest.mark.parametrize("scope", ["query", "task"])
+def test_native_interrupt_keeps_cursor_open_until_interrupt_returns(scope):
+    from vane.runners.ray import worker as worker_module
+
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._native_execution_condition = threading.Condition()
+    actor._active_native_cursors = set()
+    actor._native_cursor_query_ids = {}
+    actor._native_cursor_task_ids = {}
+    actor._native_task_query_ids = {}
+    actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
+    query_id = "query-cursor-interrupt-race"
+    task_id = f"{query_id}.0.0.0"
+    interrupt_entered = threading.Event()
+    release_interrupt = threading.Event()
+    close_attempted = threading.Event()
+    connection = vane.connect()
+
+    class Cursor:
+        def interrupt(self):
+            interrupt_entered.set()
+            assert release_interrupt.wait(timeout=5)
+            connection.interrupt()
+
+        def close(self):
+            connection.close()
+
+    cursor = Cursor()
+    assert actor_class._register_native_cursor(actor, cursor, query_id, task_id)
+    interrupt = actor_class._close_worker_native_query if scope == "query" else actor_class._close_worker_native_task
+    key = query_id if scope == "query" else task_id
+
+    def finish_execution():
+        # Make the interleaving deterministic: if interruption has not retained
+        # ownership, close the real connection before allowing it to continue.
+        acquired = actor._native_execution_condition.acquire(blocking=False)
+        if not acquired:
+            close_attempted.set()
+        try:
+            actor_class._unregister_native_cursor(actor, cursor)
+            cursor.close()
+            close_attempted.set()
+        finally:
+            if acquired:
+                actor._native_execution_condition.release()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            interrupted = executor.submit(interrupt, actor, key)
+            try:
+                assert interrupt_entered.wait(timeout=5)
+                finished = executor.submit(finish_execution)
+                assert close_attempted.wait(timeout=5)
+            finally:
+                release_interrupt.set()
+            assert interrupted.result(timeout=5) == []
+            finished.result(timeout=5)
+    finally:
+        connection.close()
 
 
 def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch):

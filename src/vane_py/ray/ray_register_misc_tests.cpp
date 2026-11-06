@@ -2,12 +2,51 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ray_binding_internal.hpp"
+#include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/dl.hpp"
 
 namespace duckdb {
 namespace ray_bindings {
 namespace py = ::duckdb::py;
 
+class DirectoryCreationRaceFileSystem : public LocalFileSystem {
+public:
+	explicit DirectoryCreationRaceFileSystem(bool inject_race) : inject_race(inject_race) {
+	}
+
+	bool DirectoryExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (inject_race) {
+			inject_race = false;
+			// Simulate a concurrent creator after the Windows preflight check.
+			LocalFileSystem::CreateDirectory(path, opener);
+			return false;
+		}
+		return LocalFileSystem::DirectoryExists(path, opener);
+	}
+
+private:
+	bool inject_race;
+};
+
 void RegisterRayMiscTestsBindings(py::module_ &m) {
+	m.def("load_media_probe_for_test", [](const std::string &path) {
+		auto handle = dlopen_with_runtime(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			throw std::runtime_error("could not load media probe: " + GetDLError());
+		}
+		auto function = reinterpret_cast<int (*)()>(dlsym(handle, "media_decode"));
+		if (!function) {
+			dlclose(handle);
+			throw std::runtime_error("media probe is missing media_decode");
+		}
+		auto result = function();
+		dlclose(handle);
+		return result;
+	});
+	m.def("create_local_directory_for_test", [](const std::string &path, bool inject_race) {
+		DirectoryCreationRaceFileSystem fs(inject_race);
+		fs.CreateDirectory(path);
+	});
 	m.def(
 	    "distributed_copy_direct_write_committed_reader_for_test",
 	    [](const std::string &local_dir) {
@@ -20,11 +59,12 @@ void RegisterRayMiscTestsBindings(py::module_ &m) {
 		    auto &fs = FileSystem::GetFileSystem(context);
 
 		    const std::string run_id = "run-reader";
-		    auto final_root = local_dir + "/copy_direct_reader";
-		    auto selected_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_selected");
-		    auto loser_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_loser");
-		    auto selected_file = selected_dir + "/part.parquet";
-		    auto loser_file = loser_dir + "/part.parquet";
+		    auto final_root = fs.JoinPath(local_dir, "copy_direct_reader");
+		    auto separator = DistributedCopyPathSeparator(fs, final_root);
+		    auto selected_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_selected", separator);
+		    auto loser_dir = BuildCopyDirectWriteTaskDirectory(final_root, run_id, "w_loser", separator);
+		    auto selected_file = fs.JoinPath(selected_dir, "part.parquet");
+		    auto loser_file = fs.JoinPath(loser_dir, "part.parquet");
 
 		    auto write_file = [&](const std::string &path, const std::string &body) {
 			    auto parent = StringUtil::GetFilePath(path);

@@ -32,7 +32,7 @@
 
 #ifndef DUCKDB_EXTENSION_API
 #ifdef _WIN32
-#ifdef DUCKDB_STATIC_BUILD
+#if defined(DUCKDB_STATIC_BUILD) && !defined(DUCKDB_BUILD_LOADABLE_EXTENSION)
 #define DUCKDB_EXTENSION_API
 #else
 #define DUCKDB_EXTENSION_API __declspec(dllexport)

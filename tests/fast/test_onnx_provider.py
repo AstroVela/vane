@@ -5,6 +5,7 @@
 
 import pickle
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -31,11 +32,11 @@ def sdk(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["text", "image", "audio", "video", "multimodal"])
 @pytest.mark.parametrize("dimensions", [128, 256, 512, 768])
-def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeypatch, kind, dimensions):
+def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeypatch, tmp_path, kind, dimensions):
     for name in ("onnxruntime", "onnx", "transformers", "torch"):
         monkeypatch.setitem(sys.modules, name, None)
     descriptor = getattr(load_provider("onnx"), f"get_{kind}_embedder")(
-        dimensions=dimensions, options={"model_path": "/not/provisioned", "model_sha256": "a" * 64}
+        dimensions=dimensions, options={"model_path": str(tmp_path / "not-provisioned"), "model_sha256": "a" * 64}
     )
     restored = pickle.loads(pickle.dumps(descriptor))
     assert restored.get_model() == ONNX_MODEL
@@ -53,7 +54,7 @@ def test_planning_is_serializable_sdk_free_and_does_not_open_model_files(monkeyp
         {"model_path": "https://host/model"},
         {"model_sha256": "bad"},
         {"dtype": "int3"},
-        {"backend": "auto"},
+        {"backend": "manual"},
         {"max_length": True},
         {"max_length": 8193},
         {"max_input_bytes": 0},
@@ -84,6 +85,108 @@ def test_public_preparation_uses_explicit_backend_resources_and_never_retries(op
     for unsupported in ({"max_retries": 1}, {"max_chunk_chars": 100}, {"chunk_overlap_chars": 0}):
         with pytest.raises(EmbeddingConfigurationError):
             _prepare_embed_call("onnx", None, 128, "ignore", options | unsupported, relation=True)
+
+
+@pytest.mark.parametrize("selected", ["CPUExecutionProvider", "CUDAExecutionProvider"])
+def test_auto_delegates_selection_to_ort_without_explicit_providers(options, sdk, selected):
+    sdk.automatic_provider = selected
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert [session.get_providers() for session in runtime.sessions.values()] == [[selected]] * 3
+        preloads = [event for event in sdk.events if event[0] == "preload_cuda"]
+        registrations = [event for event in sdk.events if event[0] == "register_native_ep"]
+        assert len(preloads) == len(registrations) == 1
+        assert preloads[0][1] == {"directory": ""}
+        library = "onnxruntime_providers_cuda.dll" if sys.platform == "win32" else "libonnxruntime_providers_cuda.so"
+        assert registrations[0][2] == str(Path(sys.modules["onnxruntime"].__file__).parent / "capi" / library)
+        first_load = next(event for event in sdk.events if event[0] == "automatic_load")
+        assert sdk.events.index(preloads[0]) < sdk.events.index(registrations[0]) < sdk.events.index(first_load)
+        assert len([event for event in sdk.events if event[0] == "native_selection_policy"]) == 3
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+        assert all(event[4] is False for event in sdk.events if event[0] == "load")
+        assert all(event[5] == {"ep.cudaexecutionprovider.use_tf32": "0"} for event in sdk.events if event[0] == "load")
+        assert len([event for event in sdk.events if event[0] == "disable_fallback"]) == 3
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("external_cuda", [False, True])
+def test_auto_cpu_package_does_not_load_bundled_cuda(options, sdk, external_cuda):
+    sys.modules["onnxruntime"].cuda_version = ""
+    sdk.available = ["CPUExecutionProvider"] + (["CUDAExecutionProvider"] if external_cuda else [])
+    sdk.external_cuda_registered = external_cuda
+    sdk.automatic_provider = "CUDAExecutionProvider" if external_cuda else "CPUExecutionProvider"
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    try:
+        assert len(runtime.embed_text(["query"])) == 1
+        assert [session.get_providers() for session in runtime.sessions.values()] == [[sdk.automatic_provider]] * 3
+        assert not any(event[0] in {"register_native_ep", "preload_cuda"} for event in sdk.events)
+        assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 3
+    finally:
+        runtime.close()
+
+
+def test_auto_instances_share_registration_after_another_model_closes(options, sdk):
+    first = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    second = None
+    try:
+        second = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+        first.close()
+        assert len(second.embed_text(["query"])) == 1
+        assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+        assert len([event for event in sdk.events if event[0] == "load"]) == 6
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+    assert sdk.active == 0
+
+
+def test_auto_registration_failure_never_starts_cpu_sessions(options, sdk):
+    error = sdk.registration_failure = RuntimeError("CUDA EP registration failed")
+    with pytest.raises(RuntimeError) as caught:
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert caught.value is error
+    assert len([event for event in sdk.events if event[0] == "register_native_ep"]) == 1
+    assert not any(event[0] == "load" for event in sdk.events)
+
+
+def test_auto_session_initialization_failure_never_retries(options, sdk):
+    sdk.failure = RuntimeError("native provider initialization failed")
+    with pytest.raises(RuntimeError, match="native provider initialization"):
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    assert len([event for event in sdk.events if event[0] == "automatic_load"]) == 1
+    assert len([event for event in sdk.events if event[0] == "load"]) == 1
+
+
+def test_auto_execution_failure_does_not_recreate_sessions(options, sdk, monkeypatch):
+    sdk.automatic_provider = "CUDAExecutionProvider"
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"}).instantiate()
+    attempts = []
+    error = RuntimeError("native provider execution failed")
+
+    def fail(*args, **kwargs):
+        attempts.append(1)
+        raise error
+
+    monkeypatch.setattr(type(runtime.sessions["model"]), "run", fail)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            runtime.embed_text(["query"])
+        assert caught.value is error and attempts == [1]
+        assert len([event for event in sdk.events if event[0] == "load"]) == 3
+    finally:
+        error.__traceback__ = None
+        del caught
+        runtime.close()
+    assert sdk.active == 0
+
+
+def test_auto_native_udf_requires_explicit_accelerator_reservation(options):
+    descriptor = load_provider("onnx").get_text_embedder(options=options | {"backend": "auto"})
+    with pytest.raises(EmbeddingConfigurationError, match="owned model service"):
+        descriptor.get_udf_options()
 
 
 @pytest.mark.parametrize(
@@ -184,6 +287,64 @@ def test_cuda_execution_failure_propagates_without_recreating_sessions(options, 
         del caught
         runtime.close()
     assert sdk.active == 0
+
+
+def test_cuda_budget_and_reclamation_cover_every_graph_without_changing_inputs(options, sdk):
+    provider = load_provider("onnx")
+    runtime = provider.get_multimodal_embedder(options=options | {"backend": "cuda", "max_length": 512}).instantiate()
+    image = np.full((8, 12, 3), 40, np.uint8)
+    audio = AudioClip(np.full((1600, 1), 0.2, np.float32), 16000)
+    video = VideoClip((image, image + 1), (0.0, 1.0), (0, 1))
+    content = EmbeddingContent(
+        tuple(
+            EmbeddingPart(EmbeddingPartSpec(kind), value)
+            for kind, value in (("text", "look"), ("image", image), ("video", video), ("audio", audio))
+        )
+    )
+    try:
+        first = runtime.embed_multimodal([content])[0]
+        repeated = runtime.embed_multimodal([content])[0]
+        np.testing.assert_array_equal(first, repeated)
+        runtime.embed_text(["query"])
+        assert len(sdk.cuda_queries) == 1
+        assert len(sdk.provider_options) == 3
+        for _, values in sdk.provider_options:
+            assert values == {
+                "device_id": 0,
+                "use_tf32": 0,
+                "gpu_mem_limit": 8 * 1024**3,
+                "arena_extend_strategy": "kSameAsRequested",
+            }
+        assert {tower for tower, _ in sdk.run_options} == {"vision_encoder", "audio_encoder", "model"}
+        assert all(values == {"memory.enable_memory_arena_shrinkage": "gpu:0"} for _, values in sdk.run_options)
+        assert len([event for event in sdk.events if event[0] == "load"]) == 3
+    finally:
+        runtime.close()
+    assert sdk.active == 0
+
+
+@pytest.mark.parametrize("backend", ["cpu", "coreml"])
+def test_non_cuda_graphs_do_not_probe_cuda_or_apply_gpu_run_options(options, sdk, backend):
+    runtime = load_provider("onnx").get_text_embedder(options=options | {"backend": backend}).instantiate()
+    try:
+        runtime.embed_text(["query"])
+        assert not sdk.cuda_queries
+        assert all(values is None for _, values in sdk.run_options)
+        assert all("gpu_mem_limit" not in values for _, values in sdk.provider_options)
+    finally:
+        runtime.close()
+
+
+def test_cuda_budget_failure_starts_no_session_and_does_not_retry(options, sdk, monkeypatch):
+    from vane.ai.providers import _onnx_cuda
+
+    def exhausted():
+        raise MemoryError("no CUDA headroom")
+
+    monkeypatch.setattr(_onnx_cuda, "cuda_arena_limit", exhausted)
+    with pytest.raises(MemoryError, match="no CUDA headroom"):
+        load_provider("onnx").get_text_embedder(options=options | {"backend": "cuda"}).instantiate()
+    assert not [event for event in sdk.events if event[0] == "load"]
 
 
 def test_partial_initialization_releases_the_preceding_session(options, sdk):

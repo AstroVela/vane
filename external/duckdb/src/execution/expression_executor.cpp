@@ -159,7 +159,9 @@ Value ExpressionExecutor::EvaluateScalar(ClientContext &context, const Expressio
 	// use an ExpressionExecutor to execute the expression
 	ExpressionExecutor executor(context, expr);
 
-	Vector result(expr.return_type);
+	// Scalar folding produces one row. A full vector of nested ARRAY values
+	// can reserve gigabytes before the constant expression replaces its data.
+	Vector result(expr.return_type, idx_t(1));
 	executor.ExecuteExpression(result);
 
 	D_ASSERT(allow_unfoldable || result.GetVectorType() == VectorType::CONSTANT_VECTOR);
