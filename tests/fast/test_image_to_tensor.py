@@ -281,7 +281,9 @@ with vane.connect(config={'threads':1}) as con:
     vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                   if line.startswith('VmSize:'))) * 1024
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    ceiling = vm + (1024 if form == "generic" else 512) * 1024 * 1024
+    # LIST-backed tensors also need per-pixel Arrow selection buffers and
+    # parameter-binding copies. Leave room for those within the bounded budget.
+    ceiling = vm + (512 if form == "fixed" else 1024) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling,hard), hard))
     result = con.sql('SELECT image_to_tensor($1) AS value', params=[value])
     table = result.to_arrow_table()
