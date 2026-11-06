@@ -103,7 +103,7 @@ onnx = [ # ONNX Runtime inference; official image/video preprocessing uses CPU T
     "onnx>=1.20,<2",
     "transformers==5.21.0",
     "torch==2.14.1",
-    "torchvision==0.29.1",
+    "torchvision==0.29.2",
     "Pillow==12.3.0",
 ]
 onnx_cuda = [ # Install this alternative instead of the CPU onnx extra
@@ -111,7 +111,7 @@ onnx_cuda = [ # Install this alternative instead of the CPU onnx extra
     "onnx>=1.20,<2",
     "transformers==5.21.0",
     "torch==2.14.1",
-    "torchvision==0.29.1",
+    "torchvision==0.29.2",
     "Pillow==12.3.0",
 ]
 litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inference
