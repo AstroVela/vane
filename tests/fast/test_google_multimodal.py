@@ -253,7 +253,7 @@ def test_invalid_vectors_abort_joint_encoding(sdk, values):
 
 @pytest.mark.parametrize("vertex", [False, True])
 def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow, vertex):
-    import httpx
+    httpx = pytest.importorskip("httpx")
 
     pytest.importorskip("google.genai")
     from vane.ai.providers import google
