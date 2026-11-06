@@ -14,9 +14,10 @@ from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai.options import validate_embed_options
 from vane.ai.provider import _ProviderResultError
 
-from .test_ai_embedding_http_runtime import _content, _descriptor, _part, _run, _text
-
 httpx = pytest.importorskip("httpx")
+
+# The shared module may already be partially imported after its optional skip.
+from .test_ai_embedding_http_runtime import _content, _descriptor, _part, _run, _text
 
 
 def descriptor(**options):
