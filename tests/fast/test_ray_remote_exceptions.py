@@ -32,7 +32,23 @@ def test_cleanup_diagnostics_keep_ray_task_cause_without_formatting_it():
             raise AssertionError("unsafe exception formatting")
 
     error = RayTaskError("test", "remote traceback", ValueError("original cause"))
+
+    class CollidingKey:
+        armed = False
+
+        def __hash__(self):
+            return hash("cause")
+
+        def __eq__(self, other):
+            if self.armed:
+                raise AssertionError("provider key compared during cleanup")
+            return False
+
+    key = CollidingKey()
+    del error.cause
+    vars(error)[key] = None
     error.cause = Failure("cte-producer-failed")
+    key.armed = True
     assert "cte-producer-failed" in driver._safe_exception_summary(error)
     assert "<error message unavailable>" in driver._safe_exception_summary(Failure())
 

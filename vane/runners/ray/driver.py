@@ -24,6 +24,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from vane._ray_cxx import require_ray_cxx_attr
@@ -126,9 +127,16 @@ def _safe_exception_summary(error: BaseException) -> str:
         # RayTaskError carries several constructor arguments. Preserve a plain-text
         # remote cause without invoking user exception formatting during teardown.
         state = BaseException.__dict__["__dict__"].__get__(error)
-        cause = dict.get(state, "cause")
-        if issubclass(type(cause), BaseException):
-            message = exception_message_from_args(cause)
+        # Match the native diagnostic field limit. A dictionary lookup could
+        # invoke a colliding provider key's __eq__ while handling this error.
+        try:
+            for key, value in islice(dict.items(state), 32):
+                if type(key) is str and key == "cause":
+                    if issubclass(type(value), BaseException):
+                        message = exception_message_from_args(value)
+                    break
+        except RuntimeError:
+            pass  # Another thread changed the dictionary during inspection.
     if message is None:
         message = "<error message unavailable>"
     message = _bounded_diagnostic_text(message)

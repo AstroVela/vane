@@ -748,7 +748,9 @@ class UDFStreamResultCollector:
                                     record.adapter.submission_scope,
                                 )
                             )
-                        cleanup_operations.extend(self._cancel_active_stream(record.adapter))
+                        cleanup_operations.extend(
+                            self._cancel_active_stream(record.adapter, shutdown_deadline=deadline)
+                        )
                     ready = [event for events in self._ready_by_slot.values() for event in events]
                     tokens = list(self._active_output_leases.values())
                     token_keys = {(token.request_id, token.lease_id) for token in tokens}
@@ -1275,11 +1277,15 @@ class UDFStreamResultCollector:
             _CLEANUP_RESPONSE_TIMEOUT_MAX_S,
         )
 
-    def _cancel_active_stream(self, adapter: RayStreamAdapter) -> tuple[RayStreamCleanupOperation, ...]:
+    def _cancel_active_stream(
+        self, adapter: RayStreamAdapter, *, shutdown_deadline: float | None = None
+    ) -> tuple[RayStreamCleanupOperation, ...]:
         # Leave one retry for cancellation and one for deleting the generator.
         # A short cleanup or shutdown deadline keeps the immediate-cancel path.
-        budget = min(self._cleanup_timeout_s, self._shutdown_timeout_s) - 2 * _CLEANUP_RETRY_MAX_DELAY_S
-        return adapter.cancel_operations(grace_deadline=time.monotonic() + budget)
+        deadline = time.monotonic() + min(self._cleanup_timeout_s, self._shutdown_timeout_s)
+        if shutdown_deadline is not None:
+            deadline = min(deadline, shutdown_deadline)
+        return adapter.cancel_operations(grace_deadline=deadline - 2 * _CLEANUP_RETRY_MAX_DELAY_S)
 
     def _retry_cleanup_ticket(self, ticket: _CleanupTicket) -> None:
         with self._cv:
