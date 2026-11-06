@@ -172,6 +172,7 @@ class FteWorkerSubmissionMixin:
         _execute_fte_fragment_execution_outbox: Any
         _fragment_query_ids: Any
         _fragment_registration_lock: Any
+        _fragment_registration_method: Any
         _fragment_registration_refs: Any
         _fte_fragment_executions: Any
         _fte_worker_placement_manager: Any
