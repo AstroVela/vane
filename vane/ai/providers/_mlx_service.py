@@ -25,6 +25,7 @@ from vane.ai._errors import _is_resource_error
 from vane.ai._video_embedding import VideoClip
 from vane.ai.options import _validate_mlx_service_options
 from vane.ai.protocols import VideoEmbedderDescriptor
+from vane.ai.provider import ProviderImportError, _ProviderResultError
 from vane.ai.providers._embedding_service_backend import owned_result
 from vane.ai.providers._mlx_media import (
     MAX_IMAGE_PIXELS,
@@ -213,11 +214,28 @@ class MLXServiceBackend:
             self.restart_required = _is_resource_error(error)
             raise
 
-    def _encode(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
+    def _encode(self, content: EmbeddingContent | list[EmbeddingContent], context: ipc.RequestContext) -> Any:
         assert self._core is not None
+        if isinstance(content, list):
+            try:
+                return self._core.encode_batch(content, context.encoding)
+            except (EmbeddingConfigurationError, ProviderImportError, _ProviderResultError):
+                raise
+            except Exception as error:
+                if _is_resource_error(error):
+                    raise
+                # One collective call has finished and produced no vectors.
+                # The client may isolate a failing row with individual calls.
+                raise ipc.BatchRejected("MLX could not encode the batch") from error
         return self._core.encode(content, context.encoding)
 
     async def embed(self, content: EmbeddingContent, context: ipc.RequestContext) -> Any:
+        return await self._run(content, context)
+
+    async def embed_batch(self, contents: list[EmbeddingContent], context: ipc.RequestContext) -> list[Any]:
+        return await self._run(contents, context)
+
+    async def _run(self, content: EmbeddingContent | list[EmbeddingContent], context: ipc.RequestContext) -> Any:
         if context.model_contract != self.contract or context.encoding == "default":
             raise EmbeddingConfigurationError("MLX service encoding/model contract mismatch")
         self._check_resource_state()

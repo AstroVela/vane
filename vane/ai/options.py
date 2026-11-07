@@ -119,6 +119,7 @@ class EmbedOptions(MultimodalEmbedOptions, total=False):
     runtime: Literal["native", "http", "service"]
     service_path: str
     service_id: str
+    service_batch_rows: int
     http_input_format: Literal["text", "multimodal", "encode"]
     http_media_tokens: Mapping[str, str]
     http_add_special_tokens: bool
@@ -203,6 +204,7 @@ _SERVICE_EMBED_OPTIONS = frozenset(
         "runtime",
         "service_path",
         "service_id",
+        "service_batch_rows",
         "timeout",
         "max_concurrency_per_actor",
         "input_modalities",
@@ -218,6 +220,7 @@ _MLX_SERVICE_OPTIONS = frozenset(
         "runtime",
         "service_path",
         "service_id",
+        "service_batch_rows",
         "timeout",
         "max_concurrency_per_actor",
         "revision",

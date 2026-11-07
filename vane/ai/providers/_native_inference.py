@@ -47,7 +47,7 @@ from vane.ai.protocols import (
     TextEmbedderDescriptor,
     VideoEmbedderDescriptor,
 )
-from vane.ai.provider import Provider, _translate_missing_provider_dependency
+from vane.ai.provider import Provider, _ProviderResultError, _translate_missing_provider_dependency
 from vane.ai.typing import UDFOptions
 from vane.execution._async_dispatch import map_async_ordered
 
@@ -741,7 +741,9 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
             raise ValueError("Native SGLang returned no embedding")
         return result["embedding"]
 
-    async def _embed_many(self, kind: Modality | Literal["multimodal"], values: list[Any]) -> list[Any]:
+    async def _embed_many(
+        self, kind: Modality | Literal["multimodal"], values: list[Any], *, collect_row_errors: bool = False
+    ) -> list[Any]:
         # Native engines accept individual requests. Overlap those requests on
         # the actor-owned engine while keeping retries/validation per input;
         # the enclosing Arrow batch must never replay successful siblings.
@@ -767,6 +769,12 @@ class NativeEmbedder(_NativeRuntime, ManagedEmbedder):
                 raise
             except Exception as exc:
                 _raise_if_resource_error(exc)
+                if collect_row_errors:
+                    if isinstance(exc, _ProviderResultError):
+                        raise
+                    # The service transports failed row positions alongside the
+                    # successful vectors. The client owns its on_error policy.
+                    return None
                 if getattr(self, "_request_on_error", "raise") == "raise":
                     raise
                 _log_substituted_failure(exc, on_error="ignore")
