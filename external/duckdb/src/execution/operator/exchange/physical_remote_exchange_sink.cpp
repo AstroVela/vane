@@ -71,6 +71,9 @@ struct RemoteSinkLocalState : public LocalSinkState {
 				mark_join_build_keys.InitializeEmpty(types);
 			}
 		}
+		if (op.PartitionsByTask()) {
+			return;
+		}
 		selections.reserve(op.NumPartitions());
 		for (idx_t i = 0; i < op.NumPartitions(); i++) {
 			selections.emplace_back(STANDARD_VECTOR_SIZE);
@@ -184,6 +187,10 @@ unique_ptr<GlobalSinkState> PhysicalRemoteExchangeSink::GetGlobalSinkState(Clien
 	if (!sink_handle_bound_) {
 		throw InvalidInputException("remote exchange sink attempt must be bound before execution");
 	}
+	if (partition_by_task_ &&
+	    (repartition_type_ != RepartitionSpec::Type::Random || collect_mark_join_build_summary_)) {
+		throw InvalidInputException("Task-partitioned CTE output requires an unkeyed exchange");
+	}
 	// Inject context for deserialized managers (context is not available during deserialization)
 	exchange_mgr_->SetContext(&context);
 	auto sink = exchange_mgr_->CreateSink(sink_handle_);
@@ -214,6 +221,20 @@ SinkResultType PhysicalRemoteExchangeSink::Sink(ExecutionContext &context, DataC
 	auto &lstate = input.local_state.Cast<RemoteSinkLocalState>();
 	const auto count = chunk.size();
 	const auto partitions = num_partitions_;
+	if (gstate.sink->IsBlocked()) {
+		gstate.sink->WaitUnblocked();
+	}
+	if (partition_by_task_) {
+		// The scheduler reuses the logical task partition on retry. Keep every row of
+		// this writer together without hashing or allocating a selection per bucket.
+		const auto partition = SinkHandle().sink_handle.task_partition_id % partitions;
+		chunk.Flatten();
+		auto written = gstate.sink->AddChunk(partition, chunk);
+		if (written.is_err()) {
+			throw IOException("[RemoteExchangeSink] %s", written.error().what());
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	if (collect_mark_join_build_summary_) {
 		gstate.mark_join_build_has_rows.store(true, std::memory_order_relaxed);
 		if (!mark_join_build_expressions_.empty() && !gstate.mark_join_build_has_null.load(std::memory_order_relaxed)) {
@@ -274,11 +295,6 @@ SinkResultType PhysicalRemoteExchangeSink::Sink(ExecutionContext &context, DataC
 	}
 	default:
 		throw NotImplementedException("remote exchange sink: unsupported repartition type");
-	}
-
-	// Check backpressure from the ExchangeSink
-	if (gstate.sink->IsBlocked()) {
-		gstate.sink->WaitUnblocked();
 	}
 
 	for (idx_t part_idx = 0; part_idx < partitions; part_idx++) {
@@ -375,6 +391,9 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 		serializer.WriteProperty(114, "mark_join_build_expressions", mark_join_build_expressions_);
 	}
 	serializer.WritePropertyWithDefault<bool>(115, "preserve_order", preserve_order_, false);
+	if (partition_by_task_) {
+		serializer.WriteProperty<bool>(116, "partition_by_task", true);
+	}
 }
 
 } // namespace duckdb

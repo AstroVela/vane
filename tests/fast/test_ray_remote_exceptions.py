@@ -16,6 +16,43 @@ from vane.runners.ray import driver
 from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 
+def test_cleanup_diagnostics_keep_ray_task_cause_without_formatting_it():
+    from ray.exceptions import RayTaskError
+
+    class Failure(RuntimeError):
+        @property
+        def args(self):
+            raise AssertionError("unsafe args lookup")
+
+        @property
+        def __class__(self):
+            raise AssertionError("unsafe class lookup")
+
+        def __str__(self):
+            raise AssertionError("unsafe exception formatting")
+
+    error = RayTaskError("test", "remote traceback", ValueError("original cause"))
+
+    class CollidingKey:
+        armed = False
+
+        def __hash__(self):
+            return hash("cause")
+
+        def __eq__(self, other):
+            if self.armed:
+                raise AssertionError("provider key compared during cleanup")
+            return False
+
+    key = CollidingKey()
+    del error.cause
+    vars(error)[key] = None
+    error.cause = Failure("cte-producer-failed")
+    key.armed = True
+    assert "cte-producer-failed" in driver._safe_exception_summary(error)
+    assert "<error message unavailable>" in driver._safe_exception_summary(Failure())
+
+
 def _chained_error(label: str) -> RuntimeError:
     try:
         raise vane.NotImplementedException(f"{label} original")

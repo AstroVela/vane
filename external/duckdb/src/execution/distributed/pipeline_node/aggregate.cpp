@@ -291,7 +291,7 @@ SubmittableTaskStream<WorkerTask> AggregateNode::produce_tasks(PlanExecutionCont
 
 	return input_node.pipeline_instruction(
 	    self,
-	    [self, &plan_context](DuckPhysicalPlanRef input) {
+	    [self, plan_context](DuckPhysicalPlanRef input) {
 		    auto plan = input; // base scan plan
 		    Allocator &alloc = Allocator::DefaultAllocator();
 
@@ -413,7 +413,7 @@ SubmittableTaskStream<WorkerTask> PerfectHashAggregateNode::produce_tasks(PlanEx
 
 	return input_node.pipeline_instruction(
 	    self,
-	    [self, &plan_context](DuckPhysicalPlanRef input) {
+	    [self, plan_context](DuckPhysicalPlanRef input) {
 		    auto plan = input;
 		    auto groups = CopyExpressionsForSpecialAggregateNode(self->group_by_);
 		    auto aggs = CopyExpressionsForSpecialAggregateNode(self->aggs_);
@@ -482,7 +482,7 @@ SubmittableTaskStream<WorkerTask> PartitionedAggregateNode::produce_tasks(PlanEx
 
 	return input_node.pipeline_instruction(
 	    self,
-	    [self, &plan_context](DuckPhysicalPlanRef input) {
+	    [self, plan_context](DuckPhysicalPlanRef input) {
 		    auto plan = input;
 		    auto groups = CopyExpressionsForSpecialAggregateNode(self->group_by_);
 		    auto aggs = CopyExpressionsForSpecialAggregateNode(self->aggs_);

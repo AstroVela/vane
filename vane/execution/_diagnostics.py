@@ -10,7 +10,7 @@ def exception_message_from_args(error: BaseException) -> str | None:
     """Return one exact string argument without invoking provider code."""
 
     try:
-        args = BaseException.__getattribute__(error, "args")
+        args = BaseException.__dict__["args"].__get__(error)
     except BaseException:
         return None
     if type(args) is not tuple or len(args) != 1 or type(args[0]) is not str:
