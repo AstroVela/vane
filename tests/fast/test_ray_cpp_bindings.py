@@ -1341,7 +1341,12 @@ def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path,
     if remote_reader:
         # With the attempt and partition subdirectories, the Windows path exceeds MAX_PATH.
         tmp_path = tmp_path / ("flight-" * 22)
-        tmp_path.mkdir()
+        # Prepare the fixture without requiring the host's LongPathsEnabled
+        # policy. The native helper still receives the ordinary long path.
+        if sys.platform == "win32":
+            Path("\\\\?\\" + str(tmp_path.resolve())).mkdir()
+        else:
+            tmp_path.mkdir()
         monkeypatch.setenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", "1")
     result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path), remote_reader)
 
