@@ -54,6 +54,8 @@ Vane Data 是面向 AI 工作负载的高性能、多模态原生数据引擎。
 
 Vane 支持 Python 3.10–3.14，推荐使用 Python 3.12，这也是主要开发版本。
 
+0.3.0 版本面向 Linux x86-64、macOS arm64 和 Windows x64，为每个受支持的 Python 版本提供预编译 wheel。可选推理引擎和原生扩展 Provider 各有其平台与依赖要求。
+
 通过 PyPI 安装 `vane-ai`：
 
 ```bash
