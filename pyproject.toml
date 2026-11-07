@@ -626,6 +626,7 @@ stubdeps = [ # dependencies used for typehints in the stubs
 ai-test = [ # dependencies used for running tests/ai
     "anthropic>=0.117.0",
     "google-genai>=1.73.0",
+    "httpx>=0.27,<1", # tests/fast/test_ai_embedding_http_runtime.py imports it; openai no longer pulls it
     "numpy<2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version < '3.12'",
     "numpy>=2; ( sys_platform != 'win32' or platform_machine != 'ARM64' ) and python_version >= '3.12'",
     "numpy>=2.3; sys_platform == 'win32' and platform_machine == 'ARM64' and python_version >= '3.11'",
