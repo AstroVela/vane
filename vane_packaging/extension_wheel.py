@@ -228,6 +228,7 @@ _MAX_PE_LIBRARY_NAME_BYTES = 255
 _PE_LIBRARY_NAME_RE = re.compile(rb"^[A-Za-z0-9_][A-Za-z0-9._+-]*\.[Dd][Ll][Ll]$")
 _WINDOWS_API_SET_LIBRARIES = frozenset(
     {
+        "api-ms-win-core-synch-l1-2-0.dll",
         "api-ms-win-crt-conio-l1-1-0.dll",
         "api-ms-win-crt-convert-l1-1-0.dll",
         "api-ms-win-crt-environment-l1-1-0.dll",
@@ -274,6 +275,7 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
         "ntdll.dll",
         "ole32.dll",
         "oleaut32.dll",
+        "pdh.dll",
         "powrprof.dll",
         "psapi.dll",
         "rpcrt4.dll",
@@ -1887,9 +1889,10 @@ def _pe_import_library_names(
         )
     if not terminated:
         raise ValueError(f"{description} PE {directory_description} directory has no terminating descriptor")
-    if len(set(names)) != len(names):
-        raise ValueError(f"{description} contains duplicate PE {directory_description} libraries")
-    return tuple(names)
+    # Linkers can emit separate descriptors for the same DLL, including Rust
+    # raw-dylib imports alongside MSVC import libraries. Validate and count every
+    # descriptor before coalescing the case-insensitive dependency names.
+    return tuple(dict.fromkeys(names))
 
 
 def _pe_library_name(

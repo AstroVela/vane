@@ -1720,6 +1720,117 @@ def test_windows_pe_platform_accepts_policy_imports_and_delay_imports():
 
 
 @pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize("library", ["api-ms-win-core-synch-l1-2-0.dll", "pdh.dll"])
+def test_windows_pe_platform_accepts_system_synchronization_and_performance_imports(import_kind, library):
+    contents = _synthetic_pe(architecture="amd64", **{import_kind: (library,)})
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == (library,)
+
+
+@pytest.mark.parametrize("library", ["api-ms-win-core-synch-l1-2-999.dll", "pdh-private.dll"])
+def test_windows_pe_platform_requires_exact_system_dll_names(library):
+    contents = _synthetic_pe(architecture="amd64", imports=(library,))
+
+    with pytest.raises(ValueError, match=rf"non-policy Windows DLLs.*{re.escape(library)}"):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize("duplicate_name", ["KERNEL32.DLL", "kernel32.dll"])
+def test_windows_pe_platform_accepts_repeated_dll_descriptors(import_kind, duplicate_name):
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "VCRUNTIME140.dll", duplicate_name)},
+    )
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == ("kernel32.dll", "vcruntime140.dll")
+
+
+def test_windows_pe_platform_coalesces_repeated_normal_and_delay_imports():
+    contents = _synthetic_pe(
+        architecture="amd64",
+        imports=("KERNEL32.DLL", "kernel32.dll"),
+        delay_imports=("kernel32.dll", "VCRUNTIME140.dll", "KERNEL32.DLL"),
+    )
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == ("kernel32.dll", "vcruntime140.dll")
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize(
+    ("library", "error"),
+    [
+        ("publisher-private.dll", "non-policy Windows DLLs.*publisher-private.dll"),
+        ("C:\\private\\library.dll", "invalid PE import-library name"),
+    ],
+)
+def test_windows_pe_platform_checks_imports_after_repeated_descriptors(import_kind, library, error):
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "kernel32.dll", library)},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+def test_windows_pe_platform_counts_repeated_descriptors_towards_the_limit(monkeypatch, import_kind):
+    monkeypatch.setattr(extension_wheel_module, "_MAX_PE_IMPORT_LIBRARIES", 2)
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "kernel32.dll", "kernel32.dll")},
+    )
+
+    with pytest.raises(ValueError, match="too many PE import libraries"):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+def test_windows_pe_platform_validates_repeated_delay_import_descriptors():
+    contents = bytearray(_synthetic_pe(architecture="amd64", delay_imports=("kernel32.dll", "kernel32.dll")))
+    raw_section_offset = 0x200
+    struct.pack_into("<I", contents, raw_section_offset + 32, 0)
+
+    with pytest.raises(ValueError, match="non-RVA PE delay-import descriptor"):
+        extension_wheel_module._validate_windows_pe_platform(
+            bytes(contents),
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
 def test_windows_pe_platform_rejects_private_imports(import_kind):
     contents = _synthetic_pe(
         architecture="amd64",
