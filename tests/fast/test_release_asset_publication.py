@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 import yaml
 
 from scripts import publish_release_assets as publishing
+from scripts.run_ci_step import bash_executable
 
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "AstroVela/vane"
@@ -438,3 +440,50 @@ def test_build_only_checks_the_real_download_layout_before_index_upload(asset_tr
     )
     assert f'"assets": {ASSET_COUNT}' in result.stdout
     assert '"verified": true' in result.stdout
+
+
+@pytest.mark.parametrize("tree_cached", [False, True])
+def test_windows_cached_dependencies_include_the_toolchain(tmp_path, tree_cached):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["windows-vcpkg"]["steps"]
+    bootstrap = next(step for step in steps if "scripts/bootstrap_vcpkg.sh" in step.get("run", ""))
+    upload = next(step for step in steps if step.get("with", {}).get("name") == "windows-vcpkg-toolchain")
+    workspace = tmp_path / "runner workspace"
+    scripts = workspace / "package/scripts"
+    scripts.mkdir(parents=True)
+    if tree_cached:
+        arrow = workspace / "package/vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake"
+        arrow.parent.mkdir(parents=True)
+        arrow.touch()
+    (scripts / "bootstrap_vcpkg.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'mkdir -p "$VCPKG_ROOT/scripts/buildsystems" "$VCPKG_ROOT/triplets"\n'
+        'touch "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"\n'
+        'touch "$VCPKG_ROOT/triplets/x64-windows-static.cmake"\n'
+        'touch "$VCPKG_ROOT/vcpkg.exe" "$VCPKG_ROOT/bootstrap-vcpkg.bat"\n',
+        encoding="utf-8",
+    )
+    output = workspace / "github-output.txt"
+    try:
+        bash = bash_executable()
+    except RuntimeError:
+        # Git Bash puts mingw64/bin/git ahead of cmd/git in its inherited PATH.
+        bash = shutil.which("bash")
+        if bash is None or "system32" in {part.lower() for part in Path(bash).parts}:
+            pytest.skip("Git Bash is required for the Windows workflow regression")
+    subprocess.run(
+        [bash, "--noprofile", "--norc", "-e", "-c", bootstrap["run"]],
+        cwd=workspace,
+        env={
+            **os.environ,
+            "VCPKG_ROOT": (workspace / ".cache/vcpkg").as_posix(),
+            "GITHUB_OUTPUT": output.as_posix(),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f"reused={str(tree_cached).lower()}" in output.read_text(encoding="utf-8")
+    for required in upload["with"]["path"].splitlines():
+        assert (workspace / required).exists(), f"toolchain artifact is missing {required}"
