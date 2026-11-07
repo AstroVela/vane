@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +41,9 @@ def asset_tree(tmp_path):
         (root / "packages" / f"{name}.sigstore.json").write_text('{"bundle":"fixture"}')
     for name in publishing.SUPPLEMENTAL:
         (root / "release-assets" / name).write_text("".join(checksums) if name == "SHA256SUMS" else "{}")
+    (root / "release-assets" / "vane-ai-sbom.cdx.json").write_text(
+        json.dumps({"bomFormat": "CycloneDX", "components": [{"name": "vane-ai", "version": "0.2.0"}]})
+    )
     return root
 
 
@@ -150,6 +154,27 @@ def test_bad_local_inventory_stops_before_upload(asset_tree, github, damage):
     else:
         checksums.write_text(checksums.read_text() + checksums.read_text().splitlines(keepends=True)[0])
     with pytest.raises(ValueError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not calls and not uploads
+
+
+@pytest.mark.parametrize(
+    "sbom",
+    [
+        {},
+        [],
+        {"bomFormat": "SPDX", "components": [{"name": "vane-ai", "version": "0.2.0"}]},
+        {"bomFormat": "CycloneDX", "components": []},
+        {"bomFormat": "CycloneDX", "components": [{"name": "other", "version": "0.2.0"}]},
+        {"bomFormat": "CycloneDX", "components": [{"name": "vane-ai", "version": "0.1.0"}]},
+        {"bomFormat": "CycloneDX", "components": [None]},
+        {"bomFormat": "CycloneDX", "components": {"name": "vane-ai", "version": "0.2.0"}},
+    ],
+)
+def test_unqualified_sbom_stops_before_github_access(asset_tree, github, sbom):
+    _, calls, uploads, _ = github
+    (asset_tree / "release-assets" / "vane-ai-sbom.cdx.json").write_text(json.dumps(sbom))
+    with pytest.raises(ValueError, match="SBOM"):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert not calls and not uploads
 

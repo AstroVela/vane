@@ -82,6 +82,17 @@ def validate_assets(assets: dict[str, Asset]) -> str:
         checksums[match[2]] = match[1]
     if set(checksums) != distributions or any(assets[name].sha256 != digest for name, digest in checksums.items()):
         raise ValueError("SHA256SUMS does not match the complete distribution set")
+    sbom = json.loads(assets["vane-ai-sbom.cdx.json"].path.read_text(encoding="utf-8"))
+    if not isinstance(sbom, dict) or sbom.get("bomFormat") != "CycloneDX":
+        raise ValueError("release SBOM must be a CycloneDX object")
+    components = sbom.get("components")
+    if not isinstance(components, list) or not any(
+        isinstance(component, dict)
+        and component.get("name") in ("vane-ai", "vane_ai")
+        and component.get("version") == version
+        for component in components
+    ):
+        raise ValueError("release SBOM must contain the matching vane-ai package component")
     return version
 
 

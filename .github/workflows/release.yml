@@ -936,10 +936,23 @@ jobs:
           mkdir -p release-assets
           (cd packages && sha256sum *.tar.gz *.whl) > release-assets/SHA256SUMS
 
+      - name: Unpack validated wheels for the SBOM catalog
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path("release-sbom")
+          root.mkdir()
+          for wheel in sorted(Path("packages").glob("*.whl")):
+              with ZipFile(wheel) as archive:
+                  archive.extractall(root / wheel.stem)
+          PY
+
       - name: Generate a CycloneDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: packages
+          path: release-sbom
           format: cyclonedx-json
           output-file: release-assets/vane-ai-sbom.cdx.json
           upload-artifact: false
