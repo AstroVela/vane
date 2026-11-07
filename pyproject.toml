@@ -39,6 +39,8 @@ dependencies = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Database",
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Scientific/Engineering",
