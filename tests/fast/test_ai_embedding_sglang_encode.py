@@ -16,6 +16,7 @@ from vane.ai.provider import _ProviderResultError
 
 httpx = pytest.importorskip("httpx")
 
+# The shared module may already be partially imported after its optional skip.
 from .test_ai_embedding_http_runtime import _content, _descriptor, _part, _run, _text
 
 

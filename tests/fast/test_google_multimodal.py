@@ -287,6 +287,10 @@ def test_invalid_vectors_abort_joint_encoding(sdk, values):
 
 
 @pytest.mark.parametrize("vertex", [False, True])
+@pytest.mark.filterwarnings(
+    "ignore:^Inheritance class AiohttpClientSession from ClientSession is discouraged$:DeprecationWarning"
+    r":google\.genai\._api_client$"
+)
 def test_real_sdk_preserves_media_parts_and_independent_rows(monkeypatch, pillow, google_http_server, vertex):
     from google.genai import types
 

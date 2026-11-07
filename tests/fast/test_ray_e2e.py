@@ -3512,6 +3512,29 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
     run_once(f"{label}: repeat")
 
 
+@pytest.mark.parametrize("join_type", ["INNER", "LEFT", "FULL OUTER"])
+def test_ray_single_partition_hash_join_keeps_both_scan_sources(
+    ray_runner, duckdb_conn, tmp_path, monkeypatch, join_type
+):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    duckdb_conn.execute("SET threads = 1")
+    left = tmp_path / "single_join_left.parquet"
+    right = tmp_path / "single_join_right.parquet"
+    duckdb_conn.execute(f"COPY (SELECT i AS id, i%4 AS k FROM range(12)t(i)) TO '{left}' (FORMAT PARQUET)")
+    duckdb_conn.execute(f"COPY (SELECT i AS id, i%5 AS k FROM range(8)t(i)) TO '{right}' (FORMAT PARQUET)")
+    query = (
+        f"SELECT l.id,r.id FROM read_parquet('{left}') l "
+        f"{join_type} JOIN read_parquet('{right}') r ON l.k=r.k ORDER BY l.id,r.id"
+    )
+    relation = duckdb_conn.sql(query)
+    plan_text, partitions = _get_distributed_plan_info(relation, "single-partition hash join")
+    assert partitions == 1
+    assert "Hash Join [partitions=1]" in plan_text
+    parts = _run_iter_tables(ray_runner, relation, f"single-partition {join_type} join", timeout_s=60.0)
+    _assert_results_match(duckdb_conn, query, parts, f"single-partition {join_type} join", ordered=True)
+
+
 def test_ray_streaming_sample(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: streaming sample"
     sql = f"""
