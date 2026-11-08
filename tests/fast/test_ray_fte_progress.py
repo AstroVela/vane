@@ -258,6 +258,8 @@ def test_progress_snapshot_uses_logical_partition_counts_and_selected_stats():
     assert snapshot["processed_rows"] == 8
     assert snapshot["processed_bytes"] == 24
     assert snapshot["fragments"][0]["display_id"] == "1"
+    assert snapshot["fragments"][0]["total_partitions"] == 4
+    assert snapshot["fragments"][0]["completed_partitions"] == 2
     assert snapshot["fragments"][0]["pipelines"] == []
 
 
@@ -555,7 +557,17 @@ def test_fragment_does_not_mix_deferred_partitions_with_native_pipeline_tasks():
     assert snapshot["running_partitions"] == 7
     assert snapshot["completed_partitions"] == 0
     assert snapshot["pending_partitions"] == 29
-    assert set(fragment) == {"id", "display_id", "name", "pending_partitions", "pipelines"}
+    assert set(fragment) == {
+        "id",
+        "display_id",
+        "name",
+        "total_partitions",
+        "completed_partitions",
+        "pending_partitions",
+        "pipelines",
+    }
+    assert fragment["total_partitions"] == 36
+    assert fragment["completed_partitions"] == 0
     assert fragment["pending_partitions"] == 29
     assert sum(pipeline["queued_pipeline_tasks"] for pipeline in fragment["pipelines"]) == 14
     assert sum(pipeline["running_pipeline_tasks"] for pipeline in fragment["pipelines"]) == 14
