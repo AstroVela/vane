@@ -55,7 +55,7 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 
 	m.def(
 	    "flight_exchange_selected_attempt_dataplane_for_test",
-	    [](const std::string &local_dir) {
+	    [](const std::string &local_dir, bool remote_reader) {
 		    using namespace duckdb;
 		    using namespace duckdb::distributed;
 
@@ -84,13 +84,13 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 			    auto sink = mgr.CreateSink(instance);
 			    DataChunk chunk;
 			    chunk.Initialize(Allocator::DefaultAllocator(), types);
-			    chunk.SetCardinality(values.size());
-			    for (idx_t row = 0; row < values.size(); row++) {
-				    chunk.SetValue(0, row, Value::INTEGER(values[row]));
-			    }
-			    auto add_res = sink->AddChunk(0, chunk);
-			    if (add_res.is_err()) {
-				    throw std::runtime_error(add_res.error().what());
+			    chunk.SetCardinality(1);
+			    for (auto value : values) {
+				    chunk.SetValue(0, 0, Value::INTEGER(value));
+				    auto add_res = sink->AddChunk(0, chunk);
+				    if (add_res.is_err()) {
+					    throw std::runtime_error(add_res.error().what());
+				    }
 			    }
 			    auto finish_res = sink->Finish();
 			    if (finish_res.is_err()) {
@@ -102,7 +102,11 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    auto lost_node_id = write_attempt(lost_instance, {101});
 		    lost_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    lost_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
-		    auto selected_node_id = write_attempt(selected_instance, {201, 202});
+		    std::vector<int32_t> selected_values;
+		    for (int32_t value = 201; value <= (remote_reader ? 213 : 202); ++value) {
+			    selected_values.push_back(value);
+		    }
+		    auto selected_node_id = write_attempt(selected_instance, std::move(selected_values));
 		    selected_instance.flight_host = FlightExchangeManager::GetLocalFlightServerHost();
 		    selected_instance.flight_server_epoch = FlightExchangeManager::GetLocalFlightServerEpoch();
 		    const auto flight_port = FlightExchangeManager::GetLocalFlightServerPort();
@@ -111,7 +115,12 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    auto handles = exchange->GetSourceHandles();
 
 		    auto read_values = [&](const std::vector<ExchangeSourceHandle> &source_handles) {
-			    auto source = mgr.CreateSource();
+			    auto reader_config = config;
+			    if (remote_reader) {
+				    reader_config.node_id = "remote-reader";
+			    }
+			    FlightExchangeManager reader(reader_config, &context);
+			    auto source = reader.CreateSource();
 			    auto copied_handles = source_handles;
 			    source->AddSourceHandles(std::move(copied_handles));
 			    DataChunk output;
@@ -171,7 +180,8 @@ void RegisterRayExchangeTestsBindings(py::module_ &m) {
 		    }
 		    return out;
 	    },
-	    py::arg("local_dir"), "Verify FlightExchangeSource reads only the selected retry attempt data.");
+	    py::arg("local_dir"), py::arg("remote_reader") = false,
+	    "Verify FlightExchangeSource reads only the selected retry attempt data.");
 
 	m.def(
 	    "flight_exchange_local_dirs_from_env_for_test",

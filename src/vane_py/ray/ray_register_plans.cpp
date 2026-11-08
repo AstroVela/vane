@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ray_binding_internal.hpp"
+#include "duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp"
+#include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 
 namespace duckdb {
 namespace ray_bindings {
@@ -60,6 +62,14 @@ void RegisterRayPlansBindings(py::module_ &m) {
 	    .def("_release_vane_fs_query_pins",
 	         [](PyPhysicalPlanWrapper &plan) { plan.vane_fs_query_pins_ = CreateVaneFSQueryPins(); })
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
+	    .def_property_readonly("_requires_cte_exchange",
+	                           [](const PyPhysicalPlanWrapper &plan) {
+		                           const PhysicalRemoteExchangeSink *sink = nullptr;
+		                           return plan.has_root() &&
+		                                  distributed::TryGetUniqueRemoteExchangeSink(
+		                                      plan.plan_->physical_plan()->Root(), sink) &&
+		                                  sink && sink->PartitionsByTask();
+	                           })
 	    .def("_memory_source_ref_count_for_test",
 	         [](const PyPhysicalPlanWrapper &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
 	    .def("clone", &PyPhysicalPlanWrapper::clone, py::arg("conn") = py::none())

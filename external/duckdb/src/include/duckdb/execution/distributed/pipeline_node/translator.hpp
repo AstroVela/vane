@@ -77,9 +77,15 @@ private:
 	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
 	std::unordered_set<const PhysicalUnion *> ordered_unions_;
+	std::unordered_set<idx_t> ordered_ctes_;
+	std::unordered_map<idx_t, DistributedPipelineNodeRef> cte_inputs_;
+	std::unordered_set<int> reserved_source_ids_;
 
 	int get_next_pipeline_node_id() {
-		return ++pipeline_node_id_counter_;
+		do {
+			++pipeline_node_id_counter_;
+		} while (reserved_source_ids_.count(pipeline_node_id_counter_));
+		return pipeline_node_id_counter_;
 	}
 
 	void CollectUnionOrderRequirements(const PhysicalOperator &op, bool output_order_required);
@@ -202,7 +208,7 @@ private:
 	TranslateUngroupedAggregate(const PhysicalUngroupedAggregate &op,
 	                            const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
-	std::shared_ptr<DistributedPipelineNode> TranslateCTESource(PhysicalOperator &op);
+	void VisitMaterializedCTE(PhysicalOperator &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateDummyScanSource(const PhysicalDummyScan &op);
 

@@ -162,6 +162,9 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 	if (collect_mark_join_build_summary) {
 		sink.EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 	}
+	if (exchange_context.partition_by_task) {
+		sink.EnableTaskPartitioning();
+	}
 	sink.children.push_back(old_root);
 	plan->SetRoot(sink);
 	return plan;

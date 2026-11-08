@@ -47,6 +47,8 @@ print(os.pathsep.join(paths))
 ' "$project_root")"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-release-tests.XXXXXX")"
 cleanup_test_workdir() {
+  # Release Windows' current-directory handle before deleting the directory.
+  cd "$project_root"
   rm -rf -- "$test_workdir"
 }
 trap cleanup_test_workdir EXIT
@@ -100,6 +102,7 @@ release_tests=(
   "$project_root/tests/fast/test_expression_udf_contracts.py"
   "$project_root/tests/fast/test_local_e2e.py"
   "$project_root/tests/fast/test_ray_cpp_bindings.py"
+  "$project_root/tests/fast/test_ray_materialized_cte.py"
   "$project_root/tests/fast/test_ray_diagnostics.py"
   "$project_root/tests/fast/test_ray_remote_exceptions.py"
   "$project_root/tests/fast/test_ray_result_contract.py"

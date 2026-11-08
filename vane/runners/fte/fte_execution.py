@@ -2039,10 +2039,13 @@ class FteFragmentExecution:
             worker_incarnation_id=worker.worker_incarnation_id,
             remote_handle=worker,
         )
+        # The descriptor can contain only a Ray ObjectRef on another worker or retry.
+        # Keep the writer's wire-format requirement with its immutable sink configuration.
+        registration_options = {}
+        if self.exchange_sink_config and self.exchange_sink_config.get("partition_by_task"):
+            registration_options["requires_cte_exchange"] = True
         registration_result = worker.ensure_fragment_registered(
-            self.query_id,
-            self.fragment_id,
-            scheduled.descriptor.fragment_plan,
+            self.query_id, self.fragment_id, scheduled.descriptor.fragment_plan, **registration_options
         )
         if registration_result is not None:
             scheduled.request["fragment_registration_result"] = registration_result
