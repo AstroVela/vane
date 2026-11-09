@@ -680,12 +680,25 @@ service = dict(
     provider="sglang", model="my-supported-embedding-checkpoint", dimensions=768,
     runtime="service", service_path="/tmp/my-embedding/engine.json",
     service_id="retrieval-model-revision-1",
+    service_batch_rows=8,
 )
 clip_vector = embed(MultimodalInput([
     VideoInput(vane.col("frames")), TextInput(vane.col("transcript")),
 ]), **service)
 query_vector = embed(TextInput(vane.col("query")), **service)
 ```
+
+For MLX, SGLang and vLLM services, `service_batch_rows` selects up to 256
+input rows per RPC (default 1). Each batch shares one reservation, shared
+memory block and response. The client also limits each batch to fit both
+control messages. MLX uses the existing list encoder for the selected role
+and modality. SGLang and vLLM submit the rows concurrently to their existing
+engine and return vectors in input order. The service metrics `accepted` and
+`completed` count RPCs, so seven rows with `service_batch_rows=3` normally
+complete three RPCs (3, 3, 1). A batch rejected for exceeding the
+service byte budget can proceed as individual rows. MLX can also authorize
+individual calls after a collective encode has returned an ordinary failure.
+Timeouts, disconnects and resource exhaustion never trigger replay.
 
 The native joint adapter renders the ordered parts once, then submits one
 embedding request per row. SGLang receives one combined `processor_output`

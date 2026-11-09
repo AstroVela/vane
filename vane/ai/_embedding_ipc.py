@@ -21,6 +21,17 @@ from vane.ai._video_embedding import VideoClip, VideoInputSpec
 
 VERSION = 2
 MAX_CONTROL_BYTES = 1024**2
+MAX_BATCH_ROWS = 256
+
+
+class BatchRejected(RuntimeError):
+    """The service explicitly permits retrying a batch as individual rows."""
+
+
+def max_response_rows(dimensions: int) -> int:
+    # A finite float32 rendered as JSON fits in 32 bytes including delimiters.
+    # Leave room for the signed response's identity and state fields.
+    return min(MAX_BATCH_ROWS, (MAX_CONTROL_BYTES - 256) // (32 * dimensions + 2))
 
 
 @dataclass(frozen=True)
@@ -171,9 +182,10 @@ def input_spec(options: dict[str, Any]) -> MultimodalInputSpec:
     )
 
 
-def describe(
-    content: EmbeddingContent, spec: MultimodalInputSpec
-) -> tuple[list[dict[str, Any]], list[np.ndarray[Any, Any]], int]:
+RowPlan = tuple[list[dict[str, Any]], list[np.ndarray[Any, Any]], int]
+
+
+def describe(content: EmbeddingContent, spec: MultimodalInputSpec) -> RowPlan:
     """Validate transport types/budgets before admission; describe array copies.
 
     Standalone TextInput preserves blank strings. MultimodalInput's conversion
@@ -363,3 +375,18 @@ def encode(value: Any) -> bytes:
     if len(data) > MAX_CONTROL_BYTES:
         raise EmbeddingConfigurationError("Embedding control message exceeds 1 MiB")
     return data
+
+
+def restore_batch(
+    rows: list[dict[str, Any]], snapshot: bytearray | None, spec: MultimodalInputSpec
+) -> list[EmbeddingContent]:
+    contents = []
+    payload = memoryview(snapshot if snapshot is not None else b"")
+    offset = 0
+    for row in rows:
+        end = offset + row["nbytes"]
+        content = restore(row["parts"], payload[offset:end])
+        describe(content, spec)
+        contents.append(content)
+        offset = end
+    return contents
