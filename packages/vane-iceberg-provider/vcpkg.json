@@ -1,0 +1,25 @@
+{
+  "name": "vane-iceberg-qualification-dependencies",
+  "version-string": "0.1.0",
+  "builtin-baseline": "44819aa2a6c10e56065e2b0330e7d6c89d1d2574",
+  "dependencies": [
+    "avro-c",
+    {
+      "name": "aws-sdk-cpp",
+      "default-features": false,
+      "features": ["sso", "sts"]
+    },
+    "curl",
+    "roaring"
+  ],
+  "vcpkg-configuration": {
+    "registries": [
+      {
+        "kind": "git",
+        "repository": "https://github.com/duckdb/vcpkg-duckdb-ports",
+        "baseline": "f13de79b66345fe31d3f9c119517613023d194a8",
+        "packages": ["avro-c", "vcpkg-cmake"]
+      }
+    ]
+  }
+}
