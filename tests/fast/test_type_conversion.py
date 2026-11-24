@@ -11,6 +11,10 @@ Issue #171: Dictionary key case sensitivity not respected for parameter bindings
 Issue #330: Integers >64-bit lose precision via double conversion
 """
 
+import subprocess
+import sys
+from datetime import datetime
+
 import numpy as np
 import pytest
 
@@ -147,3 +151,60 @@ class TestIssue330LargeIntegerPrecision:
         conn.create_function("big_uhugeint", lambda: value, return_type=UHUGEINT)
         result = conn.sql("SELECT big_uhugeint()").fetchone()[0]
         assert result == value
+
+
+def test_nested_numeric_parameters_probe_pandas_independently_of_dimension():
+    script = """
+import importlib.abc
+import sys
+
+
+class MissingPandas(importlib.abc.MetaPathFinder):
+    def __init__(self):
+        self.attempts = 0
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "pandas":
+            self.attempts += 1
+            raise ModuleNotFoundError("No module named 'pandas'", name=fullname)
+
+
+pandas = MissingPandas()
+sys.meta_path.insert(0, pandas)
+
+import vane
+
+sql = "SELECT ?::STRUCT(id BIGINT, embedding FLOAT[], active BOOLEAN, payload VARCHAR)[]"
+counts = []
+with vane.connect() as connection:
+    for dimension in (8, 128):
+        rows = [
+            {
+                "id": key,
+                "embedding": [(key + offset - 8) / 16 for offset in range(dimension)],
+                "active": key % 2 == 0,
+                "payload": "向量" if key else None,
+            }
+            for key in range(8)
+        ]
+        before = pandas.attempts
+        assert connection.execute(sql, [rows]).fetchone() == (rows,)
+        counts.append(pandas.attempts - before)
+assert "pandas" not in sys.modules
+assert counts[0] == counts[1], counts
+"""
+    result = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pandas_null_sentinels_in_parameter_binding():
+    pd = pytest.importorskip("pandas")
+    timestamp = datetime(2026, 1, 2, 3, 4, 5)
+    with vane.connect() as connection:
+        assert connection.execute(
+            "SELECT ? IS NULL, ? IS NULL, ?::TIMESTAMP", [pd.NA, pd.NaT, timestamp]
+        ).fetchone() == (
+            True,
+            True,
+            timestamp,
+        )

@@ -400,11 +400,8 @@ Value TransformDictionary(const PyDictionary &dict) {
 PythonObjectType GetPythonObjectType(py::handle &ele) {
 	auto &import_cache = *DuckDBPyConnection::ImportCache();
 
+	// Classify common Python scalars before probing the optional pandas sentinels.
 	if (ele.is_none()) {
-		return PythonObjectType::None;
-	} else if (ele.is(import_cache.pandas.NaT())) {
-		return PythonObjectType::None;
-	} else if (ele.is(import_cache.pandas.NA())) {
 		return PythonObjectType::None;
 	} else if (py::isinstance<py::bool_>(ele)) {
 		return PythonObjectType::Bool;
@@ -412,6 +409,10 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::Integer;
 	} else if (py::isinstance<py::float_>(ele)) {
 		return PythonObjectType::Float;
+	} else if (ele.is(import_cache.pandas.NaT())) {
+		return PythonObjectType::None;
+	} else if (ele.is(import_cache.pandas.NA())) {
+		return PythonObjectType::None;
 	} else if (py::isinstance(ele, import_cache.decimal.Decimal())) {
 		return PythonObjectType::Decimal;
 	} else if (py::isinstance(ele, import_cache.uuid.UUID())) {
