@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from urllib.parse import SplitResult, urlsplit
 
 _MIME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -78,19 +78,28 @@ def _split_image_url(value: str) -> SplitResult:
     return url
 
 
+def configured_prompt_image_origin() -> tuple[str, str]:
+    configured_origin = os.environ.get("VANE_AI_IMAGE_URL_ORIGIN")
+    if not configured_origin:
+        raise ValueError("Prompt image URLs require VANE_AI_IMAGE_URL_ORIGIN on the execution worker")
+    message = "VANE_AI_IMAGE_URL_ORIGIN must contain only an HTTP(S) scheme, host and optional port"
+    try:
+        origin = _split_image_url(configured_origin)
+    except ValueError:
+        raise ValueError(message) from None
+    if origin.path not in {"", "/"} or origin.query:
+        raise ValueError(message)
+    return origin.scheme, origin.netloc.lower()
+
+
 @dataclass(frozen=True, repr=False, slots=True)
 class PromptImageURL:
     """Worker-local URL forwarded to an OpenAI-compatible image fetcher."""
 
     url: str
+    allowed_origin: InitVar[tuple[str, str]]
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, allowed_origin: tuple[str, str]) -> None:
         url = _split_image_url(self.url)
-        configured_origin = os.environ.get("VANE_AI_IMAGE_URL_ORIGIN")
-        if not configured_origin:
-            raise ValueError("Prompt image URLs require VANE_AI_IMAGE_URL_ORIGIN on the execution worker")
-        origin = _split_image_url(configured_origin)
-        if origin.path not in {"", "/"} or origin.query:
-            raise ValueError("VANE_AI_IMAGE_URL_ORIGIN must contain only scheme, host and optional port")
-        if (url.scheme, url.netloc.lower()) != (origin.scheme, origin.netloc.lower()):
+        if (url.scheme, url.netloc.lower()) != allowed_origin:
             raise ValueError("Prompt image URL does not match VANE_AI_IMAGE_URL_ORIGIN")

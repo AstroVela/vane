@@ -47,7 +47,7 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
-from vane.ai._media import PromptImageURL, PromptMedia, normalize_media_content_type
+from vane.ai._media import PromptImageURL, PromptMedia, configured_prompt_image_origin, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -1115,6 +1115,7 @@ class _EmbedTextBatch:
 class _PromptBatch:
     """Actor-local row-preserving wrapper for ordered text/media Prompt parts."""
 
+    # Serialized Prompt batches created before image URL support lack this field.
     _image_url_indices: frozenset[int] = frozenset()
 
     def __init__(
@@ -1303,7 +1304,9 @@ class _PromptBatch:
             f"got {type(value).__name__}"
         )
 
-    def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
+    def _build_row_messages(
+        self, columns: list[list[Any]], index: int, allowed_image_origin: tuple[str, str] | None
+    ) -> tuple[Any, ...] | None:
         if self._packed_input_column is not None:
             packed = columns[0][index]
             if packed is None:
@@ -1318,7 +1321,8 @@ class _PromptBatch:
         parts: list[Any] = []
         for part_index, value in enumerate(values):
             if part_index in self._image_url_indices and value is not None:
-                parts.append(PromptImageURL(value))
+                assert allowed_image_origin is not None
+                parts.append(PromptImageURL(value, allowed_image_origin))
             else:
                 self._append_message_value(parts, value)
         return tuple(parts) if parts else None
@@ -1337,6 +1341,7 @@ class _PromptBatch:
         )
 
     def __call__(self, table: pa.Table) -> pa.Table:
+        allowed_image_origin = configured_prompt_image_origin() if self._image_url_indices else None
         input_columns = [self._packed_input_column] if self._packed_input_column is not None else self._message_columns
         columns = [table.column(name).to_pylist() for name in input_columns]
         row_count = table.num_rows
@@ -1344,7 +1349,7 @@ class _PromptBatch:
         row_messages: dict[int, tuple[Any, ...]] = {}
         for index in range(row_count):
             try:
-                messages = self._build_row_messages(columns, index)
+                messages = self._build_row_messages(columns, index, allowed_image_origin)
             except Exception as exc:
                 if self._on_error == "raise":
                     raise
@@ -1875,7 +1880,10 @@ def image_url(expression: Expression) -> _ImageURLExpression:
     """Mark a VARCHAR expression as an image URL for an OpenAI-compatible endpoint.
 
     Configure VANE_AI_IMAGE_URL_ORIGIN on the worker to an operator-controlled
-    image origin. The model endpoint fetches the image and controls redirects.
+    image origin (scheme, host and optional port). The worker checks the supplied
+    URL against that origin and permits any path on it. Missing or invalid worker
+    configuration fails the query. The model endpoint fetches the image and
+    controls MIME validation, download size limits and redirect handling.
     """
     if not is_expression(expression):
         raise TypeError("image_url expects a VARCHAR Expression")

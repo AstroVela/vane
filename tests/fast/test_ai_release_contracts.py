@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 import sys
 import threading
@@ -22,6 +23,126 @@ def _drive(wrapper, table: pa.Table) -> pa.Table:
         return wrapper(table)
     finally:
         loop.close()
+
+
+@pytest.mark.parametrize("entry_point", ["relation", "expression"])
+@pytest.mark.parametrize("chat_completions", [True, False])
+def test_prompt_image_url_preserves_part_order_and_provider_format(monkeypatch, entry_point, chat_completions):
+    import vane
+    from vane.ai import image_url, prompt
+    from vane.ai.providers.openai import OpenAIPrompter, OpenAIPrompterDescriptor, OpenAIProvider
+
+    class RecordingPrompter(OpenAIPrompter):
+        def __init__(self, use_chat_completions):
+            self._use_chat_completions = use_chat_completions
+            self._system_message = None
+
+        async def _prompt_chat_completions(self, messages):
+            return json.dumps(messages[0]["content"])
+
+        _prompt_responses = _prompt_chat_completions
+
+        async def aclose(self):
+            pass
+
+    class RecordingDescriptor(OpenAIPrompterDescriptor):
+        def instantiate(self):
+            return RecordingPrompter(self.options["use_chat_completions"])
+
+    origin = "https://frames.example.test"
+    monkeypatch.setenv("VANE_AI_IMAGE_URL_ORIGIN", origin)
+    text = f"Look at the image and see {origin}/help for context."
+    url = f"{origin}/frame.jpg?signature=fixture"
+    provider = OpenAIProvider()
+    monkeypatch.setattr(provider, "get_prompter", lambda **kwargs: RecordingDescriptor(options=kwargs["options"]))
+
+    with vane.connect() as con:
+        relation = con.sql("SELECT ?::VARCHAR AS text, ?::VARCHAR AS url", params=[text, url])
+        parts = [vane.col("text"), image_url(vane.col("url"))]
+        options = {"provider": provider, "use_chat_completions": chat_completions}
+        if entry_point == "relation":
+            query = prompt(relation, parts, **options).project("response")
+        else:
+            query = relation.select(prompt(parts, **options))
+        (response,) = query.fetchone()
+
+    expected = (
+        [{"type": "text", "text": text}, {"type": "image_url", "image_url": {"url": url}}]
+        if chat_completions
+        else [{"type": "input_text", "text": text}, {"type": "input_image", "image_url": url}]
+    )
+    assert json.loads(response) == expected
+
+
+@pytest.mark.parametrize("origin", [None, "https://frames.example.test/api", "file://frames.example.test"])
+def test_prompt_image_url_invalid_worker_configuration_fails_with_ignore(monkeypatch, origin):
+    from vane.ai.functions import _PromptBatch
+
+    if origin is None:
+        monkeypatch.delenv("VANE_AI_IMAGE_URL_ORIGIN", raising=False)
+    else:
+        monkeypatch.setenv("VANE_AI_IMAGE_URL_ORIGIN", origin)
+    wrapper = _PromptBatch(object(), ["url"], "response", on_error="ignore", image_url_indices=frozenset({0}))
+
+    with pytest.raises(ValueError, match="VANE_AI_IMAGE_URL_ORIGIN"):
+        _drive(wrapper, pa.table({"url": ["https://frames.example.test/frame.jpg"]}))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://other.example.test/frame.jpg",
+        "http://frames.example.test/frame.jpg",
+        "https://user@frames.example.test/frame.jpg",
+        "https://frames.example.test/frame.jpg#fragment",
+        "https://frames.example.test:invalid/frame.jpg",
+        "/frame.jpg",
+        "file:///frame.jpg",
+        "ftp://frames.example.test/frame.jpg",
+    ],
+)
+def test_prompt_image_url_rejects_invalid_row_url(monkeypatch, url):
+    from vane.ai.functions import _PromptBatch
+
+    monkeypatch.setenv("VANE_AI_IMAGE_URL_ORIGIN", "https://frames.example.test")
+    wrapper = _PromptBatch(object(), ["url"], "response", image_url_indices=frozenset({0}))
+
+    with pytest.raises(ValueError, match="Prompt image URL"):
+        _drive(wrapper, pa.table({"url": [url]}))
+
+
+@pytest.mark.parametrize("entry_point", ["relation", "expression"])
+def test_prompt_image_url_requires_varchar(entry_point):
+    import vane
+    from vane.ai import image_url, prompt
+
+    with vane.connect() as con:
+        relation = con.sql("SELECT 'not a URL'::BLOB AS image")
+        message = image_url(vane.col("image"))
+        with pytest.raises((TypeError, vane.BinderException), match="VARCHAR"):
+            if entry_point == "relation":
+                prompt(relation, message)
+            else:
+                relation.select(prompt(message))
+
+
+def test_prompt_image_url_rejects_unsupported_provider():
+    import vane
+    from vane.ai import image_url, prompt
+
+    with pytest.raises(ValueError, match="OpenAI-compatible provider with image support"):
+        prompt(image_url(vane.col("image")), provider="anthropic", model="claude-test", max_tokens=64)
+
+
+def test_prompt_batch_unpickles_state_created_before_image_url_support():
+    from vane.ai.functions import _PromptBatch
+
+    wrapper = _PromptBatch(object(), ["text"], "response")
+    del wrapper._image_url_indices
+    restored = pickle.loads(pickle.dumps(wrapper))
+    table = pa.table({"text": pa.array([None], type=pa.string())})
+
+    assert _drive(restored, table).to_pylist() == [{"response": None}]
 
 
 def _assert_only_cancellation_context(error: asyncio.CancelledError) -> None:
