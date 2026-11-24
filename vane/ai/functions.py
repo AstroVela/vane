@@ -2344,7 +2344,12 @@ def _prompt_relation(
     if has_file_inputs:
         udf_inputs = {
             _PROMPT_PACKED_INPUT_COLUMN: _packed_prompt_messages(
-                message_expressions,
+                [
+                    _validated_prompt_message(message, media_policy="text")
+                    if index in image_url_indices
+                    else message
+                    for index, message in enumerate(message_expressions)
+                ],
                 supports_media_inputs=supports_media_inputs,
                 supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
                 single_message=single_message,
@@ -2353,7 +2358,10 @@ def _prompt_relation(
     else:
         media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
         validated_messages = [
-            _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
+            _validated_prompt_message(
+                message, media_policy="text" if index in image_url_indices else media_policy
+            )
+            for index, message in enumerate(message_expressions)
         ]
         udf_inputs = dict(zip(input_names, validated_messages, strict=True))
     wrapper = _PromptBatch(
