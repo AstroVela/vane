@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vane.ai._schema import OutputValidationError, SchemaValidationError
-    from vane.ai.functions import embed, prompt
+    from vane.ai.functions import embed, image_url, prompt
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
@@ -39,6 +39,7 @@ __all__ = [
     "SchemaValidationError",
     "UDFOptions",
     "embed",
+    "image_url",
     "load_provider",
     "prompt",
 ]
@@ -55,6 +56,7 @@ _LAZY_EXPORTS = {
     "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
     "embed": ("vane.ai.functions", "embed"),
+    "image_url": ("vane.ai.functions", "image_url"),
     "load_provider": ("vane.ai.provider", "load_provider"),
     "prompt": ("vane.ai.functions", "prompt"),
 }
