@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane import PythonExceptionHandling
+from vane.ai._errors import _diagnostic_message, _restore_diagnostic_error, summarize_error
 from vane.execution._async_runtime import AsyncRuntime
 from vane.execution._common import (
     ensure_table as _ensure_table,
@@ -31,6 +32,8 @@ from vane.execution._common import (
 from vane.execution._common import (
     load_udf_from_payload,
     load_udf_from_payload_cached,
+    release_udf_cleanup,
+    retain_udf_cleanup,
 )
 from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
@@ -507,6 +510,9 @@ class UDFExecutor:
         self._finished_submitting = False
         self._closed = False
         self._close_started = False
+        self._cached_payload = (
+            payload if cache_callable and (cache_max_entries is None or cache_max_entries > 0) else None
+        )
         self._async_runtime: AsyncRuntime | None = None
         self._actor_callable: ActorCallableRuntime | None = None
         self._call_mode = str(payload.get("call_mode") or "")
@@ -1174,11 +1180,24 @@ class UDFExecutor:
                 MAX_CLOSE_ERROR_BYTES,
                 strip=False,
             )
-            # Do not retain a provider exception as the cause or context. Ray
-            # serializes the complete exception graph before the driver can
-            # apply its own diagnostic bounds.
-            raise RuntimeError(message)
+            cached_payload = getattr(self, "_cached_payload", None)
+            if cached_payload is not None:
+                retain_udf_cleanup(cached_payload, self)
+            # Capture types/errno while the original errors are still present,
+            # then transport only bounded strings, not the provider graph.
+            diagnostic = RuntimeError(message)
+            diagnostic.primary_error = close_errors[0][1]  # type: ignore[attr-defined]
+            diagnostic.cleanup_errors = tuple(error for _, error in close_errors[1:])  # type: ignore[attr-defined]
+            summary = summarize_error(diagnostic)
+            header = _diagnostic_message(summary, "")
+            message = header + bounded_utf8_text(
+                message, MAX_CLOSE_ERROR_BYTES - len(header.encode("utf-8")), strip=False
+            )
+            raise _restore_diagnostic_error(message, summary)
         self._closed = True
+        cached_payload = getattr(self, "_cached_payload", None)
+        if cached_payload is not None:
+            release_udf_cleanup(cached_payload, self)
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

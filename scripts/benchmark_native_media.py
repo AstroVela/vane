@@ -17,7 +17,6 @@ import json
 import multiprocessing
 import os
 import platform
-import resource
 import statistics
 import tempfile
 import threading
@@ -27,6 +26,7 @@ from contextlib import ExitStack, contextmanager
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 OPERATIONS = {
     "image_metadata": "image",
@@ -36,6 +36,25 @@ OPERATIONS = {
     "video_metadata": "video",
     "video_frames": "video",
 }
+
+
+class _BenchmarkHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # Only numeric loopback is served. HTTPServer's reverse lookup can
+        # block the spawned process before it announces its ready port.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
+
+def _process_peak_rss_bytes():
+    if os.name == "nt":
+        import psutil
+
+        return psutil.Process().memory_info().peak_wset
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if platform.system() == "Darwin" else peak * 1024
 
 
 def _digest(path):
@@ -108,7 +127,7 @@ def _http_server(paths, delay, counters, control):
         def log_message(self, *_args):
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+    with _BenchmarkHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         control.send(server.server_port)
@@ -393,7 +412,7 @@ def main() -> None:
                     {"seconds": elapsed, "cpu_seconds": cpu_elapsed, "http": traffic, "results": result}
                 )
 
-        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_rss = _process_peak_rss_bytes()
         if args.diagnostics:
             for backend in backends:
                 with _temporary_writes() as temporary:
@@ -449,7 +468,7 @@ def main() -> None:
         "median_seconds": {
             key: statistics.median(sample["seconds"] for sample in value) for key, value in timings.items()
         },
-        "process_peak_rss_bytes": peak_rss if platform.system() == "Darwin" else peak_rss * 1024,
+        "process_peak_rss_bytes": peak_rss,
         "process_metrics_scope": "driver only; excludes HTTP server and Ray workers; includes imports, loading, warmups and timed queries; excludes subsequent diagnostics",
         "results": results,
         "aggregate_results_match": all(value == next(iter(results.values())) for value in results.values()),

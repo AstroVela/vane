@@ -6,16 +6,39 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/vector.hpp"
+#include <pybind11/pybind11.h>
 
 namespace duckdb {
 
 class ClientContext;
+class DatabaseInstance;
 class ClientContextState;
 class PythonUDFActorResourceState;
+class PreparedStatementData;
+struct UDFFunctionData;
+
+//! Prepare and retire local UDF resources on connections opened by native extensions too.
+void RegisterPythonUDFConnectionCallbacks(DatabaseInstance &db);
+
+//! Install opaque Python owners and native transport capacity together; requires the GIL.
+void ApplyUDFExecutorOptions(UDFFunctionData &bind_data, const pybind11::object &options);
+
+//! Read native topology through the common metadata collector without taking plan ownership.
+pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared);
+
+//! Apply the input policy during binding too, before a runtime request exists.
+//! Both functions require the GIL and do not acquire the native context lock.
+void EnableLocalRuntimeInputPolicy(ClientContext &context);
+bool HasLocalRuntimeInputPolicy(const ClientContext &context);
+
+//! Cancel ordinary native UDF startup without waiting for the context lock.
+//! Requires the GIL; the active preparation scope owns the cancellation state.
+void CancelPythonUDFActorResourcePreparation(ClientContext &context);
 
 class ScopedPythonUDFActorResourcePreparation {
 public:
-	explicit ScopedPythonUDFActorResourcePreparation(ClientContext &context);
+	explicit ScopedPythonUDFActorResourcePreparation(ClientContext &context,
+	                                                 pybind11::object local_query = pybind11::none());
 	~ScopedPythonUDFActorResourcePreparation();
 	vector<string> TakeCleanupWarnings();
 

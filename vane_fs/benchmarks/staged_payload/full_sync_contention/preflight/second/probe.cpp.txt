@@ -1,0 +1,174 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "../checkpoint_progress/fixture.hpp"
+#include "request_trace.hpp"
+#include <fstream>
+#include <iomanip>
+
+static sqlite3 *writer = nullptr;
+static Checkpointer *worker = nullptr;
+using WalHook = int (*)(void *, sqlite3 *, const char *, int);
+extern "C" void *__real_sqlite3_wal_hook(sqlite3 *, WalHook, void *);
+extern "C" void *__wrap_sqlite3_wal_hook(sqlite3 *db, WalHook hook, void *context) {
+	if (hook == Checkpointer::OnCommit) {
+		Require(writer == nullptr, "Expected one workspace writer");
+		writer = db;
+		worker = static_cast<Checkpointer *>(context);
+	}
+	if (!hook && db == writer) {
+		writer = nullptr;
+		worker = nullptr;
+	}
+	// The original callback and context remain registered in both arms.
+	return __real_sqlite3_wal_hook(db, hook, context);
+}
+
+static std::pair<int, int> Status() {
+	int frames = -1, copied = -1;
+	auto code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+	if (code == SQLITE_BUSY)
+		return {-1, -1};
+	Require(code == SQLITE_OK && frames >= 0 && copied >= 0, "Read writer WAL status");
+	return {frames, copied};
+}
+static void Warm() {
+	Require(sqlite3_exec(writer,
+	                     "PRAGMA synchronous=FULL; CREATE TABLE diagnostic_padding(data BLOB);"
+	                     "INSERT INTO diagnostic_padding VALUES(zeroblob(20971520)); PRAGMA synchronous=NORMAL",
+	                     nullptr, nullptr, nullptr) == SQLITE_OK,
+	        "Warm committed CLEAN WAL");
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	for (;;) {
+		auto status = Status();
+		if (status.first >= 0 && status.first == status.second)
+			break;
+		Require(std::chrono::steady_clock::now() < deadline, "Warm checkpoint did not finish");
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
+int main(int argc, char **argv) {
+	try {
+		Require(argc == 5, "Expected database, cold|warm|gc, active|quiesced, output JSON");
+		std::string path = argv[1], state = argv[2], variant = argv[3];
+		Require(state == "cold" || state == "warm" || state == "gc", "Unknown state");
+		Require(variant == "active" || variant == "quiesced", "Unknown variant");
+		request_trace::Install(path.c_str());
+		Workspace workspace(path, 5000, Durability::Fsync);
+		auto session = workspace.Checkout();
+		Require(writer && worker, "Did not capture the registered worker");
+		std::string snapshot;
+		CollectionResult gc;
+		if (state == "gc") {
+			request_trace::Scope scope("setup_gc");
+			session->WriteFile("/retained", std::string(524288, 'k'));
+			snapshot = workspace.Snapshot();
+			session->WriteFile("/retained", std::string(524288, 'n'));
+			for (int i = 0; i < 8; ++i)
+				session->WriteFile("/junk-" + std::to_string(i), std::string(1048576, char('a' + i)));
+			for (int i = 0; i < 8; ++i)
+				session->Unlink("/junk-" + std::to_string(i));
+			gc = workspace.CollectGarbage();
+			Require(gc.versions > 0 && gc.payloads > 0, "GC fixture reclaimed no data");
+			workspace.Sync();
+		}
+		workspace.AcquireMount("main");
+		auto root = session->OpenDirectory("/").inode;
+		{
+			request_trace::Scope scope("setup_warm");
+			if (state != "cold")
+				Warm();
+			// Both arms drain the same completed setup before the measurement.
+			worker->Stop();
+			worker->CheckError();
+		}
+		auto before = Status();
+		Require(before.first >= 0 && int64_t(before.first) * 4120 < Checkpointer::LIMIT_BYTES,
+		        "Preparation exceeded WAL admission");
+		if (state != "cold")
+			Require(before.first == before.second, "Warm setup did not finish backfilling");
+		if (variant == "active")
+			worker->Start();
+		std::vector<int64_t> inodes;
+		std::vector<long long> operations;
+		inodes.reserve(128);
+		operations.reserve(128);
+		long long begin, end;
+		{
+			request_trace::Scope phase("phase_small_file_fsync");
+			begin = request_trace::Now();
+			for (int i = 0; i < 128; ++i) {
+				auto start = request_trace::Now();
+				int64_t inode;
+				{
+					request_trace::Scope scope("create");
+					inode = session->CreateNode(root, "small-" + std::to_string(i), false, 0600, true, false, 2).inode;
+				}
+				{
+					request_trace::Scope scope("write", 0, 4096);
+					session->WriteInode(inode, std::string(4096, 's'), 0);
+				}
+				{
+					request_trace::Scope scope("fsync");
+					session->StatInode(inode);
+					workspace.Sync();
+				}
+				{
+					request_trace::Scope scope("flush");
+					session->StatInode(inode);
+				}
+				{
+					request_trace::Scope scope("release");
+					session->CloseFile(inode);
+				}
+				inodes.push_back(inode);
+				operations.push_back(request_trace::Now() - start);
+			}
+			end = request_trace::Now();
+		}
+		worker->Stop();
+		worker->CheckError();
+		auto after = Status();
+		Require(after.first >= 0 && int64_t(after.first) * 4120 < Checkpointer::LIMIT_BYTES,
+		        "Small-file phase reached WAL admission");
+		if (state == "cold")
+			Require(int64_t(after.first) * 4120 < Checkpointer::START_BYTES, "Cold control became warm");
+		{
+			request_trace::Scope scope("validation");
+			for (int i = 0; i < 128; ++i) {
+				Require(session->Read("/small-" + std::to_string(i)) == std::string(4096, 's'),
+				        "Small-file content changed");
+				session->CloseFile(inodes[i]);
+			}
+			if (state == "gc") {
+				Require(session->Read("/retained") == std::string(524288, 'n'), "Retained live data changed");
+				auto pinned = workspace.OpenSnapshot(snapshot);
+				Require(pinned->Read("/retained") == std::string(524288, 'k'), "Retained snapshot data changed");
+				pinned->Close();
+			}
+			workspace.Sync();
+			session->CloseFile(root);
+			workspace.ReleaseMount("main");
+			session->Close();
+			workspace.Close();
+		}
+		SQL inspect(path);
+		Require(inspect.Text("PRAGMA quick_check") == "ok", "Integrity check failed");
+		std::ofstream result(argv[4]);
+		result << std::setprecision(17) << "{\"status\":\"PASS\",\"state\":\"" << state << "\",\"variant\":\""
+		       << variant << "\",\"begin_ns\":" << begin << ",\"end_ns\":" << end
+		       << ",\"seconds\":" << double(end - begin) / 1e9 << ",\"wal_before\":[" << before.first << ','
+		       << before.second << "],\"wal_after\":[" << after.first << ',' << after.second << "],\"gc\":["
+		       << gc.versions << ',' << gc.payloads << ',' << gc.snapshots
+		       << "],\"content_and_integrity\":true,\"operation_ns\":[";
+		for (size_t i = 0; i < operations.size(); ++i)
+			result << (i ? "," : "") << operations[i];
+		result << "]}\n";
+		std::cout << "PASS " << state << ' ' << variant << '\n';
+		return 0;
+	} catch (const std::exception &error) {
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

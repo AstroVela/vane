@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
 
 #include "duckdb/common/operator/subtract.hpp"
@@ -259,6 +265,11 @@ public:
 	SelectionVector build_sel_vec;
 	SelectionVector probe_sel_vec;
 	SelectionVector seq_sel_vec;
+
+	void ResetBatchInput() override {
+		join_keys.Reset();
+		probe_executor.ResetInput();
+	}
 };
 
 unique_ptr<OperatorState> PerfectHashJoinExecutor::GetOperatorState(ExecutionContext &context) {

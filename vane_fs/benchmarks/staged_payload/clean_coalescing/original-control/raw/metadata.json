@@ -1,0 +1,1386 @@
+{
+  "status": "PASS",
+  "config": {
+    "orders": [
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ]
+    ],
+    "durability": "fsync",
+    "application_write_bytes": [
+      8388608,
+      1048576
+    ],
+    "read_fixture_application_write_bytes": 1048576,
+    "logical_block_bytes": 4096,
+    "page_bytes": 4096,
+    "cache_configuration": "production defaults",
+    "strict_wal_trigger_frames": 4096,
+    "external_threshold_bytes": 262144,
+    "wake_mib": 16,
+    "admission_mib": 64,
+    "retained_wal_mib": 16,
+    "global_drop_caches": false,
+    "owned_concurrent_tests_or_builds": false,
+    "fresh_fuse_rounds": 6,
+    "aged_fuse_rounds": 6,
+    "native_rounds": 0,
+    "aged_guard_bytes": 33554432,
+    "aged_guard_write_bytes": 1048576,
+    "aged_guard_zero_stride": 8192,
+    "aged_fuse_read_fixture_bytes": 67108864,
+    "aged_native_read_fixture_bytes": 16777216,
+    "medium": "ext4",
+    "instrumented": false,
+    "format_version": 1004,
+    "sqlite_primitive": "original SDK fsync",
+    "buffer_page_offset": 48,
+    "sequence_mib_and_request_mib": [
+      [
+        256,
+        8
+      ],
+      [
+        64,
+        1
+      ]
+    ],
+    "first_workload": "256 MiB write into a fresh or independently aged workspace",
+    "interpretation": "tmpfs isolates software costs, not durable-storage throughput",
+    "gc_python_modules": {
+      "baseline": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/baseline/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "324aef03bf331fdf82ebfd4b413e33e087282deba18abe1f41b70b5dbbcc325d"
+      },
+      "updated": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4"
+      }
+    }
+  },
+  "native": [],
+  "space": [],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "35bbd85cbd1af082d1fa54bc356f08c52da2590fe29144f970c1cdfc066176bd"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "6ea846b6e96e7c76df2880ddf6a3a8fd4352e6c924b86879e287a310613d8688"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "4d74b492a081635d08915e5b48d774a543ba9cd46cf3573efa7b9ccf5fac0941"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "f8ee1835ad57a25ae3e3ae8ec3bef6e3d122324bc0088523a1b7dde1d210c1ec"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9bexgb5_/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "3ab3a85c9e403216df2f00a1b2f82dbf838562b5a640c4bd8624d661ff8b4e76"
+        }
+      ],
+      "pid": 2776486,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "ef2f3aadea369451c6bb81385d56f23c40c157adfeee449b1cc334bd892575b0"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "97a5850f9bd3fe06e991998cb10a90b2b967d40d24240313b52a5176a58b38f5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "71d81b16f14c99ee5a4cd79c00aef81fc3e0bc863b0867b57049034bbb47162c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "de51cfea8f758cf6702e4ffb9720fb10f1c34650e8139a6e0d563a7fd13b774e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-9hdxzwyw/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "e0bb2629738b4509a59eab92a1c4600569cbe5bb485cf9a2003493b721b800a4"
+        }
+      ],
+      "pid": 2776840,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "ed3212e7266979a6ebe5ed62a6db23d99bad6fa83fa560d1716f09e5c59edff2"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "30e52afe2ffc5a5183090bf1359d63f8a84672953f859628795f949f4e1b872d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "58b51ac7e2071474a78a705623bbf576e1c26d8b67e39890c29795376cb56cf9"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "d66689c93c617480bbdc58b51d04657867cf55a6d67ffc17fd3881fa4a32998c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-rvsvak97/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "5a3f294246b582621feb30333c1b7f61bae352d84f002a6da2d1cb30c342d80c"
+        }
+      ],
+      "pid": 2777134,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "f78e14a7b2aec54fcf11deae0d280ad847da9f45073d487c5473acac0874ab7f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "799f8b6953ab6391255f7cd447ff798b05929a69bbb79f6c264f9b9e5d5c5a01"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "bfbb652f923b9fe484c05c5c1476cf96e6804289c2e81719664aa5b2e3174e3a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "b1fc8349d800469ff7055c72fb9a4e47cd2adcb1c06073328483ee85bebe65f5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-pikj2s2k/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "0b77aa538d3da9d6e6d2a798b2e08b122c9a1a194bbd87040443cb2207b2cbf7"
+        }
+      ],
+      "pid": 2777431,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "a622d173bc7612175c9248bae7d40e209bb69047ad6eea78809dafb85b89c761"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "801b3fc6d8f2a7d49275e4e0ef00d8cf787efb3ccf5c268e36224359faf09530"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "e46d47a1032b753d6e25d5dae01de83348f16951815e18f937c5de2cea5f501e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "3d1164d5dbdef4bf7a48e940fcc9f69fb9d4379374098dc92a7490f80631aa4d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-5ri9lmzn/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "705d1108c993976f5eceec337e19cf6d7cec4c3de3acd123663a8deb4f2249ad"
+        }
+      ],
+      "pid": 2777822,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "9a694711623c7fa3a65aeb7095ff56baa2a57678ecd2dcfd3c257bebd0d20433"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "0ecba87b72efdb31d4afd7cf3e935a9eaf4e0029d5710bd3f7588ebb01a734d6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "6a7cae7d5f0dac523b2679c5af15a6ce58dbce157b2a9a0ea736923daeaf6e0e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "0103e0ac209928c7ce0821ea48ae815ab52266f20f5a1a13bd1587314f2bade3"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-fwbtnnn7/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "268bbfc159e67318c47fb348713e0b5d7de4db97b6662b2073262b4bf0f429c3"
+        }
+      ],
+      "pid": 2778126,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "36d71606e75d4e8508e19162ccfb683bc56128acc2fed440264206976439e047"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "9eae6991986d8a21156aaa8c5376e09ec293346dce30b7720adf87d76693f123"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "38a6da39564525d9359f184b885d9ce82d58f0ddb19fa3b9d20016c25d0811e8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "d5eeb53226e26ba550d06fda787d0c237412bd7e50e99e4486b292783959c6ce"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-p0o_j4wu/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "5cd00a159b21784669f8c998e4ebc0fc85dfab80fc00a39581162cc0be559bd8"
+        }
+      ],
+      "pid": 2778428,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "0e6bce7bd6be4c47aece8139a858f57b48403771df3cf650f6844c265b18d4d8"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "4e2d46a1d9ed8b62209999b48d509a8207555597313e95305b41d5966bd68eca"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "f766ac1704a5a15ff917ef4353539c8c06a9b53285d1d6bd0d51dba98e22adda"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "2c3401f03a66391e6fecf03700d6fe40d4d3672ad979059907174514ebe92bd7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-lvs8xzkz/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "dc6b847a57f54239d140da9bbf5e95e9acdf0b5c0049b8e264859ba9f4c066b2"
+        }
+      ],
+      "pid": 2778849,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "fb188f19ac4bb91f3bfb15136ce7fbf52b5e727b375c78e450f3cc47516c63f4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "7b3e9b788669a6c4ad7d27ed7eccaa15b33a8be1c6052cef838d76b21d4fab32"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "cc6df7048e7b461bebb7c9e561e421d12560b7ff8576d88ec453515da7ee8f02"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "1072ead2a01d7d421d1adaf19c877db70ede33b5d27eb2d31d6a5536c6bb5caa"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-x8s561y2/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "47e7a098d5a8252ee047d43e5009c3f79611cd9573155c0e729e84fe509598a2"
+        }
+      ],
+      "pid": 2779155,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "953adc7bb760da45833856059f7ef7f5e0bf0e21aec3db2f641672e178962c1e"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "8d688b1bdbb4929936d5ff98be0ad51f65d42de75a1f4b72b35fbff536b2d381"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "873f490d6ba3ad14720cfd04d0233e9b244bae56a2d3ecc987e7f8bdd2aa75aa"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "f7a974860afbcece29e7e930d34351dc38c6154fe138fa104b90ad9867f58029"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-6aa9c4lq/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "97808c37e310c032cbfe44902da0f56e2e99ac5965d6e86910e910948fc284c2"
+        }
+      ],
+      "pid": 2779495,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "199c475440a06d753dc74c48ee556a0b9bc3584e7e3fcc89b908128f2c77fc1c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "201e22ccbd3b6d336fc606689c3a115a60b82b614fb3d4459832326b9187e753"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "932748820b4732eb351767ef61e493b23df9bf267340159b2cb5ca2f32b498a1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "d528ed9ba4050858c1b0fec14f628a45252336f919cd19a719d385ba085f838d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-b2ojnplr/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "20db2e229d2e829df14565f013f784b5a6c449ae88ec13d5138b2dc97faa5ef1"
+        }
+      ],
+      "pid": 2779794,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite",
+          "bytes": 33189888,
+          "sha256": "a4aa5313153faae73edeacff6b70486a8cfc98a31b957849a7cd2c0ef05632a4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ae611115c38c478fff15b9cbd45d19198ac13dc10831a21d308574a55b947ba1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "8c2b05be11fb6c5b3b9eda6a7073aad922574f675a2d0f8098e16e803504efbd"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.payload",
+          "bytes": 402657280,
+          "sha256": "925f2e33f467ce264d8a9478ac3ad7baf176ba5d23916994eb22d217e6161c2b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-fuse-89ud9ocl/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "e1e071868e5834febf14735c0ea8601cfa4a327c23d942339a8921b55abda783"
+        }
+      ],
+      "pid": 2780022,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "81b0d09dcdeb1e39e01406f9cc3354141df0843171f5e7adec78a470cd4672d1"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "f744c77b2d6e76c20e7584286a646aaab224550e123ff4f72b4b0b67e0f9a9c5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "a728394dee0580e68d5047e8a4252481adca2da2eb745d74785d0946657e2943"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "b0478782f6e7bdbbea30fe1629be36f815034ad39ea9303c9e75f44e255c9cd3"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yvkdwo1x/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "11b15d69fde23c6a40d972d15202a983b8dcb9bd8db3298c49a05113aa7ece29"
+        }
+      ],
+      "pid": 2780366,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "05168e69f3014c5a99d3f08dbe694e51e305740b8d2c40262ae16495a309f294"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ffd95264744b00fc03bca60cae2d18058c72e708dff3a829c5c57ef819858cf0"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "f1f1a7a3e808b1886d0cc7d1433b35d0b0c488ecdd5c220db8d67c3658774f6f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "be0f6560bcd55c5013264036e95032335fa6bfe9c941cae7b507c013ec0fbc50"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2by74e0z/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "c19ebbb986c4b991b3d0ccd74b6d6b17c02342a8248e2fc40a5c566102ad53f3"
+        }
+      ],
+      "pid": 2780683,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "081be3dd249bf3c6fb15e63e3e845b6178837803fe234416bbd4607cf88de23c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ad52c626a0c9212fdabd98f2cb7959c274901e41c0955e986f044672257c33d7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "a27513f0e47465578bf2a335e8f7e89b6832478156bee89758b73a6a7b58b0a3"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "7613b9eeaf4ec871136c297e84b710e490a32c6d91c1693966765333c6c20e4b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-ip2e8hia/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "3b03a6d758def0579ef983d5bfbc1f85985cabf8b7f69cb34a2fb1a40be6aa19"
+        }
+      ],
+      "pid": 2781092,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "6fae4ee6e3db4d6f119bf0f8b9d60647a7af6ea7f310fa37f9c6cb6675c1d2f4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "2acc402684c0046ff914da1a1e099cbf81d3538095494632c8d9b81c8049af8b"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "e4cfdb8a46e4c4aa2d81c62419d4625b2d0e26b4f945aef8f458c5f70e04e84a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "550df37b7485c92a2d216a53d7b0620a4d52eccaa58544b968149bf4c46995a6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lf1k23t/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "66c786e9aadf35440a436c45ce631f61f39d94c1b219a76533fe89e30aca2599"
+        }
+      ],
+      "pid": 2781479,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "96b264f3fa7074ee632dc3805cc2a8355d03cea5c2db63a5cb310b0f873267b2"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "798156cfc1339411fb5c241f5ef2b27c2c56839fdf6cc38c9d6d05f0eed4af5d"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "54c0ed1efeb0a84698448b7113d6c38abee92f8c86772ab2788df31b428ae33f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "444fb69a343e23136a2ebf3b2b79dd42d050088185bcfae6ce0d923d87971c54"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2c3vs376/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "2e86289f56f4f25fa25a584624af68563086481715a8b633bfd711470f1bcc5e"
+        }
+      ],
+      "pid": 2781885,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "e2aa901c07f1d8a39c674aff9eba08b2ad775b8c20103c0284eccf0c5a31cfb5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "23b17d2f611da42388c006c734ef6a2ba66cc2a99e5703973d8d8c7e87a31545"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "bd2bc5216efaef96f74ba357f781ca1cfb0b9dd8ae8bcdf1b254b74339e1a727"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "f82d07d3a11a41651e39592bb5964b628313609e000e458dcf3fb805dea47d6c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-sxd96tzm/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "ffcaefb8eae6fe7cc8b0d26c8eb98bbd781ef5213fdfe4b18f293b27116921da"
+        }
+      ],
+      "pid": 2782258,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "fb1f27eaf9c3e1b93c388052b0b2a34108aabd34777bad67375433758338c7e6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "c62d30facdc204a005a713f71aee90d4204e1357dda5713747e25ee05aee8289"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "589b03083ede8ba03ca321e9c34dd218ed2ea8b1d390260c0204e56a56225bc6"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "b3423788aec89593dcfe1bf9e2ed31bbf425a5e3371d3b013e56b9acad5b9aa5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-p7611qb7/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "d38c794e7b53deff1e46a519bbf01ee699933960e649c7ce5f3431466608d38f"
+        }
+      ],
+      "pid": 2782621,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "2defe747ca301977753408ab8df02fc1369f56e07f46fe4916e932c4f7a06a20"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "f393b499e33145d5349e0c7ad578a60f385f8f25312bfc681ab36fdb92192d36"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "6b448ae90b747178ae101a4b732411306a22c863358b43e41bc9431dbc688ec7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "d490ef85b2ea912d5fb03687c965857cdfdf9e26baccfad65bb62c8ef726e6e2"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xlw545qk/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "2a0a7575af53ba4c2da172e62f3ef5e576ce7dbeca21e54997a5ee9f5bf84bf2"
+        }
+      ],
+      "pid": 2782942,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "188ba3cf99d69d47cac3924815464eecdbdd44afb74a394d00b6d5b730ba5dae"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "8b18b9dc76d9d72514cfbc0e5def3f184cea2325a760c0b8f93c640b9d3a253a"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "270b273de1af108882ab75e20b257d33383f63a3fa41ec768f1fedb277e741fb"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "6611dceb7019bc93f906f89c6c5a24ea28da6d36c71c819ebcc14c589bff4914"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-2lnicbsj/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "03563fb64ad6461204e95ccc79fcaeef5109822f4ff3a6a9dd8f0430c0863dc0"
+        }
+      ],
+      "pid": 2783546,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "b14b7a27e259adf8a9cdada2782dad3e77c5b75bab2fb37b08108792b7136401"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "ff82d92bd459ed6ceb4d0e756844372d1be75a0e9dbee35ee0e3d25bebd399aa"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "29403b4d9aaba32be9d688712f093436ef45960ad3d37d363196278d3fd425e5"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "9f8e03f6550aa3fe7b2a5fac4b1ea4c1e1e452e8cdc86821f68ddcdc81cc8b69"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-yoaagr88/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "4e483f3b0def0775cc830a21fa6407d45dcb8eb63e4cfd07936d092065ad09b3"
+        }
+      ],
+      "pid": 2783920,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "b46ecd768432216f06ef24a4c55276cfbf3f265485399cbc865bcf31ed259923"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "5d307b3c558080c4eab944e841010efc448d774fd931b6bbd746c8d6bacb55b4"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "31b8109f3eecd63689103667aef489a4c26c85fb7c1c98806363cbe4a28a2a87"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "77150387499e53fc0ab2f539bdc3b7d1df69184396e0a42fd541bafd9ad98dde"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-xzaa1xcq/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "ec66cd2326b3f04660eb21a07a7efc3c655f9d581398dc399b2c9cdf8dba05e8"
+        }
+      ],
+      "pid": 2784140,
+      "process_stopped": true,
+      "mount_absent": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp",
+      "removed": true,
+      "files": [
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite",
+          "bytes": 35307520,
+          "sha256": "1c057b8ee52453b881a6cac4b1cd80c99d3705acbaec1d2e0a94f74a15dcc9b7"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "aa819c69c6e304ab30d7ce330a89233d94e6aca9597e40e274ba3331122b2b3f"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite-wal",
+          "bytes": 16777216,
+          "sha256": "3145f53ceb04f1af3cb19e0e11f77ac6009f069a0d6e3a8cca49c13e5ca0112c"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.payload",
+          "bytes": 436203520,
+          "sha256": "11f73656bf315f869a5ca9ed4f415c6f34e1479e3591687fa34cab31043cda65"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/original-control/ext4-plain/vane-partial-owned-aged-t2v6iqlp/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "44baefb9229571383ce4f9cc937cc949ec3e9c380bec181d65ed3772d91be3b7"
+        }
+      ],
+      "pid": 2784522,
+      "process_stopped": true,
+      "mount_absent": true
+    }
+  ],
+  "started_epoch": 1791856304.6197486,
+  "ended_epoch": 1791856626.3494585,
+  "monitor_stopped": true,
+  "free_bytes_after": 95903248384
+}

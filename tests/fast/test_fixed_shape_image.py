@@ -40,6 +40,9 @@ def limit_additional_memory():
     resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
 
 with vane.connect(config={'threads': 1}) as con:
+    # Retire the import-created default connection before measuring memory.
+    # Its scheduler threads can reserve allocator arenas during their idle flush.
+    vane.set_default_connection(con)
     warm = con.sql('SELECT $1 AS image', params=[vane.Value(np.zeros((1, 1, 3), dtype=np.uint8),
                                                          vane.image_type('RGB', 1, 1))]).to_arrow_table()
     # Initialize Arrow's scanner thread pools before limiting image allocations.

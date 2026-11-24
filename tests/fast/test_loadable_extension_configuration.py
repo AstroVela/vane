@@ -1,12 +1,78 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("generator", ["Ninja", "Ninja Multi-Config"])
+def test_external_static_extension_is_linked_but_loadable_extension_is_not(tmp_path: Path, generator):
+    duckdb_source = tmp_path / "duckdb"
+    duckdb_source.mkdir()
+    (duckdb_source / "builtin.cpp").write_text("int builtin_value() { return 40; }\n", encoding="ascii")
+    (duckdb_source / "external.cpp").write_text("int external_value() { return 2; }\n", encoding="ascii")
+    (duckdb_source / "optional.cpp").write_text("int optional_value() { return 0; }\n", encoding="ascii")
+    (duckdb_source / "CMakeLists.txt").write_text(
+        """
+add_library(builtin_extension STATIC builtin.cpp)
+add_library(external_extension STATIC external.cpp)
+add_library(optional_extension MODULE optional.cpp)
+set(DUCKDB_EXTENSION_NAMES "builtin;external;optional")
+set(DUCKDB_EXTENSION_BUILTIN_SHOULD_LINK TRUE)
+set(DUCKDB_EXTENSION_EXTERNAL_SHOULD_LINK TRUE)
+set(DUCKDB_EXTENSION_OPTIONAL_SHOULD_LINK FALSE)
+""".lstrip(),
+        encoding="ascii",
+    )
+    (tmp_path / "loader.cpp").write_text("int loader_value() { return 0; }\n", encoding="ascii")
+    (tmp_path / "main.cpp").write_text(
+        "int builtin_value(); int external_value();\n"
+        "int main() { return builtin_value() + external_value() == 42 ? 0 : 1; }\n",
+        encoding="ascii",
+    )
+    (tmp_path / "CMakeLists.txt").write_text(
+        """
+cmake_minimum_required(VERSION 3.29)
+project(static_extension_probe LANGUAGES CXX)
+set(DUCKDB_SOURCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/duckdb")
+set(BUILD_EXTENSIONS builtin)
+set(VANE_LOADABLE_EXTENSION_NAMES optional)
+include("${VANE_TEST_REPOSITORY}/cmake/duckdb_loader.cmake")
+add_subdirectory(duckdb)
+add_library(duckdb_generated_extension_loader STATIC loader.cpp)
+add_executable(probe main.cpp)
+set_target_properties(probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+  set_target_properties(probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/bin")
+endforeach()
+duckdb_link_extensions(probe)
+""".lstrip(),
+        encoding="ascii",
+    )
+    build = tmp_path / "build"
+    for command in (
+        (
+            "cmake",
+            "-S",
+            str(tmp_path),
+            "-B",
+            str(build),
+            f"-DVANE_TEST_REPOSITORY={REPOSITORY_ROOT.as_posix()}",
+            "-G",
+            generator,
+        ),
+        ("cmake", "--build", str(build), "--config", "Release", "--target", "probe", "--parallel", "2"),
+    ):
+        result = subprocess.run(
+            command, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run((str(build / "bin" / ("probe.exe" if os.name == "nt" else "probe")),), check=True)
 
 
 def test_external_loadable_extension_preserves_duckdb_config(tmp_path: Path):

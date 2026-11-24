@@ -120,6 +120,8 @@ def _inject_duckdb_manifests(archive_path: Path, source_id: str, fork_revision: 
                             else:
                                 output_archive.addfile(member)
 
+            # Windows cannot replace the archive while its read handle is open.
+            source_archive.close()
             temporary_path.chmod(archive_path.stat().st_mode & 0o777)
             os.replace(temporary_path, archive_path)
         finally:

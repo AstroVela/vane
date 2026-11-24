@@ -1,0 +1,203 @@
+FUSE library version: 3.14.0
+unique: 2, opcode: INIT (26), nodeid: 0, insize: 104, pid: 0
+INIT: 7.40
+flags=0x73fffffb
+max_readahead=0x00020000
+   INIT: 7.31
+   flags=0x40409029
+   max_readahead=0x00020000
+   max_write=0x00100000
+   max_background=0
+   congestion_threshold=0
+   time_gran=1
+   unique: 2, success, outsize: 80
+unique: 4, opcode: GETATTR (3), nodeid: 1, insize: 56, pid: 2745038
+   unique: 4, success, outsize: 120
+unique: 6, opcode: LOOKUP (1), nodeid: 1, insize: 45, pid: 2745038
+   unique: 6, error: -2 (No such file or directory), outsize: 16
+unique: 8, opcode: CREATE (35), nodeid: 1, insize: 61, pid: 2745038
+   unique: 8, success, outsize: 160
+unique: 10, opcode: WRITE (16), nodeid: 2, insize: 1047104, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 10, success, outsize: 24
+unique: 12, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 12, success, outsize: 24
+unique: 14, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 14, success, outsize: 24
+unique: 16, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 16, success, outsize: 24
+unique: 18, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 18, success, outsize: 24
+unique: 20, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 20, success, outsize: 24
+unique: 22, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 22, success, outsize: 24
+unique: 24, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 24, success, outsize: 24
+unique: 26, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 26, success, outsize: 24
+unique: 28, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 28, success, outsize: 24
+unique: 30, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 30, success, outsize: 24
+unique: 32, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 32, success, outsize: 24
+unique: 34, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 34, success, outsize: 24
+unique: 36, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 36, success, outsize: 24
+unique: 38, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 38, success, outsize: 24
+unique: 40, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 40, success, outsize: 24
+unique: 42, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 42, success, outsize: 24
+unique: 44, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 44, success, outsize: 24
+unique: 46, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 46, success, outsize: 24
+unique: 48, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 48, success, outsize: 24
+unique: 50, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 50, success, outsize: 24
+unique: 52, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 52, success, outsize: 24
+unique: 54, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 54, success, outsize: 24
+unique: 56, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 56, success, outsize: 24
+unique: 58, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 58, success, outsize: 24
+unique: 60, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 60, success, outsize: 24
+unique: 62, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 62, success, outsize: 24
+unique: 64, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 64, success, outsize: 24
+unique: 66, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 66, success, outsize: 24
+unique: 68, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 68, success, outsize: 24
+unique: 70, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 70, success, outsize: 24
+unique: 72, opcode: WRITE (16), nodeid: 2, insize: 1048656, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 72, success, outsize: 24
+unique: 74, opcode: WRITE (16), nodeid: 2, insize: 1632, pid: 2745038
+NOTIFY: code=2 length=40
+   unique: 74, success, outsize: 24
+unique: 76, opcode: GETATTR (3), nodeid: 1, insize: 56, pid: 2745038
+   unique: 76, success, outsize: 120
+unique: 78, opcode: GETATTR (3), nodeid: 2, insize: 56, pid: 2745038
+   unique: 78, success, outsize: 120
+unique: 80, opcode: OPEN (14), nodeid: 2, insize: 48, pid: 2745038
+   unique: 80, success, outsize: 32
+unique: 82, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 82, success, outsize: 1048544
+unique: 84, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 84, success, outsize: 1048592
+unique: 86, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 86, success, outsize: 1048592
+unique: 88, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 88, success, outsize: 1048592
+unique: 90, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 90, success, outsize: 1048592
+unique: 92, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 92, success, outsize: 1048592
+unique: 94, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 94, success, outsize: 1048592
+unique: 96, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 96, success, outsize: 1048592
+unique: 98, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 98, success, outsize: 1048592
+unique: 100, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 100, success, outsize: 1048592
+unique: 102, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 102, success, outsize: 1048592
+unique: 104, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 104, success, outsize: 1048592
+unique: 106, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 106, success, outsize: 1048592
+unique: 108, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 108, success, outsize: 1048592
+unique: 110, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 110, success, outsize: 1048592
+unique: 112, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 112, success, outsize: 1048592
+unique: 114, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 114, success, outsize: 1048592
+unique: 116, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 116, success, outsize: 1048592
+unique: 118, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 118, success, outsize: 1048592
+unique: 120, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 120, success, outsize: 1048592
+unique: 122, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 122, success, outsize: 1048592
+unique: 124, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 124, success, outsize: 1048592
+unique: 126, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 126, success, outsize: 1048592
+unique: 128, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 128, success, outsize: 1048592
+unique: 130, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 130, success, outsize: 1048592
+unique: 132, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 132, success, outsize: 1048592
+unique: 134, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 134, success, outsize: 1048592
+unique: 136, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 136, success, outsize: 1048592
+unique: 138, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 138, success, outsize: 1048592
+unique: 140, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 140, success, outsize: 1048592
+unique: 142, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 142, success, outsize: 1048592
+unique: 144, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 144, success, outsize: 1048592
+unique: 146, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 146, success, outsize: 64
+unique: 148, opcode: READ (15), nodeid: 2, insize: 80, pid: 2745038
+   unique: 148, success, outsize: 16
+unique: 150, opcode: FLUSH (25), nodeid: 2, insize: 64, pid: 2745038
+   unique: 150, success, outsize: 16
+unique: 152, opcode: RELEASE (18), nodeid: 2, insize: 64, pid: 0
+   unique: 152, success, outsize: 16
+unique: 154, opcode: OPEN (14), nodeid: 2, insize: 48, pid: 2745038
+   unique: 154, success, outsize: 32
+unique: 156, opcode: FSYNC (20), nodeid: 2, insize: 56, pid: 2745038
+   unique: 156, success, outsize: 16
+unique: 158, opcode: FLUSH (25), nodeid: 2, insize: 64, pid: 2745038
+   unique: 158, success, outsize: 16
+unique: 160, opcode: RELEASE (18), nodeid: 2, insize: 64, pid: 0

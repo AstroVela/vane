@@ -1,0 +1,1 @@
+{"status":"PASS","runtime_changed_files":["src/checkpoint.hpp"],"reconstructed_files":35,"patch_fuzz":0,"publication_workspace_payload_byte_identical":true,"worker_write_admission_and_thresholds_byte_identical":true,"callback_progress_latched_after_large_generation":true,"callback_no_sql_or_sync_verified_by_tests":true}

@@ -64,8 +64,9 @@ def _local_target_rows(monkeypatch, connection):
     return [tuple(row.values()) for table in result.partition_payloads for row in table.to_pylist()]
 
 
-def test_merge_relation_runs_with_explicit_local_fast(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_merge_relation_runs_with_native_local(monkeypatch, tmp_path, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
     try:
         assert _merge(connection.table("merge_source")) is None
@@ -270,23 +271,6 @@ def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch
             ]
     finally:
         connection.execute("ROLLBACK")
-        connection.close()
-
-
-def test_merge_relation_rejects_local_fte_runner(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
-    try:
-        with pytest.raises(
-            vane.InvalidInputException,
-            match="MERGE_INTO requires a ray or local-fast connection",
-        ):
-            _merge(connection.table("merge_source"))
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
-            (1, "old"),
-            (3, "keep"),
-        ]
-    finally:
         connection.close()
 
 

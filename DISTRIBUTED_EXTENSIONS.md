@@ -131,10 +131,17 @@ providers. Each wheel contains exactly one self-contained artifact, its
 canonical descriptor, required license files, and one provider entry point,
 while declaring an exact dependency on the matching `vane-ai` version and on
 separately packaged dependency-extension wheels. Each extension-wheel package
-version contains the Vane release stage and the complete SHA-256 fingerprint of
-its immutable descriptor split across bounded numeric components. Those
-dependency-extension requirements therefore select the exact artifact identity
-instead of merely another build for the same Vane release. The provider module
+version appends an independent positive release number to the matching Vane
+release tuple: Vane `0.2.0` uses providers `0.2.0.1`, `0.2.0.2`, and so on.
+Vane prerelease/development suffixes are preserved after the fourth component.
+The counter continues across dev, rc, final and post stages of the same numeric
+Vane `X.Y.Z`: `0.2.0.2rc1` advances to `0.2.0.3`. Reset to one only for a new
+numeric base, such as the first `0.3.0.1` provider for Vane `0.3.0`.
+Dependencies pin the actual supplied wheel versions, while descriptors retain
+the exact artifact SHA-256 and dependency identities. Historical versions
+encoded from descriptor digests remain readable. Published files for a given
+version and wheel tag are immutable; changing their bytes requires a new release
+number. The provider module
 path is content-addressed too, so distinct artifacts do not overwrite each
 other's installed files. Each extension wheel is tagged for the active
 supported CPython minor, matching the native base wheel selected for that
@@ -160,6 +167,36 @@ from a trusted, hash-locked artifact set. Package version constraints alone do
 not identify wheel bytes; runtime admission also checks the exact DuckDB
 SourceID and descriptors. Build and clean verification commands are in
 [DEVELOPMENT.md](DEVELOPMENT.md#building-an-optional-extension-wheel).
+
+### Lazy batches across C++ extension boundaries
+
+Self-contained providers have a private copy of DuckDB's process-global state.
+An external block therefore carries its own process-local
+`shared_ptr<ExternalBlockBackendInterface>` in
+`ExternalBlockDescriptor::materializer`. A producer of new descriptors must
+bind a reader that understands their references. Copying, projecting, slicing
+or queueing a descriptor must preserve that binding alongside `object_ref` and
+`ownership_tokens`. The reader is a service capability; it must not retain the
+query or its input descriptors.
+
+The receiving native process binds Python ref-bundle results before passing
+them into the pipeline. The shared pointer is never part of a task's wire
+format. The backend registry remains available to producers during binding;
+consumers use only the reader already bound to the descriptor. Missing readers,
+mixed reader bindings and rejected descriptors fail before consuming rows.
+The existing `RAY_OBJECT_STORE` backend tag also covers local shared-memory
+ref bundles; its name does not select a runner or initialize Ray.
+
+Ordinary `SinkBatch` and `ExecuteBatch` adapters materialize through this
+capability, including adapters inside a provider and COPY operators created by
+that provider. A successful materialization replaces the input batch with its
+payload, which is reused across `BLOCKED` and `HAVE_MORE_OUTPUT` retries.
+Custom batch callbacks retain their existing dispatch and lazy behavior.
+
+This descriptor layout is part of the C++ extension ABI. Rebuild the base
+engine and every self-contained provider from the same matching source, then
+sign and package the resulting artifacts. An older provider cannot be reused
+by changing its manifest or relaxing source-identity checks.
 
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
@@ -194,6 +231,17 @@ deterministically during preparation.
 The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
 This validation occurs before task admission and plan deserialization.
+
+The optional native VaneFS connector adds `vane_fs_workspaces` declarations to
+the same connection snapshot. Each declaration contains an absolute local
+database path, expected workspace ID, timeout, host name and bound snapshot
+IDs. Planning and worker connections reopen their own native providers;
+worker cache identities include the exact declarations. Same-host validation
+and workspace-ID checks precede file access. Driver plans retain binding pins,
+and query replay state owns worker pins across task attempts until cleanup.
+The optional `vane-fs` package must be installed in every participating process.
+This protocol qualifies same-host reads; remote services and multi-host storage
+require their own protocol.
 
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning

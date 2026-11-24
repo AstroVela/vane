@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/updated
+Prepared 1 package in 28.47s
+Installed 1 package in 1ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/pre-open-backfill-20261013/updated)

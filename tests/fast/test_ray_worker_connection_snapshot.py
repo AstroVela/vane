@@ -526,6 +526,38 @@ def test_worker_snapshot_database_identity_includes_exact_dynamic_manifest():
     assert first.has_extension("httpfs") is False
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("database", "/other.sqlite"), ("hostname", "other-node"), ("timeout_ms", 100), ("workspace_id", "b" * 32)],
+)
+def test_worker_snapshot_database_identity_isolates_vane_fs_registrations(field, value):
+    registration = {
+        "workspace_id": "a" * 32,
+        "database": "/workspace.sqlite",
+        "timeout_ms": 5000,
+        "hostname": "local-node",
+        "snapshots": ["1" * 32],
+    }
+    snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "dynamic_extensions": [],
+        "distributed_extension_contracts": [],
+        "settings": [],
+        "vane_fs_workspaces": [registration],
+    }
+    first = _snapshot_database_identity(snapshot)
+    second = _snapshot_database_identity({**snapshot, "vane_fs_workspaces": [{**registration, field: value}]})
+    assert first != second
+    assert first == _snapshot_database_identity(
+        {**snapshot, "vane_fs_workspaces": [dict(reversed(list(registration.items())))]}
+    )
+    # Snapshot pins belong to the query; a new snapshot reuses the same database.
+    assert first == _snapshot_database_identity(
+        {**snapshot, "vane_fs_workspaces": [{**registration, "snapshots": ["2" * 32]}]}
+    )
+
+
 def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch):
     actor_class, actor = _worker_actor()
     base_snapshot = {

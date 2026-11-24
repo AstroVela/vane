@@ -39,6 +39,11 @@ class _CopyError(RuntimeError):
 class CopyResultUnavailableError(_CopyError):
     """A COPY committed, but the runner could not return its result."""
 
+    # Present when the writing backend supplies recovery identifiers.
+    base_path: str
+    run_id: str | None
+    manifest_path: str | None
+
     def __init__(
         self,
         operation_id: str,
@@ -77,10 +82,14 @@ class CopyResultUnavailableError(_CopyError):
         tuple[str, str, tuple[str, ...]],
         dict[str, Any],
     ]:
+        state = self._diagnostic_state()
+        for name in ("base_path", "run_id", "manifest_path"):
+            if hasattr(self, name):
+                state[name] = getattr(self, name)
         return (
             CopyResultUnavailableError,
             (self.operation_id, self.detail, self.cleanup_warnings),
-            self._diagnostic_state(),
+            state,
         )
 
 

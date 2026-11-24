@@ -1,0 +1,4 @@
+{
+  "failure": "fork fixture asserted every later parent WAL barrier requires a new parent-observed payload sync, even after a child already cleaned the shared fence",
+  "repair": "parent Sync before fork, while mocked hint remains blocked; no native source changes; all previous results preserved"
+}

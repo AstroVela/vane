@@ -39,11 +39,127 @@ static void SQL(const std::string &path, const std::string &sql) {
 	}
 }
 
+static void CheckDirectoryEntries(const std::string &path) {
+	Workspace workspace(path);
+	auto main = workspace.Checkout();
+	main->MakeDirectory("/entries");
+	main->MakeDirectory("/entries/subdir");
+	main->WriteFile("/entries/file", "original");
+	main->WriteFile("/entries/removed", "x");
+	auto frozen = workspace.OpenSnapshot(workspace.Snapshot());
+	auto child = workspace.Checkout(workspace.Fork("main", "child").id);
+	child->WriteFile("/entries/file", std::string(8193, 'c'));
+	child->SetAttributes("/entries/file", 0600, 123456789);
+	child->Unlink("/entries/removed");
+	child->Rename("/entries/subdir", "/entries/renamed");
+	main->WriteFile("/entries/parent-only", "parent");
+	main->MakeDirectory("/broken");
+	main->WriteFile("/broken/file", "x");
+	auto broken_inode = std::to_string(main->Stat("/broken/file").inode);
+	// Advance the frontier so fault injection can introduce overlapping rows
+	// with distinct primary keys at the live view point.
+	workspace.Snapshot();
+	workspace.AcquireMount("main");
+	workspace.AcquireMount("child");
+	auto check = [&](const std::shared_ptr<Session> &session, const std::vector<std::string> &names) {
+		auto handle = session->OpenDirectory("/entries");
+		auto entries = session->DirectoryEntries(handle.inode);
+		Require(entries.size() == names.size(), "Directory entry count differs across views");
+		for (size_t i = 0; i < names.size(); ++i) {
+			Require(entries[i].first == names[i], "Directory listing has wrong names or order");
+			auto expected = session->Stat(names[i] == "."    ? "/entries"
+			                              : names[i] == ".." ? "/"
+			                                                 : "/entries/" + names[i]);
+			const auto &actual = entries[i].second;
+			Require(actual.inode == expected.inode && actual.is_directory == expected.is_directory &&
+			            actual.size == expected.size && actual.mode == expected.mode &&
+			            actual.mtime_ns == expected.mtime_ns && actual.links == expected.links,
+			        "Directory attributes came from the wrong inode version");
+		}
+		session->CloseFile(handle.inode);
+	};
+	check(main, {".", "..", "file", "parent-only", "removed", "subdir"});
+	check(child, {".", "..", "file", "renamed"});
+	check(frozen, {".", "..", "file", "removed", "subdir"});
+	frozen->Close();
+
+	auto handle = main->OpenDirectory("/broken");
+	SQL(path, "CREATE TABLE saved_inode AS SELECT * FROM inode_versions WHERE inode=" + broken_inode);
+	for (int fault = 0; fault < 3; ++fault) {
+		if (fault == 0)
+			SQL(path, "DELETE FROM inode_versions WHERE inode=" + broken_inode);
+		else if (fault == 1)
+			SQL(path, "UPDATE inode_versions SET deleted=1 WHERE inode=" + broken_inode);
+		else
+			SQL(path, "INSERT INTO inode_versions SELECT inode,(SELECT frontier FROM branches WHERE name='main'),"
+			          "high,writer,deleted,kind,size,mode,mtime_ns FROM saved_inode");
+		for (int retry = 0; retry < 2; ++retry)
+			Expect(fault == 2 ? ErrorCode::Storage : ErrorCode::NotFound,
+			       [&] { main->DirectoryEntries(handle.inode); });
+		SQL(path, "DELETE FROM inode_versions WHERE inode=" + broken_inode +
+		              "; INSERT INTO inode_versions SELECT * FROM saved_inode");
+		Require(main->DirectoryEntries(handle.inode).size() == 3, "Failed listing poisoned a later query");
+	}
+	SQL(path, "DROP TABLE saved_inode");
+	main->CloseFile(handle.inode);
+	workspace.ReleaseMount("child");
+	workspace.ReleaseMount("main");
+}
+
+static void CheckLargeWrites(const std::string &path, Durability durability) {
+	Workspace workspace(path, 5000, durability);
+	auto main = workspace.Checkout();
+	std::string data;
+	for (int i = 0; i < 193; ++i) {
+		data += std::string(4096, i % 5 ? char(i) : '\0');
+	}
+	data += "tail";
+	main->WriteFile("/large", "");
+	main->Write("/large", data, 4095);
+	auto expected = std::string(4095, '\0') + data;
+	Require(main->Read("/large") == expected, "Large sparse write mapped blocks incorrectly");
+	auto frozen = workspace.OpenSnapshot(workspace.Snapshot());
+	auto child = workspace.Checkout(workspace.Fork("main", "child").id);
+	child->Truncate("/large", 17);
+	child->Write("/large", data, 4095);
+	Require(child->Read("/large") == expected, "Large write mishandled truncated versions");
+	Require(frozen->Read("/large") == expected, "Large child write changed a snapshot");
+	Require(main->Read("/large") == expected, "Large child write changed its parent");
+	frozen->Close();
+	main->WriteFile("/atomic", "");
+	for (const auto &table : {"block_payloads", "block_versions"}) {
+		auto generation = workspace.GetBranch().generation;
+		SQL(path, "CREATE TABLE fault_counter AS SELECT 0 AS writes; CREATE TRIGGER fail_batch BEFORE INSERT ON " +
+		              std::string(table) +
+		              " BEGIN UPDATE fault_counter SET writes=writes+1;"
+		              "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
+		              "THEN RAISE(ABORT,'injected batch failure') END; END");
+		Expect(ErrorCode::Storage, [&] { main->Write("/atomic", std::string(193 * 4096, 'x')); });
+		SQL(path, "DROP TRIGGER fail_batch; DROP TABLE fault_counter");
+		Require(main->Read("/atomic").empty(), "Failed batch left visible bytes");
+		Require(workspace.GetBranch().generation == generation, "Failed batch changed the branch generation");
+	}
+	main->Write("/atomic", data);
+	Require(main->Read("/atomic") == data, "Failed batch poisoned retry");
+	// Exhausting a consecutive ID range must retain automatic SQLite rowids.
+	SQL(path, "INSERT INTO block_payloads(id,data) VALUES(9223372036854775807,zeroblob(4096))");
+	main->WriteFile("/rowids", data);
+	Require(main->Read("/rowids") == data, "Payload rowid limit broke a large write");
+	workspace.Sync();
+	workspace.Close();
+	Workspace reopened(path);
+	Require(reopened.Checkout()->Read("/large") == expected, "Reopen lost a large write");
+	Require(reopened.Checkout()->Read("/rowids") == data, "Reopen lost automatically allocated payloads");
+}
+
 int main() {
 	auto root = std::filesystem::temp_directory_path() /
 	            ("vane-fs-native-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	try {
 		std::filesystem::create_directory(root);
+		CheckDirectoryEntries((root / "directories.sqlite").string());
+		CheckLargeWrites((root / "large-strict.sqlite").string(), Durability::Strict);
+		CheckLargeWrites((root / "large-fsync.sqlite").string(), Durability::Fsync);
 		auto path = (root / "workspace.sqlite").string();
 		{
 			Workspace workspace(path);
@@ -82,10 +198,21 @@ int main() {
 			SQL(path, "DROP TRIGGER fail_payload; DROP TABLE fault_counter");
 			Require(main->Read("/rollback") == "before", "Write failure did not roll back");
 			Require(workspace.GetBranch().generation == generation, "Failed write advanced branch generation");
+			main->WriteFile("/retry", std::string(16384, 'r'));
+			Require(main->Read("/retry") == std::string(16384, 'r'), "Failed statement poisoned later writes");
 			main->MakeDirectory("/nested");
 			main->MakeDirectory("/nested/child");
 			Expect(ErrorCode::Invalid, [&] { main->Rename("/nested", "/nested/child/cycle"); });
 			Expect(ErrorCode::NotEmpty, [&] { main->RemoveDirectory("/nested"); });
+			workspace.AcquireMount("main");
+			auto handle = main->OpenFile("/inode-ranges", true, true);
+			main->WriteInode(handle.inode, std::string(4096, 'b'), 4096);
+			main->TruncateInode(handle.inode, 12288);
+			Require(main->ReadInode(handle.inode, 4094, 4100) ==
+			            std::string(2, '\0') + std::string(4096, 'b') + std::string(2, '\0'),
+			        "Inode range read lost a partial block or sparse boundary");
+			main->CloseFile(handle.inode);
+			workspace.ReleaseMount("main");
 			workspace.Close();
 			Expect(ErrorCode::Closed, [&] { main->Stat("/"); });
 		}

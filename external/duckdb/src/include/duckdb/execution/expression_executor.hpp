@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -44,6 +50,9 @@ public:
 	//! Add an expression to the set of to-be-executed expressions of the executor
 	DUCKDB_API void AddExpression(const Expression &expr);
 	void ClearExpressions();
+
+	//! Release temporary input vectors after their outputs have been consumed, preserving function-local state.
+	void ResetInput();
 
 	//! Execute the set of expressions with the given input chunk and store the result in the output chunk
 	DUCKDB_API void Execute(DataChunk *input, DataChunk &result);

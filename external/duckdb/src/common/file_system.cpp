@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/file_system.hpp"
 
 #include "duckdb/common/checksum.hpp"
+#include "duckdb/common/environment.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/helper.hpp"
@@ -178,15 +185,9 @@ string FileSystem::GetWorkingDirectory() {
 #else
 
 string FileSystem::GetEnvVariable(const string &env) {
-	// first convert the environment variable name to the correct encoding
-	auto env_w = WindowsUtil::UTF8ToUnicode(env.c_str());
-	// use _wgetenv to get the value
-	auto res_w = _wgetenv(env_w.c_str());
-	if (!res_w) {
-		// no environment variable of this name found
-		return string();
-	}
-	return WindowsUtil::UnicodeToUTF8(res_w);
+	const EnvironmentVariable variable(env.c_str());
+	auto value = variable.GetValue();
+	return value ? string(value) : string();
 }
 
 static bool StartsWithSingleBackslash(const string &path) {
@@ -915,6 +916,12 @@ bool FileSystem::IsRemoteFile(const string &path, string &extension) {
 		}
 	}
 	return false;
+}
+
+FileWriteTarget FileSystem::ResolveWriteTarget(const string &path, const CopyInfo &, optional_ptr<FileOpener>) {
+	FileWriteTarget result;
+	result.path = path;
+	return result;
 }
 
 string FileSystem::CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener) {

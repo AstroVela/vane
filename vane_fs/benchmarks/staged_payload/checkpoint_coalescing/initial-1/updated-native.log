@@ -1,0 +1,34 @@
+Test project /home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T040740Z/updated/build/python-release
+      Start  1: vane_fs_core
+ 1/11 Test  #1: vane_fs_core .....................   Passed    0.63 sec
+      Start  2: vane_fs_inode_refs
+ 2/11 Test  #2: vane_fs_inode_refs ...............   Passed    0.13 sec
+      Start  3: vane_fs_checkpoint
+ 3/11 Test  #3: vane_fs_checkpoint ...............   Passed   11.77 sec
+      Start  4: vane_fs_durability
+ 4/11 Test  #4: vane_fs_durability ...............   Passed    1.32 sec
+      Start  5: vane_fs_crash
+ 5/11 Test  #5: vane_fs_crash ....................   Passed    7.47 sec
+      Start  6: vane_fs_sync_syscalls
+ 6/11 Test  #6: vane_fs_sync_syscalls ............   Passed    0.67 sec
+      Start  7: vane_fs_staging
+ 7/11 Test  #7: vane_fs_staging ..................   Passed    8.73 sec
+      Start  8: vane_fs_external_faults
+ 8/11 Test  #8: vane_fs_external_faults ..........   Passed    0.60 sec
+      Start  9: vane_fs_checkpoint_coalescing
+ 9/11 Test  #9: vane_fs_checkpoint_coalescing ....***Failed   10.34 sec
+Removed owned test data: "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T040740Z/updated/build/python-release/owned-coalescing-test"
+Timed out waiting for checkpoint
+
+      Start 10: vane_fs_inline_publication
+10/11 Test #10: vane_fs_inline_publication .......   Passed    1.60 sec
+      Start 11: vane_fs_transaction_cache
+11/11 Test #11: vane_fs_transaction_cache ........   Passed    0.12 sec
+
+91% tests passed, 1 tests failed out of 11
+
+Total Test time (real) =  43.38 sec
+
+The following tests FAILED:
+	  9 - vane_fs_checkpoint_coalescing (Failed)
+Errors while running CTest

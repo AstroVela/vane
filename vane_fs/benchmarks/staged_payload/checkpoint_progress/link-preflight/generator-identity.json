@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "adaptation": "Byte-preserved preceding builder, original controls and eight restart cases, plus one isolated progress patch",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/prepare.py": "0a3a3ba405a8d86f84bfa50629eb123fe4dca4b4622b627512368844d9fbcc1a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/progress.patch": "e5c199dd675fb05fc5ad94a78ddd5e4cf4ac774bab0e51efee5f4fda27c41b36",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_restart/prepare.py": "f7d92b429036a4ffa8c78d72cfa2fe51b772e294017d73be053df77c2feacbaa"
+  },
+  "generated_sha256": "03000772c562118f8738b086c8dfaad5aa9e97b8987354c30bfbf402a8322748"
+}

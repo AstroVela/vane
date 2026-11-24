@@ -1,0 +1,727 @@
+{
+  "status": "PASS",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/findings.json": "9022cdeff436303a33a8e31f53e7c189ff76f1394adc1d5c18649586f7038f6d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/plain/summary.json": "b3fe211c6e585e308203639e6319f6ec832c60392d6322b88f9e27a296c275da",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/plain/ext4-plain/results.json": "0d2c22d0c05aa5ab98814e8019562efb9d710805de77cbaf1024d5d1a8aeae91",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/host.jsonl": "5227da4d92a4dd3da7c7665f9e17ab2fbcdc9ebbd5acfdc763b01f2206297f68",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/plain/ext4-plain/host.jsonl": "8bdbf36ddd199fa447912e9b64ea687cf871cdafbd1f451c00012a260b271f3a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/sync_primitive/report.py": "8011fa52d73f32a2a08a406f228f658a30199e76d730f7e6e7e18d676c95aa87"
+  },
+  "native": [
+    {
+      "state": "cold",
+      "fsync_files_per_second": 297.3932645712139,
+      "fdatasync_files_per_second": 281.0808592067545,
+      "median_ratio": 0.9451487060812259,
+      "aggregate_ratio": 0.9787399510748084,
+      "paired_wins": 2,
+      "median_128_full_wal_sync_ms": {
+        "fsync": 288.636352,
+        "fdatasync": 317.057585
+      },
+      "wal_growth": {
+        "fsync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          }
+        ],
+        "fdatasync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 128,
+            "first_bytes": 247232,
+            "last_bytes": 12854432
+          }
+        ]
+      }
+    },
+    {
+      "state": "warm",
+      "fsync_files_per_second": 295.33973925269197,
+      "fdatasync_files_per_second": 439.36713659451766,
+      "median_ratio": 1.487666839912106,
+      "aggregate_ratio": 1.5154106629123656,
+      "paired_wins": 6,
+      "median_128_full_wal_sync_ms": {
+        "fsync": 293.7578935,
+        "fdatasync": 154.6008155
+      },
+      "wal_growth": {
+        "fsync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          }
+        ],
+        "fdatasync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          }
+        ]
+      }
+    },
+    {
+      "state": "gc",
+      "fsync_files_per_second": 285.11982215294483,
+      "fdatasync_files_per_second": 472.7157272605018,
+      "median_ratio": 1.6579546230459075,
+      "aggregate_ratio": 1.6281673049465841,
+      "paired_wins": 6,
+      "median_128_full_wal_sync_ms": {
+        "fsync": 298.800109,
+        "fdatasync": 147.59042
+      },
+      "wal_growth": {
+        "fsync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          }
+        ],
+        "fdatasync": [
+          {
+            "rep": 0,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 1,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 2,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 3,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 4,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          },
+          {
+            "rep": 5,
+            "distinct_sizes": 1,
+            "first_bytes": 16777216,
+            "last_bytes": 16777216
+          }
+        ]
+      }
+    }
+  ],
+  "plain": [
+    {
+      "state": "fuse",
+      "workload": "stream_256",
+      "median_rates": {
+        "baseline": 149.44782567582408,
+        "updated": 155.0131147025009
+      },
+      "aggregate_rates": {
+        "baseline": 148.60129879105475,
+        "updated": 153.80140053568002
+      },
+      "median_ratio": 1.0372390096778579,
+      "aggregate_ratio": 1.034993649361955
+    },
+    {
+      "state": "fuse",
+      "workload": "write_64",
+      "median_rates": {
+        "baseline": 108.78924571595417,
+        "updated": 102.71536275978286
+      },
+      "aggregate_rates": {
+        "baseline": 40.88931997804826,
+        "updated": 101.24801813909578
+      },
+      "median_ratio": 0.94416835123547,
+      "aggregate_ratio": 2.4761482507767685
+    },
+    {
+      "state": "fuse",
+      "workload": "read_64",
+      "median_rates": {
+        "baseline": 814.8353214646902,
+        "updated": 764.7324931381258
+      },
+      "aggregate_rates": {
+        "baseline": 831.6770578557816,
+        "updated": 758.6260644815206
+      },
+      "median_ratio": 0.9385117127268083,
+      "aggregate_ratio": 0.9121642316759343
+    },
+    {
+      "state": "fuse",
+      "workload": "random_read_4k",
+      "median_rates": {
+        "baseline": 74.47970899958653,
+        "updated": 72.78281847359732
+      },
+      "aggregate_rates": {
+        "baseline": 75.42626747661392,
+        "updated": 72.24174682233449
+      },
+      "median_ratio": 0.9772167406561881,
+      "aggregate_ratio": 0.9577796865625521
+    },
+    {
+      "state": "fuse",
+      "workload": "random_write_4k",
+      "median_rates": {
+        "baseline": 12.696390315939695,
+        "updated": 13.044519489465781
+      },
+      "aggregate_rates": {
+        "baseline": 11.958622638996074,
+        "updated": 12.704873387429554
+      },
+      "median_ratio": 1.0274195393228442,
+      "aggregate_ratio": 1.0624027340740747
+    },
+    {
+      "state": "fuse",
+      "workload": "small_file_fsync",
+      "median_rates": {
+        "baseline": 212.13444001076004,
+        "updated": 341.265210573813
+      },
+      "aggregate_rates": {
+        "baseline": 207.6322752833894,
+        "updated": 334.0009846545633
+      },
+      "median_ratio": 1.6087213870435328,
+      "aggregate_ratio": 1.6086178519148724
+    },
+    {
+      "state": "fuse",
+      "workload": "mkdir",
+      "median_rates": {
+        "baseline": 2107.0897336167764,
+        "updated": 2323.822433139846
+      },
+      "aggregate_rates": {
+        "baseline": 2059.797454822783,
+        "updated": 2295.1386512120384
+      },
+      "median_ratio": 1.102858789573737,
+      "aggregate_ratio": 1.1142545330552918
+    },
+    {
+      "state": "fuse",
+      "workload": "rename",
+      "median_rates": {
+        "baseline": 1777.0901338943813,
+        "updated": 2303.220716823069
+      },
+      "aggregate_rates": {
+        "baseline": 1725.8894109469356,
+        "updated": 2308.6228748590916
+      },
+      "median_ratio": 1.2960629699607331,
+      "aggregate_ratio": 1.3376424122055597
+    },
+    {
+      "state": "fuse",
+      "workload": "rmdir",
+      "median_rates": {
+        "baseline": 2223.9680350324716,
+        "updated": 2600.092901846904
+      },
+      "aggregate_rates": {
+        "baseline": 2020.0306294939048,
+        "updated": 2540.850775799041
+      },
+      "median_ratio": 1.1691233241169048,
+      "aggregate_ratio": 1.2578278461231163
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "stream_256",
+      "median_rates": {
+        "baseline": 154.04467061159477,
+        "updated": 153.21462108444462
+      },
+      "aggregate_rates": {
+        "baseline": 145.77604500748959,
+        "updated": 147.3409136511509
+      },
+      "median_ratio": 0.9946116310038208,
+      "aggregate_ratio": 1.0107347448175106
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "write_64",
+      "median_rates": {
+        "baseline": 100.38593871585178,
+        "updated": 102.59873877709688
+      },
+      "aggregate_rates": {
+        "baseline": 97.49770529659487,
+        "updated": 97.85861853778987
+      },
+      "median_ratio": 1.02204292841758,
+      "aggregate_ratio": 1.003701761391174
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "read_64",
+      "median_rates": {
+        "baseline": 793.6673495666928,
+        "updated": 751.0030453710998
+      },
+      "aggregate_rates": {
+        "baseline": 823.2597957310612,
+        "updated": 790.4522459379158
+      },
+      "median_ratio": 0.9462440980860737,
+      "aggregate_ratio": 0.960149214180911
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "random_read_4k",
+      "median_rates": {
+        "baseline": 71.96706318134704,
+        "updated": 70.41215922008462
+      },
+      "aggregate_rates": {
+        "baseline": 75.1703890126559,
+        "updated": 70.68868421769245
+      },
+      "median_ratio": 0.9783942279630853,
+      "aggregate_ratio": 0.9403793853692989
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "random_write_4k",
+      "median_rates": {
+        "baseline": 10.365463832496529,
+        "updated": 9.245981299571561
+      },
+      "aggregate_rates": {
+        "baseline": 10.549741101916764,
+        "updated": 5.145631089408001
+      },
+      "median_ratio": 0.891998799955743,
+      "aggregate_ratio": 0.487749513442856
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "small_file_fsync",
+      "median_rates": {
+        "baseline": 242.219520488503,
+        "updated": 366.68990933345844
+      },
+      "aggregate_rates": {
+        "baseline": 81.18271772000145,
+        "updated": 126.71558772182021
+      },
+      "median_ratio": 1.5138743095268552,
+      "aggregate_ratio": 1.5608690036574198
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "mkdir",
+      "median_rates": {
+        "baseline": 1990.3025132185317,
+        "updated": 2183.039295211085
+      },
+      "aggregate_rates": {
+        "baseline": 2032.7811845152858,
+        "updated": 2032.8497403980807
+      },
+      "median_ratio": 1.096837933285266,
+      "aggregate_ratio": 1.0000337251659535
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "rename",
+      "median_rates": {
+        "baseline": 1948.991927036825,
+        "updated": 2115.527203191114
+      },
+      "aggregate_rates": {
+        "baseline": 1952.243894192522,
+        "updated": 2003.3239328337258
+      },
+      "median_ratio": 1.085446878380601,
+      "aggregate_ratio": 1.0261647834029115
+    },
+    {
+      "state": "aged_fuse",
+      "workload": "rmdir",
+      "median_rates": {
+        "baseline": 2302.3251782220636,
+        "updated": 2525.79012409646
+      },
+      "aggregate_rates": {
+        "baseline": 2300.950398106022,
+        "updated": 2420.8042633627997
+      },
+      "median_ratio": 1.097060549043278,
+      "aggregate_ratio": 1.0520888522218614
+    }
+  ],
+  "tails": [
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 3,
+      "workload": "write_64",
+      "phase_seconds": 6.5620974079938605,
+      "calls": [
+        {
+          "field": "write_latencies",
+          "index": 0,
+          "seconds": 6.037154572899453
+        }
+      ]
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "workload": "small_file_fsync",
+      "phase_seconds": 6.866031396086328,
+      "calls": [
+        {
+          "field": "operation_latencies",
+          "index": 0,
+          "seconds": 1.0696899150498211
+        },
+        {
+          "field": "operation_latencies",
+          "index": 1,
+          "seconds": 1.3828231120714918
+        },
+        {
+          "field": "operation_latencies",
+          "index": 8,
+          "seconds": 1.5303228959674016
+        }
+      ]
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "random_write_4k",
+      "phase_seconds": 1.3448818729957566,
+      "calls": [
+        {
+          "field": "fsync_seconds",
+          "seconds": 1.163550327066332
+        }
+      ]
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "phase_seconds": 4.376854971051216,
+      "calls": []
+    }
+  ],
+  "host": {
+    "native": {
+      "samples": 50,
+      "seconds": 49.08389163017273,
+      "whole_host_busy_percent": 4.679779091173336,
+      "iowait_percent": 0.6787987940065087,
+      "load_min": 1.5439453125,
+      "load_max": 1.8896484375,
+      "disks": {
+        "sda": {
+          "written_sectors": 3591656,
+          "write_ms": 37434,
+          "busy_ms": 11939,
+          "flushes": 10186,
+          "flush_ms": 7612
+        },
+        "sda2": {
+          "written_sectors": 3591656,
+          "write_ms": 37433,
+          "busy_ms": 12383,
+          "flushes": 0,
+          "flush_ms": 0
+        }
+      }
+    },
+    "plain": {
+      "samples": 307,
+      "seconds": 306.67005801200867,
+      "whole_host_busy_percent": 5.945096666830709,
+      "iowait_percent": 0.9315813552494636,
+      "load_min": 1.22265625,
+      "load_max": 2.93115234375,
+      "disks": {
+        "sda": {
+          "written_sectors": 40571920,
+          "write_ms": 621134,
+          "busy_ms": 72729,
+          "flushes": 13653,
+          "flush_ms": 25935
+        },
+        "sda2": {
+          "written_sectors": 40571920,
+          "write_ms": 621134,
+          "busy_ms": 78115,
+          "flushes": 0,
+          "flush_ms": 0
+        }
+      }
+    }
+  },
+  "kernel": "6.11.0-24-generic",
+  "logical_cpus": 36,
+  "adoption_gate_pass": false,
+  "failed_gates": [
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "write_64",
+      "median_ratio": 0.94416835123547,
+      "aggregate_ratio": 2.4761482507767685,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "read_64",
+      "median_ratio": 0.9385117127268083,
+      "aggregate_ratio": 0.9121642316759343,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "combined_large_writes",
+      "aggregate_ratio": 1.4316546820321059,
+      "paired_wins": 2,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "read_64",
+      "median_ratio": 0.9462440980860737,
+      "aggregate_ratio": 0.960149214180911,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_read_4k",
+      "median_ratio": 0.9783942279630853,
+      "aggregate_ratio": 0.9403793853692989,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_write_4k",
+      "median_ratio": 0.891998799955743,
+      "aggregate_ratio": 0.487749513442856,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "combined_large_writes",
+      "aggregate_ratio": 1.0088114086236344,
+      "paired_wins": 5,
+      "pass_gate": false
+    }
+  ],
+  "large_writes": {
+    "ext4/fuse": {
+      "aggregate_mib_per_second": {
+        "baseline": 97.32562982350892,
+        "updated": 139.3366936185501
+      },
+      "aggregate_ratio": 1.4316546820321059,
+      "paired_wins": 2
+    },
+    "ext4/aged_fuse": {
+      "aggregate_mib_per_second": {
+        "baseline": 132.64006018524864,
+        "updated": 133.80880595540432
+      },
+      "aggregate_ratio": 1.0088114086236344,
+      "paired_wins": 5
+    }
+  }
+}

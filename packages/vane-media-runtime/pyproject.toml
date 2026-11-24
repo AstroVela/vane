@@ -1,5 +1,11 @@
 [build-system]
-requires = ["packaging>=24.2", "pyelftools>=0.33", "patchelf>=0.17", "setuptools-scm>=9.2.0"]
+requires = [
+    "packaging>=24.2",
+    "pyelftools>=0.33",
+    "patchelf>=0.17; sys_platform == 'linux'",
+    "lief>=0.17.6,<0.18; sys_platform == 'win32'",
+    "setuptools-scm>=9.2.0",
+]
 build-backend = "backend"
 backend-path = ["."]
 

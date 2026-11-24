@@ -1,0 +1,14 @@
+--- a/tests/test_core.cpp
++++ b/tests/test_core.cpp
+@@ -135 +135 @@
+-		              "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
++		              "SELECT CASE WHEN (SELECT writes FROM fault_counter)=2 "
+--- a/tests/test_workspace.py
++++ b/tests/test_workspace.py
+@@ -153 +153 @@
+-        "SELECT CASE WHEN (SELECT writes FROM fault_counter)=100 "
++        "SELECT CASE WHEN (SELECT writes FROM fault_counter)=2 "
+@@ -241 +241,2 @@
+-    main.write_file("/file", data)
++    main.write_file("/file", data[:4096])
++    main.write("/file", data[4096:], 4096)

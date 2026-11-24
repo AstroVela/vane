@@ -10,6 +10,7 @@ import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -386,14 +387,14 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, ag
             captured.append(relation)
             return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
     projection = "sum(x) AS x" if aggregate else "*"
     con.sql(f"select {projection} from read_parquet('{src}')").write_parquet(str(dst))
-    assert captured, "expected local write relation to be captured"
+    assert captured, "expected distributed write relation to be captured"
 
     query_id = captured[0].idx()
     plan = captured[0].to_physical_plan(con)
@@ -420,13 +421,13 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
             captured.append(relation)
             return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_isolation_output.parquet"
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
-    assert captured, "expected local write relation to be captured"
+    assert captured, "expected distributed write relation to be captured"
     return con, dst, captured[0]
 
 
@@ -574,6 +575,34 @@ def test_native_worker_manager_logs_submit_tasks_when_enabled(monkeypatch, capsy
     assert "task_id=query-submit-log.0.1.0" in captured
     assert "worker_id=native-worker-0" in captured
     assert "worker_max_running=2" in captured
+
+
+@pytest.mark.parametrize("probe", ["missing", "error", "zero"])
+def test_native_memory_capacity_falls_back_without_usable_sysconf(monkeypatch, probe):
+    def sysconf(_name):
+        if probe == "error":
+            raise OSError("sysconf unavailable")
+        return 0
+
+    platform_os = SimpleNamespace() if probe == "missing" else SimpleNamespace(sysconf=sysconf)
+    monkeypatch.setattr(native_backend_mod, "os", platform_os)
+    monkeypatch.setattr("psutil.virtual_memory", lambda: SimpleNamespace(total=8192, available=1))
+
+    assert native_backend_mod._native_total_memory_bytes() == 8192
+
+
+def test_native_memory_capacity_preserves_usable_sysconf(monkeypatch):
+    monkeypatch.setattr(
+        native_backend_mod,
+        "os",
+        SimpleNamespace(sysconf=lambda name: {"SC_PHYS_PAGES": 1024, "SC_PAGE_SIZE": 4096}[name]),
+    )
+
+    def unexpected_fallback():
+        raise AssertionError("the POSIX capacity probe should take precedence")
+
+    monkeypatch.setattr("psutil.virtual_memory", unexpected_fallback)
+    assert native_backend_mod._native_total_memory_bytes() == 1024 * 4096
 
 
 def test_native_worker_snapshots_report_resource_capacity():
@@ -3565,7 +3594,7 @@ def test_cxx_ray_manager_cleans_nested_execution_resource_owner_state(cleanup_mo
 
 
 def test_cxx_backend_registers_order_by_internal_queries_under_resource_owner(tmp_path, monkeypatch):
-    from vane.runners.local.runner import _InProcessFragmentExecutor
+    from tests.local_plan_helpers import _InProcessFragmentExecutor
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
@@ -4802,7 +4831,7 @@ def test_native_cxx_extension_write_preserves_terminal_state_when_result_marshal
 def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
-    from vane.runners.local.runner import _InProcessFragmentExecutor
+    from tests.local_plan_helpers import _InProcessFragmentExecutor
 
     backend = NativeFteWorkerManagerBackend(
         execute_fn=_InProcessFragmentExecutor(),
@@ -4837,7 +4866,7 @@ def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, mon
 def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_paths(tmp_path, monkeypatch):
     con, dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
-    from vane.runners.local.runner import _InProcessFragmentExecutor
+    from tests.local_plan_helpers import _InProcessFragmentExecutor
 
     executor = _InProcessFragmentExecutor()
     backend = NativeFteWorkerManagerBackend(execute_fn=executor, max_running_tasks=2)
@@ -4889,7 +4918,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     import weakref
     from concurrent.futures import ThreadPoolExecutor
 
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     class FakeCursor:
         def __init__(self, conn_id: int) -> None:
@@ -5013,7 +5042,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
 
 
 def test_in_process_fragment_executor_close_does_not_release_live_resources(monkeypatch):
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     execute_started = threading.Event()
     release_execute = threading.Event()
@@ -5080,7 +5109,7 @@ def test_in_process_fragment_executor_close_does_not_release_live_resources(monk
 
 
 def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatch):
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     close_started = threading.Event()
     release_close = threading.Event()
@@ -5146,7 +5175,7 @@ def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatc
 
 
 def test_in_process_fragment_executor_interrupt_ownership_blocks_cursor_close():
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     first_interrupt_started = threading.Event()
     release_first_interrupt = threading.Event()
@@ -5266,7 +5295,7 @@ def test_in_process_fragment_executor_interrupt_ownership_blocks_cursor_close():
 
 
 def test_in_process_fragment_executor_reports_active_cursor_interrupt_failure():
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     class ActiveCursor:
         def interrupt(self) -> None:
@@ -5284,7 +5313,7 @@ def test_in_process_fragment_executor_reports_active_cursor_interrupt_failure():
 
 
 def test_in_process_fragment_executor_registration_failure_releases_execution_ownership(monkeypatch):
-    from vane.runners.local import runner as local_runner
+    from tests import local_plan_helpers as local_runner
 
     class FakeCursor:
         def __init__(self) -> None:
@@ -5456,7 +5485,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
         assert result["copy_selected_file_count"] == 1
         assert result["copy_duplicate_file_count"] == 0
         assert result["rows_copied"] == 1
-        assert con.sql(f"select list(x order by x) from read_parquet('{dst}')").fetchone()[0] == [101]
+        assert pq.read_table(dst).column("x").to_pylist() == [101]
         assert backend.handles[0].get_result_calls == 1
         assert backend.handles[1].get_result_calls == 0
         assert backend.handles[0].acked is True
@@ -5749,3 +5778,72 @@ def test_native_task_result_handle_normalizes_none_as_no_output_for_cxx():
     finally:
         worker.fte_drop_query("q")
         worker.shutdown()
+
+
+def test_local_runner_preloads_arrow_dataset_imports():
+    from tests.local_plan_helpers import _preload_arrow_dataset_imports
+
+    _preload_arrow_dataset_imports()
+    _preload_arrow_dataset_imports()
+
+
+@pytest.mark.parametrize("failure", [None, "typed", "forged"])
+def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch, failure):
+    import json
+
+    from tests import local_plan_helpers as runner_module
+    from vane.ai import DiagnosticError, summarize_error
+    from vane.runners.fte import FteTaskAttemptId, FteTaskId
+
+    attempt_id = FteTaskAttemptId(FteTaskId("query-id", 7, 3), 2)
+    native_calls = []
+
+    class FakeCursor:
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakePlanRunner:
+        def execute_native(self, *args):
+            native_calls.append(args)
+            if failure is not None:
+                message = "DiagnosticError: " + str(DiagnosticError("fixture", OSError(28, "private path")))
+                if failure == "forged":
+                    message = "RuntimeError: " + message
+                raise ValueError(
+                    "Execution failed: "
+                    + json.dumps(
+                        {
+                            "exception_type": "Invalid Input",
+                            "exception_message": "streaming UDF async error: " + message,
+                        }
+                    )
+                )
+            return "ok"
+
+    monkeypatch.setattr(
+        runner_module.NativeFteWorkerManagerBackend,
+        "materialize_task_context",
+        staticmethod(lambda _request, *, merge_scan_split_batches: {}),
+    )
+    monkeypatch.setattr(runner_module, "require_ray_cxx_attr", lambda _name: object())
+
+    executor = runner_module._InProcessFragmentExecutor()
+    monkeypatch.setattr(executor, "_get_conn", lambda: FakeConnection())
+    monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
+
+    request = {"task_id": attempt_id.to_dict(), "fragment_plan": object()}
+    if failure is None:
+        assert executor(request) == "ok"
+    else:
+        with pytest.raises(ValueError, match="Execution failed"):
+            executor(request)
+    if failure == "typed":
+        assert summarize_error(executor.diagnostic) == "OSError (errno=28)"
+    else:
+        assert executor.diagnostic is None
+    assert len(native_calls) == 1
+    assert native_calls[0][10] == {"task_id": str(attempt_id)}

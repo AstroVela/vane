@@ -137,10 +137,12 @@ public:
 		return res;
 	}
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
-	wait_query_finished_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+	wait_query_finished_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output,
+	                              bool preserve_task_order = true) {
 		(void)query_id;
 		(void)timeout_s;
 		(void)on_output;
+		(void)preserve_task_order;
 		return DuckDBResult<std::vector<MaterializedOutput>>::err(
 		    DuckDBError::invalid_state_error("FTE task submitter does not support streaming result drain"));
 	}

@@ -1,0 +1,8 @@
+patching file src/workspace.cpp
+Hunk #1 succeeded at 2344 (offset 166 lines).
+Hunk #2 succeeded at 2382 (offset 166 lines).
+patching file include/vane_fs/workspace.hpp
+patching file CMakeLists.txt
+patching file tests/test_inode_refs.cpp
+patching file tests/test_lookup_validation.cpp
+patching file src/checkpoint.hpp

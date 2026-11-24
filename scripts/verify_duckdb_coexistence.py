@@ -93,7 +93,7 @@ def _assert_duckdb_only(python: Path, *, cwd: Path) -> None:
         assert importlib.util.find_spec("vane") is None
         assert not any(name == "vane" or name.startswith("vane.") for name in sys.modules)
         assert _duckdb.__name__ == "_duckdb"
-        assert duckdb.sql("SELECT 40 + 2").fetchone() == (42,)
+        assert duckdb.sql("SELECT 40 + 2").fetchall() == [(42,)]
         with duckdb_adbc.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 21 * 2")

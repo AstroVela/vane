@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 import vane
-from vane.ai import embed, embed_image
+from vane.ai import ImageInput, embed
 
 MODEL = "sentence-transformers/clip-ViT-B-32"
 
@@ -47,9 +47,14 @@ def main() -> None:
         )
         vectors = decoded.select(
             vane.col("path"),
-            embed_image(vane.col("image"), model=MODEL, revision=args.revision, normalize=True, batch_size=16).alias(
-                "embedding"
-            ),
+            embed(
+                ImageInput(vane.col("image")),
+                model=MODEL,
+                revision=args.revision,
+                normalize=True,
+                batch_size=16,
+                provider="transformers",
+            ).alias("embedding"),
         )
         # Materialize once so retrieval does not encode every image again.
         conn.register("image_vectors", vectors.to_arrow_table())

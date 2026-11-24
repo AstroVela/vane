@@ -228,6 +228,7 @@ _MAX_PE_LIBRARY_NAME_BYTES = 255
 _PE_LIBRARY_NAME_RE = re.compile(rb"^[A-Za-z0-9_][A-Za-z0-9._+-]*\.[Dd][Ll][Ll]$")
 _WINDOWS_API_SET_LIBRARIES = frozenset(
     {
+        "api-ms-win-core-synch-l1-2-0.dll",
         "api-ms-win-crt-conio-l1-1-0.dll",
         "api-ms-win-crt-convert-l1-1-0.dll",
         "api-ms-win-crt-environment-l1-1-0.dll",
@@ -274,9 +275,11 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
         "ntdll.dll",
         "ole32.dll",
         "oleaut32.dll",
+        "pdh.dll",
         "powrprof.dll",
         "psapi.dll",
         "rpcrt4.dll",
+        "rstrtmgr.dll",
         "secur32.dll",
         "setupapi.dll",
         "shell32.dll",
@@ -290,6 +293,7 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
         "winmm.dll",
         "wintrust.dll",
         "ws2_32.dll",
+        "wsock32.dll",
         "wtsapi32.dll",
     }
 )
@@ -436,6 +440,7 @@ def build_extension_wheel(
     trust_identity: str,
     license_expression: str,
     license_files: Iterable[str | Path],
+    release_number: int = 1,
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
     release_materials: str | Path | None = None,
@@ -577,7 +582,7 @@ def build_extension_wheel(
 
     vane_version = _validate_vane_version(vane.__version__)
     descriptor_digest = _descriptor_digest(descriptor)
-    distribution_version = _extension_distribution_version(vane_version, descriptor)
+    distribution_version = _extension_release_version(vane_version, release_number)
     distribution_name = f"vane-extension-{name}"
     distribution_root = f"vane_extension_{name}-{distribution_version}"
     wheel_tag = f"{interpreter_tag}-none-{normalized_platform_tag}"
@@ -612,7 +617,11 @@ def build_extension_wheel(
             tuple(
                 (
                     dependency.name,
-                    _extension_distribution_version(vane_version, dependency),
+                    next(
+                        wheel.distribution_version
+                        for wheel in resolved_dependency_wheels
+                        if wheel.descriptor.identity == dependency.identity
+                    ),
                 )
                 for dependency in dependencies
             ),
@@ -856,7 +865,8 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, test_only: boo
                 raise ValueError("dependency extension wheel artifact SHA-256 does not match its descriptor")
 
             distribution_name = f"vane-extension-{descriptor.name}"
-            distribution_version = _extension_distribution_version(descriptor.vane_version, descriptor)
+            distribution_version = str(filename_version)
+            _validate_extension_distribution_version(distribution_version, descriptor.vane_version, descriptor_digest)
             if filename_name != canonicalize_name(distribution_name) or filename_version != Version(
                 distribution_version
             ):
@@ -1553,13 +1563,27 @@ def _core_metadata_lines(contents: bytes) -> Iterable[bytes]:
         yield contents[line_start:]
 
 
+def _bundled_library_names(libraries: Iterable[str]) -> frozenset[str]:
+    names = frozenset(libraries)
+    if len(names) > 128 or any(
+        not isinstance(name, str) or name in {".", ".."} or re.fullmatch(r"[A-Za-z0-9_+.-]{1,255}", name) is None
+        for name in names
+    ):
+        raise ValueError("bundled libraries require bounded, plain filenames")
+    return names
+
+
 def _runtime_linkage_options(libraries):
     if libraries is None:
         return {}
     from vane_packaging.media_runtime import exported_versions
 
     return {
-        "bundled_versions": {name: exported_versions(contents) for name, contents in libraries.items()},
+        "bundled_versions": {
+            name: exported_versions(contents) if contents.startswith(_ELF_MAGIC) else frozenset()
+            for name, contents in libraries.items()
+        },
+        "bundled_libraries": frozenset(libraries),
         "allowed_runpath": "$ORIGIN/.libs",
     }
 
@@ -1573,6 +1597,7 @@ def _validate_native_binary_platform(
     interpreter_tag: str,
     bundled_versions: dict[str, frozenset[str]] | None = None,
     allowed_runpath: str | None = None,
+    bundled_libraries: Iterable[str] = (),
 ) -> None:
     if platform_build_details.platform_tag != platform_tag:
         raise ValueError(
@@ -1591,13 +1616,16 @@ def _validate_native_binary_platform(
             allowed_runpath=allowed_runpath,
         )
     elif policy.family == "macosx":
-        _validate_macos_binary_platform(contents, platform_tag, description=description)
+        _validate_macos_binary_platform(
+            contents, platform_tag, description=description, bundled_libraries=bundled_libraries
+        )
     elif policy.family == "windows":
         _validate_windows_pe_platform(
             contents,
             platform_tag,
             description=description,
             interpreter_tag=interpreter_tag,
+            bundled_libraries=bundled_libraries,
         )
 
 
@@ -1607,6 +1635,7 @@ def _validate_windows_pe_platform(
     *,
     description: str,
     interpreter_tag: str,
+    bundled_libraries: Iterable[str] = (),
 ) -> tuple[str, ...]:
     policy = _wheel_platform_policy(platform_tag)
     if policy.family != "windows":
@@ -1736,7 +1765,9 @@ def _validate_windows_pe_platform(
         description=description,
     )
     dependencies = tuple(dict.fromkeys((*imports, *delay_imports)))
-    allowed_libraries = _windows_policy_external_libraries(interpreter_tag)
+    allowed_libraries = _windows_policy_external_libraries(interpreter_tag) | frozenset(
+        name.casefold() for name in _bundled_library_names(bundled_libraries)
+    )
     unsupported_libraries = tuple(sorted(set(dependencies).difference(allowed_libraries)))
     if unsupported_libraries:
         raise ValueError(f"{description} requires non-policy Windows DLLs: {unsupported_libraries}")
@@ -1858,9 +1889,10 @@ def _pe_import_library_names(
         )
     if not terminated:
         raise ValueError(f"{description} PE {directory_description} directory has no terminating descriptor")
-    if len(set(names)) != len(names):
-        raise ValueError(f"{description} contains duplicate PE {directory_description} libraries")
-    return tuple(names)
+    # Linkers can emit separate descriptors for the same DLL, including Rust
+    # raw-dylib imports alongside MSVC import libraries. Validate and count every
+    # descriptor before coalescing the case-insensitive dependency names.
+    return tuple(dict.fromkeys(names))
 
 
 def _pe_library_name(
@@ -2684,6 +2716,7 @@ def _validate_macos_binary_platform(
     platform_tag: str,
     *,
     description: str,
+    bundled_libraries: Iterable[str] = (),
 ) -> tuple[int, int, int]:
     policy = _wheel_platform_policy(platform_tag)
     if policy.family != "macosx":
@@ -2780,8 +2813,14 @@ def _validate_macos_binary_platform(
         raise ValueError(f"{description} Mach-O load-command sizes do not match their declared total")
     if len(set(dynamic_library_dependencies)) != len(dynamic_library_dependencies):
         raise ValueError(f"{description} contains duplicate Mach-O dynamic-library dependencies")
+    bundled_names = _bundled_library_names(bundled_libraries)
+    bundled_paths = {f"{prefix}/{name}" for prefix in ("@loader_path", "@loader_path/.libs") for name in bundled_names}
     non_system_dependencies = tuple(
-        sorted(path for path in dynamic_library_dependencies if not _is_macos_system_library_path(path))
+        sorted(
+            path
+            for path in dynamic_library_dependencies
+            if not _is_macos_system_library_path(path) and path not in bundled_paths
+        )
     )
     if non_system_dependencies:
         raise ValueError(f"{description} requires non-system Mach-O dynamic libraries: {non_system_dependencies}")
@@ -3281,6 +3320,31 @@ def _descriptor_digest(descriptor: DynamicExtensionDescriptor) -> str:
     return hashlib.sha256(descriptor.to_json().encode("utf-8")).hexdigest()
 
 
+def _extension_release_version(vane_version: str, release_number: int) -> str:
+    """Append a provider counter that continues across stages of the same X.Y.Z."""
+    if type(release_number) is not int or release_number < 1:
+        raise ValueError("extension release_number must be a positive integer")
+    base = Version(_validate_vane_version(vane_version))
+    if base.epoch or base.local is not None or len(base.release) != 3:
+        raise ValueError("four-part extension versions require a Vane X.Y.Z version without epoch or local label")
+    prefix = ".".join(str(component) for component in base.release)
+    suffix = str(base)[len(prefix) :]
+    return str(Version(f"{prefix}.{release_number}{suffix}"))
+
+
+def _validate_extension_distribution_version(value: str, vane_version: str, descriptor_digest: str) -> None:
+    """Accept numbered provider releases and exact historical descriptor versions."""
+    parsed = Version(value)
+    if len(parsed.release) == 4 and parsed.release[3] > 0:
+        expected = _extension_release_version(vane_version, parsed.release[3])
+    else:
+        expected = _extension_distribution_version_from_digest(vane_version, descriptor_digest)
+    if value != expected:
+        raise ValueError(
+            f"extension wheel version does not match its descriptor-bound distribution: expected={expected}, actual={value}"
+        )
+
+
 def _extension_distribution_version(
     vane_version: str,
     descriptor: DynamicExtensionDescriptor,
@@ -3652,7 +3716,11 @@ def _license_entries(
     entries: dict[str, bytes] = {}
     casefolded_paths: dict[str, str] = {}
     for license_file in license_files:
-        path = Path(license_file).expanduser().resolve(strict=True)
+        path = Path(license_file).expanduser()
+        # Reject invalid archive basenames before touching the filesystem;
+        # Windows cannot even create some names that other hosts can reject.
+        _license_member_path(Path(path.name), windows_paths=windows_paths)
+        path = path.resolve(strict=True)
         if not path.is_file():
             raise ValueError(f"license file is not a regular file: {path}")
         relative_path = _license_member_path(path, windows_paths=windows_paths)

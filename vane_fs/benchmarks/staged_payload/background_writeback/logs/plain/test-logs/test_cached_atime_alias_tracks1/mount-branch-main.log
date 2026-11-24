@@ -1,0 +1,32 @@
+FUSE library version: 3.14.0
+unique: 2, opcode: INIT (26), nodeid: 0, insize: 104, pid: 0
+INIT: 7.40
+flags=0x73fffffb
+max_readahead=0x00020000
+   INIT: 7.31
+   flags=0x40409029
+   max_readahead=0x00020000
+   max_write=0x00100000
+   max_background=0
+   congestion_threshold=0
+   time_gran=1
+   unique: 2, success, outsize: 80
+unique: 4, opcode: GETATTR (3), nodeid: 1, insize: 56, pid: 3548148
+   unique: 4, success, outsize: 120
+unique: 6, opcode: LOOKUP (1), nodeid: 1, insize: 45, pid: 3548148
+   unique: 6, success, outsize: 144
+unique: 8, opcode: SETATTR (4), nodeid: 2, insize: 128, pid: 3548148
+   unique: 8, success, outsize: 120
+unique: 10, opcode: OPEN (14), nodeid: 2, insize: 48, pid: 3548148
+NOTIFY: code=2 length=40
+   unique: 10, success, outsize: 32
+unique: 12, opcode: GETXATTR (22), nodeid: 2, insize: 68, pid: 3548148
+   unique: 12, error: -38 (Function not implemented), outsize: 16
+unique: 14, opcode: FLUSH (25), nodeid: 2, insize: 64, pid: 3548505
+   unique: 14, success, outsize: 16
+unique: 16, opcode: GETATTR (3), nodeid: 2, insize: 56, pid: 3548505
+   unique: 16, success, outsize: 120
+unique: 18, opcode: FLUSH (25), nodeid: 2, insize: 64, pid: 3548148
+   unique: 18, success, outsize: 16
+unique: 20, opcode: RELEASE (18), nodeid: 2, insize: 64, pid: 0
+   unique: 20, success, outsize: 16

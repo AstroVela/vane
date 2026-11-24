@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: vane_fs/build/payload-presync-20261012T080704Z/updated/venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-presync-20261012T080704Z/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-presync-20261012T080704Z/updated
+Prepared 1 package in 27.49s
+Installed 1 package in 1ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-presync-20261012T080704Z/updated)

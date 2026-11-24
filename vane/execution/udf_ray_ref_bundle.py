@@ -61,6 +61,10 @@ def apply_ref_bundle_slices(
             if start < 0 or end < start or end > table.num_rows:
                 raise ValueError(f"invalid ref bundle slice [{start}, {end}) for block rows={table.num_rows}")
             table = table.slice(start, end - start)
+        if output_names:
+            # Source projections can repeat columns. Unify schemas by position
+            # before restoring the logical names, which can also be duplicated.
+            table = table.rename_columns([f"__vane_ref_column_{index}" for index in range(table.num_columns)])
         tables.append(table)
     if not tables:
         raise ValueError("empty ref bundle input is not supported")

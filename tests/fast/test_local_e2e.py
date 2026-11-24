@@ -3,128 +3,170 @@
 
 from __future__ import annotations
 
-import builtins
+import os
+import subprocess
 import sys
 
+import pyarrow.parquet as pq
 import pytest
 
 import vane
-from vane import runners as _runners
-from vane.runners.local import set_runner_local
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.resources import ResourceVector
 
 
-def _teardown_runner_if_supported():
-    vane_mod = vane
-    if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
-        vane_mod.teardown_runner()
+@pytest.mark.parametrize("entrypoint", ["root", "runners", "local"])
+def test_set_runner_local_selects_native_execution(monkeypatch, entrypoint):
+    from vane import runners
+    from vane.runners import local
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    setter = {"root": vane.set_runner_local, "runners": runners.set_runner_local, "local": local.set_runner_local}[
+        entrypoint
+    ]
+    assert setter() is None
+    assert vane.current_config().runner == "local"
+    assert vane.get_runner() is None
+    with vane.connect() as connection:
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        assert connection.sql("SELECT 1")._get_runner_type() == "local"
 
 
-@pytest.fixture
-def local_runner():
-    _teardown_runner_if_supported()
-    try:
-        set_runner_local(num_workers=1, max_running_tasks=1)
-        runner = _runners.get_or_create_runner()
-    except Exception:
-        pytest.skip("duckdb local FTE runner API not available in this environment")
-    if getattr(runner, "name", None) != "local":
-        pytest.skip(f"Local runner not active, got runner={getattr(runner, 'name', None)!r}")
-    try:
-        yield runner
-    finally:
-        _teardown_runner_if_supported()
+@pytest.mark.parametrize("option", ["num_workers", "max_running_tasks", "execution_mode"])
+def test_set_runner_local_rejects_removed_fte_options(option):
+    with pytest.raises(TypeError, match=option):
+        vane.set_runner_local(**{option: 1})
 
 
-def test_local_run_iter_is_not_implemented(local_runner):
-    with pytest.raises(NotImplementedError, match="local FTE run_iter"):
-        list(local_runner.run_iter(None))
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_local_native_write_and_repartition(monkeypatch, tmp_path, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    target = tmp_path / "output.parquet"
+    with vane.connect() as connection:
+        connection.sql("SELECT i::INTEGER AS x, (i % 5)::INTEGER AS k FROM range(100) t(i)").filter(
+            "x >= 10 AND x < 90"
+        ).repartition(4).write_parquet(str(target))
+        assert connection.read_parquet(str(target)).aggregate("count(*), sum(x), min(k), max(k)").fetchone() == (
+            80,
+            3960,
+            0,
+            4,
+        )
+    assert target.is_file()
+    assert pq.read_table(target).num_rows == 80
 
 
-def test_local_runner_write_parquet_e2e(local_runner, tmp_path, monkeypatch):
-    src = tmp_path / "local_e2e_input.parquet"
-    dst = tmp_path / "local_e2e_output.parquet"
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    setup_conn = vane.connect()
-    try:
-        setup_conn.sql("select i::integer as x, (i % 5)::integer as k from range(100) tbl(i)").write_parquet(str(src))
-    finally:
-        setup_conn.close()
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_public_local_configuration_supports_shared_model_runtime(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    assert vane.configure(runner=runner).runner == "local"
 
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    con = vane.connect()
-    try:
-        con.read_parquet(str(src)).filter("x >= 10 and x < 90").repartition(4).write_parquet(str(dst))
-        rows = con.sql(f"select count(*), sum(x), min(k), max(k) from read_parquet('{dst}')").fetchone()
-    finally:
-        con.close()
+    @vane.cls(actor_number=1, return_dtype="BIGINT")
+    class Add:
+        def __init__(self, offset):
+            self.offset = offset
 
-    assert rows == (80, 3960, 0, 4)
+        def __call__(self, value):
+            return value + self.offset
 
-
-def test_local_runner_direct_target_per_thread_output_allows_sequential_partitions(tmp_path, monkeypatch):
-    monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
-    _teardown_runner_if_supported()
-    try:
-        set_runner_local(num_workers=1, max_running_tasks=1)
-        runner = _runners.get_or_create_runner()
-        if getattr(runner, "name", None) != "local":
-            pytest.skip(f"Local runner not active, got runner={getattr(runner, 'name', None)!r}")
-
-        src = tmp_path / "local_direct_input.parquet"
-        dst = tmp_path / "local_direct_output"
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        setup_conn = vane.connect()
-        try:
-            setup_conn.sql("select i::integer as x, (i % 7)::integer as k from range(4096) tbl(i)").write_parquet(
-                str(src)
-            )
-        finally:
-            setup_conn.close()
-
-        monkeypatch.setenv("VANE_RUNNER", "local")
-        con = vane.connect()
-        try:
-            con.read_parquet(str(src)).repartition(8).write_parquet(str(dst), per_thread_output=True)
-            rows = con.sql(f"select count(*), sum(x), min(k), max(k) from read_parquet('{dst}/*.parquet')").fetchone()
-            files = list(dst.glob("*.parquet"))
-        finally:
-            con.close()
-
-        assert rows == (4096, 8386560, 0, 6)
-        assert len(files) >= 2
-    finally:
-        _teardown_runner_if_supported()
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            resident_limit=ResourceVector(cpu=1),
+        )
+        model = runtime.register_model("add", Add(10), version="v1", parameters=["BIGINT"], cpus=1)
+        vane.attach_function(model, "add_value", connection=connection)
+        with connection.cursor() as cursor:
+            assert cursor.execute("SELECT add_value(?)", [2]).fetchall() == [(12,)]
+            assert cursor.sql("SELECT 3::BIGINT AS x").project(model(vane.col("x"))).fetchall() == [(13,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+    assert runtime.resource_snapshot()["closed"]
 
 
-def test_local_runner_without_ray_import(local_runner, tmp_path, monkeypatch):
-    for module_name in list(sys.modules):
-        if module_name == "ray" or module_name.startswith("ray."):
-            monkeypatch.delitem(sys.modules, module_name, raising=False)
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_native_local_execution_does_not_start_ray(tmp_path, runner):
+    script = r"""
+import sys
+import ray
+def blocked_init(*args, **kwargs):
+    raise AssertionError("native local execution must not start Ray")
+ray.init = blocked_init
+import vane
+with vane.connect() as connection:
+    connection.sql("SELECT i AS x FROM range(10) t(i)").write_parquet(sys.argv[1])
+    assert connection.read_parquet(sys.argv[1]).aggregate("count(*), sum(x)").fetchone() == (10, 45)
+assert vane.get_runner() is None
+assert not ray.is_initialized()
+"""
+    subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "without-ray-runtime.parquet")],
+        env={**os.environ, "VANE_RUNNER": runner},
+        check=True,
+        timeout=30,
+    )
 
-    orig_import = builtins.__import__
 
-    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "ray" or name.startswith("ray."):
-            raise ImportError("ray import is blocked in local-runner e2e test")
-        return orig_import(name, globals, locals, fromlist, level)
+@pytest.mark.parametrize("sink", ["parquet", "datasink"])
+def test_local_subprocess_actors_write_across_repartition(tmp_path, sink):
+    script = """
+import sys
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+import vane
+from vane.datasink import BoundDataSink, DataSink, DataSinkWorker, WriteOutcome, WriteResult
 
-    monkeypatch.setattr(builtins, "__import__", blocked_import)
+class AddOne:
+    def __call__(self, batch):
+        return pa.table({"x": pc.add(batch.column(0), 1)})
 
-    src = tmp_path / "local_no_ray_input.parquet"
-    dst = tmp_path / "local_no_ray_output.parquet"
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    setup_conn = vane.connect()
-    try:
-        setup_conn.sql("select i::integer as x from range(10) tbl(i)").write_parquet(str(src))
-    finally:
-        setup_conn.close()
+class AddTen:
+    def __call__(self, batch):
+        return pa.table({"x": pc.add(batch.column(0), 10)})
 
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    con = vane.connect()
-    try:
-        con.read_parquet(str(src)).write_parquet(str(dst))
-        rows = con.sql(f"select count(*), sum(x) from read_parquet('{dst}')").fetchone()
-    finally:
-        con.close()
+class Worker(DataSinkWorker):
+    def __init__(self, path):
+        self.path = path
 
-    assert rows == (10, 45)
+    def write(self, table):
+        pq.write_to_dataset(table, self.path)
+        return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows, bytes_received=table.nbytes)
+
+class Bound(BoundDataSink):
+    def __init__(self, path):
+        self.path = path
+
+    def open_worker(self, context):
+        return Worker(self.path)
+
+class Sink(DataSink):
+    def __init__(self, path):
+        self.path = path
+
+    def bind(self, schema):
+        return Bound(self.path)
+
+vane.set_runner_local()
+try:
+    with vane.connect() as conn:
+        relation = conn.sql("SELECT i::BIGINT AS x FROM range(3) t(i)").map_batches(
+            AddOne, schema={"x": "BIGINT"}, execution_backend="subprocess_actor", actor_number=1
+        ).repartition(2).map_batches(
+            AddTen, schema={"x": "BIGINT"}, execution_backend="subprocess_actor", actor_number=1
+        )
+        if sys.argv[2] == "parquet":
+            relation.write_parquet(sys.argv[1])
+        else:
+            summary = relation.write_datasink(Sink(sys.argv[1]))
+            assert summary.outcome is WriteOutcome.APPLIED and summary.rows_received == 3
+    assert sorted(pq.read_table(sys.argv[1]).column(0).to_pylist()) == [11, 12, 13]
+finally:
+    vane.teardown_runner()
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "actor.parquet"), sink],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

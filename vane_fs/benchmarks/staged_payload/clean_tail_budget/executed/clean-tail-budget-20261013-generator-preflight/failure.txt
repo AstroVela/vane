@@ -1,0 +1,1 @@
+Generator preflight failed importing prepare.digest: the generated script lives outside the benchmark source directory. No component build or measurement ran. Corrected the generated script import path to the immutable checkpoint_followthrough helper module.

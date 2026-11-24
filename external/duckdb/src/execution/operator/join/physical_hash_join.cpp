@@ -272,6 +272,12 @@ public:
 	unique_ptr<JoinHashTable> hash_table;
 
 	unique_ptr<JoinFilterLocalState> local_filter_state;
+
+	void ResetBatchInput() override {
+		join_keys.Reset();
+		payload_chunk.Reset();
+		join_key_executor.ResetInput();
+	}
 };
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context) const {
@@ -1128,6 +1134,16 @@ public:
 	DataChunk spill_chunk;
 
 public:
+	void ResetBatchInput() override {
+		lhs_join_keys.Reset();
+		lhs_output.Reset();
+		spill_chunk.Reset();
+		probe_executor.ResetInput();
+		if (perfect_hash_join_state) {
+			perfect_hash_join_state->ResetBatchInput();
+		}
+	}
+
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}

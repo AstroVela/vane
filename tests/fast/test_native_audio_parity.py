@@ -15,6 +15,10 @@ from tests.fast.test_audio_file import _flac_with_unknown_total_samples
 from tests.fast.test_file_reader import _start_object_server
 from tests.fast.test_native_media_extensions import _connect, _wav
 
+# SoXR HQ is a 20-bit converter with a float32 internal engine by default,
+# even with float64 I/O. Independent scalar/SIMD builds can round differently.
+SOXR_HQ_ATOL = 1e-6
+
 
 def _audio_value(tmp_path, *, frames, channels=2, source_rate=48000, format="WAV", subtype="FLOAT", unknown=False):
     np = pytest.importorskip("numpy")
@@ -244,7 +248,7 @@ def test_native_audio_short_waveform_matches_python(tmp_path, channels, frames, 
         expression = native.sql("SELECT 1").select(vane.resample(value, target_rate)).fetchone()[0]
         assert result.dtype == np.float64 and result.flags.c_contiguous
         assert result.shape == ((frames * target_rate + 7999) // 8000, channels)
-        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(result, expected, rtol=0, atol=SOXR_HQ_ATOL)
         np.testing.assert_array_equal(result, expression)
 
 
@@ -276,7 +280,7 @@ def test_native_audio_fractional_and_unknown_lengths_match_python(
         expected = value.resample(target_rate, connection=python)
         result = native.execute("SELECT resample($1, $2)", [value, target_rate]).fetchone()[0]
         assert result.shape == expected.shape
-        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(result, expected, rtol=0, atol=SOXR_HQ_ATOL)
         np.testing.assert_array_equal(result[-1], 0)
         profile = native.execute("SELECT native_audio_resample_profile($1, $2)", [value, target_rate]).fetchone()[0]
         assert profile["decoded_frames"] == frames
@@ -434,7 +438,8 @@ def test_native_audio_retains_flac_formats_unsupported_by_soundfile(tmp_path, co
         expression = native.sql("SELECT 1").select(vane.resample(value, target_rate)).fetchone()[0]
         assert result.dtype == np.float64 and result.flags.c_contiguous
         assert result.shape == expected.shape == (target_rate // 10, 2)
-        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+        # Keep decoder-only comparisons strict when no resampling occurs.
+        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12 if target_rate == 8000 else SOXR_HQ_ATOL)
         np.testing.assert_array_equal(result, expression)
         profile = native.execute("SELECT native_audio_resample_profile($1, $2)", [value, target_rate]).fetchone()[0]
         assert profile["decoder_library"] == "ffmpeg"

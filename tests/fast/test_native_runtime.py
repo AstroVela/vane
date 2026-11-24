@@ -117,9 +117,23 @@ def test_runtime_library_bytes_and_exact_directory_are_checked(tmp_path):
     library.unlink()
     with pytest.raises(ValueError, match="differs"):
         fmt.verify_files(tmp_path, value)
-    library.symlink_to("/dev/zero")
+
+
+def test_runtime_library_symlinks_are_rejected(tmp_path):
+    value = manifest()
+    directory = tmp_path / "libraries"
+    directory.mkdir()
+    target = tmp_path / "outside"
+    target.write_bytes(b"library bytes")
+    library = directory / next(iter(value["files"]))
+    try:
+        library.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows symlink creation requires a privilege unavailable on this host")
     with pytest.raises((OSError, ValueError)):
-        fmt.verify_files(tmp_path, value)
+        fmt.verify_files(directory, value)
 
 
 def test_runtime_trailer_preserves_footer_and_must_precede_signing():
@@ -191,7 +205,7 @@ def snapshot_inputs(tmp_path, monkeypatch):
         format_version=2,
         native_runtime=reference,
     )
-    return runtime, artifact, descriptor, tmp_path / "cache", source
+    return runtime, artifact, descriptor, fmt.filesystem_path(tmp_path / "cache"), source
 
 
 def test_native_runtime_reuses_valid_snapshot_without_staging(snapshot_inputs, monkeypatch):
@@ -322,7 +336,7 @@ def test_distributed_worker_requires_independent_local_authorization(snapshot_in
     shutil.copytree(source, worker_source)
     monkeypatch.setenv("VANE_NATIVE_MEDIA_RUNTIME", str(worker_source))
     runtime.prepare_distributed_runtime([descriptor], digest)
-    assert runtime._override == worker_source
+    assert runtime._override.samefile(worker_source)
     assert runtime.distributed_runtime_selection([descriptor]) == digest
     with pytest.raises(ValueError, match="differs from the coordinator"):
         runtime.prepare_distributed_runtime([descriptor], "f" * 64)
@@ -422,6 +436,7 @@ def test_native_runtime_cache_hit_revalidates_sources_and_snapshot(snapshot_inpu
     elif damage == "source-signature":
         monkeypatch.setattr(_native, "_verify_native_runtime_signature", lambda *args: False)
     elif damage == "missing-library":
+        library.chmod(0o600)
         library.unlink()
     elif damage == "extra-library":
         (library.parent / "extra.so").write_bytes(b"unexpected")
@@ -430,13 +445,27 @@ def test_native_runtime_cache_hit_revalidates_sources_and_snapshot(snapshot_inpu
     elif damage == "hardlink-library":
         (source / "linked.so").hardlink_to(library)
     elif damage == "symlink-library":
+        library.chmod(0o600)
         library.unlink()
-        library.symlink_to(source / ".libs" / SOXR_LIBRARY)
+        try:
+            library.symlink_to(source / ".libs" / SOXR_LIBRARY)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            pytest.skip("Windows symlink creation requires a privilege unavailable on this host")
     elif damage == "symlink-destination":
         moved = destination.with_name("moved")
         destination.rename(moved)
-        destination.symlink_to(moved, target_is_directory=True)
+        try:
+            destination.symlink_to(moved, target_is_directory=True)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            pytest.skip("Windows symlink creation requires a privilege unavailable on this host")
     elif damage == "empty-destination":
+        for path in destination.rglob("*"):
+            if path.is_file():
+                path.chmod(0o600)
         shutil.rmtree(destination)
         destination.mkdir(mode=0o700)
     else:

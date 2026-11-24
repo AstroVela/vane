@@ -1,0 +1,30 @@
+{
+  "fuse": [
+    "fuse-0-baseline.json",
+    "fuse-0-updated.json",
+    "fuse-1-updated.json",
+    "fuse-1-baseline.json",
+    "fuse-2-baseline.json",
+    "fuse-2-updated.json",
+    "fuse-3-updated.json",
+    "fuse-3-baseline.json",
+    "fuse-4-baseline.json",
+    "fuse-4-updated.json",
+    "fuse-5-updated.json",
+    "fuse-5-baseline.json"
+  ],
+  "aged_fuse": [
+    "aged_fuse-0-baseline.json",
+    "aged_fuse-0-updated.json",
+    "aged_fuse-1-updated.json",
+    "aged_fuse-1-baseline.json",
+    "aged_fuse-2-baseline.json",
+    "aged_fuse-2-updated.json",
+    "aged_fuse-3-updated.json",
+    "aged_fuse-3-baseline.json",
+    "aged_fuse-4-baseline.json",
+    "aged_fuse-4-updated.json",
+    "aged_fuse-5-updated.json",
+    "aged_fuse-5-baseline.json"
+  ]
+}

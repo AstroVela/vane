@@ -1,0 +1,133 @@
+{
+  "status": "RUNNING",
+  "commands": [
+    {
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-baseline"
+      ],
+      "started_epoch": 1792292541.8195457,
+      "ended_epoch": 1792292543.2881236,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-baseline.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=pwrite",
+        "-Wl,--wrap=pwrite64",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-extent"
+      ],
+      "started_epoch": 1792292543.3011897,
+      "ended_epoch": 1792292544.7691894,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-extent.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/bin/python",
+        "-I",
+        "-c",
+        "import sys,vane_fs; w=vane_fs.Workspace(sys.argv[1]); w.close()",
+        "/dev/shm/owned-extent-formats-mh1jd7wm/baseline.sqlite"
+      ],
+      "started_epoch": 1792292544.7825255,
+      "ended_epoch": 1792292544.8150105,
+      "returncode": 0,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-create-baseline.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/venv/bin/python",
+        "-I",
+        "-c",
+        "import sys,vane_fs\ntry: vane_fs.Workspace(sys.argv[1])\nexcept vane_fs.Error: pass\nelse: raise AssertionError('Wrong format accepted')\n",
+        "/dev/shm/owned-extent-formats-mh1jd7wm/baseline.sqlite"
+      ],
+      "started_epoch": 1792292544.8174427,
+      "ended_epoch": 1792292544.8497694,
+      "returncode": 1,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-refuse-baseline.log",
+      "log_sha256": "8dcb84b91c9dee8c81ef13bd8b24b2d1bb05d53ffdf58ca271357df698f87545"
+    }
+  ],
+  "binaries": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-baseline": "b2ac4c67d2e0cdecad086a2d44815c476659f341070423a465b91986f0218916",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/count-extent": "7eae6bca8b70691c9fb694431b252fe4b05c2670d130e6e326a8d3bbe90f9b19"
+  },
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-extent-formats-mh1jd7wm",
+      "files": {
+        "baseline.sqlite.stage-fence": {
+          "bytes": 4096,
+          "sha256": "51c7c549c1a831a40c10f71b70c5ec0fc1077addcbfb82ebb5cb244cd08b77cd"
+        },
+        "baseline.sqlite-shm": {
+          "bytes": 32768,
+          "sha256": "a3d1aecc103a8ed511744385747436d741dc72e49bb9eab170a35ddac74df64d"
+        },
+        "baseline.sqlite-wal": {
+          "bytes": 148352,
+          "sha256": "58264bd52a228731999dd8b2e4b285d8eed4924221394ca209694fd08484c54c"
+        },
+        "baseline.sqlite.payload": {
+          "bytes": 4096,
+          "sha256": "e5ab7147e8aea2f1b6178d252ba1b43cea894f263e3530ad0fb008cce3011aeb"
+        },
+        "baseline.sqlite": {
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        "baseline.sqlite.stage-publish": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "baseline.sqlite.stage-live": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "baseline.sqlite.stage-init": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true,
+      "mount_absent": true
+    }
+  ]
+}

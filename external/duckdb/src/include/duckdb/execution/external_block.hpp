@@ -21,6 +21,7 @@
 namespace duckdb {
 
 class ClientContext;
+class ExternalBlockBackendInterface;
 
 enum class ExternalBlockBackend : uint8_t { RAY_OBJECT_STORE };
 
@@ -44,6 +45,10 @@ struct ExternalBlockMetadata {
 struct ExternalBlockDescriptor {
 	ExternalBlockBackend backend = ExternalBlockBackend::RAY_OBJECT_STORE;
 	shared_ptr<void> object_ref;
+	// The producer binds its process-local reader explicitly. Keep this capability
+	// with the reference across descriptor transforms and self-contained DSOs;
+	// consumers must not resolve it through their own backend registry.
+	shared_ptr<ExternalBlockBackendInterface> materializer;
 	// Lifetime credits associated with this block. Descriptor transforms copy
 	// these shared tokens so ownership is released only after the final slice,
 	// projection, queue entry, or downstream consumer drops the block.

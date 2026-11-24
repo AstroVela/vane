@@ -1,0 +1,2 @@
+{"epoch_ns":1792224073559834788,"begin_monotonic_ns":108578552315154,"end_monotonic_ns":108578552877960,"threads":[{"tid":471315,"cpu":10,"runtime_ns":383939239,"runqueue_ns":105989,"slices":224}],"frequency_khz":{"10":1363958}}
+{"epoch_ns":1792224073565543914,"begin_monotonic_ns":108578558021639,"end_monotonic_ns":108578558587127,"threads":[{"tid":471315,"cpu":10,"runtime_ns":383939239,"runqueue_ns":105989,"slices":224}],"frequency_khz":{"10":2091273}}

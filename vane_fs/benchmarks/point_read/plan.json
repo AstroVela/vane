@@ -1,0 +1,106 @@
+{
+  "frozen_epoch": 1791705111.9550586,
+  "variants": [
+    "blob",
+    "blob_point",
+    "external",
+    "external_point"
+  ],
+  "states": [
+    "fresh",
+    "aged",
+    "history"
+  ],
+  "native_medium": "tmpfs",
+  "fuse_medium": "ext4",
+  "native_orders": [
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ],
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ],
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ]
+  ],
+  "fuse_orders": [
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ],
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ],
+    [
+      "blob",
+      "blob_point",
+      "external",
+      "external_point"
+    ],
+    [
+      "external_point",
+      "external",
+      "blob_point",
+      "blob"
+    ]
+  ],
+  "fuse_states": [
+    "fresh",
+    "aged"
+  ],
+  "measurement_scope": "Read-only query optimization. Writes, barriers, GC, schema and checkpoint policy unchanged. Native history adds 16 retained versions for first 1 MiB. FUSE reads use warmed O_RDWR direct I/O. Plain binaries only. No owned builds/tests overlap.",
+  "adoption_gates": {
+    "native_old_snapshot_cpu_improvement_minimum": 0.1,
+    "point_read_native_cpu_regression_maximum": 0.05,
+    "fuse_throughput_median_and_aggregate_ratio_minimum": 0.95,
+    "fuse_p99_latency_ratio_maximum": 1.2,
+    "fuse_p99_absolute_increase_allowance_seconds": 0.001
+  },
+  "global_cache_eviction": false,
+  "source_revision": "4e83455308faea9d5f6fc45200df20a608ec6f25"
+}

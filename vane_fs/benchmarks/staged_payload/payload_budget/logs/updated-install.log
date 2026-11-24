@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: vane_fs/build/payload-budget-20261012T095736Z/updated/venv
+Resolved 1 package in 2ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-budget-20261012T095736Z/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-budget-20261012T095736Z/updated
+Prepared 1 package in 27.48s
+Installed 1 package in 0.94ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/payload-budget-20261012T095736Z/updated)

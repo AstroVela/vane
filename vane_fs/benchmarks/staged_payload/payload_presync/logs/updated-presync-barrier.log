@@ -1,0 +1,2 @@
+barrier payload_calls=1 passive_calls=2
+barrier PASS

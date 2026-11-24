@@ -1,0 +1,10 @@
+{
+  "src/workspace.cpp": {
+    "batched": "6b81e6fb739c530f8a5a46f01357fea2d12ecf9ed2d4f59b2e3b399b6cbaa410",
+    "reused": "72ddefe7dc407e7dfea2c3e1d718e69aa3cb9b422b15843253c887361d98a30d"
+  },
+  "tests/test_checkpoint.cpp": {
+    "batched": "135b7525925169dffe6ad53296d9b0f1ac7ae0f452368fa531a8cf3d7d05d814",
+    "reused": "38ff975e6f6e77347ba3905b4369e2a3b34af758722a69d9c119410655d98b32"
+  }
+}

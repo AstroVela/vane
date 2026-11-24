@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from vane.runners.ray import cluster_resource_coordinator as coordinator_module
-from vane.runners.ray.cluster_resource_coordinator import (
+from vane.execution import cluster_resource_policy as coordinator_module
+from vane.execution.cluster_resource_policy import (
     ClusterQueryResourceCoordinator,
     NodeCapacity,
     QueryDemand,
-    read_ray_node_capacities,
 )
-from vane.runners.ray.query_resource_graph import ResourceVector
+from vane.execution.query_resource_spec import ResourceVector
+from vane.runners.ray.node_resource_capacity import read_ray_node_capacities
 
 
 def _r(

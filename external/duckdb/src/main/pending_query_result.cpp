@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
@@ -57,6 +63,17 @@ PendingExecutionResult PendingQueryResult::CheckPulse() {
 	auto lock = LockContext();
 	CheckExecutableInternal(*lock);
 	return context->ExecuteTaskInternal(*lock, *this, true);
+}
+
+vector<PipelineProgressSnapshot> PendingQueryResult::GetPipelinesProgressSnapshots() {
+	if (!context) {
+		return {};
+	}
+	auto lock = context->LockContext();
+	if (!context->IsActiveResult(*lock, *this)) {
+		return {};
+	}
+	return context->GetExecutor().GetPipelinesProgressSnapshots();
 }
 
 bool PendingQueryResult::AllowStreamResult() const {

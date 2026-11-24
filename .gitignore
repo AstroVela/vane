@@ -89,6 +89,7 @@ dist
 duckdb.egg-info
 .eggs
 .pytest_cache
+/test-results/
 .coverage
 duckdb_build
 build-asan

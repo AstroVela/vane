@@ -163,8 +163,9 @@ def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monke
     ).fetchone() == (0,)
 
 
-def test_relation_mutations_run_with_explicit_local_fast(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.parametrize("runner", ["local", "local-fast"])
+def test_relation_mutations_run_with_native_local(monkeypatch, tmp_path, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
     import vane
 
     connection = _new_mutation_connection(vane, tmp_path / "mutations.db", monkeypatch)
@@ -175,38 +176,28 @@ def test_relation_mutations_run_with_explicit_local_fast(monkeypatch, tmp_path):
     assert connection.execute("SELECT * FROM created_target").fetchall() == [(7,)]
 
 
-def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local")
+def test_ray_mutation_after_native_local_write_uses_ray(tmp_path, monkeypatch):
     import vane
 
-    local_calls = []
+    monkeypatch.setenv("VANE_RUNNER", "local")
     ray_calls = []
 
-    class FakeLocalRunner:
-        def run_write(self, relation):
-            local_calls.append(relation)
-            monkeypatch.setenv("VANE_RUNNER", "ray")
-            with vane.connect(database) as ray_connection:
-                ray_connection.sql("SELECT 42 AS value").insert_into("target")
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
-
     class FakeRayRunner:
-        def run_write(self, relation, **_kwargs):
-            ray_calls.append(relation)
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
+        def run_write(self, plan):
+            ray_calls.append(plan)
+            return {"copy_operation_id": plan.idx(), "rows_copied": 1}
 
-    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: FakeLocalRunner())
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
-
-    database = str(tmp_path / "nested.db")
-    connection = vane.connect(database)
-    connection.execute("CREATE TABLE target (value INTEGER)")
-    connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
-
-    assert len(local_calls) == 1 and isinstance(local_calls[0], vane.ray_cxx.PyLogicalPlan)
-    assert len(ray_calls) == 1 and isinstance(ray_calls[0], vane.ray_cxx.PyLogicalPlan)
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
+    database = str(tmp_path / "same-database.db")
+    with vane.connect(database) as local:
+        local.execute("CREATE TABLE target(value INTEGER)")
+        local.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "local.parquet"))
+        assert ray_calls == []
+        monkeypatch.setenv("VANE_RUNNER", "ray")
+        with vane.connect(database) as distributed:
+            distributed.sql("SELECT 42 AS value").insert_into("target")
+        assert len(ray_calls) == 1
+        assert local.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
 
 @pytest.mark.parametrize("prepare_source", [False, True], ids=["inside-transaction", "before-transaction"])
@@ -245,24 +236,6 @@ def test_ray_relation_mutations_reject_explicit_transactions(
         ).fetchone() == (0,)
     finally:
         connection.execute("ROLLBACK")
-
-
-@pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_relation_mutations_reject_local_fte_runner(monkeypatch, tmp_path, operation, expected_name):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    import vane
-
-    connection = _new_mutation_connection(vane, tmp_path / "mutations.db", monkeypatch)
-    with pytest.raises(
-        vane.InvalidInputException,
-        match=rf"{expected_name} requires a ray or local-fast connection",
-    ):
-        _execute_relation_mutation(vane, connection, operation)
-
-    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
-    assert connection.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
-    ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize(("operation", "_expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)

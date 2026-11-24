@@ -1,0 +1,56 @@
+{
+  "status": "FROZEN_BEFORE_MEASUREMENT",
+  "baseline_revision": "8e21f48ea64c7811893d847116ccc4fbf204f81d",
+  "candidate": "priority.patch; checkpoint.hpp only; isolated from partial-write batching",
+  "hypothesis": "A worker must yield its next PASSIVE checkpoint to announced foreground admission; evaluate complete write/admission time, not just the moved mutex wait",
+  "unchanged": {
+    "format": 2,
+    "payload_bytes": 4096,
+    "sqlite_sync": "original SDK fsync",
+    "durability": "fsync",
+    "checkpoint_start_mib": 16,
+    "checkpoint_admission_mib": 64,
+    "retained_wal_mib": 16,
+    "retry_wait_ms": 20,
+    "global_cache_eviction": false
+  },
+  "correctness": {
+    "scheduling_scenarios": ["success", "busy", "restart"],
+    "baseline_scheduling_expected_exit": 1,
+    "candidate_scheduling_expected_exit": 0,
+    "component_suites": "6 baseline C++ suites; 6 candidate C++ suites and component Python tests"
+  },
+  "fuse": {
+    "runner": "../partial_write/acceptance/run_fuse.py",
+    "media": ["tmpfs", "ext4"],
+    "states": ["fresh", "post_gc"],
+    "pairs_per_state_medium": 6,
+    "order": "AB,BA repeated 3 times",
+    "application_buffer_page_offset": 48,
+    "sequential_mib_and_request_mib": [[256, 8], [64, 1]],
+    "random_reads": 4096,
+    "random_overwrites": 512,
+    "small_files": 128,
+    "metadata_operations_each": 128,
+    "host_baseline_seconds_per_window": 20
+  },
+  "diagnostic": {
+    "medium": "ext4",
+    "pairs_per_state": 2,
+    "separate_window": true,
+    "metrics": ["full admission", "mutex wait", "PASSIVE and RESTART", "fsync", "request time", "completed device I/O"]
+  },
+  "ordinary_file_controls": {
+    "runner": "../partial_write/acceptance/run_controls.py",
+    "trials_before": 6,
+    "trials_after": 6,
+    "serial": true
+  },
+  "adoption_gate": {
+    "correctness": "All candidate scheduling, component and content/schema checks pass",
+    "benefit": "For each ext4 state, 256 MiB aggregate throughput >=5% higher with faster complete writes in >=5 of 6 pairs",
+    "nonregression": "Every plain workload median and aggregate rate >=95% of baseline; pooled request p99 <=120% (ignore increases <=1ms); lifecycle total <=105%",
+    "interpretation": "These fixed gates are not a significance test; retain every slow sample; if gates fail, preserve candidate without enabling or tuning"
+  },
+  "cleanup": "Stop only owned processes and unmount before removing generated workspaces; retain traces, hashes, logs, configurations and code/binary identities"
+}

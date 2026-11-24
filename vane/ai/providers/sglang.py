@@ -17,7 +17,7 @@ from vane.ai.options import (
     normalize_prompt_options,
 )
 from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
-from vane.ai.providers._native_inference import NativeEmbeddingProviderMixin
+from vane.ai.providers._native_inference import InferenceEmbeddingProviderMixin
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
@@ -201,13 +201,14 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
         return options
 
 
-class SGLangProvider(NativeEmbeddingProviderMixin):
-    """Provider backed by a native Python SGLang engine."""
+class SGLangProvider(InferenceEmbeddingProviderMixin):
+    """Native prompting and explicit native or HTTP embedding."""
 
     _native_family = "sglang"
 
-    def __init__(self, name: str | None = None):
+    def __init__(self, name: str | None = None, *, api_key: str | None = None):
         self._name = name or "sglang"
+        self._capture_http_client(api_key)
 
     @property
     def name(self) -> str:

@@ -1,0 +1,11 @@
+{
+  "status": "TEST_FIXTURE_LOAD_REPAIR",
+  "observed_error": "Pinned reader did not apply backpressure",
+  "first_release_result": "11 of 12 component suites passed",
+  "root_cause": "Checkpoint padding trigger adds 4096 bytes per external payload row; format 1005 shares one row across 64 blocks so the fixture no longer reaches its existing 64 MiB budget within 80 writes",
+  "repair": "Use 262144 padding bytes per full external extent; preserve existing 64 MiB limits, reader contention and atomicity assertions",
+  "binaries": {
+    "vane_fs/build/versioned-extents-20261018/candidate/build/python-release/libvane_fs.a": "6bf89e03216caefe6dc1f6a65393eedff1dad21cecef1349ed490ce139002990",
+    "vane_fs/build/versioned-extents-20261018/candidate/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "4032e64b35ad231046b821ae241c00cd15bc980c6cf1e6b7b8e8e1bca656217d"
+  }
+}

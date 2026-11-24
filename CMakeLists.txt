@@ -105,6 +105,11 @@ if(EXISTS "${_VANE_VCPKG_INSTALLED_DIR}")
       if(_VANE_PREFIX_INDEX EQUAL -1)
         list(APPEND CMAKE_PREFIX_PATH "${_VANE_VCPKG_PREFIX}")
       endif()
+      # An ambient host OpenSSL root can override CMAKE_PREFIX_PATH and mix a
+      # different ABI with vcpkg's gRPC. Keep the default on the same prefix.
+      if(NOT OPENSSL_ROOT_DIR)
+        set(OPENSSL_ROOT_DIR "${_VANE_VCPKG_PREFIX}")
+      endif()
       set(VCPKG_BUILD TRUE)
       message(
         STATUS "Vane: using repo-local vcpkg prefix: ${_VANE_VCPKG_PREFIX}")

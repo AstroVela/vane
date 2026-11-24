@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "vane_fs/workspace.hpp"
+#include <sqlite3.h>
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+
+using namespace vane_fs;
+
+static std::atomic<bool> counting {false}, fail_inode_update {false};
+static std::atomic<int> updates[3], inserts {0}, deletes {0};
+static void Require(bool value, const char *message) {
+	if (!value)
+		throw std::runtime_error(message);
+}
+extern "C" int __real_sqlite3_step(sqlite3_stmt *);
+extern "C" int __wrap_sqlite3_step(sqlite3_stmt *stmt) {
+	const char *sql = sqlite3_sql(stmt);
+	const char *tables[] = {"inode_versions", "dirent_versions", "block_versions"};
+	if (counting) {
+		for (int i = 0; i < 3; ++i) {
+			if (!std::strncmp(sql, ("UPDATE " + std::string(tables[i]) + " ").c_str(), 8 + std::strlen(tables[i])))
+				++updates[i];
+			if (!std::strncmp(sql, ("INSERT INTO " + std::string(tables[i]) + " ").c_str(),
+			                  13 + std::strlen(tables[i])))
+				++inserts;
+			if (!std::strncmp(sql, ("DELETE FROM " + std::string(tables[i]) + " ").c_str(),
+			                  13 + std::strlen(tables[i])))
+				++deletes;
+		}
+	}
+	if (fail_inode_update && !std::strncmp(sql, "UPDATE inode_versions ", 22) && fail_inode_update.exchange(false))
+		return SQLITE_IOERR;
+	return __real_sqlite3_step(stmt);
+}
+static void Reset() {
+	for (auto &value : updates)
+		value = 0;
+	inserts = deletes = 0;
+	counting = true;
+}
+static int64_t Scalar(const std::string &path, const char *sql) {
+	sqlite3 *db = nullptr;
+	Require(sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK, "Opening inspection");
+	struct Close {
+		sqlite3 *db;
+		~Close() {
+			sqlite3_close_v2(db);
+		}
+	} close {db};
+	sqlite3_stmt *stmt = nullptr;
+	Require(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK, "Preparing inspection");
+	struct Finalize {
+		sqlite3_stmt *stmt;
+		~Finalize() {
+			sqlite3_finalize(stmt);
+		}
+	} finalize {stmt};
+	Require(sqlite3_step(stmt) == SQLITE_ROW, "Reading inspection");
+	return sqlite3_column_int64(stmt, 0);
+}
+int main(int argc, char **argv) {
+	if (argc != 2)
+		return 2;
+	try {
+		std::filesystem::path root(argv[1]);
+		Require(std::filesystem::create_directory(root), "Test directory must not exist");
+		struct Cleanup {
+			std::filesystem::path root;
+			~Cleanup() {
+				std::filesystem::remove_all(root);
+			}
+		} cleanup {root};
+		auto path = (root / "workspace.sqlite").string();
+		Workspace workspace(path, 5000, Durability::Fsync);
+		auto main = workspace.Checkout();
+		main->WriteFile("/file", std::string(4096, 'a'));
+		Reset();
+		main->Write("/file", std::string(4096, 'b'));
+		Require(updates[0] == 1 && updates[2] == 1 && inserts == 0 && deletes == 0,
+		        "Same-interval overwrite replaced version rows");
+		counting = false;
+		auto snapshot_id = workspace.Snapshot();
+		auto frozen = workspace.OpenSnapshot(snapshot_id);
+		Reset();
+		main->Write("/file", std::string(4096, 'c'));
+		Require(deletes == 2 && inserts == 4 && updates[0] == 0 && updates[2] == 0,
+		        "Snapshot boundary did not use interval splitting");
+		counting = false;
+		auto child = workspace.Checkout(workspace.Fork("main", "child").id);
+		child->Write("/file", std::string(4096, 'd'));
+		main->Write("/file", std::string(4096, 'e'));
+		Reset();
+		child->Write("/file", std::string(4096, 'f'));
+		Require(updates[0] == 1 && updates[2] == 1 && inserts == 0 && deletes == 0,
+		        "Child's own interval did not update in place");
+		counting = false;
+		Require(main->Read("/file") == std::string(4096, 'e') && frozen->Read("/file") == std::string(4096, 'b'),
+		        "Updating a child changed its parent or snapshot");
+		// Both directions of the deleted/payload-null transition reuse the row.
+		Reset();
+		child->Write("/file", std::string(4096, '\0'));
+		Require(updates[2] == 1 && deletes == 0 && inserts == 0, "Zero write replaced the block version");
+		counting = false;
+		Require(child->Read("/file") == std::string(4096, '\0'), "Tombstoned block remained visible");
+		Require(Scalar(path, "SELECT count(*) FROM block_versions WHERE deleted=1 AND payload IS NULL") == 1,
+		        "Deleted block did not store a NULL payload");
+		Reset();
+		child->Write("/file", std::string(4096, 'g'));
+		Require(updates[2] == 1 && deletes == 0 && inserts == 0, "Reviving a block replaced its version");
+		counting = false;
+		Require(child->Read("/file") == std::string(4096, 'g'), "Revived block has wrong contents");
+		Require(Scalar(path, "SELECT count(*) FROM block_versions WHERE (deleted=1)!=(payload IS NULL)") == 0,
+		        "Payload/tombstone invariant failed");
+		main->WriteFile("/entry", "old");
+		auto original = main->Stat("/entry").inode;
+		Reset();
+		main->Unlink("/entry");
+		main->WriteFile("/entry", "new");
+		Require(updates[1] == 2, "Directory entry removal and revival did not update the same interval");
+		counting = false;
+		Require(main->Stat("/entry").inode != original && main->Read("/entry") == "new",
+		        "Revived name retained the old inode");
+		// Fail after the block UPDATE, so its new reference and payload must
+		// roll back together with the inode and branch generation.
+		auto payloads = Scalar(path, "SELECT count(*) FROM block_payloads");
+		auto generation = workspace.GetBranch("child").generation;
+		Reset();
+		fail_inode_update = true;
+		bool failed = false;
+		try {
+			child->Write("/file", std::string(4096, 'h'));
+		} catch (const Error &error) {
+			Require(error.code == ErrorCode::Storage, "Wrong failure code");
+			failed = true;
+		}
+		counting = false;
+		Require(failed && !fail_inode_update && updates[2] == 1, "Fault missed the inode update after block update");
+		Require(child->Read("/file") == std::string(4096, 'g') &&
+		            workspace.GetBranch("child").generation == generation &&
+		            Scalar(path, "SELECT count(*) FROM block_payloads") == payloads,
+		        "Failed UPDATE left a partial mutation");
+		child->Write("/file", std::string(4096, 'i'));
+		main->SetAttributes("/file", 0600, 123456789);
+		Require(frozen->Stat("/file").mode == 0644, "Metadata update changed the snapshot");
+		workspace.Sync();
+		frozen->Close();
+		workspace.Close();
+		Workspace reopened(path);
+		Require(reopened.Checkout("child")->Read("/file") == std::string(4096, 'i') &&
+		            reopened.Checkout()->Read("/file") == std::string(4096, 'e') &&
+		            reopened.OpenSnapshot(snapshot_id)->Read("/file") == std::string(4096, 'b'),
+		        "Reopen changed a branch or snapshot");
+		Require(reopened.Checkout()->Stat("/file").mode == 0600 &&
+		            reopened.Checkout()->Stat("/file").mtime_ns == 123456789,
+		        "Reopen lost metadata changes");
+		std::cout << "Exact-interval updates, snapshot/fork isolation, tombstones and failed-update rollback passed\n";
+	} catch (const std::exception &error) {
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

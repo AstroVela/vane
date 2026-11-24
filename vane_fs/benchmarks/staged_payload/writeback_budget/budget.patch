@@ -1,0 +1,239 @@
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -8,6 +8,8 @@
+ // passed a data barrier; a CLEAN fence permits ordinary SQLite WAL recovery.
+ #include "payload_file.hpp"
+ #include <array>
++#include <atomic>
++#include <condition_variable>
+ #include <mutex>
+ 
+ namespace vane_fs {
+@@ -323,8 +325,13 @@
+ 	void ReleaseLive() {
+ 		liveness.Close();
+ 	}
++	~Staging() {
++		StopWriteback();
++	}
+ 	void AbandonInherited() {
+ 		// Do not unlock the parent's shared open-file descriptions after fork.
++		// Database abandons this object rather than destroying inherited threads.
++		writeback.Close();
+ 		liveness.Close();
+ 		publication.Close();
+ 		initialization.Close();
+@@ -334,6 +341,10 @@
+ 		return Decode(record.data() + 40) != 0;
+ 	}
+ 	void BeginBatch(sqlite3 *writer) {
++		// Observe writeback errors from before the first external append through
++		// its final barrier. Keep this description alive even when hints fail.
++		if (writeback.fd < 0)
++			writeback.Open(path + ".payload", false);
+ 		if (Pending())
+ 			return;
+ 		// A running PASSIVE checkpoint must finish before a new OPEN fence.
+@@ -370,21 +381,90 @@
+ 		Sync(wal.fd);
+ 		Save(true);
+ 	}
++	// Pause only unclaimed hints; an in-kernel call is neither cancelled nor
++	// awaited by FULL publication. Nesting is balanced even on rollback/error.
++	class WritebackPause {
++	public:
++		explicit WritebackPause(Staging &stage, bool enabled = true) : stage(enabled ? &stage : nullptr) {
++			if (this->stage) {
++				std::lock_guard<std::mutex> lock(stage.writeback_mutex);
++				++stage.writeback_pauses;
++				stage.writeback_wake.notify_one();
++			}
++		}
++		~WritebackPause() {
++			if (stage) {
++				std::lock_guard<std::mutex> lock(stage->writeback_mutex);
++				--stage->writeback_pauses;
++				stage->writeback_wake.notify_one();
++			}
++		}
++		WritebackPause(const WritebackPause &) = delete;
++		WritebackPause &operator=(const WritebackPause &) = delete;
++
++	private:
++		Staging *stage;
++	};
+ 	void BeforeFullCommit() {
++		CheckWritebackError();
+ 		if (!Pending())
+ 			return;
+ 		// Flush the whole file, including bytes appended by other connections.
+-		File data;
+-		data.Open(path + ".payload", false);
+-		Sync(data.fd);
++		if (writeback.fd >= 0) {
++			Sync(writeback.fd);
++		} else {
++			File data;
++			data.Open(path + ".payload", false);
++			Sync(data.fd);
++		}
++		CheckWritebackError();
+ 	}
+ 	void AfterFullCommit() {
+ 		if (Pending())
+ 			Save(false);
++		// The whole-file barrier makes unsent hints redundant. An active hint
++		// can finish independently; it never publishes metadata or the fence.
++		std::lock_guard<std::mutex> lock(writeback_mutex);
++		writeback_pending = writeback_requested = false;
++	}
++	void CheckWritebackError() {
++		auto code = writeback_error.exchange(0);
++		if (code)
++			throw Error(ErrorCode::Storage, std::string("Background payload writeback: ") + std::strerror(code));
++	}
++	void Writeback(int64_t offset, int64_t bytes) {
++		CheckWritebackError();
++		std::lock_guard<std::mutex> lock(writeback_mutex);
++		if (!writeback_supported)
++			return;
++		// One coalesced pending range plus one active range bounds queue memory.
++		// Including gaps is harmless: these calls are optional hints, not fences.
++		writeback_begin = writeback_pending ? std::min(writeback_begin, offset) : offset;
++		writeback_end = writeback_pending ? std::max(writeback_end, offset + bytes) : offset + bytes;
++		writeback_pending = true;
++		if (writeback_end - writeback_begin < 16 * 1024 * 1024)
++			return;
++		if (!writeback_worker.joinable()) {
++			writeback_stopped = false;
++			writeback_worker = std::thread(&Staging::RunWriteback, this);
++		}
++		writeback_requested = true;
++		writeback_wake.notify_one();
++	}
++	void StopWriteback() {
++		{
++			std::lock_guard<std::mutex> lock(writeback_mutex);
++			writeback_stopped = true;
++			writeback_pending = writeback_requested = false;
++		}
++		writeback_wake.notify_one();
++		if (writeback_worker.joinable())
++			writeback_worker.join();
+ 	}
+ 	void Publish(sqlite3 *db) {
+ 		if (!Pending())
+ 			return;
++		WritebackPause pause(*this);
+ 		Exec(db, "PRAGMA synchronous=FULL; BEGIN IMMEDIATE");
+ 		try {
+ 			Exec(db, "UPDATE sync_barrier SET value=1-value WHERE id=1");
+@@ -399,9 +479,56 @@
+ 	}
+ 
+ private:
++	void RunWriteback() {
++		std::unique_lock<std::mutex> lock(writeback_mutex);
++		for (;;) {
++			writeback_wake.wait(lock, [&] { return writeback_stopped || (!writeback_pauses && writeback_requested); });
++			if (writeback_stopped)
++				return;
++			if (std::chrono::steady_clock::now() < writeback_next) {
++				writeback_wake.wait_until(lock, writeback_next, [&] {
++					return writeback_stopped || writeback_pauses || !writeback_requested;
++				});
++				continue;
++			}
++			// Bound each submission and leave a cancellable idle interval between
++			// calls. The aggregate budget is at most 250 MiB/s per coordinator.
++			auto begin = writeback_begin;
++			auto bytes = std::min(writeback_end - begin, int64_t(4 * 1024 * 1024));
++			writeback_begin += bytes;
++			writeback_pending = writeback_requested = writeback_begin < writeback_end;
++			lock.unlock();
++			// No SQLite connection, publication/payload guard, or queue mutex is
++			// held while Linux may block allocating a writeback request.
++			int rc;
++			do {
++				rc = sync_file_range(writeback.fd, begin, bytes, SYNC_FILE_RANGE_WRITE);
++			} while (rc && errno == EINTR);
++			auto code = rc ? errno : 0;
++			lock.lock();
++			writeback_next = std::chrono::steady_clock::now() + std::chrono::milliseconds(16);
++			if (code) {
++				writeback_pending = writeback_requested = false;
++				if (code == ENOSYS || code == EOPNOTSUPP || code == EINVAL) {
++					writeback_supported = false;
++				} else {
++					int expected = 0;
++					writeback_error.compare_exchange_strong(expected, code);
++				}
++			}
++		}
++	}
+ 	const int timeout;
+ 	std::string path, uuid;
+-	File initialization, liveness, publication, fence;
++	File initialization, liveness, publication, fence, writeback;
++	std::mutex writeback_mutex;
++	std::condition_variable writeback_wake;
++	std::thread writeback_worker;
++	std::atomic<int> writeback_error {0};
++	int64_t writeback_begin = 0, writeback_end = 0;
++	unsigned writeback_pauses = 0;
++	std::chrono::steady_clock::time_point writeback_next {};
++	bool writeback_pending = false, writeback_requested = false, writeback_stopped = false, writeback_supported = true;
+ 	std::mutex mutex, checkpoint_mutex;
+ 	std::unique_ptr<Lock> init_lock;
+ 	std::unique_ptr<Guard> startup;
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -599,6 +599,7 @@
+ 			bytes += block.second;
+ 		Staging::Get(db).BeginBatch(db);
+ 		external = PayloadFile::Get(db).Append(bytes);
++		Staging::Get(db).Writeback(external, int64_t(bytes.size()));
+ 	}
+ 	Statement payloads(db, payload_sql), versions(db, version_sql);
+ 	versions.Bind(1, inode);
+@@ -894,6 +895,7 @@
+ 				insert.Bind(4, owner_lock.inode);
+ 				insert.Step();
+ 			}
++			Staging::WritebackPause pause(*staging);
+ 			staging->BeforeFullCommit();
+ 			Exec(db, "COMMIT");
+ 			owner_committed = true;
+@@ -972,6 +974,8 @@
+ 		if (!database.db) {
+ 			Fail(ErrorCode::Closed, "Workspace is closed");
+ 		}
++		if (write)
++			database.staging->CheckWritebackError();
+ 		if (write && database.checkpointer) {
+ 			if (barrier)
+ 				database.checkpointer->CheckError();
+@@ -1019,6 +1023,7 @@
+ 		}
+ 	}
+ 	void Commit() {
++		Staging::WritebackPause pause(*database.staging, full);
+ 		// OPEN keeps a durable recovery prefix while NORMAL commits remain visible.
+ 		if (full)
+ 			database.staging->BeforeFullCommit();
+@@ -2026,6 +2031,7 @@
+ 	}
+ 	if (checkpointer)
+ 		checkpointer->Stop();
++	staging->StopWriteback();
+ 	try {
+ 		if (checkpointer)
+ 			checkpointer->CheckError();
+@@ -2036,6 +2042,7 @@
+ 		Exec(db, "BEGIN IMMEDIATE");
+ 		try {
+ 			RetireOwner(db, owner);
++			Staging::WritebackPause pause(*staging);
+ 			staging->BeforeFullCommit();
+ 			Exec(db, "COMMIT");
+ 			staging->AfterFullCommit();

@@ -1,0 +1,253 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Freeze and run matched count-only native write probes, including worker I/O."""
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from generate import digest, save
+
+
+def clean(path):
+    assert str(path) not in Path("/proc/mounts").read_text()
+    files = {
+        str(p.relative_to(path)): dict(bytes=p.stat().st_size, sha256=digest(p)) for p in path.rglob("*") if p.is_file()
+    }
+    shutil.rmtree(path)
+    return dict(path=str(path), files=files, removed=not path.exists(), processes_stopped=True, mount_absent=True)
+
+
+def host():
+    return dict(
+        epoch=time.time(),
+        **{
+            key: Path("/proc", key).read_text()
+            for key in ("loadavg", "stat", "diskstats", "meminfo", "pressure/cpu", "pressure/io", "pressure/memory")
+        },
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    parser.add_argument("--stage", choices=("prepare", "run"), required=True)
+    args = parser.parse_args()
+    out, here = args.artifacts.resolve(), Path(__file__).resolve().parent
+    build = json.loads((out / "build.json").read_text())
+    source = json.loads((out / "source.json").read_text())
+    assert build["status"] == "PASS"
+    assert all(
+        digest(Path(p)) == sha
+        for p, sha in dict(source["inputs"], **source["sources"], **build["inputs"], **build["binaries"]).items()
+    )
+    if args.stage == "prepare":
+        assert not (out / "count-plan.json").exists()
+        report = dict(status="RUNNING", commands=[], binaries={}, cleanup=[])
+
+        def command(label, argv, env=None):
+            log = out / ("count-" + label + ".log")
+            start = time.time()
+            with log.open("w") as stream:
+                result = subprocess.run(argv, stdout=stream, stderr=stream, env=env, timeout=120)
+            report["commands"].append(
+                dict(
+                    argv=argv,
+                    started_epoch=start,
+                    ended_epoch=time.time(),
+                    returncode=result.returncode,
+                    log=str(log),
+                    log_sha256=digest(log),
+                )
+            )
+            save(out / "count-build.json", report)
+            assert result.returncode == 0, log
+
+        sdk = Path(source["sdk"])
+        cores = dict(baseline=Path(source["original"]), extent=Path(source["candidate"]))
+        for variant, core in cores.items():
+            binary = out / ("count-" + variant)
+            command(
+                variant,
+                [
+                    "c++",
+                    "-std=c++17",
+                    "-O2",
+                    "-I" + str(core / "include"),
+                    "-I" + str(sdk / "include"),
+                    str(here / "probe.cpp"),
+                    str(core / "build/python-release/libvane_fs.a"),
+                    str(sdk / "lib/libsqlite3.a"),
+                    "-ldl",
+                    "-pthread",
+                    *[
+                        "-Wl,--wrap=" + name
+                        for name in (
+                            "pwrite",
+                            "pwrite64",
+                            "fsync",
+                            "fdatasync",
+                            "sqlite3_step",
+                            "sqlite3_wal_checkpoint_v2",
+                        )
+                    ],
+                    "-o",
+                    str(binary),
+                ],
+            )
+            report["binaries"][str(binary)] = digest(binary)
+            command("self-test-" + variant, [str(binary), "--self-test"])
+        # Both isolated formats must reject each other before changing file bytes.
+        root = Path(tempfile.mkdtemp(prefix="owned-extent-formats-", dir="/dev/shm"))
+        try:
+            for variant, core in cores.items():
+                path = root / (variant + ".sqlite")
+                python = str(core / "venv/bin/python")
+                command(
+                    "create-" + variant,
+                    [python, "-I", "-c", "import sys,vane_fs; w=vane_fs.Workspace(sys.argv[1]); w.close()", str(path)],
+                )
+                before = {str(p): digest(p) for p in root.iterdir() if p.is_file()}
+                other = cores["extent" if variant == "baseline" else "baseline"] / "venv/bin/python"
+                code = (
+                    "import sys,vane_fs\ntry: vane_fs.Workspace(sys.argv[1])\n"
+                    "except ValueError as e: assert 'Not a staged-payload workspace' in str(e)\n"
+                    "else: raise AssertionError('Wrong format accepted')\n"
+                )
+                command("refuse-" + variant, [str(other), "-I", "-c", code, str(path)])
+                assert {str(p): digest(p) for p in root.iterdir() if p.is_file()} == before
+        finally:
+            report["cleanup"].append(clean(root))
+            save(out / "count-build.json", report)
+        report.update(status="PASS", ended_epoch=time.time())
+        save(out / "count-build.json", report)
+        identities = dict(
+            source["inputs"], **source["sources"], **build["binaries"], **build["inputs"], **report["binaries"]
+        )
+        identities.update(
+            {
+                str(p): digest(p)
+                for p in [
+                    here / "probe.cpp",
+                    Path(__file__),
+                    out / "build.json",
+                    out / "count-build.json",
+                    out / "source.json",
+                ]
+            }
+        )
+        tile = bytes((i * 17 + (i // 4096) * 29) % 251 + 1 for i in range(8 * 1048576))
+        content_hashes = {}
+        for mib in (4, 64, 256):
+            hasher = hashlib.sha256()
+            for start in range(0, mib, 8):
+                hasher.update(tile[: min(8, mib - start) * 1048576])
+            content_hashes[str(mib)] = hasher.hexdigest()
+        runs = [
+            dict(mib=4, shape=s, variant=v, rep=0, validation=True)
+            for s in ("aligned", "fuse8", "fuse1")
+            for v in cores
+        ]
+        for mib in (64, 256):
+            for shape in ("aligned", "fuse8", "fuse1"):
+                for rep, order in enumerate((("baseline", "extent"), ("extent", "baseline"))):
+                    runs.extend(dict(mib=mib, shape=shape, variant=v, rep=rep, validation=False) for v in order)
+        save(
+            out / "count-plan.json",
+            dict(
+                status="PASS",
+                frozen_epoch=time.time(),
+                expected_content_sha256=content_hashes,
+                inputs=identities,
+                runs=runs,
+                durability="fsync",
+                checkpoint_thresholds_mib=[16, 64],
+                page_size=4096,
+                fuse_page_offset=48,
+                instrumented=True,
+                scope="Count-only native replay; no FUSE latency or throughput inference",
+                phases="All threads; attribution at call entry. Lifecycle totals exclude read-only SQL inspection.",
+                direct_vm_steps="Direct sqlite3_step calls only, excluding internal sqlite3_exec execution",
+                fd_roles="Resolved using readlink(/proc/self/fd/N), without changing descriptor flags or file contents",
+            ),
+        )
+        print("PASS count probes frozen; cross-format rejection and byte preservation", flush=True)
+        return
+
+    plan = json.loads((out / "count-plan.json").read_text())
+    assert all(digest(Path(p)) == sha for p, sha in plan["inputs"].items())
+    assert not (out / "counts.json").exists()
+    report = dict(status="RUNNING", started_epoch=time.time(), runs=[], cleanup=[], host=[], host_monitor_stopped=False)
+    stop = threading.Event()
+
+    def monitor():
+        while not stop.is_set():
+            report["host"].append(host())
+            stop.wait(1)
+
+    observer = threading.Thread(target=monitor)
+    observer.start()
+    try:
+        for index, run in enumerate(plan["runs"]):
+            assert shutil.disk_usage(out).free > 5 * 1024**3
+            work = Path(tempfile.mkdtemp(prefix="owned-extent-count-", dir=out))
+            path = work / "workspace.sqlite"
+            label = f"{index:02}-{run['variant']}-{run['mib']}-{run['shape']}"
+            result_path, log = out / (label + ".json"), out / (label + ".log")
+            binary = out / ("count-" + run["variant"])
+            argv = [str(binary), str(path), str(run["mib"]), run["shape"], str(result_path)]
+            start = time.time()
+            try:
+                with log.open("w") as stream:
+                    result = subprocess.run(argv, stdout=stream, stderr=stream, timeout=180)
+                row = dict(
+                    **run,
+                    argv=argv,
+                    started_epoch=start,
+                    ended_epoch=time.time(),
+                    returncode=result.returncode,
+                    log=str(log),
+                    log_sha256=digest(log),
+                    free_bytes_before_cleanup=shutil.disk_usage(out).free,
+                )
+                if result_path.exists():
+                    row["result"] = json.loads(result_path.read_text())
+                    row["result_sha256"] = digest(result_path)
+                report["runs"].append(row)
+                assert result.returncode == 0, log
+                assert row["result"]["status"] == "PASS"
+                data = row["result"]
+                assert data["format"] == (1005 if run["variant"] == "extent" else 1004)
+                operational = data["phases"][:5]
+                assert all(p["checkpoint_errors"] == 0 for p in operational)
+                assert all(values[2] == values[5] == 0 for p in operational for values in p["io"].values())
+                assert all(p["io"]["payload"][0] == p["io"]["payload"][1] // 262144 for p in data["phases"][1:2])
+                assert sum(p["io"]["payload"][1] for p in operational) <= run["mib"] * 1048576 + 4096
+                assert sum(p["io"]["payload"][4] for p in operational) >= 1
+                assert data["phases"][2]["io"]["wal"][3] >= 1
+                print("PASS", label, flush=True)
+            finally:
+                report["cleanup"].append(clean(work))
+                save(out / "counts.json", report)
+        assert all(digest(Path(p)) == sha for p, sha in plan["inputs"].items())
+        report["status"] = "PASS"
+    except BaseException as error:
+        report.update(status="FAIL", error=repr(error))
+        raise
+    finally:
+        stop.set()
+        observer.join()
+        report.update(ended_epoch=time.time(), host_monitor_stopped=True)
+        save(out / "counts.json", report)
+    print("PASS all", len(report["runs"]), "native count runs and full content checks", flush=True)
+
+
+if __name__ == "__main__":
+    main()

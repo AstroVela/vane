@@ -1,0 +1,296 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "checkpoint.hpp"
+#include "vane_fs/workspace.hpp"
+#include <sqlite3.h>
+#include <sys/file.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <iostream>
+#include <map>
+
+using namespace vane_fs;
+static const auto foreground = std::this_thread::get_id();
+static std::atomic<bool> pause_after {false}, paused {false}, shared_wait {false};
+static std::atomic<bool> inject_error {false}, kill_restart {false};
+static std::atomic<int> passes {0}, restarts {0}, successes {0}, busy {0}, partial {0}, bad_timeout {0};
+static std::mutex timeout_mutex;
+static std::map<sqlite3 *, int> timeouts;
+static std::atomic<sqlite3 *> worker_db {nullptr};
+static void Require(bool value, const char *message) {
+	if (!value)
+		throw std::runtime_error(message);
+}
+template <class F>
+static void Wait(F condition, const char *message) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	while (!condition()) {
+		Require(std::chrono::steady_clock::now() < deadline, message);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+extern "C" int __real_sqlite3_busy_timeout(sqlite3 *, int);
+extern "C" int __wrap_sqlite3_busy_timeout(sqlite3 *db, int value) {
+	{
+		std::lock_guard<std::mutex> guard(timeout_mutex);
+		timeouts[db] = value;
+	}
+	return __real_sqlite3_busy_timeout(db, value);
+}
+static int Timeout(sqlite3 *db) {
+	std::lock_guard<std::mutex> guard(timeout_mutex);
+	return timeouts.at(db);
+}
+extern "C" int __real_flock(int, int);
+extern "C" int __wrap_flock(int fd, int operation) {
+	auto result = __real_flock(fd, operation);
+	int error = errno;
+	if (result && (error == EWOULDBLOCK || error == EAGAIN) && (operation & LOCK_SH)) {
+		char descriptor[64], path[4096] {};
+		std::snprintf(descriptor, sizeof(descriptor), "/proc/self/fd/%d", fd);
+		auto n = readlink(descriptor, path, sizeof(path) - 1);
+		if (n > 0 && std::string(path).find(".stage-checkpoint") != std::string::npos)
+			shared_wait = true;
+	}
+	errno = error;
+	return result;
+}
+extern "C" int __real_sqlite3_wal_checkpoint_v2(sqlite3 *, const char *, int, int *, int *);
+extern "C" int __wrap_sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *name, int mode, int *frames, int *copied) {
+	bool background = std::this_thread::get_id() != foreground;
+	if (background && mode == SQLITE_CHECKPOINT_RESTART) {
+		worker_db = db;
+		++restarts;
+		if (Timeout(db) != 0)
+			++bad_timeout;
+		if (kill_restart)
+			_exit(78);
+		if (inject_error.exchange(false))
+			return SQLITE_IOERR;
+	}
+	auto code = __real_sqlite3_wal_checkpoint_v2(db, name, mode, frames, copied);
+	if (background && mode == SQLITE_CHECKPOINT_PASSIVE) {
+		worker_db = db;
+		++passes;
+		if (code == SQLITE_OK && *frames > *copied)
+			++partial;
+		if (pause_after) {
+			paused = true;
+			while (pause_after)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	if (background && mode == SQLITE_CHECKPOINT_RESTART) {
+		if (code == SQLITE_OK)
+			++successes;
+		if (code == SQLITE_BUSY)
+			++busy;
+	}
+	return code;
+}
+struct SQL {
+	sqlite3 *db = nullptr;
+	explicit SQL(const std::string &path) {
+		Require(sqlite3_open(path.c_str(), &db) == SQLITE_OK, "Open inspector");
+		sqlite3_busy_timeout(db, 1000);
+		sqlite3_wal_autocheckpoint(db, 0);
+		Staging::Configure(db);
+		Exec("SELECT count(*) FROM sqlite_master");
+	}
+	~SQL() {
+		sqlite3_close_v2(db);
+	}
+	void Exec(const char *sql) {
+		auto code = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+		Require(code == SQLITE_OK, sqlite3_errmsg(db));
+	}
+	std::pair<int, int> Status() {
+		int frames = -1, copied = -1;
+		auto code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+		Require(code == SQLITE_OK, "Read WAL status");
+		Require(frames >= 0 && copied >= 0, "Inspector did not open the WAL");
+		return {frames, copied};
+	}
+};
+struct Resume {
+	std::thread append;
+	~Resume() {
+		pause_after = false;
+		if (append.joinable())
+			append.join();
+	}
+};
+static void Trigger(Checkpointer &worker, SQL &writer, int frames = -1) {
+	if (frames < 0)
+		frames = writer.Status().first;
+	Checkpointer::OnCommit(&worker, writer.db, "main", frames);
+}
+static void Stop(Checkpointer &worker) {
+	worker.Stop();
+	Require(bad_timeout == 0, "Restart waited for reader/writer locks");
+	Require(Timeout(worker_db) == 5000, "Worker busy timeout was not restored");
+}
+static void CheckContent(Workspace &workspace) {
+	Require(workspace.Checkout()->Read("/stable") == std::string(512 * 1024, 's'), "Stable content changed");
+}
+static void Exercise(const std::string &path, const std::string &mode) {
+	Workspace workspace(path);
+	workspace.Checkout()->WriteFile("/stable", std::string(512 * 1024, 's'));
+	SQL writer(path), reader(path), status(path);
+	writer.Exec("PRAGMA synchronous=NORMAL; CREATE TABLE padding(data BLOB)");
+	writer.Exec(mode == "small" ? "INSERT INTO padding VALUES(zeroblob(4096))"
+	                            : "INSERT INTO padding VALUES(zeroblob(20971520))");
+	Staging staging(path, 5000);
+	staging.Initialize(workspace.Id(), false);
+	staging.Ready();
+	Checkpointer worker(writer.db, 4096, 5000, staging);
+	Resume resume;
+	std::unique_ptr<Workspace> other;
+	std::atomic<bool> finished {false};
+	std::exception_ptr append_error;
+	if (mode == "reader")
+		reader.Exec("BEGIN; SELECT count(*) FROM padding");
+	if (mode == "partial") {
+		// Pin an older read mark so PASSIVE must keep its original retry path.
+		reader.Exec("BEGIN; SELECT count(*) FROM padding");
+		writer.Exec("INSERT INTO padding VALUES(zeroblob(4096))");
+	}
+	if (mode == "writer" || mode == "external") {
+		if (mode == "external")
+			other = std::make_unique<Workspace>(path);
+		pause_after = true;
+	}
+	if (mode == "error")
+		inject_error = true;
+	Trigger(worker, writer, mode == "small" ? 5000 : -1);
+	if (mode == "small") {
+		Wait([] { return passes > 0; }, "No small stale-wake pass");
+		worker.Stop();
+		Require(restarts == 0, "Small/reset generation triggered restart");
+	} else if (mode == "error") {
+		Wait(
+		    [&] {
+			    try {
+				    worker.BeforeWrite(writer.db);
+			    } catch (const Error &error) {
+				    Require(error.code == ErrorCode::Storage, "Wrong restart error");
+				    return true;
+			    }
+			    return false;
+		    },
+		    "Restart I/O error was not reported before a mutation");
+		Wait([] { return successes > 0; }, "Restart error did not remain retryable");
+		Stop(worker);
+	} else if (mode == "reader") {
+		Wait([] { return busy > 0; }, "No optional restart with a pinned reader");
+		Stop(worker);
+		Require(status.Status().first >= 4072, "Pinned reader did not retain the generation");
+		reader.Exec("ROLLBACK");
+		worker.Start();
+		Trigger(worker, writer);
+		Wait([] { return successes > 0; }, "Released reader prevented restart");
+		Stop(worker);
+	} else if (mode == "partial") {
+		Wait([] { return partial > 0; }, "Reader did not pin unfinished backfill");
+		Require(restarts == 0, "Restart attempted an incomplete PASSIVE checkpoint");
+		reader.Exec("ROLLBACK");
+		Wait([] { return successes > 0; }, "Partial reader retry did not finish");
+		Stop(worker);
+	} else if (mode == "writer" || mode == "external") {
+		Wait([] { return paused.load(); }, "No completed PASSIVE checkpoint");
+		if (mode == "writer")
+			reader.Exec("BEGIN IMMEDIATE");
+		else {
+			resume.append = std::thread([&] {
+				try {
+					other->Checkout()->WriteFile("/external", std::string(512 * 1024, 'e'));
+				} catch (...) {
+					append_error = std::current_exception();
+				}
+				finished = true;
+			});
+			Wait([] { return shared_wait.load(); }, "External writer did not wait for checkpoint lease");
+		}
+		pause_after = false;
+		Wait([] { return busy > 0; }, "Restart did not yield to the SQLite writer");
+		Stop(worker);
+		if (mode == "writer")
+			reader.Exec("ROLLBACK");
+		else {
+			Wait([&] { return finished.load(); }, "Checkpoint/append lock inversion");
+			resume.append.join();
+			if (append_error)
+				std::rethrow_exception(append_error);
+			Require(other->Checkout()->Read("/external") == std::string(512 * 1024, 'e'), "External content changed");
+			other->Close();
+		}
+	} else {
+		Require(mode == "progress", "Unknown mode");
+		Wait([] { return successes > 0; }, "No optional restart after completed PASSIVE checkpoint");
+		Stop(worker);
+		writer.Exec("INSERT INTO padding VALUES(zeroblob(4096))");
+		Require(status.Status().first < 4072, "Next writer did not reuse WAL generation");
+	}
+	CheckContent(workspace);
+	workspace.Close();
+	Workspace reopened(path);
+	CheckContent(reopened);
+	if (mode == "external")
+		Require(reopened.Checkout()->Read("/external") == std::string(512 * 1024, 'e'), "Reopen lost external data");
+}
+static void Crash(const std::string &path) {
+	std::string snapshot;
+	{
+		Workspace workspace(path);
+		workspace.Checkout()->WriteFile("/stable", std::string(512 * 1024, 's'));
+		snapshot = workspace.Snapshot();
+		workspace.Close();
+	}
+	auto child = fork();
+	Require(child >= 0, "Fork failed");
+	if (child == 0) {
+		Workspace workspace(path);
+		SQL writer(path);
+		writer.Exec("PRAGMA synchronous=NORMAL; CREATE TABLE padding(data BLOB); INSERT INTO padding "
+		            "VALUES(zeroblob(20971520))");
+		Staging staging(path, 5000);
+		staging.Initialize(workspace.Id(), false);
+		staging.Ready();
+		Checkpointer worker(writer.db, 4096, 5000, staging);
+		kill_restart = true;
+		Trigger(worker, writer);
+		Wait([] { return false; }, "No restart crash point");
+		_exit(1);
+	}
+	int state = 0;
+	Require(waitpid(child, &state, 0) == child, "Wait child failed");
+	Require(WIFEXITED(state) && WEXITSTATUS(state) == 78, "Child missed restart crash point");
+	for (int i = 0; i < 2; ++i) {
+		Workspace reopened(path);
+		CheckContent(reopened);
+		Require(reopened.OpenSnapshot(snapshot)->Read("/stable") == std::string(512 * 1024, 's'),
+		        "Crash lost retained snapshot");
+		reopened.RecoverOwners();
+		reopened.Close();
+	}
+}
+int main(int argc, char **argv) {
+	try {
+		Require(argc == 3, "Expected database and case");
+		if (std::string(argv[2]) == "crash")
+			Crash(argv[1]);
+		else
+			Exercise(argv[1], argv[2]);
+		std::cout << argv[2] << " PASS passive=" << passes << " restart=" << restarts << " success=" << successes
+		          << " busy=" << busy << " partial=" << partial << " bad_timeout=" << bad_timeout << '\n';
+		return 0;
+	} catch (const std::exception &error) {
+		pause_after = false;
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

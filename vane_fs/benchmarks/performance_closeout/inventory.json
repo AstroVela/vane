@@ -1,0 +1,967 @@
+{
+  "status": "PASS",
+  "recorded_epoch": 1792424091.1100047,
+  "source_head": "5c8c06322494d67c8469161b14c3665c69b61acf",
+  "default": {
+    "storage": "SQLite 4 KiB BLOB payloads",
+    "supported_formats": [
+      1,
+      2
+    ],
+    "native_sources_clean": true,
+    "identities": {
+      "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "02ff3d6fd90c65062f6693311c7be3d88a385e46de956b86d53abd42632dad7e",
+      "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b"
+    },
+    "adopted_commits": [
+      "87b38929436591b1b20cc6ff2ee27449886589c4 [perf](filesystem) Reduce VaneFS block I/O SQL overhead",
+      "98b0fe44c6d475a3331b9de8cebbc15084a12571 [perf](filesystem) Cache VaneFS metadata under mount leases",
+      "9ee791a625b50a571e0939c7bc4e6b1ebc52e244 [perf](filesystem) Avoid repeated durable inode reference updates",
+      "49545265f8569080a7d999d3ef42abbe00d56f40 [perf](filesystem) Amortize VaneFS WAL checkpoint syncs",
+      "08535e6e5323745e8cd79a26136f37cbeb945cac [perf](filesystem) Defer and batch VaneFS directory enumeration",
+      "f40c57742e8b755a2ab00c410ef50209a35e0c77 [perf](filesystem) Add optional fsync durability to VaneFS",
+      "0fc47514e438c6bf965b6af3af198281927e00a5 [perf](filesystem) Bound background VaneFS checkpoints",
+      "7cccaf814f8b09d0270732e0d06160a9091f6968 [perf](filesystem) Batch writes to vacant VaneFS block ranges"
+    ]
+  },
+  "mechanism_control": {
+    "component": "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2",
+    "candidate": "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate",
+    "format": 1005,
+    "trigger_mib": 64,
+    "claim_mib": 4,
+    "completion_delay_ms": 16,
+    "begin_restart_gate": false,
+    "adopted": false,
+    "identities": {
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/pyproject.toml": "0284c8594e8f65b7d497655959f4e9390d6602e3cd7338cdb8031f145a8f4a83",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/README.md": "25e124483b2e123ef12434e0110edcf948c0aa9b362215f5955ce84aa40b70b6",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/CMakeLists.txt": "ffd81e4260bf03649416c7d772d5c839d21ad75eefa19f5441e33196af3ffd44",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/LICENSES/SQLite.txt": "1472ec10e27c62157cebd95d9186e8912a75a1a829fe3a612611710da2992ed5",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/staging.hpp": "9439db80e3c87ce638c8a00ad492acabdaccad8128272fb185f2e1fac36adce0",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/payload_file.hpp": "bda89dcba9c5490d27d6b0526fb073558aa79010b73809606697b1280d8dfbf4",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/prewriteback.hpp": "00a13825056de4492910dfcfa9518c06c1c0b33ad400688217831bc9eae0e139",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/extent_data.hpp": "73f9d62f3fcfd00f28b58b99cdecc8e378f7d4d763427a15d75f2549b433c786",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/workspace.cpp": "f197f0b35554214b0939e3a3255b3fd396aa3248ebe08a05f86917a78d792ff7",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/extent_records.hpp": "c16fba2f7e98e2a4ac1fb3a9c08c12d3135ed7e38316d53280baad05380e20d6",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_core.cpp": "b71cf3587ffce390ce19f7c02fc0868c60ea3e452500d286de7c721217330471",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_external.py": "c95a45b8e6a72467371facca3de76a6c7c72ea875f1b20b0975992e6a6f549cb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_checkpoint.cpp": "a66df1d0b2566c3d90abb147b5c5a4e296f9adc00b8e68b5afdac963f8e0d741",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_staging.py": "51893437716eaea0ed2526ebce1acdd1dd33566a0d60b1a505d91754f0757a31",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_workspace.py": "fb6c9716b81c4cbdadc002a999be0016b9516f94c6028407d740098bfadb3176",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_staging.cpp": "811f38a76528a485205c4284956edefb1251499a66b378c5e97d05ade4c652be",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_recovery.py": "9269ef3f9b1172ec38697cc32c08638ff40e861dcf6fff2ec7a4f9ece02f3794",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-extents-release": "a84e666194966bc2855cf14629a6ce84c9aa5bb614579c17a264e689c7391cc6",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-extents-asan": "44b1d18b285b5cf8571aa12cfc4aea1b6151de7f6674ca9b99597b1898f82793",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/build/python-release/libvane_fs.a": "23662e33c4621efb7a71b2da7e2e0a857a212cab34aaa44af58c801c5c7d518b",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/build/python-release/vane-fs-mount": "7c50b27c21b0840426aa24972d97c693e25031355ccbd7a3df7b9c3a4dc484d5",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/build/python-release/vane-fs": "5918e04fdd1d459533d43a46ea2705c511129ccced96c3948d6c0cacc6bbcfd1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "e46366153dd7b286219c1fa598e00bb74bf18fb4e4cea10b4e4afc1281adb080",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/sanitize/libvane_fs.a": "76f3722a19c04630bc794a7c01ac62b31a231ab59842fd4782cb850f0d730749",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-pacing-release": "4339217ef0b577d82b4e16655223c602570f07aec33733cb18705093cda1d6eb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-inherited-release": "9141a0216c9687ce054c180b1733fa0e1cbbd82694cd0bb6cb8cdb02c6889d0f",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-pacing-asan": "3a79b1107baca1ef353eeaaf47407d3ac5bed80bd89d42a385535ddfec9de12a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/test-inherited-asan": "54d2e7e332afd5b61f59319ffb7b64588e1870df0001c7b76fbe15c79d9e5c28"
+    }
+  },
+  "historical_experiments": [
+    {
+      "experiment": "aged_write",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/aged_write/README.md",
+      "records": {}
+    },
+    {
+      "experiment": "background_writeback",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/background_writeback/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/background_writeback/audit.json",
+          "sha256": "3ed3fa8deb3672b249782cff01de287522f2c63db1f67272e0b0fd6dcfd303ef",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "begin_gate_matched",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/begin_gate_matched/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_gate_matched/audit.json",
+          "sha256": "1da908f08261dd7b7f73e89d4ff5ec9f9699c718984115694dab5235ee61a4c9",
+          "status": "PASS",
+          "decision": "MEASURED_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_gate_matched/findings.json",
+          "sha256": "972ac6a71e300119d3fcb825dd62df894cc6d1a037ff5ab8b4412a2664569f25",
+          "status": "PASS",
+          "decision": "MEASURED_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": false
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_gate_matched/final-checks.json",
+          "sha256": "d0a7c5d8d6d6962f2ec42f3b58b022fe3ead17bb993ce7011dfe68902703120f",
+          "status": "PASS",
+          "decision": "MEASURED_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "begin_restart_gate",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/begin_restart_gate/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_restart_gate/audit.json",
+          "sha256": "f8c1f9d327a8cf9a939d24b0790646dd6a9f9f91a721b8827fe793c01ec64924",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_restart_gate/findings.json",
+          "sha256": "39198644f92b54fdbeae3d47c3fd2e5699f27cb2b2f455ec46f944810329d6bf",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/begin_restart_gate/final-checks.json",
+          "sha256": "024ac0bb1a357c39e75fa9d88605e49985516663ac393cbe7092ac0bc9234b1b",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "block_sync",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/block_sync/README.md",
+      "records": {}
+    },
+    {
+      "experiment": "checkpoint_batching",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_batching/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_batching/audit.json",
+          "sha256": "83ea349c5831613c4e1eb078e2dca5ceef82ba9b537b9f68d56363bca67db430",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_coalescing",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_coalescing/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_coalescing/audit.json",
+          "sha256": "aac57db10bbe107a37059ef04402b020b217f9bf37395078fd4efe74b69639d6",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_followthrough",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_followthrough/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_followthrough/audit.json",
+          "sha256": "14bbb05edd85ee6a255463b5f63051482032aed28673c06c773ff196fc2ff440",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_pause_control",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_pause_control/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_pause_control/audit.json",
+          "sha256": "af441453b8541c6714d5bfa2d664b20af61c5bfddf8248edccd8451997219313",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_pause_control/findings.json",
+          "sha256": "9be488f7a5c03b51b9580cb6ac715c83477664e3452d84f0ebd4e227e5ec332f",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_pause_control/final-checks.json",
+          "sha256": "cee6acc3c016895441012c276e80e3fe9561ad010436e0352b2af285bb7c9c27",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_progress",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_progress/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_progress/audit.json",
+          "sha256": "fd3996bbc9da85d56903a8e38e0b0c0aaff8d0e44dabcf28b3783476b5c76b9f",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_request_costs",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_request_costs/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_request_costs/audit.json",
+          "sha256": "7fdb98d4b665bfa0bb95c707fcccc62f8184aac307ae11a3339f0a2285d5920b",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_request_costs/findings.json",
+          "sha256": "b45c10ce81b61095c52e889061d3a99626ab8147ab818b28f9a43b8dfa43073e",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "checkpoint_restart",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/checkpoint_restart/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/checkpoint_restart/audit.json",
+          "sha256": "b3bee3ab5bca2e936408476df344c2b3949c5faee215a5e3903727b26b32c5e9",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "clean_coalescing",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/clean_coalescing/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/clean_coalescing/audit.json",
+          "sha256": "a52471e14eb56ac61c446486d7aeb42fb8c309efb7b3920691bf9fb7fa44cfea",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "clean_tail_budget",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/clean_tail_budget/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/clean_tail_budget/audit.json",
+          "sha256": "5bf7522025613892def5c2e6907d06e3848a4f19fdc8ca25d31a7b418f77f41a",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "conditional",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/conditional/README.md",
+      "records": {}
+    },
+    {
+      "experiment": "extent_fuse",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/extent_fuse/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/extent_fuse/audit.json",
+          "sha256": "0825bcfc97e3fd56a93c08a1d1c88e57267b91755ad03e3aee047c4d95a02476",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": false
+        }
+      }
+    },
+    {
+      "experiment": "extent_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/extent_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/extent_waits/audit.json",
+          "sha256": "ed6bcbe6fd6f8b5e3b74dc6d7f7ab911fc7be67bd9627545ca50a22f922143a4",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/extent_waits/findings.json",
+          "sha256": "020549145b54cced8a3ea749f51db961b9aa7e388fb05f091e3872b4a6dd14a5",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "fence_slots",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/fence_slots/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fence_slots/audit.json",
+          "sha256": "f8b029062a947b74320cdb47bfa5bb87aaf3a67bcd21b0c482e3a117eb5356fa",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fence_slots/findings.json",
+          "sha256": "eb64dfca42de982aee567dc653acf43980e522e0486b5be90f4a51c5f3c80b41",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fence_slots/final-checks.json",
+          "sha256": "aa095d567f205b9d8258e17c1cf37b799cfad2de992945e3d7de329bd24b2195",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "full_sync_contention",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/full_sync_contention/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/full_sync_contention/audit.json",
+          "sha256": "76fcf2240302e0c60c05558073c4bf32118aabe2c1ebdddaaa1a4598511cb9a2",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "fuse_sync_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/fuse_sync_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fuse_sync_waits/audit.json",
+          "sha256": "0802d3f106b19643bffb10a26dee9b95945f3f0f08702bab4272a5327432a5c9",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fuse_sync_waits/findings.json",
+          "sha256": "4cb7534ce481a5aebe78526e2ce3d1b2894f46d91e2fb69630482d8d600beb9e",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fuse_sync_waits/final-checks.json",
+          "sha256": "3afe20396d323aa78f9cbeb3690292d7b1f9ffeba6db85805fc6d26adf0e8837",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "fuse_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/fuse_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fuse_waits/audit.json",
+          "sha256": "84bee720b0efd627ef652e18720ab912692bde2d792b4c0c10e085c6bdd115a2",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/fuse_waits/findings.json",
+          "sha256": "77b1619fb8c24e3b7298df25d9a3426e4c41454255e42655ef7399cca08f4f85",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "gate_sync_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/gate_sync_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/gate_sync_waits/audit.json",
+          "sha256": "2c402c40eda2f13cdf619a2c4c2670f3c6f7e4ef32fdb9e9481a3560474a5bac",
+          "status": "PASS",
+          "decision": "DIAGNOSTIC_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/gate_sync_waits/findings.json",
+          "sha256": "ff68d5c03a11974da60d4495020ded58d8ceef5fb45f3d19601f0b5be3e1308a",
+          "status": "PASS",
+          "decision": "DIAGNOSTIC_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/gate_sync_waits/final-checks.json",
+          "sha256": "099f59e57b70b38346f9583c93ac936f6592ccffb54e30e71f2f0d196ba20ba0",
+          "status": "PASS",
+          "decision": "DIAGNOSTIC_ONLY_NO_ADOPTION",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "metadata_index",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/metadata_index/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/metadata_index/audit.json",
+          "sha256": "9d9aa53d7d380601a609a2b5d6b58dee60b2c7100791b6343fc37dc495b90866",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "native_write_costs",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/native_write_costs/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/native_write_costs/audit.json",
+          "sha256": "a2098f8587e76ae2c60813402bc9d036ff63c462534fd63136fcfa135ae70f17",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "orphan_batching",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/orphan_batching/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/orphan_batching/audit.json",
+          "sha256": "5497191da1b9b09faf8694d62b7aa25f9fa424dff0c1ddce44f77b6bfc2ceedf",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "paced_range_writeback",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/paced_range_writeback/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/paced_range_writeback/audit.json",
+          "sha256": "9e5d7af301a45bb63e95b487d567c29047e8a07ff6f68f1f99b888fabd165de3",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/paced_range_writeback/findings.json",
+          "sha256": "ed6937ff612f665890dea3387cb3b366c23f43bef80ae59cdb0b878f2e162bad",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/paced_range_writeback/final-checks.json",
+          "sha256": "b3072b1355132922a4270ea6f6297db1b5e1b532b2c3047d6eb3b11c4653ff47",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "paced_request_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/paced_request_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/paced_request_waits/audit.json",
+          "sha256": "5accad0f559fea1d971fb89368b1d90851864a72a97d1c8abf1b0f78574bfb78",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/paced_request_waits/final-checks.json",
+          "sha256": "b4f9918a32b41e0b57dd371b523e5d013d02b14872dbfd6341cc66a3fe04e949",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "partial_edges",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/partial_edges/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/partial_edges/audit.json",
+          "sha256": "472b5d9b49569515e8759c1ef2e012c406ecff1e36121807dd2488dcc824136e",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "partial_sync",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/partial_sync/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/partial_sync/audit.json",
+          "sha256": "3eb1e71b1d1de36495482973757e5637121b8edf49bce33a3eacf36071001af1",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "payload_allocation",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_allocation/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_allocation/audit.json",
+          "sha256": "b0f0c27dd9cc4b91c734099a7232bb2d0bac88bb81a6848fd29f2b2c85069059",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "payload_budget",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_budget/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_budget/audit.json",
+          "sha256": "76bde758dab1943a46910dbab41edc8187ea63363679342a56e1c26771ab2dac",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "payload_presync",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_presync/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_presync/audit.json",
+          "sha256": "bafb59314be2e3c0c0054e69cf3565a044e521a5360f154456bd2084914ad45e",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "payload_prewriteback",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_prewriteback/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_prewriteback/audit.json",
+          "sha256": "46294038e8490fcda6ec9ea1ea204785c00e1e0be7bed3de79f7420b6c8252d2",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": false
+        }
+      }
+    },
+    {
+      "experiment": "payload_progress",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_progress/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_progress/audit.json",
+          "sha256": "7b70b80b9f665433543b82530608e1986c53a26e1197e0d50b406b43b5163bc8",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": false
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_progress/findings.json",
+          "sha256": "9e9ab8b430abeaa431037ffb18175ec67e87836e99c03614dab4bca61ddc0b9d",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "payload_range_writeback",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_range_writeback/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_range_writeback/audit.json",
+          "sha256": "540b79cd8df7e1624ac35f6da6f6246a69d539c66a1856d916e76069f2187c53",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": false
+        }
+      }
+    },
+    {
+      "experiment": "payload_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/payload_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_waits/audit.json",
+          "sha256": "24c31e5a17c679d5969e057193a59a6d76c526ec1ff670813fe6b3c0868eebe1",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/payload_waits/findings.json",
+          "sha256": "3ac08822bddef4b29b1ca1561933909baa5a3cb0fabcc3892c7a62fc41c0a603",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "pre_open_backfill",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/pre_open_backfill/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/pre_open_backfill/audit.json",
+          "sha256": "0bd9ab46be7cf600969fcdc23e3f70406abbe307b2f53fc9760c8bd52f902804",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "prewriteback_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/prewriteback_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/prewriteback_waits/audit.json",
+          "sha256": "60f25abe140d7f544d579120eb094bed785a82602346bea3be4ce19047a6352c",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/prewriteback_waits/findings.json",
+          "sha256": "b731f65a8c0d0816967b0d717be31340071f3432fccf25f1255e8524e4a95232",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "random_io",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/random_io/README.md",
+      "records": {}
+    },
+    {
+      "experiment": "range_writeback_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/range_writeback_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/range_writeback_waits/audit.json",
+          "sha256": "ab55264875fe889ec10419047eac7a880d6a30f106b350ba83bfbbb023df30ca",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/range_writeback_waits/findings.json",
+          "sha256": "01afe5d904e548fb08a03f0a12d3004ac9aff2de5ef182019e84e0179fc6db30",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "request_costs",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/request_costs/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/request_costs/audit.json",
+          "sha256": "a3c34e3f65b4e9607f642591d6e0fe17d8bb2ec4bedfa6b9069c8e538dfe67e2",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "sqlite_step_waits",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/sqlite_step_waits/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/sqlite_step_waits/audit.json",
+          "sha256": "791b0f0fb0180b1638a75ff3d60f9c918416e75aa6144cf3f1c0067b108de43f",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "final-checks.json": {
+          "path": "vane_fs/benchmarks/staged_payload/sqlite_step_waits/final-checks.json",
+          "sha256": "e9ec06d42458365b9a00e0b310e1f18041ce9e0a5314622db450e0786b9d0c70",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "sync_costs",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/sync_costs/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/sync_costs/audit.json",
+          "sha256": "5714700ddfd83019065f6c8d8866bbaef71f74d76205d334ae4f194c0ea58b2e",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "sync_primitive",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/sync_primitive/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/sync_primitive/audit.json",
+          "sha256": "c7584b901100f38b2dbc7934b107016f701320aefc5875f45fd0a8f12e12de02",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "versioned_extents",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/versioned_extents/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/versioned_extents/audit.json",
+          "sha256": "cd7a82d02748fdc624e172acf16d88e6df1b78f2b96d333599e8d8c9da0735a8",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "wal_preallocation",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/wal_preallocation/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/wal_preallocation/audit.json",
+          "sha256": "abda3142622245df4ddd279c985ec53ef8d90dff84437ffe6db8aa08b88a5bc2",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        },
+        "findings.json": {
+          "path": "vane_fs/benchmarks/staged_payload/wal_preallocation/findings.json",
+          "sha256": "7222ea5502414f11e1455d27ff1c9e53747225a1f47d6866bc25701d75bb07c8",
+          "status": "PASS",
+          "decision": null,
+          "explicit_acceptance_pass": null
+        }
+      }
+    },
+    {
+      "experiment": "wal_sync",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/wal_sync/README.md",
+      "records": {}
+    },
+    {
+      "experiment": "writeback_budget",
+      "default_adoption": false,
+      "classification": "isolated evidence; audit status alone is not an adoption decision",
+      "readme": "vane_fs/benchmarks/staged_payload/writeback_budget/README.md",
+      "records": {
+        "audit.json": {
+          "path": "vane_fs/benchmarks/staged_payload/writeback_budget/audit.json",
+          "sha256": "567331f496ebcfda514bc9cf9c4d26b3d3b06611b9a3d9f43d531dc2198d7b89",
+          "status": "PASS",
+          "decision": "REJECT",
+          "explicit_acceptance_pass": null
+        }
+      }
+    }
+  ],
+  "last_gate_failed_checks": 9,
+  "decision": "Default storage retained; isolated variants need separate performance and compatibility decisions",
+  "candidate_budget": {
+    "total": 3,
+    "prewriteback": 2,
+    "checkpoint": 1,
+    "consumed": 0
+  },
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/performance_closeout/inventory.py": "970130306a396eecfd257a7959853290bb4bddb1f8416f77b68620de6a9cc9be",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/gate_sync_waits/final-checks.json": "099f59e57b70b38346f9583c93ac936f6592ccffb54e30e71f2f0d196ba20ba0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/source.json": "197bf31185c2c714ab73e7a110091309b9d5f53abf6a55ee3a87f15b91358a20",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/build.json": "210bf52b624969aad77ff578f494bb305a3f0f900ff2eae3eecc01623d0783df"
+  }
+}

@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: vane_fs/build/checkpoint-coalescing-20261012T041450Z/updated/venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T041450Z/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T041450Z/updated
+Prepared 1 package in 27.19s
+Installed 1 package in 0.94ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T041450Z/updated)

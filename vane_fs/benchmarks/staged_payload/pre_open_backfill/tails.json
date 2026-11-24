@@ -1,0 +1,52 @@
+[
+  {
+    "window": "plain",
+    "state": "fresh",
+    "variant": "updated",
+    "rep": 3,
+    "workload": "write_64",
+    "field": "write_latencies",
+    "index": 0,
+    "seconds": 1.6005549679975957
+  },
+  {
+    "window": "plain",
+    "state": "fresh",
+    "variant": "updated",
+    "rep": 3,
+    "workload": "write_64",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 4.168882334954105
+  },
+  {
+    "window": "plain",
+    "state": "post_gc",
+    "variant": "updated",
+    "rep": 0,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 4.36590312293265
+  },
+  {
+    "window": "plain",
+    "state": "post_gc",
+    "variant": "baseline",
+    "rep": 3,
+    "workload": "write_64",
+    "field": "write_latencies",
+    "index": 23,
+    "seconds": 2.902107925969176
+  },
+  {
+    "window": "plain",
+    "state": "post_gc",
+    "variant": "baseline",
+    "rep": 3,
+    "workload": "write_64",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 2.8386292629875243
+  }
+]

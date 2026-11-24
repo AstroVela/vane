@@ -3512,6 +3512,29 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
     run_once(f"{label}: repeat")
 
 
+@pytest.mark.parametrize("join_type", ["INNER", "LEFT", "FULL OUTER"])
+def test_ray_single_partition_hash_join_keeps_both_scan_sources(
+    ray_runner, duckdb_conn, tmp_path, monkeypatch, join_type
+):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    duckdb_conn.execute("SET threads = 1")
+    left = tmp_path / "single_join_left.parquet"
+    right = tmp_path / "single_join_right.parquet"
+    duckdb_conn.execute(f"COPY (SELECT i AS id, i%4 AS k FROM range(12)t(i)) TO '{left}' (FORMAT PARQUET)")
+    duckdb_conn.execute(f"COPY (SELECT i AS id, i%5 AS k FROM range(8)t(i)) TO '{right}' (FORMAT PARQUET)")
+    query = (
+        f"SELECT l.id,r.id FROM read_parquet('{left}') l "
+        f"{join_type} JOIN read_parquet('{right}') r ON l.k=r.k ORDER BY l.id,r.id"
+    )
+    relation = duckdb_conn.sql(query)
+    plan_text, partitions = _get_distributed_plan_info(relation, "single-partition hash join")
+    assert partitions == 1
+    assert "Hash Join [partitions=1]" in plan_text
+    parts = _run_iter_tables(ray_runner, relation, f"single-partition {join_type} join", timeout_s=60.0)
+    _assert_results_match(duckdb_conn, query, parts, f"single-partition {join_type} join", ordered=True)
+
+
 def test_ray_streaming_sample(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: streaming sample"
     sql = f"""
@@ -3747,6 +3770,38 @@ def test_ray_perfect_hash_group_by(ray_runner, duckdb_conn, parquet_path):
         sql,
         label,
         require_all=["PERFECT_HASH_GROUP_BY"],
+    )
+
+
+_ARROW_EXTENSION_KEYS_SOURCE = """
+    SELECT
+        i AS id,
+        ('00000000-0000-0000-0000-00000000000' || (i % 4))::UUID AS u,
+        ('{"a": ' || (i % 3) || '}')::JSON AS j,
+        (CASE WHEN i = 0 THEN '170141183460469231731687303715884105727'::HUGEINT
+              WHEN i = 1 THEN '-170141183460469231731687303715884105728'::HUGEINT
+              ELSE (i % 3)::HUGEINT END) AS h,
+        (CASE WHEN i = 0 THEN '340282366920938463463374607431768211455'::UHUGEINT
+              ELSE (i % 3)::UHUGEINT END) AS uh,
+        ('1010' || (i % 2)::VARCHAR)::BIT AS b,
+        {'u': ('00000000-0000-0000-0000-00000000000' || (i % 2))::UUID} AS s,
+        [('00000000-0000-0000-0000-00000000000' || (i % 2))::UUID] AS l
+    FROM range(0, 12) AS t(i)
+"""
+
+
+@pytest.mark.parametrize("key", ["u", "j", "h", "uh", "b", "s", "l"])
+def test_ray_group_by_shuffles_keys_without_native_arrow_types(ray_runner, duckdb_conn, key):
+    # The keys cross the Flight shuffle but are absent from the result, so the
+    # default arrow_lossless_conversion=false must not change their logical types.
+    sql = f"SELECT COUNT(*) AS cnt, MIN(id) AS first_id FROM ({_ARROW_EXTENSION_KEYS_SOURCE}) GROUP BY {key}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        f"test_ray_e2e: shuffle {key} keys",
+        require_all=["HASH_GROUP_BY"],
+        timeout_s=60.0,
     )
 
 

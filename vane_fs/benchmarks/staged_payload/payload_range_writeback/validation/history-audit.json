@@ -1,0 +1,42 @@
+{
+  "status": "PASS",
+  "recorded_epoch": 1792328076.190839,
+  "reason": "Final retention audit found an omitted initial primitive-negative manifest; all initial JSON manifests now retained. Frozen measurement inputs are unchanged.",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build-adapter.json": "8b8ed76bc411108160b6cab4b91f2c86a7286954b60ff74d8c0965112c280824",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build-source-000.json": "6a17ecceff0e897d14e18f87115b0c25d01a0095cc1b86b7d4ef70ac0a51b7f6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build.json": "00a18a00db9fe7c77a52b4877d0217f770fccdd6f8c10c9697a8e3ebe54ab58d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before-async.json": "4b96aca9e3791f68c553707870539deec098859cae566993c86e560b49aa24b1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before.json": "492fb21f9169d21c82e234d5221235a10c15781f2651a74806b4d5c350591fc5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/source.json": "6a17ecceff0e897d14e18f87115b0c25d01a0095cc1b86b7d4ef70ac0a51b7f6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/audit_history.py": "464bda0188cf597c217901247a5f21c8f9bb5480a3bbb6bc6853290bf5d8eb2d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/regression_async.py": "8d3ac5f64559337850e5bb6c7ab1d4e51e355727856e66a1b74c81e04bc98c78",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/test_prewriteback.cpp": "f4562113cd3dc427ad51dc1e4b9976617692757981717f9905e6b87c748fb309",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/candidate/build/python-release/libvane_fs.a": "ff80672257b1aa5d08d96e204bddbacd9375b747279ec90f420686ec25fae90f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/lib/libsqlite3.a": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/candidate/src/staging.hpp": "9d8f4f647aeadb6301c67e23ca3921366dea2dbbda318af95329aa2c08d2b802",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_range_writeback/regression_before.py": "8c83ae45120ec867ad92aed9261f9aa077247aa738ca2b0aab3faa146cee2c52",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-prewriteback-20261018/candidate/build/python-release/libvane_fs.a": "9b018466f34fb2c67142b4b7a4c0ab6ae1c4ad9fef8080c67ed7c18a1f1a51ad",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/test_prewriteback.cpp.frozen.txt": "62d56d92a747051e6b44667ce2597cefd2e53d8cd1ecb42f7eb3ea31aec0f16e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-retained-20261018/history-cleanup.json": "bfd6c7c03c797e60681900f273d90f6fb4f3e72b2cc3918ca6de5fa6966dd725"
+  },
+  "initial_manifests": [
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build-adapter.json",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build-source-000.json",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/build.json",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before-async.json",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/regression-before.json",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-range-writeback-20261018/source.json"
+  ],
+  "component_and_preflight_cleanup": {
+    "sha256": "bfd6c7c03c797e60681900f273d90f6fb4f3e72b2cc3918ca6de5fa6966dd725",
+    "bytes": 688111,
+    "retained_as": [
+      "validation/initial-preflight/history-cleanup.json/000.txt",
+      "validation/initial-preflight/history-cleanup.json/001.txt",
+      "validation/initial-preflight/history-cleanup.json/002.txt"
+    ],
+    "bytes_unchanged": true
+  },
+  "total_cleanup_directories": 49
+}

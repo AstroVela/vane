@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Runner package - configuration and lifecycle for local FTE and Ray execution."""
+"""Runner package - configuration for native local execution and lifecycle for Ray execution."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ __all__ = [
 
 
 def get_or_create_runner() -> Runner:
-    """Get or create the runner selected by the current environment."""
+    """Get or create the Ray runner; native local execution has no runner object."""
     return _native.get_or_create_runner()
 
 

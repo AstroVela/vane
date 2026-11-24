@@ -209,7 +209,7 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 result = self._output
                 self._output = None
                 return result
@@ -270,6 +270,136 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
         timeout=20,
         check=False,
         env={**os.environ, "VANE_RUNNER": "local-fast"},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("notification", ["admission", "result"])
+def test_native_dispatcher_notification_cannot_cross_the_wait_boundary(notification):
+    """A notification after the empty check must still wake native execution."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import os
+        import sys
+        import threading
+        import time
+        import traceback
+
+        import pyarrow as pa
+        import vane
+        from vane import _native
+        import vane.execution.udf as udf_exec
+        from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
+
+        notification = sys.argv[1]
+        pending = threading.Event()
+        finished = threading.Event()
+        outcome = []
+
+        class Executor:
+            def __init__(self):
+                self.state = 'idle'
+                self.retained = 0
+                self.output = None
+                self.finished = False
+                self.waiting_output = False
+
+            def register_wakeup(self, callback):
+                self.wakeup = callback
+
+            def request_task_admission(self, retained):
+                self.retained = retained
+                self.state = 'requested' if notification == 'admission' else 'ready'
+                if notification == 'admission':
+                    pending.set()
+                return True
+
+            def task_admission_state(self):
+                return {'state': self.state, 'available': self.state == 'ready',
+                        'retained_input_bytes': self.retained}
+
+            def submit_with_id(self, submit_id, table):
+                self.state = 'idle'
+                self.submit_id = submit_id
+                self.values = table.column(0).to_pylist()
+                if notification == 'result':
+                    self.waiting_output = True
+                    pending.set()
+                else:
+                    self.produce()
+
+            def produce(self):
+                self.output = (SUBMIT_RESULT_MARKER, self.submit_id,
+                               make_local_shm_ref_bundle_result(pa.table({'y': self.values})))
+                self.waiting_output = False
+
+            def take_ready_result(self, capacity=None):
+                result, self.output = self.output, None
+                return result
+
+            def finished_submitting(self):
+                self.finished = True
+
+            def all_tasks_finished(self):
+                return self.finished and not self.waiting_output and self.output is None
+
+            def close(self):
+                self.state = 'closed'
+
+        executor = Executor()
+        udf_exec.build_executor = lambda *_args, **_kwargs: executor
+        connection = vane.connect()
+
+        def execute():
+            try:
+                relation = connection.sql('SELECT 7::BIGINT AS x').map_batches(
+                    lambda table: table, schema={'y': vane.sqltypes.BIGINT},
+                    execution_backend='subprocess_task',
+                )
+                outcome.append(relation.fetchall())
+            except BaseException as error:
+                outcome.append(error)
+            finally:
+                finished.set()
+
+        try:
+            threading.Thread(target=execute, daemon=True).start()
+            assert pending.wait(5), 'native query never requested the delayed work'
+            _native._pause_udf_dispatcher_wait_for_testing()
+            deadline = time.monotonic() + 5
+            while not _native._udf_executor_debug_counters()['udf_dispatcher_wait_paused']:
+                assert time.monotonic() < deadline, 'dispatcher did not enter the wait window'
+                time.sleep(0.001)
+            if notification == 'admission':
+                executor.state = 'ready'
+            else:
+                executor.produce()
+            executor.wakeup()
+            assert _native._udf_executor_debug_counters()['udf_dispatcher_wait_notifications'] > 0
+            assert finished.wait(5), 'dispatcher lost the notification before sleeping'
+            assert outcome == [[(7,)]], outcome
+            connection.close()
+        except BaseException:
+            traceback.print_exc()
+            faulthandler.dump_traceback(all_threads=True)
+            # The deliberately stranded native query cannot perform normal
+            # teardown on the faulty implementation; isolate it in this child.
+            os._exit(1)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, notification],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ, "VANE_RUNNER": "local-fast", "VANE_ENABLE_UDF_TEST_HOOKS": "1"},
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -411,7 +541,7 @@ def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
                 self._producer = threading.Thread(target=publish, daemon=True)
                 self._producer.start()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 with self._lock:
                     output = self._output
                     self._output = None
@@ -517,7 +647,7 @@ def test_native_dispatcher_shutdown_closes_active_executor():
                 self._admission_state = "idle"
                 submitted.set()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -678,7 +808,7 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
                 self._admission_state = "idle"
                 return object()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -853,7 +983,7 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
                 self._admission_state = "idle"
                 return object()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1055,7 +1185,7 @@ def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1181,7 +1311,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 if self._output is None:
                     return None
                 if self._block_result:
@@ -1614,7 +1744,7 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -1863,7 +1993,7 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
                 self._admission_state = "idle"
                 return FakeSource(table.column(0).to_pylist()[0])
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 return None
 
             def finished_submitting(self):
@@ -2033,7 +2163,7 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
                 if self._wakeup is not None:
                     self._wakeup()
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 if self._output is None:
                     return None
                 result = self._output
@@ -2296,7 +2426,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
                 self._publish(submit_id, table)
                 return None
 
-            def take_ready_result(self):
+            def take_ready_result(self, capacity=None):
                 with self._lock:
                     if not self._output:
                         return None
@@ -2321,7 +2451,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         udf_exec.build_executor = build_executor
         connection = vane.connect()
         cursor = connection.cursor()
-        lazy = connection.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
+        lazy = connection.sql("SELECT i::BIGINT AS x FROM (VALUES (0), (1), (2), (3)) t(i)").map_batches(
             Stage1,
             schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
@@ -2330,7 +2460,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
             batch_size=4,
             task_input_max_bytes=1024 * 1024,
         )
-        materialized = connection.sql("SELECT (100 + i)::BIGINT AS y FROM range(4) t(i)")
+        materialized = connection.sql("SELECT i::BIGINT AS y FROM (VALUES (100), (101), (102), (103)) t(i)")
         relation = materialized.union(lazy).map_batches(
             Stage2,
             schema={"z": vane.sqltypes.BIGINT},
@@ -2354,6 +2484,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
             }
             for node in plan.collect_udf_nodes(conn=connection)
         }
+        plan.collect_query_resource_graph_metadata(conn=connection)
         plan.set_udf_actor_handles(handles, conn=connection)
 
         try:

@@ -252,6 +252,22 @@ public:
 	DataChunk aggregate_input_chunk;
 	vector<HashAggregateGroupingLocalState> grouping_states;
 	AggregateFilterDataSet filter_set;
+
+	void ResetBatchInput() override {
+		for (auto &vector : aggregate_input_chunk.data) {
+			vector.Reference(Vector(vector.GetType(), nullptr));
+		}
+		aggregate_input_chunk.Reset();
+		filter_set.ResetInput();
+		for (auto &grouping : grouping_states) {
+			grouping.table_state->ResetBatchInput();
+			for (auto &state : grouping.distinct_states) {
+				if (state) {
+					state->ResetBatchInput();
+				}
+			}
+		}
+	}
 };
 
 void PhysicalHashAggregate::SetMultiScan(GlobalSinkState &state) {

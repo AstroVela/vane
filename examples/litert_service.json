@@ -1,0 +1,16 @@
+{
+  "path": "/tmp/vane-litert/engine.json",
+  "service_id": "embeddinggemma2-v1",
+  "family": "litert",
+  "model": "litert-community/embeddinggemma-2-740m-litert-lm",
+  "dimensions": 256,
+  "max_bytes": 268435456,
+  "max_inflight": 8,
+  "options": {
+    "model_path": "/models/embeddinggemma-2-740m.litertlm",
+    "model_sha256": "e7a8a2204b91e0f96e92960e84a09a89212e1633dcb7575a9bf3378b4df77f4c",
+    "backend": "cpu",
+    "max_length": 2048,
+    "vision_tokens_per_image": 70
+  }
+}

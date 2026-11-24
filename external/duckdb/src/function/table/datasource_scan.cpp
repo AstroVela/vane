@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/function/table/datasource_scan.hpp"
+#include "duckdb/execution/execution_runtime.hpp"
+#include "duckdb/main/database.hpp"
 
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -19,18 +21,10 @@ namespace duckdb {
 
 static const string DATASOURCE_SPLIT_CODEC = "vane.datasource-split.python-pickle";
 
-// Global produce_stream callback — set once from Python module init,
-// used to restore the callback on workers after deserialization.
-static std::atomic<datasource_produce_stream_t> g_global_produce_stream {nullptr};
-static std::atomic<datasource_acquire_source_t> g_global_acquire_source {nullptr};
-static std::atomic<datasource_release_source_t> g_global_release_source {nullptr};
-static std::atomic<datasource_get_schema_t> g_global_get_schema {nullptr};
-
 static datasource_produce_stream_t RequireProduceStream(datasource_produce_stream_t callback) {
 	if (!callback) {
 		throw InvalidInputException(
-		    "Python datasource runtime is not initialized in this process; import duckdb before executing "
-		    "datasource_scan on Ray workers");
+		    "Python datasource runtime is not initialized on this database; missing datasource stream callback");
 	}
 	return callback;
 }
@@ -174,19 +168,20 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 
 	// Resolve ownership callbacks before restoring schema, but do not acquire
 	// until schema restoration has passed every fallible initialization step.
-	auto acquire_source = g_global_acquire_source.load();
-	auto release_source = g_global_release_source.load();
+	auto callbacks = DataSourceScanFunction::GetCallbacks(context);
+	auto acquire_source = callbacks.acquire_source;
+	auto release_source = callbacks.release_source;
 	if (!bind_data.pickled_source.empty() && (!acquire_source || !release_source)) {
 		throw InvalidInputException(
-		    "Python datasource runtime is not initialized on this Ray worker; missing datasource source callbacks");
+		    "Python datasource runtime is not initialized on this database; missing datasource source callbacks");
 	}
 
 	// Restore arrow_table on worker nodes (type_info is not picklable).
 	if (!bind_data.pickled_source.empty()) {
-		auto get_schema_cb = g_global_get_schema.load();
+		auto get_schema_cb = callbacks.get_schema;
 		if (!get_schema_cb) {
 			throw InvalidInputException(
-			    "Python datasource runtime is not initialized on this Ray worker; missing datasource schema callback");
+			    "Python datasource runtime is not initialized on this database; missing datasource schema callback");
 		}
 		ArrowSchemaWrapper arrow_schema;
 		get_schema_cb(bind_data.pickled_source.c_str(), bind_data.pickled_source.size(), &arrow_schema.arrow_schema);
@@ -357,8 +352,10 @@ static unique_ptr<FunctionData> DataSourceScanDeserialize(Deserializer &deserial
 	result->query_id = deserializer.ReadProperty<string>(102, "query_id");
 	result->estimated_cardinality = deserializer.ReadPropertyWithDefault<optional_idx>(103, "estimated_cardinality");
 	result->snapshot_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(104, "snapshot_types");
-	// Restore produce_stream from global callback (set by Python module on load)
-	result->produce_stream = g_global_produce_stream.load();
+	// Resolve the callback from the receiving database, including when this
+	// deserializer is running inside a self-contained extension.
+	auto &context = deserializer.Get<ClientContext &>();
+	result->produce_stream = DataSourceScanFunction::GetCallbacks(context).produce_stream;
 	RequireProduceStream(result->produce_stream);
 	return std::move(result);
 }
@@ -399,24 +396,16 @@ void DataSourceScanFunction::RegisterFunction(BuiltinFunctions &set) {
 	set.AddFunction(DataSourceScanFunction::GetFunction());
 }
 
-void DataSourceScanFunction::SetGlobalProduceStream(datasource_produce_stream_t callback) {
-	g_global_produce_stream.store(callback);
+void DataSourceScanFunction::SetCallbacks(DatabaseInstance &db, DataSourceCallbacks callbacks) {
+	auto &runtime = db.GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	runtime.datasource = callbacks;
 }
 
-datasource_produce_stream_t DataSourceScanFunction::GetGlobalProduceStream() {
-	return g_global_produce_stream.load();
-}
-
-void DataSourceScanFunction::SetGlobalAcquireSource(datasource_acquire_source_t callback) {
-	g_global_acquire_source.store(callback);
-}
-
-void DataSourceScanFunction::SetGlobalReleaseSource(datasource_release_source_t callback) {
-	g_global_release_source.store(callback);
-}
-
-void DataSourceScanFunction::SetGlobalGetSchema(datasource_get_schema_t callback) {
-	g_global_get_schema.store(callback);
+DataSourceCallbacks DataSourceScanFunction::GetCallbacks(ClientContext &context) {
+	auto &runtime = DatabaseInstance::GetDatabase(context).GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	return runtime.datasource;
 }
 
 } // namespace duckdb

@@ -1,0 +1,215 @@
+{
+  "recorded_epoch": 1792483149.3164246,
+  "pr": "https://github.com/AstroVela/vane/pull/967",
+  "head": "5f13479740e5d94c36370aa0ebf12a47d8f65e9a",
+  "base": "b7c00df040418a1e252044960503349ebeb4f62c",
+  "draft": true,
+  "mergeable": true,
+  "body_matches_completed_delivery_body": true,
+  "checks": [
+    {
+      "name": "Required CI",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118243979403"
+    },
+    {
+      "name": "Milvus integration test",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596414"
+    },
+    {
+      "name": "Fast tests (non-Ray 4/4)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596399"
+    },
+    {
+      "name": "Fast tests (non-Ray 3/4)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596184"
+    },
+    {
+      "name": "Fast tests (isolated Ray owners)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596170"
+    },
+    {
+      "name": "Fast tests (non-Ray 1/4)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596138"
+    },
+    {
+      "name": "Fast tests (non-Ray 2/4)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596099"
+    },
+    {
+      "name": "Fast tests (shared Ray)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596080"
+    },
+    {
+      "name": "Gravitino integration tests",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228596014"
+    },
+    {
+      "name": "Doris integration test",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228595964"
+    },
+    {
+      "name": "AI tests",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228595928"
+    },
+    {
+      "name": "Qdrant integration test",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118228595924"
+    },
+    {
+      "name": "CodeQL (${{ matrix.language }})",
+      "status": "completed",
+      "conclusion": "skipped",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302745/job/118173082074"
+    },
+    {
+      "name": "Validate pull request title",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285456212/job/118169983719"
+    },
+    {
+      "name": "Lint, format and type checks for changed files",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302587/job/118169833134"
+    },
+    {
+      "name": "Native build and fast tests (Python 3.13)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721626"
+    },
+    {
+      "name": "Native build and fast tests (Python 3.11)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721605"
+    },
+    {
+      "name": "Source package (Python 3.11)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721591"
+    },
+    {
+      "name": "Source package (Python 3.10)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721518"
+    },
+    {
+      "name": "Source package (Python 3.13)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721511"
+    },
+    {
+      "name": "Native build and fast tests (Python 3.12)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721494"
+    },
+    {
+      "name": "Native build and tests (Windows x64)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721457"
+    },
+    {
+      "name": "Native build and fast tests (Python 3.14)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721449"
+    },
+    {
+      "name": "Source package (Python 3.14)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721436"
+    },
+    {
+      "name": "Source package (Python 3.12)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721421"
+    },
+    {
+      "name": "Native build and fast tests (Python 3.10)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721353"
+    },
+    {
+      "name": "Native build and tests (macOS arm64)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169721348"
+    },
+    {
+      "name": "Classify changes",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302705/job/118169440469"
+    },
+    {
+      "name": "native-and-mounted-filesystem (fsync, x64-linux-release)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285303127/job/118169417244"
+    },
+    {
+      "name": "native-and-mounted-filesystem (fdatasync, x64-linux-fdatasync-release)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285303127/job/118169417223"
+    },
+    {
+      "name": "Validate format helper (ubuntu-24.04)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302587/job/118169414701"
+    },
+    {
+      "name": "Validate format helper (macos-15)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302587/job/118169414178"
+    },
+    {
+      "name": "Dependency review",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285302745/job/118169414040"
+    },
+    {
+      "name": "Validate pull request title",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/AstroVela/vane/actions/runs/39285295604/job/118169393694"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "recorded_epoch": 1792425629.5432212,
+  "candidate": "C3",
+  "decision": "NOT_STARTED_OUTSIDE_SHIPPING_SCOPE",
+  "budget_consumed": 0,
+  "reason": "The optional CLEAN-prefix PrepareExternal path and local BEGIN/RESTART gate exist only in the format-1005 experiment. The shipping format-1/2 component has neither. Its existing RESTART enforces the 64 MiB admission budget and must remain. Promoting a format/protocol or removing backpressure is outside this closeout.",
+  "evidence": {
+    "default_has_prepare_external": false,
+    "default_has_begin_restart_gate": false,
+    "default_restart_sites": 1,
+    "default_admission_bytes": 67108864,
+    "experiment_has_prepare_external": true
+  },
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/paced-range-writeback-20261019-v2/candidate/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a"
+  }
+}

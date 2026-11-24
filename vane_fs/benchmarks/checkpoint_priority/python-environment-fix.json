@@ -1,0 +1,9 @@
+{
+  "reason": "Use the same explicit pytest/fsspec support path as the previous component environment; no native source or binary changed",
+  "before_support": "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages\n",
+  "after_support": "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages\n/home/kaka/astrovela_vane-batch-udf-20260930/.venv-gpu/lib/python3.12/site-packages\n",
+  "started_epoch": 1791698370.6271176,
+  "identity": "/home/kaka/astrovela_vane-batch-udf-20260930/.venv-gpu/lib/python3.12/site-packages/pytest/__init__.py\n/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-priority-20261011T055101Z/updated/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so\n{'pytest': '9.1.1', 'pytest-timeout': '2.4.0', 'fsspec': '2026.9.0'}\n",
+  "returncode": 0,
+  "ended_epoch": 1791698462.5403764
+}

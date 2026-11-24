@@ -20,7 +20,7 @@
 
 namespace duckdb {
 
-class FunctionData;
+struct FunctionData;
 class FileSystem;
 class ClientContext;
 class TableFilterSet;

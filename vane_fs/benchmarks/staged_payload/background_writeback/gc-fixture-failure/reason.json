@@ -1,0 +1,4 @@
+{
+  "failure": "GC fixture incorrectly required the hint fd for the separate post-publication payload hole-punch/truncate flush",
+  "repair": "allow Reclaim fd only inside GC after successful watched payload and WAL barriers; pre-publication persistent observer requirement retained; no native source changes"
+}

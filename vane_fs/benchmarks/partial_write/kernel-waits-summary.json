@@ -1,0 +1,600 @@
+{
+  "status": "PASS",
+  "scope": "20ms thread sampling within independently instrumented fsync intervals; counts are observations, not exact blocked-time attribution.",
+  "runs": [
+    {
+      "variant": "baseline",
+      "rep": 0,
+      "pid": 1442772,
+      "long_syncs": [
+        {
+          "milliseconds": 3525.5856,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [
+            "stream_256"
+          ],
+          "begin_epoch": 1791642434.0297213,
+          "end_epoch": 1791642437.5553067,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-hjtz79xx/db.sqlite-wal",
+            "begin_ns": 9918931042,
+            "end_ns": 13444516642,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 17905552,
+            "allocated_before": 17907712,
+            "size_after": 68235472,
+            "allocated_after": 68243456,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 9918911213,
+              "end_ns": 9918930857,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25727525, 27832368, 5340082131, 152143949, 0, 35387641, 196812033, 945293, 0, 432752344, 564628, 6574183, 19672458]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 13444517072,
+              "end_ns": 13444542377,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25727692, 27832471, 5340217987, 152171410, 0, 35391100, 196841005, 945293, 0, 432752344, 564628, 6574189, 19673969]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 127
+            },
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 14
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 4
+            }
+          ]
+        },
+        {
+          "milliseconds": 1937.860289,
+          "file": "db.sqlite",
+          "owner": "background",
+          "overlapping_workloads": [
+            "stream_256"
+          ],
+          "begin_epoch": 1791642437.8317668,
+          "end_epoch": 1791642439.7696269,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-hjtz79xx/db.sqlite",
+            "begin_ns": 13720976482,
+            "end_ns": 15658836771,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 527765504,
+            "allocated_before": 527769600,
+            "size_after": 527765504,
+            "allocated_after": 527769600,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 13720960857,
+              "end_ns": 13720976372,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25727757, 27832492, 5340218723, 152171855, 0, 35391261, 196841709, 945293, 0, 432752344, 564628, 6574198, 19674227]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 15658837266,
+              "end_ns": 15658860932,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25728868, 27832537, 5340344659, 152203371, 0, 35393177, 196873675, 945293, 0, 432752344, 564628, 6574213, 19674678]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 85
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 3
+            },
+            {
+              "state": "D",
+              "wchan": "0",
+              "syscall": "running",
+              "count": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "updated",
+      "rep": 0,
+      "pid": 1443563,
+      "long_syncs": [
+        {
+          "milliseconds": 3224.436067,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [],
+          "begin_epoch": 1791642470.8793628,
+          "end_epoch": 1791642474.1037989,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-piz_ien2/db.sqlite-wal",
+            "begin_ns": 15676262919,
+            "end_ns": 18900698986,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 26096112,
+            "allocated_before": 26103808,
+            "size_after": 67716352,
+            "allocated_after": 67723264,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 15676241830,
+              "end_ns": 15676262795,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25740509, 27835137, 5345446571, 152270749, 0, 35399955, 196942907, 945293, 0, 432752344, 564628, 6575052, 19676532]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 18900699379,
+              "end_ns": 18900722162,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25740608, 27835249, 5345564435, 152290896, 0, 35403162, 196963431, 945293, 0, 432752344, 564628, 6575056, 19676909]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 96
+            },
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 7
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 3
+            }
+          ]
+        },
+        {
+          "milliseconds": 1597.777844,
+          "file": "db.sqlite",
+          "owner": "background",
+          "overlapping_workloads": [],
+          "begin_epoch": 1791642474.2433643,
+          "end_epoch": 1791642475.8411422,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-piz_ien2/db.sqlite",
+            "begin_ns": 19040264560,
+            "end_ns": 20638042404,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 839958528,
+            "allocated_before": 839962624,
+            "size_after": 839958528,
+            "allocated_after": 839962624,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 19040250877,
+              "end_ns": 19040264496,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25740615, 27835266, 5345564683, 152291026, 0, 35403221, 196963634, 945293, 0, 432752344, 564628, 6575060, 19676981]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 20638042792,
+              "end_ns": 20638064817,
+              "values": [47456581, 4861956, 2122873726, 24430997, 25741766, 27835322, 5345687739, 152314832, 0, 35404793, 196987641, 945293, 0, 432752344, 564628, 6575068, 19677182]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 71
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 2
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "updated",
+      "rep": 1,
+      "pid": 1444481,
+      "long_syncs": [
+        {
+          "milliseconds": 2694.116377,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [
+            "write_64"
+          ],
+          "begin_epoch": 1791642487.2457755,
+          "end_epoch": 1791642489.9398918,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-l9bhpmil/db.sqlite-wal",
+            "begin_ns": 1892887226,
+            "end_ns": 4587003603,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 67543312,
+            "allocated_before": 67547136,
+            "size_after": 67543312,
+            "allocated_after": 67547136,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 1892869790,
+              "end_ns": 1892887116,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25743946, 27836483, 5346084883, 152341431, 0, 35406848, 197015274, 945293, 0, 432752344, 564628, 6575595, 19678216]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 4587004027,
+              "end_ns": 4587027007,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25744050, 27836529, 5346183379, 152366386, 0, 35409337, 197041337, 945293, 0, 432752344, 564628, 6575600, 19679324]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 70
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 26
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 22
+            }
+          ]
+        },
+        {
+          "milliseconds": 2355.546815,
+          "file": "db.sqlite",
+          "owner": "background",
+          "overlapping_workloads": [
+            "write_64"
+          ],
+          "begin_epoch": 1791642490.0312917,
+          "end_epoch": 1791642492.3868384,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-l9bhpmil/db.sqlite",
+            "begin_ns": 4678403667,
+            "end_ns": 7033950482,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 61509632,
+            "allocated_before": 61509632,
+            "size_after": 61509632,
+            "allocated_after": 61513728,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 4678390741,
+              "end_ns": 4678403610,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25744050, 27836529, 5346183379, 152366386, 0, 35409337, 197041337, 945293, 0, 432752344, 564628, 6575600, 19679324]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 7033950842,
+              "end_ns": 7033975864,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25744192, 27836571, 5346304451, 152392386, 0, 35411677, 197067359, 945293, 0, 432752344, 564628, 6575602, 19679345]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 58
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 52
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "milliseconds": 1119.477541,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [
+            "write_64"
+          ],
+          "begin_epoch": 1791642486.0070226,
+          "end_epoch": 1791642487.1265001,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-l9bhpmil/db.sqlite-wal",
+            "begin_ns": 654134500,
+            "end_ns": 1773612041,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 17833984,
+            "allocated_before": 17833984,
+            "size_after": 67543312,
+            "allocated_after": 67547136,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 654120254,
+              "end_ns": 654134417,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25743600, 27836385, 5346046019, 152318763, 0, 35405659, 196992040, 945293, 0, 432752344, 564628, 6575590, 19677649]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 1773626182,
+              "end_ns": 1773649469,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25743714, 27836440, 5346082579, 152339394, 0, 35406765, 197013156, 945293, 0, 432752344, 564628, 6575592, 19678136]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 25
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 23
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "rep": 1,
+      "pid": 1445450,
+      "long_syncs": [
+        {
+          "milliseconds": 2792.813507,
+          "file": "db.sqlite",
+          "owner": "background",
+          "overlapping_workloads": [
+            "stream_256"
+          ],
+          "begin_epoch": 1791642537.556617,
+          "end_epoch": 1791642540.3494306,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-kurq8uj_/db.sqlite",
+            "begin_ns": 14500346863,
+            "end_ns": 17293160370,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 606715904,
+            "allocated_before": 606720000,
+            "size_after": 606715904,
+            "allocated_after": 606720000,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 14500333694,
+              "end_ns": 14500346792,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756691, 27839826, 5352532443, 152515796, 0, 35427812, 197199416, 945293, 0, 432752344, 564628, 6576592, 19687993]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 17293161277,
+              "end_ns": 17293184494,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756852, 27839884, 5352656995, 152553108, 0, 35430562, 197237361, 945293, 0, 432752344, 564628, 6576601, 19688626]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 44
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 25
+            },
+            {
+              "state": "D",
+              "wchan": "0",
+              "syscall": "running",
+              "count": 1
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "milliseconds": 2708.741069,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [
+            "stream_256"
+          ],
+          "begin_epoch": 1791642534.756833,
+          "end_epoch": 1791642537.465574,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-kurq8uj_/db.sqlite-wal",
+            "begin_ns": 11700563014,
+            "end_ns": 14409304083,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 67967672,
+            "allocated_before": 67969024,
+            "size_after": 67967672,
+            "allocated_after": 67973120,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 11700545157,
+              "end_ns": 11700562904,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756569, 27839735, 5352433147, 152485791, 0, 35425434, 197168294, 945293, 0, 432752344, 564628, 6576583, 19686877]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 14409304470,
+              "end_ns": 14409329028,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756678, 27839804, 5352532107, 152515664, 0, 35427751, 197199208, 945293, 0, 432752344, 564628, 6576587, 19687917]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 75
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 27
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 22
+            }
+          ]
+        },
+        {
+          "milliseconds": 1011.459154,
+          "file": "db.sqlite-wal",
+          "owner": "background",
+          "overlapping_workloads": [
+            "stream_256"
+          ],
+          "begin_epoch": 1791642533.7048812,
+          "end_epoch": 1791642534.7163403,
+          "event": {
+            "name": "fsync",
+            "file": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-batch-20261010T135923Z/measure-waits/owned-fuse-kurq8uj_/db.sqlite-wal",
+            "begin_ns": 10648610970,
+            "end_ns": 11660070124,
+            "offset": -1,
+            "rc": 0,
+            "frames": -1,
+            "copied": -1,
+            "size_before": 17654232,
+            "allocated_before": 17657856,
+            "size_after": 67967672,
+            "allocated_after": 67969024,
+            "errno": 0,
+            "disk_before": {
+              "valid": true,
+              "begin_ns": 10648589808,
+              "end_ns": 10648610860,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756519, 27839727, 5352398475, 152480622, 0, 35424468, 197163048, 945293, 0, 432752344, 564628, 6576581, 19686799]
+            },
+            "disk_after": {
+              "valid": true,
+              "begin_ns": 11660070517,
+              "end_ns": 11660095151,
+              "values": [47456582, 4861956, 2122873734, 24430997, 25756569, 27839735, 5352433147, 152485791, 0, 35425434, 197168294, 945293, 0, 432752344, 564628, 6576583, 19686877]
+            }
+          },
+          "wait_samples": [
+            {
+              "state": "D",
+              "wchan": "rq_qos_wait",
+              "syscall": "74",
+              "count": 13
+            },
+            {
+              "state": "D",
+              "wchan": "folio_wait_bit_common",
+              "syscall": "74",
+              "count": 9
+            },
+            {
+              "state": "D",
+              "wchan": "jbd2_log_wait_commit",
+              "syscall": "74",
+              "count": 4
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

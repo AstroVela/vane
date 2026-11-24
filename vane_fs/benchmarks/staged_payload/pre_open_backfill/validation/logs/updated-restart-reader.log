@@ -1,0 +1,1 @@
+reader PASS passive=2 restart=2 success=1 busy=1 partial=0 bad_timeout=0

@@ -1,0 +1,12 @@
+{
+  "status": "PASS",
+  "completed_epoch": 1791714498.512775,
+  "source_count": 35,
+  "changed_files": [
+    "src/staging.hpp",
+    "src/workspace.cpp"
+  ],
+  "exact_measured_native_and_test_source_bytes": true,
+  "temporary_path": "/dev/shm/owned-vane-writeback-patch-vn0i4ljw",
+  "temporary_path_removed": true
+}

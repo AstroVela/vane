@@ -1,0 +1,2007 @@
+{
+  "status": "PASS",
+  "plan": {
+    "media": [
+      "ext4"
+    ],
+    "orders": [
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "updated"
+      ],
+      [
+        "updated",
+        "baseline"
+      ]
+    ],
+    "states": [
+      "fresh",
+      "post_gc"
+    ],
+    "large_sequence": [
+      {
+        "mib": 256,
+        "application_mib": 8
+      },
+      {
+        "mib": 64,
+        "application_mib": 1
+      }
+    ],
+    "buffer_page_offset": 48,
+    "durability": "fsync",
+    "gc_preparation": "Identical CollectGarbage code/format; candidate wheel supplies GC for both daemons.",
+    "primary_gates": {
+      "ext4_combined_large_write_aggregate_ratio_minimum": 1.1,
+      "ext4_combined_large_write_paired_wins_minimum": 5
+    },
+    "regression_gates": {
+      "all_workloads_median_and_aggregate_ratio_minimum": 0.95,
+      "pooled_p99_ratio_maximum": 1.2,
+      "pooled_p99_absolute_increase_allowance_seconds": 0.001,
+      "lifecycle_median_ratio_maximum": 1.05
+    },
+    "owned_build_or_test_overlap": false,
+    "global_cache_eviction": false,
+    "measurement_scope": "Complete first-256 plus subsequent-64 writes are the combined ext4 target; tmpfs only checks software regressions; all other gates include every slow sample",
+    "runner_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/run_fuse.py",
+    "runner_source_sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948",
+    "prepared_runner_sha256": "d556c34026b2f3c56019fc198f6018089a7b47a49b57425afcc1d2f3fefe722b",
+    "workload_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/workload.py",
+    "workload_source_sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37",
+    "prepared_workload_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "original_prepared_runner_sha256": "6e4ee94b5658ce6cd5e4b4bbfa22d0f5108a7e7146be48331c3c261cf69a433b",
+    "variant_gc_python_modules": {
+      "baseline": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "4e56206eedd93280633ed15513c32814efc90c4430cb2d949978aff75984ae1c"
+      },
+      "updated": {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4"
+      }
+    },
+    "schema_checked_outside_workload_timers": true,
+    "status": "FROZEN_BEFORE_PLAIN_COMPARISON",
+    "frozen_epoch": 1791855989.625376,
+    "baseline": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup",
+    "candidate": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced",
+    "full_adoption_eligible": false,
+    "original_protocol_subset": "ext4 fresh/post-GC only; original workload and gate constants",
+    "publication_presync": false,
+    "block_high_index_removed": false,
+    "checkpoint_restart_busy_timeout_ms": 0,
+    "restart_still_performs_real_io": true,
+    "row_layout_and_format_unchanged": true,
+    "causal_comparison": {
+      "medium": "ext4",
+      "pairs_per_state": 6,
+      "baseline": "Preceding orphan batching",
+      "adoption_gates_replaced": false
+    },
+    "writeback_hints": false,
+    "wal_checkpoint_thresholds_unchanged": true,
+    "post_reuse_clean_progress_enabled": true,
+    "payload_publication_coalescing_and_admission_unchanged": true,
+    "commit_wake_latched_after_large_generation": true,
+    "final_barriers_unchanged": true,
+    "timing_boundaries_unchanged": true,
+    "inputs": {
+      "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/screen.py": "c079262beea141ceb6ee1c417c8c1944ec29511dd0534d7080e4df9eb10ba5de",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/tests.json": "dd5bccd107137ff315d3cb50852eaabea1ec4ce347da1b3b20f62247ca7008ca",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/build/python-release/vane-fs-mount": "bfea1cb005a4dde631efff35bf131e1ab8aec54e24aaa95a438ca14a9737c6a8",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "4e56206eedd93280633ed15513c32814efc90c4430cb2d949978aff75984ae1c",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/checkpoint.hpp": "c28b2d3647f5f084b766bd956fe17095def5a882cf01fc61ff062c0607a47628",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/workspace.cpp": "8ef0f04764bfb9fb5d2b31f09df8b10c06496f78b02e5a7c8e5932c9902e465a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/build/python-release/vane-fs-mount": "fb3798267ce0794a498cfaa821318d619ad14d43d7f4e20d06e6e2d1e14be000",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/checkpoint.hpp": "7176de3758454758777114e7ef24400615895972052f047af47425a0ba4bc6be",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/workspace.cpp": "8ef0f04764bfb9fb5d2b31f09df8b10c06496f78b02e5a7c8e5932c9902e465a",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/clean-ablation/run_fuse.py": "d556c34026b2f3c56019fc198f6018089a7b47a49b57425afcc1d2f3fefe722b",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/clean-ablation/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+    },
+    "role": "clean-ablation",
+    "interpretation": "Original ext4 subset and unchanged gates; ablations isolate mechanisms, not overall adoption",
+    "lookup_reads_enabled": true,
+    "small_clean_fixed_deferral_ms": 5
+  },
+  "plain": {
+    "ext4": {
+      "fuse": {
+        "workloads": {
+          "stream_256": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 155.31589597702288,
+                "min": 36.25469949877092,
+                "max": 159.5204862075199,
+                "p95": 158.7288530610423,
+                "p99": 159.36215957822438,
+                "sum": 815.7171700171946
+              },
+              "seconds": {
+                "count": 6,
+                "median": 1.6482941774884239,
+                "min": 1.6048095519654453,
+                "max": 7.061153548071161,
+                "p95": 5.714285491791088,
+                "p99": 6.791779936815147,
+                "sum": 15.273543469957076
+              },
+              "aggregate_rate": 100.56605417212438,
+              "requests_seconds": {
+                "count": 6,
+                "median": 1.4860949189169332,
+                "min": 1.446141675929539,
+                "max": 6.881379873957485,
+                "p95": 5.539577577204909,
+                "p99": 6.6130194146069705,
+                "sum": 14.287805364700034
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.15714780148118734,
+                "min": 0.15429202001541853,
+                "max": 0.17523600603453815,
+                "p95": 0.17112025554524735,
+                "p99": 0.17441285593668,
+                "sum": 0.9572776280110702
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00018266646657139063,
+                "min": 0.00016249297186732292,
+                "max": 0.0001919229980558157,
+                "p95": 0.0001910699938889593,
+                "p99": 0.00019175239722244442,
+                "sum": 0.00107707385905087
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.965,
+                "min": 0.94,
+                "max": 0.99,
+                "p95": 0.9875,
+                "p99": 0.9895,
+                "sum": 5.8
+              },
+              "latencies": {
+                "count": 192,
+                "median": 0.022770784446038306,
+                "min": 0.019313143100589514,
+                "max": 5.679959619068541,
+                "p95": 0.32414887165650724,
+                "p99": 0.3565654560143594,
+                "sum": 14.268085670773871
+              },
+              "requests_over_1s": 1
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 154.74894787915213,
+                "min": 137.45336028514322,
+                "max": 156.4529457536625,
+                "p95": 156.06621009471127,
+                "p99": 156.37559862187226,
+                "sum": 911.5912806128549
+              },
+              "seconds": {
+                "count": 6,
+                "median": 1.6542924915556796,
+                "min": 1.6362747199600562,
+                "max": 1.862449920969084,
+                "p95": 1.814371044980362,
+                "p99": 1.8528341457713395,
+                "sum": 10.130059142131358
+              },
+              "aggregate_rate": 151.62794001978813,
+              "requests_seconds": {
+                "count": 6,
+                "median": 1.485505960532464,
+                "min": 1.4671201349701732,
+                "max": 1.7026863259961829,
+                "p95": 1.6500533579965122,
+                "p99": 1.6921597323962487,
+                "sum": 9.105531696113758
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.1591489705024287,
+                "min": 0.15502262697555125,
+                "max": 0.18355625099502504,
+                "p95": 0.18327034899266437,
+                "p99": 0.1834990705945529,
+                "sum": 0.9974239299772307
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.000157977978233248,
+                "min": 0.0001504549290984869,
+                "max": 0.0001729360083118081,
+                "p95": 0.00017018849030137062,
+                "p99": 0.00017238650470972062,
+                "sum": 0.0009557408047839999
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.96,
+                "min": 0.94,
+                "max": 0.97,
+                "p95": 0.97,
+                "p99": 0.97,
+                "sum": 5.74
+              },
+              "latencies": {
+                "count": 192,
+                "median": 0.022975750034675002,
+                "min": 0.021421355078928173,
+                "max": 0.6072777360677719,
+                "p95": 0.32197711648186667,
+                "p99": 0.35408547745901164,
+                "sum": 9.08543278858997
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9963497097685698,
+            "aggregate_rate_ratio": 1.5077447481460144,
+            "paired_complete_write_wins": 3,
+            "nonregression_gate": true
+          },
+          "write_64": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 106.94070674752118,
+                "min": 10.959195081842035,
+                "max": 138.10883410953306,
+                "p95": 131.7615100111432,
+                "p99": 136.83936928985509,
+                "sum": 580.8490795769559
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.5984699854743667,
+                "min": 0.46340265206526965,
+                "max": 5.8398449450032786,
+                "p95": 4.532003740256187,
+                "p99": 5.578276704053861,
+                "sum": 8.67644858895801
+              },
+              "aggregate_rate": 44.25773933458137,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.2829366624937393,
+                "min": 0.22797767398878932,
+                "max": 1.05107687599957,
+                "p95": 0.8644518397341017,
+                "p99": 1.0137518687464764,
+                "sum": 2.395691401907243
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.17690366052556783,
+                "min": 0.17214819602668285,
+                "max": 4.680657388991676,
+                "p95": 3.5750901634746697,
+                "p99": 4.459543943888276,
+                "sum": 5.637953658937477
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00014392047887668014,
+                "min": 0.00011462403926998377,
+                "max": 0.0001611759653314948,
+                "p95": 0.00015957397408783436,
+                "p99": 0.00016085556708276272,
+                "sum": 0.0008595359977334738
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.3849999999999999,
+                "min": 0.27,
+                "max": 0.4099999999999999,
+                "p95": 0.4074999999999999,
+                "p99": 0.4094999999999999,
+                "sum": 2.1899999999999995
+              },
+              "latencies": {
+                "count": 384,
+                "median": 0.0030143504845909774,
+                "min": 0.0023683810140937567,
+                "max": 0.8114934830227867,
+                "p95": 0.005113625229569151,
+                "p99": 0.05274421460926534,
+                "sum": 2.362025045673363
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 97.27117302677162,
+                "min": 90.5493292915259,
+                "max": 101.4506078447292,
+                "p95": 100.525754028188,
+                "p99": 101.26563708142096,
+                "sum": 579.475979749046
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.6579605409642681,
+                "min": 0.6308488569920883,
+                "max": 0.7067970630014315,
+                "p95": 0.6981959175027441,
+                "p99": 0.7050768339016941,
+                "sum": 3.980682952911593
+              },
+              "aggregate_rate": 96.46585888462448,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.4260038834763691,
+                "min": 0.4135582270100713,
+                "max": 0.45903568295761943,
+                "p95": 0.4556839752185624,
+                "p99": 0.458365341409808,
+                "sum": 2.5872034948552027
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.12329268548637629,
+                "min": 0.11374805402010679,
+                "max": 0.1448446880094707,
+                "p95": 0.14444607973564416,
+                "p99": 0.1447649663547054,
+                "sum": 0.7651896888855845
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00014615495456382632,
+                "min": 0.00010985496919602156,
+                "max": 0.00015599292237311602,
+                "p95": 0.00015596119919791818,
+                "p99": 0.00015598657773807645,
+                "sum": 0.0008533068466931581
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.4099999999999999,
+                "min": 0.3599999999999999,
+                "max": 0.43999999999999995,
+                "p95": 0.43749999999999994,
+                "p99": 0.43949999999999995,
+                "sum": 2.4399999999999995
+              },
+              "latencies": {
+                "count": 384,
+                "median": 0.003427767485845834,
+                "min": 0.0026008218992501497,
+                "max": 0.17697690706700087,
+                "p95": 0.005714667344000189,
+                "p99": 0.14778382824966688,
+                "sum": 2.5521127752726898
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9095804206383394,
+            "aggregate_rate_ratio": 2.1796381906305275,
+            "paired_complete_write_wins": 1,
+            "nonregression_gate": false
+          },
+          "read_64": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 767.3019480908279,
+                "min": 721.1430194027712,
+                "max": 784.0057058754272,
+                "p95": 783.2778058049355,
+                "p99": 783.8601258613289,
+                "sum": 4542.775027943933
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.08341625693719834,
+                "min": 0.0816320589510724,
+                "max": 0.08874799904879183,
+                "p95": 0.08872386501752771,
+                "p99": 0.088743172242539,
+                "sum": 0.5078003847738728
+              },
+              "aggregate_rate": 756.2026566226373
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 774.696220018456,
+                "min": 728.0043391592521,
+                "max": 810.0275435302025,
+                "p95": 803.3593736672724,
+                "p99": 808.6939095576165,
+                "sum": 4602.5827597791385
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.08262072451179847,
+                "min": 0.07900965900626034,
+                "max": 0.08791156392544508,
+                "p95": 0.08779746343498118,
+                "p99": 0.0878887438273523,
+                "sum": 0.5013177159707993
+              },
+              "aggregate_rate": 765.9813083931931
+            },
+            "median_rate_ratio": 1.0096367172610812,
+            "aggregate_rate_ratio": 1.0129312581553593,
+            "paired_complete_write_wins": 4,
+            "nonregression_gate": true
+          },
+          "random_read_4k": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 69.97646511552279,
+                "min": 61.56542744842728,
+                "max": 81.80671225447084,
+                "p95": 80.71816963364635,
+                "p99": 81.58900373030595,
+                "sum": 429.83733683264524
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.22865367349004373,
+                "min": 0.19558297307230532,
+                "max": 0.25988611893262714,
+                "p95": 0.25283546844730154,
+                "p99": 0.258475988835562,
+                "sum": 1.3510380699299276
+              },
+              "aggregate_rate": 71.0564728978948
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 70.75813437492326,
+                "min": 69.06271261643583,
+                "max": 74.84317674143183,
+                "p95": 74.0117506658988,
+                "p99": 74.67689152632522,
+                "sum": 426.7476124644309
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.22612255800049752,
+                "min": 0.21378034306690097,
+                "max": 0.23167349491268396,
+                "p95": 0.2310551589471288,
+                "p99": 0.23154982771957294,
+                "sum": 1.350620658020489
+              },
+              "aggregate_rate": 71.07843303737154
+            },
+            "median_rate_ratio": 1.0111704593552995,
+            "aggregate_rate_ratio": 1.0003090519213962,
+            "paired_complete_write_wins": 3,
+            "nonregression_gate": true
+          },
+          "random_write_4k": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 10.450561270501087,
+                "min": 9.2045728874184,
+                "max": 13.514261087666819,
+                "p95": 13.096478029952857,
+                "p99": 13.430704476124028,
+                "sum": 64.74871513202254
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.19308915454894304,
+                "min": 0.14799181302078068,
+                "max": 0.21728330303449184,
+                "p95": 0.21680912128067575,
+                "p99": 0.21718846668372863,
+                "sum": 1.1357142931083217
+              },
+              "aggregate_rate": 10.566037667059165,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.18983662052778527,
+                "min": 0.14299781306181103,
+                "max": 0.2140959680546075,
+                "p95": 0.2139645837887656,
+                "p99": 0.21406969120143912,
+                "sum": 1.1155996191082522
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.0033973679528571665,
+                "min": 0.0018149269744753838,
+                "max": 0.0049929950619116426,
+                "p95": 0.004667854780564085,
+                "p99": 0.004927967005642131,
+                "sum": 0.02010522282216698
+              },
+              "latencies": {
+                "count": 3072,
+                "median": 0.0003157890751026571,
+                "min": 0.00011651299428194761,
+                "max": 0.03710770606994629,
+                "p95": 0.0003941912436857819,
+                "p99": 0.0004805832414422184,
+                "sum": 1.1130366115830839
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 10.047859977017076,
+                "min": 8.396372282881961,
+                "max": 11.865048529322735,
+                "p95": 11.77362047345836,
+                "p99": 11.84676291814986,
+                "sum": 60.88740156905999
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.19981186446966603,
+                "min": 0.1685623109806329,
+                "max": 0.23819810897111893,
+                "p95": 0.23401389899663627,
+                "p99": 0.2373612669762224,
+                "sum": 1.2017684989841655
+              },
+              "aggregate_rate": 9.985284195869168,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.19441165297757834,
+                "min": 0.16228427295573056,
+                "max": 0.23414098902139813,
+                "p95": 0.22984867327613756,
+                "p99": 0.23328252587234602,
+                "sum": 1.1711903410032392
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.005085684533696622,
+                "min": 0.00405607302673161,
+                "max": 0.006275814026594162,
+                "p95": 0.006101687002228573,
+                "p99": 0.006240988621721044,
+                "sum": 0.0305706390645355
+              },
+              "latencies": {
+                "count": 3072,
+                "median": 0.00033475353848189116,
+                "min": 0.00014936807565391064,
+                "max": 0.056698889937251806,
+                "p95": 0.00040348004549741736,
+                "p99": 0.00047621301608160134,
+                "sum": 1.168274992494844
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.961466060715732,
+            "aggregate_rate_ratio": 0.945035831833104,
+            "paired_complete_write_wins": 3,
+            "nonregression_gate": false
+          },
+          "small_file_fsync": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 232.09341819907587,
+                "min": 210.7876057857302,
+                "max": 271.1240712231492,
+                "p95": 264.0158109758637,
+                "p99": 269.7024191736921,
+                "sum": 1416.1841559296538
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.551513945509214,
+                "min": 0.4721085790079087,
+                "max": 0.6072463298914954,
+                "p95": 0.5961592776875477,
+                "p99": 0.6050289194507059,
+                "sum": 3.2727004959015176
+              },
+              "aggregate_rate": 234.66858667995592,
+              "latencies": {
+                "count": 768,
+                "median": 0.004159862000960857,
+                "min": 0.002625183085910976,
+                "max": 0.03422132704872638,
+                "p95": 0.0051434407127089795,
+                "p99": 0.01015098630217842,
+                "sum": 3.2717258983757347
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 246.3968546272092,
+                "min": 241.54179831398486,
+                "max": 277.0290568237559,
+                "p95": 272.30573653180227,
+                "p99": 276.0843927653652,
+                "sum": 1511.3752725583383
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.5195544789894484,
+                "min": 0.4620453950483352,
+                "max": 0.5299289849353954,
+                "p95": 0.5297465172188822,
+                "p99": 0.5298924913920928,
+                "sum": 3.056145529029891
+              },
+              "aggregate_rate": 251.29693357363956,
+              "latencies": {
+                "count": 768,
+                "median": 0.003710100019816309,
+                "min": 0.0026130150072276592,
+                "max": 0.034698204952292144,
+                "p95": 0.005017092794878408,
+                "p99": 0.009847292329650374,
+                "sum": 3.055158268660307
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 1.0616279278366467,
+            "aggregate_rate_ratio": 1.0708588530273189,
+            "paired_complete_write_wins": 5,
+            "nonregression_gate": true
+          },
+          "mkdir": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 2117.0095492400587,
+                "min": 1066.55592325667,
+                "max": 2228.635699710246,
+                "p95": 2220.9005235500144,
+                "p99": 2227.0886644782,
+                "sum": 11735.239014750956
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.060488109535072,
+                "min": 0.057434241054579616,
+                "max": 0.12001245992723852,
+                "p95": 0.1059429551823996,
+                "p99": 0.11719855897827075,
+                "sum": 0.42040020192507654
+              },
+              "aggregate_rate": 1826.8307115058724,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.003748076967895031,
+                "min": 0.0024560129968449473,
+                "max": 0.00529722694773227,
+                "p95": 0.004955121461534873,
+                "p99": 0.00522880585049279,
+                "sum": 0.021848062868230045
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00043897697469219565,
+                "min": 0.0003183110384270549,
+                "max": 0.02336495299823582,
+                "p95": 0.0007130143872927873,
+                "p99": 0.0008063154807314283,
+                "sum": 0.39800911815837026
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 1939.9440027276062,
+                "min": 1822.8959956967442,
+                "max": 2206.226921798163,
+                "p95": 2170.8271625711327,
+                "p99": 2199.146969952757,
+                "sum": 11809.880662861375
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06604371301364154,
+                "min": 0.05801760405302048,
+                "max": 0.07021793909370899,
+                "p95": 0.07009035258670337,
+                "p99": 0.07019242179230786,
+                "sum": 0.3920272062532604
+              },
+              "aggregate_rate": 1959.0477082956606,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.00496259902138263,
+                "min": 0.004466495011001825,
+                "max": 0.006067597074434161,
+                "p95": 0.005860712059075013,
+                "p99": 0.0060262200713623315,
+                "sum": 0.030238557141274214
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00046151294372975826,
+                "min": 0.0003436330007389188,
+                "max": 0.0009132369887083769,
+                "p95": 0.0005818884877953678,
+                "p99": 0.0006692091154400261,
+                "sum": 0.3612599567277357
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9163605348043831,
+            "aggregate_rate_ratio": 1.072375067901503,
+            "paired_complete_write_wins": 2,
+            "nonregression_gate": false
+          },
+          "rename": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 1979.307547254684,
+                "min": 1877.5037370740358,
+                "max": 2270.9366522527707,
+                "p95": 2204.081296830917,
+                "p99": 2257.5655811684,
+                "sum": 12019.514257440329
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06467836356023327,
+                "min": 0.05636440799571574,
+                "max": 0.06817562994547188,
+                "p95": 0.06789492120151408,
+                "p99": 0.06811948819668032,
+                "sum": 0.38483727001585066
+              },
+              "aggregate_rate": 1995.6487061878586,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.002255738014355302,
+                "min": 0.001654839958064258,
+                "max": 0.003114802995696664,
+                "p95": 0.003044834505999461,
+                "p99": 0.0031008092977572233,
+                "sum": 0.013909322093240917
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00039940798887982965,
+                "min": 0.00030265701934695244,
+                "max": 0.011136373970657587,
+                "p95": 0.0005751192744355648,
+                "p99": 0.0007699686288833622,
+                "sum": 0.37050997733604163
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 1854.894769984601,
+                "min": 1729.3283373075824,
+                "max": 2314.938231650124,
+                "p95": 2208.3249563941904,
+                "p99": 2293.6155765989374,
+                "sum": 11450.771832968503
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06901771103730425,
+                "min": 0.05529305199161172,
+                "max": 0.07401717605534941,
+                "p95": 0.07320974001777358,
+                "p99": 0.07385568884783425,
+                "sum": 0.4059122760081664
+              },
+              "aggregate_rate": 1892.0344256465626,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.003344340017065406,
+                "min": 0.0022332320222631097,
+                "max": 0.0037933409912511706,
+                "p95": 0.0037734200013801455,
+                "p99": 0.0037893567932769656,
+                "sum": 0.019540800130926073
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00042050250340253115,
+                "min": 0.00033530499786138535,
+                "max": 0.011267740046605468,
+                "p95": 0.0005481837375555187,
+                "p99": 0.0007430245133582515,
+                "sum": 0.38593916583340615
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9371432815265901,
+            "aggregate_rate_ratio": 0.9480798999242593,
+            "paired_complete_write_wins": 1,
+            "nonregression_gate": false
+          },
+          "rmdir": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 2471.517467029603,
+                "min": 2037.7757781126988,
+                "max": 2547.030821188615,
+                "p95": 2536.8272030606236,
+                "p99": 2544.9900975630167,
+                "sum": 14189.644629016757
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.05179839546326548,
+                "min": 0.050254594068974257,
+                "max": 0.06281358399428427,
+                "p95": 0.06195533400750719,
+                "p99": 0.06264193399692886,
+                "sum": 0.32711855799425393
+              },
+              "aggregate_rate": 2347.77263848629,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.004471797030419111,
+                "min": 0.003136717015877366,
+                "max": 0.015509049058891833,
+                "p95": 0.014587323530577123,
+                "p99": 0.015324703953228892,
+                "sum": 0.043247235007584095
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00035861897049471736,
+                "min": 0.0003050570376217365,
+                "max": 0.0008033739868551493,
+                "p95": 0.0004623579268809408,
+                "p99": 0.0005295260751154277,
+                "sum": 0.2835147528676316
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 2217.928769674141,
+                "min": 1547.0922684766854,
+                "max": 2414.8238328235516,
+                "p95": 2404.7802578477485,
+                "p99": 2412.815117828391,
+                "sum": 12578.119701700647
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.057737766997888684,
+                "min": 0.05300593702122569,
+                "max": 0.08273585396818817,
+                "p95": 0.07977358374046162,
+                "p99": 0.08214339992264286,
+                "sum": 0.37600678903982043
+              },
+              "aggregate_rate": 2042.516311902725,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.006445388018619269,
+                "min": 0.004048606031574309,
+                "max": 0.009830930037423968,
+                "p95": 0.009269317262805998,
+                "p99": 0.009718607482500375,
+                "sum": 0.04062244400847703
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0003778394893743098,
+                "min": 0.0003111109836027026,
+                "max": 0.021668522036634386,
+                "p95": 0.0005095375352539122,
+                "p99": 0.0006954774225596342,
+                "sum": 0.33502398477867246
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.8973955471736004,
+            "aggregate_rate_ratio": 0.8699804565486474,
+            "paired_complete_write_wins": 1,
+            "nonregression_gate": false
+          }
+        },
+        "lifecycle": {
+          "baseline": {
+            "count": 6,
+            "median": 8.836170209979173,
+            "min": 8.181962664006278,
+            "max": 14.097277716966346,
+            "p95": 14.06935537798563,
+            "p99": 14.091693249170202,
+            "sum": 62.654450620058924
+          },
+          "updated": {
+            "count": 6,
+            "median": 8.732013618515339,
+            "min": 8.604889182024635,
+            "max": 8.84464561205823,
+            "p95": 8.83858302628505,
+            "p99": 8.843433094903594,
+            "sum": 52.37576295505278
+          },
+          "nonregression_gate": true
+        }
+      },
+      "aged_fuse": {
+        "workloads": {
+          "stream_256": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 152.85025142151898,
+                "min": 150.23094907140484,
+                "max": 154.3396493085688,
+                "p95": 154.33886740295497,
+                "p99": 154.33949292744603,
+                "sum": 915.0540448446079
+              },
+              "seconds": {
+                "count": 6,
+                "median": 1.6748714565183036,
+                "min": 1.6586794200120494,
+                "max": 1.704043018980883,
+                "p95": 1.7034328764711972,
+                "p99": 1.7039209904789459,
+                "sum": 10.072780834045261
+              },
+              "aggregate_rate": 152.49016386899163,
+              "requests_seconds": {
+                "count": 6,
+                "median": 1.5043336235103197,
+                "min": 1.48947397491429,
+                "max": 1.5206833120901138,
+                "p95": 1.5201858193031512,
+                "p99": 1.5205838135327212,
+                "sum": 9.033873580978252
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.1644128505140543,
+                "min": 0.15676120901480317,
+                "max": 0.1888784960610792,
+                "p95": 0.18698628153651953,
+                "p99": 0.18850005315616727,
+                "sum": 1.0137859820388258
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00018032046500593424,
+                "min": 0.0001438619801774621,
+                "max": 0.0002593159442767501,
+                "p95": 0.00024347944417968392,
+                "p99": 0.00025614864425733687,
+                "sum": 0.0011330248089507222
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 1.005,
+                "min": 0.98,
+                "max": 1.03,
+                "p95": 1.0275,
+                "p99": 1.0295,
+                "sum": 6.029999999999999
+              },
+              "latencies": {
+                "count": 192,
+                "median": 0.0234359489986673,
+                "min": 0.021832447964698076,
+                "max": 0.36777984991203994,
+                "p95": 0.32649248142261056,
+                "p99": 0.3582201966736466,
+                "sum": 9.013726041419432
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 151.09234400191232,
+                "min": 40.089512691369585,
+                "max": 157.07160461514167,
+                "p95": 156.94298944350538,
+                "p99": 157.0458815808144,
+                "sum": 786.0338880608072
+              },
+              "seconds": {
+                "count": 6,
+                "median": 1.6943434764980339,
+                "min": 1.6298299150075763,
+                "max": 6.3857099479064345,
+                "p95": 5.281094789184863,
+                "p99": 6.164786916162121,
+                "sum": 15.006661809864454
+              },
+              "aggregate_rate": 102.35454223339187,
+              "requests_seconds": {
+                "count": 6,
+                "median": 1.5166243819985539,
+                "min": 1.4620664350222796,
+                "max": 6.2211816989583895,
+                "p95": 5.116706861474086,
+                "p99": 6.00028673146153,
+                "sum": 13.992590732988901
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.16157255950383842,
+                "min": 0.15893981303088367,
+                "max": 0.18358921899925917,
+                "p95": 0.17857380548957735,
+                "p99": 0.18258613629732282,
+                "sum": 0.989003794034943
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00015263643581420183,
+                "min": 0.00011295999865978956,
+                "max": 0.00016974599566310644,
+                "p95": 0.00016751326620578766,
+                "p99": 0.00016929944977164268,
+                "sum": 0.0008933170465752482
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 1.0099999999999998,
+                "min": 0.9500000000000001,
+                "max": 1.02,
+                "p95": 1.02,
+                "p99": 1.02,
+                "sum": 5.97
+              },
+              "latencies": {
+                "count": 192,
+                "median": 0.023800416965968907,
+                "min": 0.021356022101826966,
+                "max": 5.02565604809206,
+                "p95": 0.33058385227341197,
+                "p99": 0.38955960933817635,
+                "sum": 13.972409984911792
+              },
+              "requests_over_1s": 1
+            },
+            "median_rate_ratio": 0.98849915258066,
+            "aggregate_rate_ratio": 0.6712206193268137,
+            "paired_complete_write_wins": 2,
+            "nonregression_gate": false
+          },
+          "write_64": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 109.52879122413394,
+                "min": 103.71192499344949,
+                "max": 126.41644888096526,
+                "p95": 122.96868098778208,
+                "p99": 125.72689530232863,
+                "sum": 670.6274316422006
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.5843212570762262,
+                "min": 0.5062632320914418,
+                "max": 0.6170939359581098,
+                "p95": 0.6098575199430343,
+                "p99": 0.6156466527550947,
+                "sum": 3.448403542046435
+              },
+              "aggregate_rate": 111.35587680440597,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.2546025200281292,
+                "min": 0.23944754095282406,
+                "max": 0.3153396340785548,
+                "p95": 0.30069982531131245,
+                "p99": 0.31241167232510636,
+                "sum": 1.564574076095596
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.18488253449322656,
+                "min": 0.15334282396361232,
+                "max": 0.2058360300725326,
+                "p95": 0.2042710738023743,
+                "p99": 0.20552303881850092,
+                "sum": 1.1009636130183935
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00014729343820363283,
+                "min": 9.89189138635993e-05,
+                "max": 0.00016251008491963148,
+                "p95": 0.00015947056817822158,
+                "p99": 0.0001619021815713495,
+                "sum": 0.000838508945889771
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.3700000000000001,
+                "min": 0.33999999999999986,
+                "max": 0.3999999999999999,
+                "p95": 0.3949999999999999,
+                "p99": 0.3989999999999999,
+                "sum": 2.2299999999999995
+              },
+              "latencies": {
+                "count": 384,
+                "median": 0.0029808799736201763,
+                "min": 0.002734052948653698,
+                "max": 0.08101470395922661,
+                "p95": 0.004376693471567705,
+                "p99": 0.05138295434531757,
+                "sum": 1.5304752174997702
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 92.72879836016062,
+                "min": 88.99224831664012,
+                "max": 96.6417427745186,
+                "p95": 96.47265251556699,
+                "p99": 96.60792472272828,
+                "sum": 557.2851524551328
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.6904596425010823,
+                "min": 0.6622397130122408,
+                "max": 0.7191637610085309,
+                "p95": 0.7167010067496449,
+                "p99": 0.7186712101567536,
+                "sum": 4.138542660977691
+              },
+              "aggregate_rate": 92.78628528364224,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.42932123003993183,
+                "min": 0.4150441560195759,
+                "max": 0.4667515150504187,
+                "p95": 0.4606750360399019,
+                "p99": 0.46553621924831534,
+                "sum": 2.606005172128789
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.11614340852247551,
+                "min": 0.1137039209716022,
+                "max": 0.14575690194033086,
+                "p95": 0.14482733645127155,
+                "p99": 0.145570988842519,
+                "sum": 0.7492854539304972
+              },
+              "close_seconds": {
+                "count": 6,
+                "median": 0.00014118646504357457,
+                "min": 0.00010274001397192478,
+                "max": 0.0001558420481160283,
+                "p95": 0.00015241405344568193,
+                "p99": 0.00015515644918195903,
+                "sum": 0.000821974128484726
+              },
+              "daemon_cpu_seconds": {
+                "count": 6,
+                "median": 0.43000000000000016,
+                "min": 0.3999999999999999,
+                "max": 0.4900000000000002,
+                "p95": 0.47750000000000026,
+                "p99": 0.4875000000000002,
+                "sum": 2.6200000000000006
+              },
+              "latencies": {
+                "count": 384,
+                "median": 0.0036380295059643686,
+                "min": 0.0024729709839448333,
+                "max": 0.16056866408325732,
+                "p95": 0.005877736915135756,
+                "p99": 0.14895456275437027,
+                "sum": 2.57088371925056
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.8466157375041719,
+            "aggregate_rate_ratio": 0.8332410281912577,
+            "paired_complete_write_wins": 0,
+            "nonregression_gate": false
+          },
+          "read_64": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 743.2785483453954,
+                "min": 693.5474985965478,
+                "max": 800.9684418128944,
+                "p95": 790.9994483093826,
+                "p99": 798.9746431121921,
+                "sum": 4446.119391306971
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.08612802298739552,
+                "min": 0.07990327291190624,
+                "max": 0.0922791879856959,
+                "p95": 0.09193815250182524,
+                "p99": 0.09221098088892177,
+                "sum": 0.5194432039279491
+              },
+              "aggregate_rate": 739.2531023531571
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 795.0158635845089,
+                "min": 758.4947950878478,
+                "max": 1200.5795712029799,
+                "p95": 1139.8053813246897,
+                "p99": 1188.424733227322,
+                "sum": 5294.086233704066
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.08050250943051651,
+                "min": 0.05330758704803884,
+                "max": 0.08437763899564743,
+                "p95": 0.08360075848759152,
+                "p99": 0.08422226289403625,
+                "sum": 0.44680229283403605
+              },
+              "aggregate_rate": 859.44053143576
+            },
+            "median_rate_ratio": 1.0696068995321948,
+            "aggregate_rate_ratio": 1.1625795396732563,
+            "paired_complete_write_wins": 5,
+            "nonregression_gate": true
+          },
+          "random_read_4k": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 68.87292268069817,
+                "min": 66.62399563998083,
+                "max": 71.685932562651,
+                "p95": 71.46841441043469,
+                "p99": 71.64242893220774,
+                "sum": 414.3028004857408
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.23238985100761056,
+                "min": 0.22319581301417202,
+                "max": 0.24015371408313513,
+                "p95": 0.23943503605551086,
+                "p99": 0.24000997847761027,
+                "sum": 1.3913463191129267
+              },
+              "aggregate_rate": 68.99791854928412
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 69.46614760510971,
+                "min": 66.66939620290003,
+                "max": 74.89723699427614,
+                "p95": 74.16699136674653,
+                "p99": 74.75118786877022,
+                "sum": 419.4613007833844
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.23044974997173995,
+                "min": 0.21362603805027902,
+                "max": 0.2399901740718633,
+                "p95": 0.23970649554394186,
+                "p99": 0.239933438366279,
+                "sum": 1.3756667070556432
+              },
+              "aggregate_rate": 69.78434493444274
+            },
+            "median_rate_ratio": 1.008613325837235,
+            "aggregate_rate_ratio": 1.0113978276692055,
+            "paired_complete_write_wins": 3,
+            "nonregression_gate": true
+          },
+          "random_write_4k": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 10.62599645213448,
+                "min": 8.521366914621533,
+                "max": 12.54997131571909,
+                "p95": 12.385644864047357,
+                "p99": 12.517106025384743,
+                "sum": 63.132729679749765
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.1882229649927467,
+                "min": 0.1593629140406847,
+                "max": 0.23470412904862314,
+                "p95": 0.23210244576330297,
+                "p99": 0.23418379239155912,
+                "sum": 1.1629812469473109
+              },
+              "aggregate_rate": 10.318309114182702,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.18018573749577627,
+                "min": 0.15545909199863672,
+                "max": 0.2318765000673011,
+                "p95": 0.22800904428004287,
+                "p99": 0.23110300890984944,
+                "sum": 1.1276556329103187
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.004569538461510092,
+                "min": 0.002826581010594964,
+                "max": 0.011561161954887211,
+                "p95": 0.01064321945887059,
+                "p99": 0.011377573455683888,
+                "sum": 0.03531901189126074
+              },
+              "latencies": {
+                "count": 3072,
+                "median": 0.00033421453554183245,
+                "min": 0.00013345899060368538,
+                "max": 0.03670844994485378,
+                "p95": 0.0004045434936415404,
+                "p99": 0.0004686361586209387,
+                "sum": 1.1249940103152767
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 13.140544900209385,
+                "min": 10.445509760790934,
+                "max": 15.212631319999772,
+                "p95": 15.000696807170456,
+                "p99": 15.17024441743391,
+                "sum": 78.63229586016224
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.15233083895873278,
+                "min": 0.13146969501394778,
+                "max": 0.19146983209066093,
+                "p95": 0.1841598883329425,
+                "p99": 0.19000784333911724,
+                "sum": 0.9290595850907266
+              },
+              "aggregate_rate": 12.916286740455027,
+              "requests_seconds": {
+                "count": 6,
+                "median": 0.146368725982029,
+                "min": 0.11946205492131412,
+                "max": 0.1874741220381111,
+                "p95": 0.17972071102121845,
+                "p99": 0.18592343983473256,
+                "sum": 0.8891651278827339
+              },
+              "fsync_seconds": {
+                "count": 6,
+                "median": 0.005982409988064319,
+                "min": 0.00399459304753691,
+                "max": 0.012006568955257535,
+                "p95": 0.010605279210722074,
+                "p99": 0.011726311006350444,
+                "sum": 0.039888300001621246
+              },
+              "latencies": {
+                "count": 3072,
+                "median": 0.00027949450304731727,
+                "min": 0.00010519498027861118,
+                "max": 0.009288968984037638,
+                "p95": 0.00039500527200289057,
+                "p99": 0.0004987403156701475,
+                "sum": 0.8871245668269694
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 1.2366411902546606,
+            "aggregate_rate_ratio": 1.2517832716119501,
+            "paired_complete_write_wins": 6,
+            "nonregression_gate": true
+          },
+          "small_file_fsync": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 231.65955362071963,
+                "min": 220.27905084108295,
+                "max": 248.65775370972074,
+                "p95": 247.83970105545063,
+                "p99": 248.49414317886672,
+                "sum": 1399.7881526078806
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.5533009924693033,
+                "min": 0.514763758983463,
+                "max": 0.5810811310075223,
+                "p95": 0.5798598047695123,
+                "p99": 0.5808368657599203,
+                "sum": 3.3002708229469135
+              },
+              "aggregate_rate": 232.70817493524035,
+              "latencies": {
+                "count": 768,
+                "median": 0.004303950001485646,
+                "min": 0.0024768159491941333,
+                "max": 0.03420576697681099,
+                "p95": 0.005145124503178522,
+                "p99": 0.009304002427961682,
+                "sum": 3.299348210915923
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 252.99303546533744,
+                "min": 242.90782498856083,
+                "max": 277.33779053102774,
+                "p95": 275.80350626939537,
+                "p99": 277.0309336787013,
+                "sum": 1540.8302852659042
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.5059597759973258,
+                "min": 0.4615310439839959,
+                "max": 0.5269488539779559,
+                "p95": 0.5266835802176502,
+                "p99": 0.5268957992258947,
+                "sum": 2.998262472799979
+              },
+              "aggregate_rate": 256.14835491129963,
+              "latencies": {
+                "count": 768,
+                "median": 0.0036312135052867234,
+                "min": 0.00251773907802999,
+                "max": 0.03423566394485533,
+                "p95": 0.00496801549452357,
+                "p99": 0.009876680504530678,
+                "sum": 2.997325113043189
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 1.0920897994975232,
+            "aggregate_rate_ratio": 1.100727789140121,
+            "paired_complete_write_wins": 5,
+            "nonregression_gate": true
+          },
+          "mkdir": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 1952.3252994613554,
+                "min": 1228.0297679175274,
+                "max": 2361.556777298586,
+                "p95": 2289.2127976404186,
+                "p99": 2347.0879813669526,
+                "sum": 11463.944486055003
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06557845999486744,
+                "min": 0.054201534017920494,
+                "max": 0.10423200100194663,
+                "p95": 0.09503806050634012,
+                "p99": 0.10239321290282533,
+                "sum": 0.418817364028655
+              },
+              "aggregate_rate": 1833.7348590624679,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.0031469889800064266,
+                "min": 0.002195061999373138,
+                "max": 0.0039972730446606874,
+                "p95": 0.003967412048950791,
+                "p99": 0.003991300845518709,
+                "sum": 0.018756605102680624
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0004529859870672226,
+                "min": 0.0003189659910276532,
+                "max": 0.011094072018750012,
+                "p95": 0.0007645560428500176,
+                "p99": 0.0008488234539981936,
+                "sum": 0.399530187016353
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 1978.5741720222427,
+                "min": 1633.6468980163063,
+                "max": 2239.872180811995,
+                "p95": 2198.088714565079,
+                "p99": 2231.5154875626117,
+                "sum": 11809.676973200225
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06475890701403841,
+                "min": 0.05714611802250147,
+                "max": 0.07835230499040335,
+                "p95": 0.07555092699476518,
+                "p99": 0.07779202939127572,
+                "sum": 0.3939170869998634
+              },
+              "aggregate_rate": 1949.648861005784,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.004909593553747982,
+                "min": 0.003846994019113481,
+                "max": 0.024360226932913065,
+                "p95": 0.01962488645222038,
+                "p99": 0.02341315883677453,
+                "sum": 0.04772269004024565
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0004332595271989703,
+                "min": 0.0003397410036996007,
+                "max": 0.0009349599713459611,
+                "p95": 0.0005768767790868878,
+                "p99": 0.0007039589551277467,
+                "sum": 0.34568140760529786
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 1.0134449277321405,
+            "aggregate_rate_ratio": 1.0632119749321771,
+            "paired_complete_write_wins": 3,
+            "nonregression_gate": true
+          },
+          "rename": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 1882.0937312549654,
+                "min": 1559.2370212156325,
+                "max": 2653.9559310583354,
+                "p95": 2509.6877218298314,
+                "p99": 2625.102289212635,
+                "sum": 11754.348716044107
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.06805861555039883,
+                "min": 0.04822988901287317,
+                "max": 0.08209143206477165,
+                "p95": 0.0803911600378342,
+                "p99": 0.08175137765938416,
+                "sum": 0.40335971221793443
+              },
+              "aggregate_rate": 1904.0077051251246,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.0025630739983171225,
+                "min": 0.002038885955698788,
+                "max": 0.017999658943153918,
+                "p95": 0.014395622973097488,
+                "p99": 0.017278851749142635,
+                "sum": 0.03086625097785145
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0004130410379730165,
+                "min": 0.0002941080601885915,
+                "max": 0.011185416020452976,
+                "p95": 0.0005948193080257624,
+                "p99": 0.0006683483649976552,
+                "sum": 0.3720787412021309
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 1819.4403285333385,
+                "min": 1318.357221990542,
+                "max": 1921.2207654946737,
+                "p95": 1916.5808791634493,
+                "p99": 1920.292788228429,
+                "sum": 10395.652352130764
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.07035164802800864,
+                "min": 0.06662430590949953,
+                "max": 0.09709052892867476,
+                "p95": 0.09263787569943815,
+                "p99": 0.09619999828282744,
+                "sum": 0.450972240883857
+              },
+              "aggregate_rate": 1702.987302488514,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.003884989069774747,
+                "min": 0.003137405961751938,
+                "max": 0.004509837948717177,
+                "p95": 0.004449756728718057,
+                "p99": 0.004497821704717353,
+                "sum": 0.022973609156906605
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.00042214151471853256,
+                "min": 0.0002792159793898463,
+                "max": 0.02308059309143573,
+                "p95": 0.000609051069477573,
+                "p99": 0.0008301145315635987,
+                "sum": 0.4276000749086961
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9667107957052437,
+            "aggregate_rate_ratio": 0.8944224846908377,
+            "paired_complete_write_wins": 1,
+            "nonregression_gate": false
+          },
+          "rmdir": {
+            "baseline": {
+              "rate": {
+                "count": 6,
+                "median": 2354.0708701055105,
+                "min": 2066.7929004980424,
+                "max": 2668.4638771559494,
+                "p95": 2663.7500573898715,
+                "p99": 2667.521113202734,
+                "sum": 14181.702760608581
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.054469705966766924,
+                "min": 0.047967671998776495,
+                "max": 0.06193170102778822,
+                "p95": 0.06176934202085249,
+                "p99": 0.06189922922640108,
+                "sum": 0.32843007193878293
+              },
+              "aggregate_rate": 2338.397319911527,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.003442909976001829,
+                "min": 0.0029957819497212768,
+                "max": 0.007502823951654136,
+                "p95": 0.006676735210930929,
+                "p99": 0.007337606203509496,
+                "sum": 0.024740607826970518
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0003762305132113397,
+                "min": 0.000316931982524693,
+                "max": 0.0007251490605995059,
+                "p95": 0.0005315369693562387,
+                "p99": 0.0006206094031222164,
+                "sum": 0.3033451907103881
+              },
+              "requests_over_1s": 0
+            },
+            "updated": {
+              "rate": {
+                "count": 6,
+                "median": 2329.6915463643672,
+                "min": 1819.4002484491766,
+                "max": 2448.81287501324,
+                "p95": 2441.587009193411,
+                "p99": 2447.3677018492745,
+                "sum": 13451.398694924093
+              },
+              "seconds": {
+                "count": 6,
+                "median": 0.05494645400904119,
+                "min": 0.05227022501640022,
+                "max": 0.07035285397432745,
+                "p95": 0.06797453897888772,
+                "p99": 0.0698771909752395,
+                "sum": 0.3462501229951158
+              },
+              "aggregate_rate": 2218.04975361939,
+              "final_directory_fsync_seconds": {
+                "count": 6,
+                "median": 0.005683875468093902,
+                "min": 0.004739293013699353,
+                "max": 0.006418426986783743,
+                "p95": 0.006386490247678012,
+                "p99": 0.006412039638962597,
+                "sum": 0.0340073190163821
+              },
+              "latencies": {
+                "count": 768,
+                "median": 0.0003801929415203631,
+                "min": 0.0002981389407068491,
+                "max": 0.0009869990171864629,
+                "p95": 0.0005631330190226435,
+                "p99": 0.000648836616892368,
+                "sum": 0.3118781662778929
+              },
+              "requests_over_1s": 0
+            },
+            "median_rate_ratio": 0.9896437596460083,
+            "aggregate_rate_ratio": 0.9485341668554894,
+            "paired_complete_write_wins": 2,
+            "nonregression_gate": false
+          }
+        },
+        "lifecycle": {
+          "baseline": {
+            "count": 6,
+            "median": 10.419891834259033,
+            "min": 10.291329860687256,
+            "max": 16.322848320007324,
+            "p95": 14.897819638252258,
+            "p99": 16.037842583656314,
+            "sum": 68.38802480697632
+          },
+          "updated": {
+            "count": 6,
+            "median": 10.390277028083801,
+            "min": 10.344993829727173,
+            "max": 15.44704270362854,
+            "p95": 14.262502551078796,
+            "p99": 15.210134673118592,
+            "sum": 67.64288234710693
+          },
+          "nonregression_gate": true
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "stream_256",
+      "median_ratio": 0.9963497097685698,
+      "aggregate_ratio": 1.5077447481460144,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "write_64",
+      "median_ratio": 0.9095804206383394,
+      "aggregate_ratio": 2.1796381906305275,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "read_64",
+      "median_ratio": 1.0096367172610812,
+      "aggregate_ratio": 1.0129312581553593,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "random_read_4k",
+      "median_ratio": 1.0111704593552995,
+      "aggregate_ratio": 1.0003090519213962,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "random_write_4k",
+      "median_ratio": 0.961466060715732,
+      "aggregate_ratio": 0.945035831833104,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "small_file_fsync",
+      "median_ratio": 1.0616279278366467,
+      "aggregate_ratio": 1.0708588530273189,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "mkdir",
+      "median_ratio": 0.9163605348043831,
+      "aggregate_ratio": 1.072375067901503,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "rename",
+      "median_ratio": 0.9371432815265901,
+      "aggregate_ratio": 0.9480798999242593,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "rmdir",
+      "median_ratio": 0.8973955471736004,
+      "aggregate_ratio": 0.8699804565486474,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "combined_large_writes",
+      "aggregate_ratio": 1.69728791707763,
+      "paired_wins": 2,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "fuse",
+      "workload": "lifecycle",
+      "median_ratio": 0.9882124733918995,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "stream_256",
+      "median_ratio": 0.98849915258066,
+      "aggregate_ratio": 0.6712206193268137,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "write_64",
+      "median_ratio": 0.8466157375041719,
+      "aggregate_ratio": 0.8332410281912577,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "read_64",
+      "median_ratio": 1.0696068995321948,
+      "aggregate_ratio": 1.1625795396732563,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_read_4k",
+      "median_ratio": 1.008613325837235,
+      "aggregate_ratio": 1.0113978276692055,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "random_write_4k",
+      "median_ratio": 1.2366411902546606,
+      "aggregate_ratio": 1.2517832716119501,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "small_file_fsync",
+      "median_ratio": 1.0920897994975232,
+      "aggregate_ratio": 1.100727789140121,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "mkdir",
+      "median_ratio": 1.0134449277321405,
+      "aggregate_ratio": 1.0632119749321771,
+      "pass_gate": true
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "rename",
+      "median_ratio": 0.9667107957052437,
+      "aggregate_ratio": 0.8944224846908377,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "rmdir",
+      "median_ratio": 0.9896437596460083,
+      "aggregate_ratio": 0.9485341668554894,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "combined_large_writes",
+      "aggregate_ratio": 0.7062439263411501,
+      "paired_wins": 0,
+      "pass_gate": false
+    },
+    {
+      "medium": "ext4",
+      "state": "aged_fuse",
+      "workload": "lifecycle",
+      "median_ratio": 0.9971578585798883,
+      "pass_gate": true
+    }
+  ],
+  "large_writes": {
+    "ext4/fuse": {
+      "aggregate_mib_per_second": {
+        "baseline": 80.16704119470904,
+        "updated": 136.06655036764428
+      },
+      "aggregate_ratio": 1.69728791707763,
+      "paired_wins": 2
+    },
+    "ext4/aged_fuse": {
+      "aggregate_mib_per_second": {
+        "baseline": 141.99939491949866,
+        "updated": 100.28621020601429
+      },
+      "aggregate_ratio": 0.7062439263411501,
+      "paired_wins": 0
+    }
+  },
+  "pass_all": false
+}

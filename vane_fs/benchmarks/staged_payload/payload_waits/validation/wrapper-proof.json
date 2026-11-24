@@ -1,0 +1,27 @@
+{
+  "status": "PASS",
+  "original_sha256": "7020ea9c6456872684697c03bc8e0562f5986f887572144a7a166c56f345afa4",
+  "exact_reverse": true,
+  "changes": [
+    [
+      "template = Path(build[\"parent\"]) / \"fuse-screen\"",
+      "template = Path(build[\"template\"])"
+    ],
+    [
+      "replace(\"(1 if args.diagnostic else 3)\", \"(2 if args.diagnostic else 3)\")",
+      "replace('m.ORDERS = m.FIRST = [[\"baseline\", \"updated\"], [\"updated\", \"baseline\"]] * 3', 'm.ORDERS = m.FIRST = [[\"baseline\", \"updated\"], [\"updated\", \"baseline\"]] * 2')"
+    ],
+    [
+      "    replace(\"import types\", \"import types\\nimport threading\")",
+      "    replace(\"import types\", \"import types\\nimport threading\")\n    replace('assert not args.diagnostic, \"Ordinary uninstrumented components only\"', 'assert args.diagnostic, \"Diagnostic components only\"')"
+    ],
+    [
+      "interpretation=\"Borrowed input buffers in matched format-1004 FUSE components on ext4; native CPU screen is separate\",",
+      "interpretation=\"Independent 64 MiB payload progress: full ordinary FUSE window; both formats 1005\","
+    ],
+    [
+      "interpretation=\"Wait attribution for both frozen buffer implementations; original FUSE gate failures remain\",",
+      "interpretation=\"Payload progress sync/hold attribution; all original 11 ordinary FUSE failures remain\","
+    ]
+  ]
+}

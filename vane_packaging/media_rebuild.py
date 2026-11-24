@@ -21,9 +21,9 @@ from vane_packaging.media_version import runtime_format
 REBUILD_PROOF = "libsoxr-local-rebuild-proof"
 
 
-def rebuild_soxr(source: Path, runtime: Path, directory: Path, *, jobs: int = 2) -> Path:
+def rebuild_soxr(source: Path, runtime: Path, directory: Path, *, jobs: int | None = 2) -> Path:
     """Make an observable change to SoXR's actual implementation and compile it."""
-    if type(jobs) is not int or not 1 <= jobs <= 256:
+    if jobs is not None and (type(jobs) is not int or not 1 <= jobs <= 256):
         raise ValueError("jobs must be between 1 and 256")
     implementation = source / "src/soxr.c"
     contents = implementation.read_text()
@@ -32,6 +32,8 @@ def rebuild_soxr(source: Path, runtime: Path, directory: Path, *, jobs: int = 2)
         raise ValueError("SoXR replacement proof no longer matches the pinned source")
     implementation.write_text(contents.replace(original, f'return "{REBUILD_PROOF}";'))
     build = directory / "local-soxr-build"
+    windows = sys.platform == "win32"
+    generator = "Visual Studio 17 2022" if windows else "Ninja"
     subprocess.run(
         [
             "cmake",
@@ -40,19 +42,38 @@ def rebuild_soxr(source: Path, runtime: Path, directory: Path, *, jobs: int = 2)
             "-B",
             str(build),
             "-G",
-            "Ninja",
+            generator,
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
             "-DBUILD_SHARED_LIBS=ON",
             "-DBUILD_TESTS=OFF",
             "-DBUILD_EXAMPLES=OFF",
             "-DWITH_OPENMP=OFF",
+            *(["-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-headerpad_max_install_names"] if sys.platform == "darwin" else []),
         ],
         check=True,
     )
-    subprocess.run(["cmake", "--build", str(build), "--parallel", str(jobs)], check=True)
+    arguments = ["cmake", "--build", str(build), "--config", "Release", "--parallel"]
+    if jobs is not None:
+        arguments.append(str(jobs))
+    subprocess.run(arguments, check=True)
     output = directory / "local-runtime"
-    prepare_local(runtime, {"libsoxr.so.0": build / "src/libsoxr.so"}, output)
+    if sys.platform in {"win32", "darwin"}:
+        fmt = runtime_format()
+        manifest = fmt.parse_manifest((runtime / fmt.MANIFEST).read_bytes())
+        prefix = manifest["namespace"] + "_"
+        original = [
+            name.removeprefix(prefix) for name, record in manifest["files"].items() if record["component"] == "soxr"
+        ]
+        suffix = ".dll" if windows else ".dylib"
+        libraries = [
+            path for path in build.rglob(f"*soxr*{suffix}") if not path.is_symlink() and "lsr" not in path.name
+        ]
+        if len(original) != 1 or len(libraries) != 1:
+            raise ValueError("expected one native SoXR replacement library")
+        prepare_local(runtime, {original[0]: libraries[0]}, output)
+    else:
+        prepare_local(runtime, {"libsoxr.so.0": build / "src/libsoxr.so"}, output)
     return output
 
 

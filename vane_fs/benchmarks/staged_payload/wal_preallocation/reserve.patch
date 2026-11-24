@@ -1,0 +1,37 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -898,6 +898,34 @@
+ 			Exec(db, "COMMIT");
+ 			owner_committed = true;
+ 			staging->AfterFullCommit();
++			if (new_workspace && durability == Durability::Fsync) {
++				// Serialize the size hint against other writers. Registration is
++				// already durable, so a failed hint has the same recoverable owner
++				// as a failed worker startup. Restore the default truncation policy.
++				Exec(db, "BEGIN IMMEDIATE");
++				sqlite3_file *wal = nullptr;
++				Check(db, sqlite3_file_control(db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal));
++				if (wal && wal->pMethods) {
++					auto allocation_error = [](int code) {
++						if (code != SQLITE_OK)
++							Fail(ErrorCode::Storage, std::string("Preparing WAL allocation: ") + sqlite3_errstr(code));
++					};
++					int chunk = int(Checkpointer::START_BYTES);
++					auto code = wal->pMethods->xFileControl(wal, SQLITE_FCNTL_CHUNK_SIZE, &chunk);
++					if (code == SQLITE_OK) {
++						sqlite3_int64 bytes = Checkpointer::START_BYTES;
++						code = wal->pMethods->xFileControl(wal, SQLITE_FCNTL_SIZE_HINT, &bytes);
++						chunk = 0;
++						auto reset = wal->pMethods->xFileControl(wal, SQLITE_FCNTL_CHUNK_SIZE, &chunk);
++						if (code != SQLITE_NOTFOUND)
++							allocation_error(code);
++						allocation_error(reset);
++					} else if (code != SQLITE_NOTFOUND) {
++						allocation_error(code);
++					}
++				}
++				Exec(db, "COMMIT");
++			}
+ 			if (durability == Durability::Fsync) {
+ 				Exec(db, "PRAGMA synchronous=NORMAL");
+ 				// Reuse a modest WAL allocation after restart, including after a

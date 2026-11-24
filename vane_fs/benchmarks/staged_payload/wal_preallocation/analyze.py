@@ -1,0 +1,195 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Evaluate complete cold-start costs and reconcile the separate sync diagnostic."""
+
+import argparse
+import collections
+import hashlib
+import json
+import math
+import statistics
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def stats(values):
+    values = sorted(values)
+    return dict(
+        count=len(values),
+        median=statistics.median(values),
+        total=sum(values),
+        p99=values[math.ceil(len(values) * 0.99) - 1],
+        maximum=max(values),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    out = parser.parse_args().artifacts.resolve()
+    report = dict(status="PASS", inputs={}, plain=[], diagnostic=[], checks=[], tails=[])
+
+    def read(path):
+        report["inputs"][str(path)] = digest(path)
+        return json.loads(path.read_text())
+
+    plain = read(out / "plain/results.json")
+    plan = read(out / "plain/plan.json")
+    assert plain["status"] == "PASS" and len(plain["runs"]) == 48
+    grouped = collections.defaultdict(list)
+    for row in plain["runs"]:
+        grouped[row["sdk"], row["workload"], row["variant"]].append(row)
+        slow = [dict(index=i, seconds=v / 1e9) for i, v in enumerate(row["operation_ns"]) if v >= 1_000_000_000]
+        if slow or max(row["initialization_seconds"], row["close_seconds"]) >= 1:
+            report["tails"].append(
+                dict(
+                    sdk=row["sdk"],
+                    workload=row["workload"],
+                    rep=row["rep"],
+                    variant=row["variant"],
+                    total_seconds=row["total_seconds"],
+                    initialization_seconds=row["initialization_seconds"],
+                    close_seconds=row["close_seconds"],
+                    operations=slow,
+                )
+            )
+    for sdk in plan["sdk_variants"]:
+        for workload in plan["workloads"]:
+            data = {}
+            for variant in ("baseline", "reserved"):
+                rows = grouped[sdk, workload, variant]
+                assert len(rows) == 6
+                data[variant] = {
+                    metric: stats([r[metric] for r in rows])
+                    for metric in (
+                        "total_seconds",
+                        "initialization_seconds",
+                        "phase_seconds",
+                        "first_durable_seconds",
+                        "close_seconds",
+                    )
+                }
+                work = 128 if workload == "small128" else 64
+                data[variant]["median_rate"] = statistics.median(work / r["total_seconds"] for r in rows)
+                data[variant]["aggregate_rate"] = 6 * work / sum(r["total_seconds"] for r in rows)
+            baseline, reserved = data["baseline"], data["reserved"]
+            median_ratio = reserved["median_rate"] / baseline["median_rate"]
+            aggregate_ratio = reserved["aggregate_rate"] / baseline["aggregate_rate"]
+            first_ratio = reserved["first_durable_seconds"]["median"] / baseline["first_durable_seconds"]["median"]
+            close_ratio = reserved["close_seconds"]["median"] / baseline["close_seconds"]["median"]
+            a, b = ({r["rep"]: r for r in grouped[sdk, workload, variant]} for variant in ("baseline", "reserved"))
+            wins = sum(b[i]["total_seconds"] < a[i]["total_seconds"] for i in range(6))
+            report["plain"].append(
+                dict(
+                    sdk=sdk,
+                    workload=workload,
+                    variants=data,
+                    median_rate_ratio=median_ratio,
+                    aggregate_rate_ratio=aggregate_ratio,
+                    paired_wins=wins,
+                    first_durable_median_ratio=first_ratio,
+                    close_median_ratio=close_ratio,
+                )
+            )
+            report["checks"].extend(
+                [
+                    dict(
+                        sdk=sdk,
+                        workload=workload,
+                        metric="total_cost",
+                        pass_gate=min(median_ratio, aggregate_ratio)
+                        >= plan["primary_gates"]["total_median_and_aggregate_rate_minimum"]
+                        and wins >= plan["primary_gates"]["paired_wins_minimum"],
+                    ),
+                    dict(
+                        sdk=sdk,
+                        workload=workload,
+                        metric="first_durable_file",
+                        pass_gate=first_ratio
+                        <= plan["regression_gates"]["first_durable_file_median_seconds_ratio_maximum"],
+                    ),
+                    dict(
+                        sdk=sdk,
+                        workload=workload,
+                        metric="close",
+                        pass_gate=close_ratio <= plan["regression_gates"]["close_median_seconds_ratio_maximum"],
+                    ),
+                ]
+            )
+    diagnostic = read(out / "diagnostic/results.json")
+    assert diagnostic["status"] == "PASS" and len(diagnostic["runs"]) == 16
+    for row in diagnostic["runs"]:
+        label = f"{row['sdk']}-{row['workload']}-{row['rep']}-{row['variant']}"
+        trace = read(out / "diagnostic" / (label + "-trace.json"))
+        syncs = []
+        requests = []
+        for thread in trace["threads"]:
+            rows = [dict(zip(trace["columns"], r, strict=True)) for r in thread["rows"]]
+            requests += rows
+            for value in thread["syncs"]:
+                sync = dict(zip(trace["sync_columns"], value, strict=True), tid=thread["tid"])
+                sync["request"] = rows[sync["request_index"]]["name"] if sync["request_index"] >= 0 else "unscoped"
+                assert sync["result"] == sync["errno"] == 0
+                if row["total_begin_ns"] <= sync["begin_ns"] < row["phase_end_ns"]:
+                    syncs.append(sync)
+        wal = [s for s in syncs if s["kind"] == "wal" and s["request"] == "fsync"]
+        assert len(wal) >= (128 if row["workload"] == "small128" else 1)
+        if row["workload"] == "small128":
+            assert len(wal) == 128
+        assert all(s["operation"] == row["sdk"] for s in wal)
+        assert len([r for r in requests if r["name"] == "fsync"]) == (128 if row["workload"] == "small128" else 1)
+        report["diagnostic"].append(
+            dict(
+                label=label,
+                sdk=row["sdk"],
+                workload=row["workload"],
+                variant=row["variant"],
+                initialization_seconds=row["initialization_seconds"],
+                total_seconds=row["total_seconds"],
+                explicit_full_barriers=128 if row["workload"] == "small128" else 1,
+                actual_foreground_wal_syncs=len(wal),
+                foreground_wal_sync_seconds=stats([(s["end_ns"] - s["begin_ns"]) / 1e9 for s in wal]),
+                distinct_foreground_wal_sizes=len({s["file_size"] for s in wal}),
+                measured_syncs=syncs,
+                requests=[
+                    dict(
+                        name=r["name"],
+                        begin_ns=r["begin_ns"],
+                        end_ns=r["end_ns"],
+                        cpu_ns=r["cpu_ns"],
+                        pwrite_calls=r["counts"][trace["stages"].index("pwrite")],
+                        pwrite_ns=r["stage_ns"][trace["stages"].index("pwrite")],
+                    )
+                    for r in requests
+                ],
+            )
+        )
+    report["native_gates_pass"] = all(c["pass_gate"] for c in report["checks"])
+    report["adoption_eligible"] = False
+    report["interpretation"] = (
+        "Cold native core screen; plain includes initialization; diagnostic costs cannot replace ordinary throughput; FUSE acceptance is still required after any successful screen"
+    )
+    report["inputs"][str(Path(__file__).resolve())] = digest(Path(__file__))
+    (out / "findings.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("PASS all 64 runs retained; native gates", report["native_gates_pass"])
+    for row in report["plain"]:
+        print(
+            row["sdk"],
+            row["workload"],
+            "median",
+            round(row["median_rate_ratio"], 4),
+            "aggregate",
+            round(row["aggregate_rate_ratio"], 4),
+            "first",
+            round(row["first_durable_median_ratio"], 4),
+            "wins",
+            row["paired_wins"],
+        )
+
+
+if __name__ == "__main__":
+    main()

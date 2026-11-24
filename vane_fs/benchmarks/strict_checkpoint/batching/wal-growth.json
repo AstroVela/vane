@@ -1,0 +1,509 @@
+{
+  "scope": "Instrumented WAL size observations; growth classification compares consecutive foreground WAL syncs and is not an independent causal experiment",
+  "runs": [
+    {
+      "variant": "fsync-inline",
+      "candidate_stage": "inline_control",
+      "samples": [
+        {
+          "workload": "write_64",
+          "foreground_wal_syncs": 137,
+          "groups": {
+            "grew": {
+              "count": 28,
+              "sum_ms": 105.718169,
+              "median_ms": 4.95167,
+              "max_ms": 5.570697
+            },
+            "same": {
+              "count": 109,
+              "sum_ms": 363.76924,
+              "median_ms": 1.996261,
+              "max_ms": 6.845618
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "random_write_4k",
+          "foreground_wal_syncs": 516,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 516,
+              "sum_ms": 1055.536134,
+              "median_ms": 1.9476010000000001,
+              "max_ms": 30.664046
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "small_file_fsync",
+          "foreground_wal_syncs": 258,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 258,
+              "sum_ms": 533.355449,
+              "median_ms": 1.9459265000000001,
+              "max_ms": 31.499185
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "mkdir",
+          "foreground_wal_syncs": 130,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 130,
+              "sum_ms": 286.568919,
+              "median_ms": 1.9997319999999998,
+              "max_ms": 30.690019
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "rename",
+          "foreground_wal_syncs": 128,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 128,
+              "sum_ms": 243.06642300000001,
+              "median_ms": 1.9100640000000002,
+              "max_ms": 2.546916
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "variant": "fdatasync-inline",
+      "candidate_stage": "inline_control",
+      "samples": [
+        {
+          "workload": "write_64",
+          "foreground_wal_syncs": 137,
+          "groups": {
+            "grew": {
+              "count": 28,
+              "sum_ms": 118.809945,
+              "median_ms": 5.055194,
+              "max_ms": 17.13063
+            },
+            "same": {
+              "count": 109,
+              "sum_ms": 288.966788,
+              "median_ms": 1.011427,
+              "max_ms": 33.596007
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "random_write_4k",
+          "foreground_wal_syncs": 516,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 516,
+              "sum_ms": 515.761208,
+              "median_ms": 0.94226,
+              "max_ms": 29.576118
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "small_file_fsync",
+          "foreground_wal_syncs": 258,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 258,
+              "sum_ms": 282.801769,
+              "median_ms": 0.9789,
+              "max_ms": 30.371767
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "mkdir",
+          "foreground_wal_syncs": 130,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 130,
+              "sum_ms": 145.121289,
+              "median_ms": 1.0502855,
+              "max_ms": 10.161613
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "rename",
+          "foreground_wal_syncs": 128,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 128,
+              "sum_ms": 127.83914,
+              "median_ms": 1.0032155,
+              "max_ms": 1.117543
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "variant": "fsync-batched",
+      "candidate_stage": "final",
+      "samples": [
+        {
+          "workload": "write_64",
+          "foreground_wal_syncs": 131,
+          "groups": {
+            "grew": {
+              "count": 104,
+              "sum_ms": 413.166117,
+              "median_ms": 4.130421500000001,
+              "max_ms": 33.981121
+            },
+            "same": {
+              "count": 26,
+              "sum_ms": 86.076698,
+              "median_ms": 2.0193909999999997,
+              "max_ms": 5.500812
+            },
+            "shrunk": {
+              "count": 1,
+              "sum_ms": 5.127133,
+              "median_ms": 5.127133,
+              "max_ms": 5.127133
+            }
+          }
+        },
+        {
+          "workload": "random_write_4k",
+          "foreground_wal_syncs": 512,
+          "groups": {
+            "grew": {
+              "count": 383,
+              "sum_ms": 844.146414,
+              "median_ms": 2.044949,
+              "max_ms": 30.716563
+            },
+            "same": {
+              "count": 129,
+              "sum_ms": 249.597607,
+              "median_ms": 1.903693,
+              "max_ms": 3.451448
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "small_file_fsync",
+          "foreground_wal_syncs": 256,
+          "groups": {
+            "grew": {
+              "count": 256,
+              "sum_ms": 574.241371,
+              "median_ms": 2.1208175000000002,
+              "max_ms": 31.501523
+            },
+            "same": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "mkdir",
+          "foreground_wal_syncs": 130,
+          "groups": {
+            "grew": {
+              "count": 97,
+              "sum_ms": 237.38880699999999,
+              "median_ms": 2.15026,
+              "max_ms": 30.901853
+            },
+            "same": {
+              "count": 32,
+              "sum_ms": 59.895449,
+              "median_ms": 1.9127290000000001,
+              "max_ms": 2.104314
+            },
+            "shrunk": {
+              "count": 1,
+              "sum_ms": 2.259454,
+              "median_ms": 2.259454,
+              "max_ms": 2.259454
+            }
+          }
+        },
+        {
+          "workload": "rename",
+          "foreground_wal_syncs": 128,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 128,
+              "sum_ms": 246.808235,
+              "median_ms": 1.9345750000000002,
+              "max_ms": 2.352953
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "variant": "fdatasync-batched",
+      "candidate_stage": "final",
+      "samples": [
+        {
+          "workload": "write_64",
+          "foreground_wal_syncs": 131,
+          "groups": {
+            "grew": {
+              "count": 104,
+              "sum_ms": 383.685347,
+              "median_ms": 4.8901959999999995,
+              "max_ms": 6.310654
+            },
+            "same": {
+              "count": 26,
+              "sum_ms": 59.255719,
+              "median_ms": 1.005762,
+              "max_ms": 4.244779
+            },
+            "shrunk": {
+              "count": 1,
+              "sum_ms": 4.9109,
+              "median_ms": 4.9109,
+              "max_ms": 4.9109
+            }
+          }
+        },
+        {
+          "workload": "random_write_4k",
+          "foreground_wal_syncs": 512,
+          "groups": {
+            "grew": {
+              "count": 383,
+              "sum_ms": 828.853357,
+              "median_ms": 1.941684,
+              "max_ms": 31.336041
+            },
+            "same": {
+              "count": 129,
+              "sum_ms": 120.482148,
+              "median_ms": 0.925422,
+              "max_ms": 1.334307
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "small_file_fsync",
+          "foreground_wal_syncs": 256,
+          "groups": {
+            "grew": {
+              "count": 256,
+              "sum_ms": 536.772312,
+              "median_ms": 1.9290505,
+              "max_ms": 31.464607
+            },
+            "same": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        },
+        {
+          "workload": "mkdir",
+          "foreground_wal_syncs": 130,
+          "groups": {
+            "grew": {
+              "count": 97,
+              "sum_ms": 242.34115,
+              "median_ms": 2.140899,
+              "max_ms": 30.745269
+            },
+            "same": {
+              "count": 32,
+              "sum_ms": 32.371921,
+              "median_ms": 1.0260965,
+              "max_ms": 1.225873
+            },
+            "shrunk": {
+              "count": 1,
+              "sum_ms": 2.046136,
+              "median_ms": 2.046136,
+              "max_ms": 2.046136
+            }
+          }
+        },
+        {
+          "workload": "rename",
+          "foreground_wal_syncs": 128,
+          "groups": {
+            "grew": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            },
+            "same": {
+              "count": 128,
+              "sum_ms": 129.957691,
+              "median_ms": 1.004359,
+              "max_ms": 1.604545
+            },
+            "shrunk": {
+              "count": 0,
+              "sum_ms": 0,
+              "median_ms": null,
+              "max_ms": null
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+continuous PASS signals=256 hook_queries=0 passive=5 partial=4

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 
 import pytest
@@ -13,12 +14,13 @@ from vane_packaging.extension_wheel import _extension_distribution_version_from_
 from vane_packaging.media_version import (
     VERSION_FILE,
     identity_version,
+    provider_release_number,
     runtime_format,
     source_version,
 )
 
 
-def test_runtime_version_uses_the_iceberg_provider_encoder():
+def test_runtime_version_keeps_its_content_identity():
     fmt = runtime_format()
     identity = {
         "git_commit": "a" * 40,
@@ -39,6 +41,15 @@ def test_runtime_version_uses_the_iceberg_provider_encoder():
     with pytest.raises(ValueError):
         identity_version({**identity, "git_dirty": True})
     assert identity_version({**identity, "vane_version": "0.2.0.dev613"}) != actual
+
+
+def test_native_media_release_number_is_independent_of_runtime_identity(tmp_path):
+    config = tmp_path / "native-media-release.toml"
+    config.write_text("[providers.native_media]\nrelease_number = 2\n")
+    assert provider_release_number(tmp_path) == 2
+    config.write_text("[providers.native_media]\nrelease_number = 0\n")
+    with pytest.raises(ValueError, match="positive integer"):
+        provider_release_number(tmp_path)
 
 
 def test_exported_version_survives_without_git_and_rejects_mismatches(tmp_path, monkeypatch):
@@ -151,17 +162,19 @@ def test_checkout_version_records_commits_and_dirty_state(tmp_path):
     assert source_version(project) == untracked
     extra.chmod(0o755)
     executable = source_version(project)
-    assert executable["version"] != untracked["version"]
+    if os.name != "nt":
+        assert executable["version"] != untracked["version"]
     extra.unlink()
     deleted = source_version(project)
     assert deleted["version"] != executable["version"]
-    extra.symlink_to("source.txt")
-    linked = source_version(project)
-    assert linked["version"] != deleted["version"]
-    extra.unlink()
-    extra.symlink_to("elsewhere.txt")
-    assert source_version(project)["version"] != linked["version"]
-    extra.unlink()
+    if os.name != "nt":
+        extra.symlink_to("source.txt")
+        linked = source_version(project)
+        assert linked["version"] != deleted["version"]
+        extra.unlink()
+        extra.symlink_to("elsewhere.txt")
+        assert source_version(project)["version"] != linked["version"]
+        extra.unlink()
     git("add", ".")
     git("commit", "-qm", "change source")
     changed = source_version(project)

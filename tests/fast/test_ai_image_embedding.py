@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import embed_image
+from vane.ai import ImageInput, embed
 from vane.ai.functions import _EmbedImageBatch
 from vane.ai.options import validate_embed_image_options
 from vane.ai.protocols import ImageEmbedderDescriptor
@@ -164,18 +164,18 @@ def test_public_entry_points_have_fixed_outputs(provider, entry):
         rel = conn.table("images")
         opts = dict(provider=provider, max_retries=0, batch_size=2)
         if entry == "expression":
-            result = rel.select(vane.col("id"), embed_image(vane.col("image"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(ImageInput(vane.col("image")), **opts).alias("embedding"))
         elif entry == "keyword":
-            result = rel.select(vane.col("id"), embed_image(image=vane.col("image"), **opts).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(input=ImageInput(vane.col("image")), **opts).alias("embedding"))
         elif entry == "relation":
-            result = embed_image(rel, vane.col("image"), **opts)
+            result = embed(rel, ImageInput(vane.col("image")), **opts)
         elif entry == "relation_keyword":
-            result = embed_image(rel=rel, image=vane.col("image"), **opts)
+            result = embed(rel=rel, input=ImageInput(vane.col("image")), **opts)
         elif entry == "method":
-            result = rel.embed_image(vane.col("image"), **opts)
+            result = rel.embed(ImageInput(vane.col("image")), **opts)
         else:
             result = conn.sql(
-                "SELECT id, ai_embed_image(image, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
+                "SELECT id, ai_embed(image, input_spec => {kind: 'image'}, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
             )
         assert str(result.types[result.columns.index("embedding")]) == "FLOAT[3]"
         assert result.select("id", "embedding").order("id").fetchall() == [(0, (3, 2, 4)), (1, None), (2, (7, 2, 4))]
@@ -185,7 +185,9 @@ def test_public_entry_points_have_fixed_outputs(provider, entry):
 def test_sql_preserves_image_layout(provider, declared):
     with vane.connect() as conn:
         conn.register("images", pa.table({"image": image_array([pixels(5), None], vane.sqltype(declared))}))
-        assert conn.sql("SELECT ai_embed_image(image, provider => 'image_fixture') FROM images").fetchall() == [
+        assert conn.sql(
+            "SELECT ai_embed(image, input_spec => {kind: 'image'}, provider => 'image_fixture') FROM images"
+        ).fetchall() == [
             ((5, 2, 4),),
             (None,),
         ]
@@ -194,11 +196,13 @@ def test_sql_preserves_image_layout(provider, declared):
 @pytest.mark.parametrize("sql", ["NULL", "NULL::IMAGE", "NULL::IMAGE('RGB', 2, 4)"])
 def test_sql_null_and_explain_never_load_model(provider, sql):
     with vane.connect() as conn:
-        query = f"SELECT ai_embed_image({sql}, provider => 'image_fixture', model => 'must_not_load') AS embedding"
+        query = f"SELECT ai_embed({sql}, input_spec => {{kind: 'image'}}, provider => 'image_fixture', model => 'must_not_load') AS embedding"
         assert conn.sql(query).types == [vane.array_type(vane.sqltypes.FLOAT, 3)]
         assert conn.sql(query).fetchall() == [(None,)]
         conn.sql("EXPLAIN " + query).fetchall()
-        conn.sql("EXPLAIN SELECT ai_embed_image(image('abc'::BLOB, 1, 1, 3, 'RGB'))").fetchall()
+        conn.sql(
+            "EXPLAIN SELECT ai_embed(image('abc'::BLOB, 1, 1, 3, 'RGB'), input_spec => {kind: 'image'}, provider => 'transformers')"
+        ).fetchall()
 
 
 @pytest.mark.parametrize(
@@ -208,10 +212,10 @@ def test_sql_null_and_explain_never_load_model(provider, sql):
 def test_rejects_implicit_decoding_in_both_apis(provider, sql):
     with vane.connect() as conn:
         with pytest.raises(Exception, match="decoded IMAGE"):
-            conn.sql(f"SELECT ai_embed_image({sql}, provider => 'image_fixture')").fetchall()
+            conn.sql(f"SELECT ai_embed({sql}, input_spec => {{kind: 'image'}}, provider => 'image_fixture')").fetchall()
         rel = conn.sql(f"SELECT {sql} AS value")
         with pytest.raises(Exception, match="decoded IMAGE"):
-            rel.select(embed_image(vane.col("value"), provider=provider)).fetchall()
+            rel.select(embed(ImageInput(vane.col("value")), provider=provider)).fetchall()
 
 
 @pytest.mark.parametrize(
@@ -240,7 +244,7 @@ def test_model_capabilities_and_metadata_are_local(provider):
     with pytest.raises(ValueError, match="currently supports"):
         TransformersProvider().get_image_embedder(model="sentence-transformers/all-MiniLM-L6-v2", dimensions=384)
     with pytest.raises(ValueError, match="image embedding provider"):
-        embed_image(vane.col("image"), provider="openai")
+        embed(ImageInput(vane.col("image")), provider="openai")
     with pytest.raises(ValueError, match="cannot produce"):
         TransformersProvider().get_image_embedder(dimensions=513)
     with pytest.raises(ValueError, match="pinned revision"):
@@ -306,11 +310,11 @@ def test_decode_errors_remain_at_explicit_decode_boundary(provider):
     pytest.importorskip("PIL.Image")
     with vane.connect(config={"image_backend": "python"}) as conn:
         assert conn.sql(
-            "SELECT ai_embed_image(decode_image('invalid'::BLOB, on_error => 'null'), provider => 'image_fixture')"
+            "SELECT ai_embed(decode_image('invalid'::BLOB, on_error => 'null'), input_spec => {kind: 'image'}, provider => 'image_fixture')"
         ).fetchall() == [(None,)]
         with pytest.raises(Exception):
             conn.sql(
-                "SELECT ai_embed_image(decode_image('invalid'::BLOB), provider => 'image_fixture', on_error => 'ignore')"
+                "SELECT ai_embed(decode_image('invalid'::BLOB), input_spec => {kind: 'image'}, provider => 'image_fixture', on_error => 'ignore')"
             ).fetchall()
 
 
@@ -318,7 +322,7 @@ def test_decode_errors_remain_at_explicit_decode_boundary(provider):
 def test_relation_backends_replace_output_column(provider, backend):
     with vane.connect() as conn:
         rel = conn.sql("SELECT 1 AS Embedding, image('abc'::BLOB, 1, 1, 3, 'RGB') AS image")
-        result = embed_image(rel, vane.col("image"), provider=provider, execution_backend=backend)
+        result = embed(rel, ImageInput(vane.col("image")), provider=provider, execution_backend=backend)
         assert result.columns.count("embedding") == 1
         assert "Embedding" not in result.columns
         assert result.select("embedding").fetchall() == [((97, 1, 1),)]
@@ -338,9 +342,11 @@ def test_image_embedding_through_ray_actor(ray_local, provider, fixed, monkeypat
         if fixed:
             rel.create_view("images")
             result = conn.sql(
-                "SELECT i, ai_embed_image(image, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
+                "SELECT i, ai_embed(image, input_spec => {kind: 'image'}, provider => 'image_fixture', options => {batch_size: 2}) AS embedding FROM images"
             )
         else:
-            result = rel.embed_image(vane.col("image"), provider=provider, execution_backend="ray_actor", batch_size=2)
+            result = rel.embed(
+                ImageInput(vane.col("image")), provider=provider, execution_backend="ray_actor", batch_size=2
+            )
         assert "ray_actor" in result.explain()
         assert result.select("i", "embedding").order("i").fetchall() == [(0, (97, 1, 1)), (1, None), (2, (97, 1, 1))]

@@ -1,0 +1,67 @@
+{
+  "status": "PASS",
+  "source_sha256": "1c4c745266a0622e2d8a3fb1b0464cc3430fe06f53f2d77cd15e404b99304b4c",
+  "control": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-writeback-20261011T095055Z/updated",
+  "binary_sha256": "a7cea20042b3f0fe0c0608adf2d6ebe59133bdcbc6abfbc3002eb076fa5d5da8",
+  "runs": [
+    {
+      "started_epoch": 1791727791.24829,
+      "ended_epoch": 1791727796.42697,
+      "returncode": 1,
+      "expected": 1
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-vane-background-negative-of6qrzya",
+      "files": [
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.stage-checkpoint",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.stage-fence",
+          "bytes": 8192,
+          "sha256": "a87670cc972460efb2165b63068bba5dffa957b91a1811c56acaf6a8a2a9fd84"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite-shm",
+          "bytes": 32768,
+          "sha256": "f763d10c732375bb738afeacd6a263a646a0ce9ffb60d4412ea31f564c78baa6"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite-wal",
+          "bytes": 2579152,
+          "sha256": "63c042f4c0df8bfc1e0b719894dc7ebc2ff8b8dd441f60b7024997b4795f7f9c"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.payload",
+          "bytes": 33558528,
+          "sha256": "135d42f594887aa5e8f922612822f3e6c9614afa4e20a8b1b232925b88e43984"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite",
+          "bytes": 4096,
+          "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.stage-publish",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.stage-live",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "/dev/shm/owned-vane-background-negative-of6qrzya/db.sqlite.stage-init",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "removed": true
+    }
+  ]
+}

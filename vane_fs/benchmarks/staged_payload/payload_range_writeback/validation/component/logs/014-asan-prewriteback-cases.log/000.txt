@@ -1,0 +1,22 @@
+PASS threshold, writer progress, independent lease, OPEN and authoritative FULL
+PASS repeated budget, explicit-FULL reset and reopen
+PASS FULL during preflush, monotonic completion and late-commit wake
+PASS asynchronous error/retry and failed barrier
+PASS asynchronous error/retry and failed close
+PASS no rollback notification, conservative bytes and GC
+PASS GC exclusion, pinned snapshots and monotonic budget after tail reuse
+PASS fork abandonment preserves the parent's lease
+PASS strict mode has no prewriteback worker
+PASS unsupported fallback 38
+PASS unsupported fallback 95
+PASS unsupported fallback 22
+PASS EINTR retry preserves range and does not latch failure
+PASS asynchronous error/retry and failed barrier
+PASS actual append offsets after GC regrowth beyond the previous end
+PASS owner-local accounting coalesces physical gaps conservatively
+PASS stale pending ranges clip at EOF after cross-owner GC
+PASS failed submission retains its range and merges later commits
+PASS successful hint cannot replace a failed authoritative payload barrier
+PASS late error after FULL remains observable without resubmitting retired data
+PASS retained barrier descriptor observes asynchronous error already seen elsewhere
+PASS twenty-one finite-range prewriteback cases

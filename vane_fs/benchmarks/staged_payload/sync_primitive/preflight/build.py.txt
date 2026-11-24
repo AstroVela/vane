@@ -1,0 +1,356 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build matched SQLite sync variants without changing the frozen C++ prototype."""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--parent", type=Path, required=True)
+    parser.add_argument("--sdk-build", type=Path, required=True)
+    args = parser.parse_args()
+    out, parent, here = args.output.resolve(), args.parent.resolve(), Path(__file__).resolve().parent
+    repo = here.parents[3]
+    out.mkdir()
+    original = json.loads((parent / "candidate.json").read_text())
+    sdks = json.loads(args.sdk_build.read_text())
+    assert original["status"] == sdks["status"] == "PASS"
+    trace = json.loads((parent / "trace/build.json").read_text())
+    assert trace["status"] == json.loads((parent / "trace/source-proof.json").read_text())["status"] == "PASS"
+    core = parent / "trace/diagnostic/updated"
+    recorder = parent / "trace-generator"
+    libraries = {
+        "release": core / "build/libvane_fs.a",
+        "asan": repo / "vane_fs/build/full-sync-contention-20261013/sanitize/libvane_fs.a",
+    }
+    frozen_libraries = json.loads((repo / "vane_fs/build/full-sync-contention-20261013/build.json").read_text())
+    assert frozen_libraries["status"] == "PASS"
+    assert digest(libraries["release"]) == frozen_libraries["inputs"][str(libraries["release"])]
+    for filename in ("trace.cpp", "trace.hpp"):
+        assert digest(recorder / filename) == trace["inputs"][str(recorder / filename)]
+    assert digest(recorder / "trace.hpp") == digest(core / "src/request_trace.hpp")
+    source = parent / "updated"
+    inputs = {
+        str(path): digest(path)
+        for path in (
+            Path(__file__),
+            args.sdk_build.resolve(),
+            here / "identity.cpp",
+            here.parent / "full_sync_contention/probe.cpp",
+            here.parent / "checkpoint_progress/fixture.hpp",
+            parent / "candidate.json",
+            parent / "tests.json",
+            parent / "trace/build.json",
+            parent / "trace/source-proof.json",
+            repo / "vane_fs/build/full-sync-contention-20261013/build.json",
+            recorder / "trace.cpp",
+            recorder / "trace.hpp",
+            *libraries.values(),
+        )
+    }
+    for root, expected in ((source, original["sources"]), (core, trace["source_inputs"]["updated"])):
+        for path, sha in expected.items():
+            assert digest(root / path) == sha
+            inputs[str(root / path)] = sha
+    report = dict(status="RUNNING", inputs=inputs, commands=[], cleanup=[], components={}, probes={}, tests=[])
+
+    def save():
+        (out / "build.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    def run(label, argv, cwd=None, env=None, expected=0):
+        start = time.time()
+        with (out / (label + ".log")).open("w") as log:
+            done = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=log, timeout=600)
+        report["commands"].append(
+            dict(label=label, argv=argv, cwd=str(cwd), start=start, end=time.time(), returncode=done.returncode)
+        )
+        save()
+        assert done.returncode == expected, label
+        print(label, "PASS", flush=True)
+
+    def clean(path):
+        assert str(path) not in Path("/proc/mounts").read_text()
+        files = {
+            str(p.relative_to(path)): dict(bytes=p.stat().st_size, sha256=digest(p))
+            for p in path.rglob("*")
+            if p.is_file()
+        }
+        shutil.rmtree(path)
+        report["cleanup"].append(dict(path=str(path), removed=not path.exists(), mount_absent=True, files=files))
+        save()
+
+    try:
+        fuse = repo / ".cache/fuse-sdk/root/usr"
+        for variant in ("fsync", "fdatasync"):
+            sdk = Path(sdks["libraries"][variant]["prefix"])
+            assert digest(sdk / "lib/libsqlite3.a") == sdks["libraries"][variant]["sha256"]
+            for path in (sdk / "lib/libsqlite3.a", sdk / "include/sqlite3.h"):
+                inputs[str(path)] = digest(path)
+            component = out / variant
+            shutil.copytree(
+                source, component, ignore=shutil.ignore_patterns("build", "venv", "sanitize", "__pycache__", "*.orig")
+            )
+            assert all(digest(component / path) == sha for path, sha in original["sources"].items())
+            python = component / "venv/bin/python"
+            run(variant + "-venv", ["uv", "venv", "--python", str(repo / ".venv/bin/python"), str(component / "venv")])
+            (component / "venv/lib/python3.12/site-packages/support.pth").write_text(
+                str(repo / ".venv/lib/python3.12/site-packages")
+                + "\n"
+                + str(repo.parent / "astrovela_vane-batch-udf-20260930/.venv-gpu/lib/python3.12/site-packages")
+                + "\n"
+            )
+            env = dict(
+                os.environ,
+                SKBUILD_BUILD_DIR=str(component / "build/python-release"),
+                SKBUILD_CMAKE_BUILD_TYPE="Release",
+                CMAKE_BUILD_PARALLEL_LEVEL="2",
+                PKG_CONFIG_PATH=str(fuse / "lib/x86_64-linux-gnu/pkgconfig"),
+                PKG_CONFIG_SYSROOT_DIR=str(fuse.parent),
+            )
+            run(
+                variant + "-install",
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python),
+                    ".",
+                    "--no-build-isolation",
+                    "-Ccmake.define.unofficial-sqlite3_DIR=" + str(sdk / "share/unofficial-sqlite3"),
+                    "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+                    "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+                    "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+                    "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=" + variant,
+                ],
+                component,
+                env,
+            )
+            release = component / "build/python-release"
+            run(variant + "-native", ["ctest", "--test-dir", str(release), "--output-on-failure"])
+            owned = out / (variant + "-pytest-data")
+            try:
+                run(
+                    variant + "-python",
+                    [
+                        str(python),
+                        "-I",
+                        "-m",
+                        "pytest",
+                        "--rootdir",
+                        str(component),
+                        "--confcutdir",
+                        str(component),
+                        "--basetemp",
+                        str(owned),
+                        "-q",
+                        str(component / "tests"),
+                    ],
+                    "/tmp",
+                    dict(
+                        os.environ,
+                        VANE_FS_MOUNT_BINARY=str(release / "vane-fs-mount"),
+                        VANE_FS_PRODUCTION_PYTHON=str(repo / ".venv/bin/python"),
+                    ),
+                )
+            finally:
+                if owned.exists():
+                    clean(owned)
+            sanitized = component / "sanitize"
+            run(
+                variant + "-asan-configure",
+                [
+                    "cmake",
+                    "-S",
+                    str(component),
+                    "-B",
+                    str(sanitized),
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                    "-DCMAKE_PREFIX_PATH=" + str(sdk),
+                    "-DVANE_FS_BUILD_PYTHON=OFF",
+                    "-DVANE_FS_BUILD_TOOLS=OFF",
+                    "-DVANE_FS_BUILD_FUSE=OFF",
+                    "-DVANE_FS_BUILD_TESTS=ON",
+                    "-DVANE_FS_TEST_SQLITE_SYNC=" + variant,
+                    "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer",
+                    "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
+                ],
+            )
+            run(variant + "-asan-build", ["cmake", "--build", str(sanitized), "-j", "2"])
+            run(
+                variant + "-asan-tests",
+                ["ctest", "--test-dir", str(sanitized), "--output-on-failure"],
+                env=dict(os.environ, ASAN_OPTIONS="detect_leaks=1:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1"),
+            )
+            # An opposite primitive must fail, establishing the syscall check is sensitive.
+            owned = Path(tempfile.mkdtemp(prefix="owned-sync-negative-", dir="/dev/shm"))
+            try:
+                run(
+                    variant + "-wrong-primitive",
+                    [
+                        str(release / "vane_fs_sync_syscalls_test"),
+                        str(owned / "cases"),
+                        "fdatasync" if variant == "fsync" else "fsync",
+                    ],
+                    expected=1,
+                )
+                assert "SQLite WAL used unexpected syscall" in (out / (variant + "-wrong-primitive.log")).read_text()
+            finally:
+                if owned.exists():
+                    clean(owned)
+            identity = out / (variant + "-identity")
+            run(
+                variant + "-identity-build",
+                [
+                    "c++",
+                    "-std=c++17",
+                    "-O2",
+                    "-I" + str(sdk / "include"),
+                    str(here / "identity.cpp"),
+                    str(sdk / "lib/libsqlite3.a"),
+                    "-ldl",
+                    "-pthread",
+                    "-o",
+                    str(identity),
+                ],
+            )
+            run(variant + "-identity", [str(identity)])
+            report["components"][variant] = dict(
+                path=str(component),
+                sdk=str(sdk),
+                sources={str(component / path): sha for path, sha in original["sources"].items()},
+                binaries={
+                    str(path): digest(path)
+                    for path in [
+                        release / "vane-fs-mount",
+                        release / "libvane_fs.a",
+                        component / "venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+                    ]
+                },
+            )
+            for mode, library in libraries.items():
+                binary = out / ("probe-" + variant + "-" + mode)
+                argv = [
+                    "c++",
+                    "-std=c++17",
+                    "-O2",
+                    "-DNDEBUG",
+                    "-I" + str(core / "src"),
+                    "-I" + str(core / "include"),
+                    "-I" + str(sdk / "include"),
+                    "-I" + str(recorder),
+                    str(here.parent / "full_sync_contention/probe.cpp"),
+                    str(recorder / "trace.cpp"),
+                    str(library),
+                    str(sdk / "lib/libsqlite3.a"),
+                    "-ldl",
+                    "-pthread",
+                ]
+                if mode == "asan":
+                    argv += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+                argv += [
+                    "-Wl,--wrap=" + symbol
+                    for symbol in (
+                        "sqlite3_wal_hook",
+                        "sqlite3_wal_checkpoint_v2",
+                        "fsync",
+                        "fdatasync",
+                        "pread",
+                        "pwrite",
+                        "pread64",
+                        "pwrite64",
+                        "sync_file_range",
+                    )
+                ]
+                run(variant + "-" + mode + "-probe", argv + ["-o", str(binary)])
+                report["probes"][str(binary)] = digest(binary)
+                for state in ("cold", "warm", "gc"):
+                    label = variant + "-" + mode + "-" + state
+                    owned = Path(tempfile.mkdtemp(prefix="owned-sync-probe-", dir="/dev/shm"))
+                    try:
+                        run(
+                            label,
+                            [str(binary), str(owned / "db.sqlite"), state, "active", str(out / (label + ".json"))],
+                            env=dict(
+                                os.environ,
+                                ASAN_OPTIONS="detect_leaks=1:halt_on_error=1",
+                                UBSAN_OPTIONS="halt_on_error=1",
+                            ),
+                        )
+                        data = json.loads((out / (label + ".json")).read_text())
+                        records = json.loads((owned / "db.sqlite.request-costs.json").read_text())
+                        wal = [
+                            dict(zip(records["sync_columns"], value, strict=True))
+                            for thread in records["threads"]
+                            for value in thread["syncs"]
+                        ]
+                        wal = [
+                            s for s in wal if s["kind"] == "wal" and data["begin_ns"] <= s["begin_ns"] < data["end_ns"]
+                        ]
+                        assert len(wal) == 128 and all(
+                            s["operation"] == variant and s["result"] == s["errno"] == 0 for s in wal
+                        )
+                        shutil.copy2(owned / "db.sqlite.request-costs.json", out / (label + "-trace.json"))
+                        report["tests"].append(dict(label=label, full_wal_syncs=128, primitive=variant))
+                    finally:
+                        if (owned / "db.sqlite.request-costs.json").exists() and not (
+                            out / (label + "-trace.json")
+                        ).exists():
+                            shutil.copy2(owned / "db.sqlite.request-costs.json", out / (label + "-trace.json"))
+                        clean(owned)
+        assert (out / "fsync-identity.log").read_bytes() == (out / "fdatasync-identity.log").read_bytes()
+        assert digest(Path(sdks["libraries"]["fsync"]["prefix"]) / "include/sqlite3.h") == digest(
+            Path(sdks["libraries"]["fdatasync"]["prefix"]) / "include/sqlite3.h"
+        )
+        assert digest(out / "fsync/build/python-release/libvane_fs.a") == digest(
+            out / "fdatasync/build/python-release/libvane_fs.a"
+        )
+        assert all(digest(Path(p)) == sha for p, sha in inputs.items())
+        report.update(
+            status="PASS",
+            core_static_libraries_identical=True,
+            runtime_sqlite_identity_identical=True,
+            full_wal_barriers_per_probe=128,
+            worker_active_in_both_variants=True,
+        )
+        (out / "tests.json").write_text(
+            json.dumps(
+                dict(
+                    status="PASS",
+                    build=str(out / "build.json"),
+                    python_tests_per_variant=154,
+                    native_tests_per_variant=12,
+                    asan_ubsan_tests_per_variant=12,
+                    probe_cases_per_mode=6,
+                    expected_negative_checks=2,
+                ),
+                indent=2,
+            )
+            + "\n"
+        )
+    except BaseException as error:
+        report.update(status="FAIL", error=repr(error))
+        raise
+    finally:
+        save()
+
+
+if __name__ == "__main__":
+    main()

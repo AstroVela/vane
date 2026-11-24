@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import pickle
 import sys
+import traceback
 from collections import Counter
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -59,6 +61,62 @@ def _drive(wrapper, texts):
     finally:
         wrapper.close()
         loop.close()
+
+
+@pytest.mark.parametrize(
+    "phase,on_error",
+    [
+        (phase, on_error)
+        for phase in ("initialization", "batch", "isolation", "conversion", "result_iteration")
+        for on_error in ("raise", "ignore")
+        if phase != "isolation" or on_error == "ignore"
+    ],
+)
+@pytest.mark.parametrize("kind", ["memory", "cause", "diagnostic"])
+def test_embedding_memory_errors_are_sanitized_and_fatal(phase, kind, on_error):
+    from vane.ai import DiagnosticError
+
+    calls = []
+
+    def fail():
+        if kind == "cause":
+            raise RuntimeError("private allocation") from OSError(errno.ENOMEM, "private path")
+        if kind == "diagnostic":
+            raise pickle.loads(pickle.dumps(DiagnosticError("embedding", OSError(errno.ENOSPC, "private path"))))
+        raise MemoryError("private allocation credential")
+
+    class AllocatingVector:
+        def __array__(self, *args, **kwargs):
+            fail()
+
+    class AllocatingResult:
+        def __iter__(self):
+            fail()
+
+    async def request(texts):
+        calls.append(texts)
+        if phase == "conversion":
+            return [AllocatingVector() for _ in texts]
+        if phase == "result_iteration":
+            return AllocatingResult()
+        if phase == "isolation" and len(texts) > 1:
+            raise RuntimeError("isolate a row-level failure")
+        fail()
+
+    wrapper = _wrapper(SimpleNamespace(embed_text=request), on_error=on_error)
+    if phase == "initialization":
+
+        def instantiate():
+            fail()
+
+        wrapper._descriptor.instantiate = instantiate
+    with pytest.raises(MemoryError, match="resources") as raised:
+        _drive(wrapper, ["first", "second"])
+    assert "private" not in str(raised.value)
+    assert "private" not in "".join(traceback.format_exception(raised.value))
+    assert (
+        len(calls) == {"initialization": 0, "batch": 1, "isolation": 2, "conversion": 1, "result_iteration": 1}[phase]
+    )
 
 
 def test_bounded_requests_restore_order_without_replaying_success():

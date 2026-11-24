@@ -281,7 +281,9 @@ with vane.connect(config={'threads':1}) as con:
     vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                   if line.startswith('VmSize:'))) * 1024
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    ceiling = vm + (1024 if form == "generic" else 512) * 1024 * 1024
+    # LIST-backed tensors also need per-pixel Arrow selection buffers and
+    # parameter-binding copies. Leave room for those within the bounded budget.
+    ceiling = vm + (512 if form == "fixed" else 1024) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling,hard), hard))
     result = con.sql('SELECT image_to_tensor($1) AS value', params=[value])
     table = result.to_arrow_table()
@@ -295,7 +297,10 @@ with vane.connect(config={'threads':1}) as con:
         assert normalized.schema.equals(table.schema)
         assert (normalized.column(0).chunk(0).storage.values.buffers()[1].address ==
                 table.column(0).chunk(0).storage.values.buffers()[1].address)
-    column = table.column(0).combine_chunks()
+    # Inspect the exported row without an unrelated Arrow concatenation copy
+    # competing for the image conversion's bounded address space.
+    assert table.num_rows == 1 and table.column(0).num_chunks == 1
+    column = table.column(0).chunk(0)
     array = (column.to_numpy_ndarray() if form == 'fixed' else
              column.storage.field('data').values.to_numpy().reshape(1,2160,3840,4))
     assert array.dtype == (np.float32 if form == "generic" else np.uint8) and array.shape == (1,2160,3840,4)
@@ -367,7 +372,12 @@ def test_nullable_fixed_tensor_normalization_preserves_sliced_child_buffers(elem
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("execution", ["contract", "subprocess"])
-def test_nullable_large_tensor_udf_normalization_has_bounded_memory(nested, execution):
+def test_nullable_large_tensor_udf_normalization_has_bounded_memory(monkeypatch, nested, execution):
+    # Workers map the entire output arena on first use. Fix its capacity for
+    # this address-space test instead of including host-sized virtual mappings
+    # in the 512 MiB normalization allowance. Two 4K RGBA rows need about 64 MiB.
+    monkeypatch.setenv("VANE_LOCAL_SHM_STORE_BYTES", "128m")
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "128m")
     program = """
 import resource
 import sys

@@ -1,0 +1,14 @@
+{
+  "status": "FAIL",
+  "epoch": 1792292585.2787035,
+  "reason": "Cross-format rejection correctly raises ValueError, but harness only caught vane_fs.Error; no count samples collected.",
+  "files": {
+    "vane_fs/build/versioned-extents-20261018/count-build.json": "7dd3d7f00ebcaf548751f2634a55eab8e4f119239f508af311739d2700023dd6",
+    "vane_fs/build/versioned-extents-20261018/count-baseline.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/versioned-extents-20261018/count-refuse-baseline.log": "8dcb84b91c9dee8c81ef13bd8b24b2d1bb05d53ffdf58ca271357df698f87545",
+    "vane_fs/build/versioned-extents-20261018/count-create-baseline.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/build/versioned-extents-20261018/count-extent.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vane_fs/benchmarks/staged_payload/versioned_extents/count.py": "88b4fc237aaea826eec456543303145b11112294673df62e9ed710aec23fea05",
+    "vane_fs/benchmarks/staged_payload/versioned_extents/probe.cpp": "06af0a9c97f93925235a0db801b998c23511ac028aa0bcb2d75017d787941d62"
+  }
+}

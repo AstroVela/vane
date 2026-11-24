@@ -671,6 +671,13 @@ SinkFinalizeType PhysicalCopyToFile::FinalizeInternal(ClientContext &context, Gl
 	if (partition_output) {
 		// finalize any outstanding partitions
 		gstate.FinalizePartitions(context, *this);
+		if (gstate.rows_copied.load() == 0 && write_empty_file && write_partition_columns) {
+			// With no partition values, retain the complete schema in a root file.
+			// This also supplies an exact output for distributed COPY's manifest.
+			auto global_lock = gstate.lock.GetExclusiveLock();
+			gstate.global_state = CreateFileState(context, global_state, *global_lock);
+			function.copy_to_finalize(context, *bind_data, *gstate.global_state);
+		}
 		return SinkFinalizeType::READY;
 	}
 	if (per_thread_output) {

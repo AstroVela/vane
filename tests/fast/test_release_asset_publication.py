@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,12 +16,18 @@ import pytest
 import yaml
 
 from scripts import publish_release_assets as publishing
+from scripts.run_ci_step import bash_executable
 
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "AstroVela/vane"
 TAG = "v0.2.0"
 SDIST = "vane_ai-0.2.0.tar.gz"
-WHEELS = {f"vane_ai-0.2.0-cp3{minor}-cp3{minor}-manylinux_2_28_x86_64.whl" for minor in range(10, 15)}
+PLATFORM_TAGS = ("manylinux_2_28_x86_64", "macosx_11_0_arm64", "win_amd64")
+WHEELS = {
+    f"vane_ai-0.2.0-cp3{minor}-cp3{minor}-{platform}.whl" for minor in range(10, 15) for platform in PLATFORM_TAGS
+}
+DISTRIBUTIONS = WHEELS | {SDIST}
+ASSET_COUNT = len(DISTRIBUTIONS) * 2 + len(publishing.SUPPLEMENTAL)
 
 
 @pytest.fixture
@@ -35,6 +43,9 @@ def asset_tree(tmp_path):
         (root / "packages" / f"{name}.sigstore.json").write_text('{"bundle":"fixture"}')
     for name in publishing.SUPPLEMENTAL:
         (root / "release-assets" / name).write_text("".join(checksums) if name == "SHA256SUMS" else "{}")
+    (root / "release-assets" / "vane-ai-sbom.cdx.json").write_text(
+        json.dumps({"bomFormat": "CycloneDX", "components": [{"name": "vane-ai", "version": "0.2.0"}]})
+    )
     return root
 
 
@@ -106,11 +117,11 @@ def github(monkeypatch):
     return state, calls, uploads, after_upload
 
 
-def test_nested_artifacts_upload_all_fifteen_files(asset_tree, github):
+def test_nested_artifacts_upload_the_complete_platform_matrix(asset_tree, github):
     state, _, uploads, _ = github
     assert any(path.is_dir() for path in asset_tree.glob("*"))  # The old upload glob includes these directories.
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
     assert {path.name for path in uploads} == (
         WHEELS | {SDIST} | {f"{name}.sigstore.json" for name in WHEELS | {SDIST}} | publishing.SUPPLEMENTAL
     )
@@ -145,6 +156,27 @@ def test_bad_local_inventory_stops_before_upload(asset_tree, github, damage):
     else:
         checksums.write_text(checksums.read_text() + checksums.read_text().splitlines(keepends=True)[0])
     with pytest.raises(ValueError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not calls and not uploads
+
+
+@pytest.mark.parametrize(
+    "sbom",
+    [
+        {},
+        [],
+        {"bomFormat": "SPDX", "components": [{"name": "vane-ai", "version": "0.2.0"}]},
+        {"bomFormat": "CycloneDX", "components": []},
+        {"bomFormat": "CycloneDX", "components": [{"name": "other", "version": "0.2.0"}]},
+        {"bomFormat": "CycloneDX", "components": [{"name": "vane-ai", "version": "0.1.0"}]},
+        {"bomFormat": "CycloneDX", "components": [None]},
+        {"bomFormat": "CycloneDX", "components": {"name": "vane-ai", "version": "0.2.0"}},
+    ],
+)
+def test_unqualified_sbom_stops_before_github_access(asset_tree, github, sbom):
+    _, calls, uploads, _ = github
+    (asset_tree / "release-assets" / "vane-ai-sbom.cdx.json").write_text(json.dumps(sbom))
+    with pytest.raises(ValueError, match="SBOM"):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert not calls and not uploads
 
@@ -189,14 +221,14 @@ def test_existing_conflicts_stop_without_overwriting(asset_tree, github, damage)
     assert not uploads
 
 
-@pytest.mark.parametrize("present", [3, 15])
+@pytest.mark.parametrize("present", [3, ASSET_COUNT])
 def test_retry_uploads_only_missing_matching_assets(asset_tree, github, present):
     state, _, uploads, _ = github
     paths = [path for path in asset_tree.rglob("*") if path.is_file()]
     state["assets"] = [remote_asset(path) for path in paths[:present]]
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15 - present
-    assert len(uploads) == 15 - present
-    assert len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - present
+    assert len(uploads) == ASSET_COUNT - present
+    assert len(state["assets"]) == ASSET_COUNT
 
 
 def test_interrupted_upload_resumes_the_original_bytes(asset_tree, github):
@@ -210,8 +242,8 @@ def test_interrupted_upload_resumes_the_original_bytes(asset_tree, github):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert len(state["assets"]) == 1
     callbacks.clear()
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 14
-    assert len(uploads) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - 1
+    assert len(uploads) == ASSET_COUNT
 
 
 def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asset_tree, github):
@@ -227,8 +259,8 @@ def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asse
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     completed, failed = copy.deepcopy(state["assets"])
     callbacks.clear()
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 14
-    assert len(uploads) == 16 and len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT - 1
+    assert len(uploads) == ASSET_COUNT + 1 and len(state["assets"]) == ASSET_COUNT
     assert completed in state["assets"] and failed not in state["assets"]
     assert [call for call in calls if "DELETE" in call] == [
         ("api", "--method", "DELETE", f"repos/{REPOSITORY}/releases/assets/{failed['id']}")
@@ -239,8 +271,8 @@ def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asse
 def test_multiple_empty_starters_are_recovered(asset_tree, github):
     state, calls, uploads, _ = github
     state["assets"] = [starter_asset(SDIST), starter_asset("SHA256SUMS", 102)]
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
     assert len([call for call in calls if "DELETE" in call]) == 2
 
 
@@ -324,8 +356,8 @@ def test_failed_starter_cleanup_can_be_retried(asset_tree, github, monkeypatch, 
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert not uploads and state["draft"]
     monkeypatch.setattr(publishing.subprocess, "run", run)
-    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
-    assert len(uploads) == len(state["assets"]) == 15
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == ASSET_COUNT
+    assert len(uploads) == len(state["assets"]) == ASSET_COUNT
 
 
 @pytest.mark.parametrize(
@@ -335,7 +367,7 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
     state, calls, uploads, callbacks = github
 
     def damage_last_upload(path, release):
-        if len(uploads) != 15:
+        if len(uploads) != ASSET_COUNT:
             return
         if damage == "truncated":
             release["assets"][-1]["size"] -= 1
@@ -355,7 +387,7 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
     callbacks.append(damage_last_upload)
     with pytest.raises(ValueError):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
-    assert len(uploads) == 15
+    assert len(uploads) == ASSET_COUNT
     assert not any("DELETE" in call for call in calls)
 
 
@@ -406,5 +438,52 @@ def test_build_only_checks_the_real_download_layout_before_index_upload(asset_tr
         cwd=asset_tree.parent,
         env={**os.environ, "PATH": ""},
     )
-    assert '"assets": 15' in result.stdout
+    assert f'"assets": {ASSET_COUNT}' in result.stdout
     assert '"verified": true' in result.stdout
+
+
+@pytest.mark.parametrize("tree_cached", [False, True])
+def test_windows_cached_dependencies_include_the_toolchain(tmp_path, tree_cached):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["windows-vcpkg"]["steps"]
+    bootstrap = next(step for step in steps if "scripts/bootstrap_vcpkg.sh" in step.get("run", ""))
+    upload = next(step for step in steps if step.get("with", {}).get("name") == "windows-vcpkg-toolchain")
+    workspace = tmp_path / "runner workspace"
+    scripts = workspace / "package/scripts"
+    scripts.mkdir(parents=True)
+    if tree_cached:
+        arrow = workspace / "package/vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake"
+        arrow.parent.mkdir(parents=True)
+        arrow.touch()
+    (scripts / "bootstrap_vcpkg.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'mkdir -p "$VCPKG_ROOT/scripts/buildsystems" "$VCPKG_ROOT/triplets"\n'
+        'touch "$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"\n'
+        'touch "$VCPKG_ROOT/triplets/x64-windows-static.cmake"\n'
+        'touch "$VCPKG_ROOT/vcpkg.exe" "$VCPKG_ROOT/bootstrap-vcpkg.bat"\n',
+        encoding="utf-8",
+    )
+    output = workspace / "github-output.txt"
+    try:
+        bash = bash_executable()
+    except RuntimeError:
+        # Git Bash puts mingw64/bin/git ahead of cmd/git in its inherited PATH.
+        bash = shutil.which("bash")
+        if bash is None or "system32" in {part.lower() for part in Path(bash).parts}:
+            pytest.skip("Git Bash is required for the Windows workflow regression")
+    subprocess.run(
+        [bash, "--noprofile", "--norc", "-e", "-c", bootstrap["run"]],
+        cwd=workspace,
+        env={
+            **os.environ,
+            "VCPKG_ROOT": (workspace / ".cache/vcpkg").as_posix(),
+            "GITHUB_OUTPUT": output.as_posix(),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f"reused={str(tree_cached).lower()}" in output.read_text(encoding="utf-8")
+    for required in upload["with"]["path"].splitlines():
+        assert (workspace / required).exists(), f"toolchain artifact is missing {required}"

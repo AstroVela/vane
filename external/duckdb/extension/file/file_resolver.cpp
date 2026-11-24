@@ -12,6 +12,7 @@
 
 #include "file_mime_type.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/opener_file_system.hpp"
@@ -27,6 +28,12 @@
 #endif
 
 namespace duckdb {
+
+static bool IsUnsupportedFileOperation(const std::exception &error) {
+	// A host file system can throw from another private-engine DSO. Its DuckDB
+	// RTTI need not match ours, but the serialized exception type is shared.
+	return ErrorData(error).Type() == ExceptionType::NOT_IMPLEMENTED;
+}
 
 namespace {
 
@@ -166,7 +173,10 @@ FileStatValue ResolvedFile::Stat() const {
 	try {
 		metadata = handle->file_system.Stats(*handle);
 		has_metadata = true;
-	} catch (const NotImplementedException &) {
+	} catch (const std::exception &error) {
+		if (!IsUnsupportedFileOperation(error)) {
+			throw;
+		}
 	}
 
 	if (has_metadata) {
@@ -187,7 +197,10 @@ FileStatValue ResolvedFile::Stat() const {
 				result.has_last_modified = true;
 				result.last_modified = last_modified;
 			}
-		} catch (const NotImplementedException &) {
+		} catch (const std::exception &error) {
+			if (!IsUnsupportedFileOperation(error)) {
+				throw;
+			}
 		}
 	}
 
@@ -198,7 +211,10 @@ FileStatValue ResolvedFile::Stat() const {
 				result.has_etag = true;
 				result.etag = std::move(version_tag);
 			}
-		} catch (const NotImplementedException &) {
+		} catch (const std::exception &error) {
+			if (!IsUnsupportedFileOperation(error)) {
+				throw;
+			}
 		}
 	}
 
@@ -225,7 +241,10 @@ bool ResolvedFile::MimeTypeFromResolvedMetadata(string &result) const {
 		    TryGetMetadataString(metadata, "mime_type", result)) {
 			return true;
 		}
-	} catch (const NotImplementedException &) {
+	} catch (const std::exception &error) {
+		if (!IsUnsupportedFileOperation(error)) {
+			throw;
+		}
 	}
 	return FileMimeType::FromPath(file.url, result);
 }
@@ -249,7 +268,10 @@ void ResolvedFile::ReadExact(data_ptr_t target, uint64_t size, uint64_t logical_
 			throw InterruptException();
 		}
 		return;
-	} catch (const NotImplementedException &) {
+	} catch (const std::exception &error) {
+		if (!IsUnsupportedFileOperation(error)) {
+			throw;
+		}
 		// Some registered file systems only implement seek plus sequential reads.
 	}
 

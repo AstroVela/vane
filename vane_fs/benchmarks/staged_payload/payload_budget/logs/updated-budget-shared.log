@@ -1,0 +1,2 @@
+shared fixture WAL bytes=9508992 CLEAN=1
+shared PASS foreground_syncs=0 background_syncs=1

@@ -941,6 +941,33 @@ def _probe_video_metadata(
     buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
 ) -> tuple[int, int, float | None, float | None, float | None, int | None, int, int]:
     """Bounded PyAV helper called by the native SQL scalar function."""
+    metadata = _probe_container(
+        read_at,
+        logical_size,
+        max_bytes,
+        buffer_size,
+        lambda container, av: _metadata_from_container(container, content_type, av),
+    )
+    return (
+        metadata.width,
+        metadata.height,
+        metadata.fps,
+        metadata.duration,
+        metadata.container_duration,
+        metadata.frame_count,
+        metadata.time_base.numerator,
+        metadata.time_base.denominator,
+    )
+
+
+def _probe_container(
+    read_at: Callable[[int, int], bytes],
+    logical_size: int,
+    max_bytes: int,
+    buffer_size: int,
+    inspect: Callable[[Any, Any], Any],
+) -> Any:
+    """Inspect a container while the bounded FILE view and parser remain owned."""
     av_module = _load_av()
     stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes, buffer_size=buffer_size)
     nested_io = _NestedIOBlocker()
@@ -964,7 +991,7 @@ def _probe_video_metadata(
         with _close_container(container):
             stream.raise_if_error()
             nested_io.raise_if_error()
-            metadata = _metadata_from_container(container, content_type, av_module)
+            metadata = inspect(container, av_module)
             stream.raise_if_error()
             nested_io.raise_if_error()
     except BaseException as error:
@@ -997,16 +1024,7 @@ def _probe_video_metadata(
         raise VideoFileLimitError(f"video metadata requires more than max_bytes={max_bytes}")
     if stream.fetch_limit_exhausted:
         raise VideoFileLimitError(f"video metadata requires more than {_MAX_VIDEO_METADATA_FETCHES} source ranges")
-    return (
-        metadata.width,
-        metadata.height,
-        metadata.fps,
-        metadata.duration,
-        metadata.container_duration,
-        metadata.frame_count,
-        metadata.time_base.numerator,
-        metadata.time_base.denominator,
-    )
+    return metadata
 
 
 def _optional_frame_integer(value: Any, *, name: str, nonnegative: bool = False) -> int | None:

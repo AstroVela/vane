@@ -400,7 +400,9 @@ class FteWorkerSubmissionMixin:
             # admission; the query resource graph does not synthesize a
             # per-fragment heap requirement.
             task_memory_bytes=None,
-            max_attempts=4 if data_sink_max_attempts is None else data_sink_max_attempts,
+            max_attempts=resource_manager.max_native_task_attempts
+            if data_sink_max_attempts is None
+            else data_sink_max_attempts,
         )
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):

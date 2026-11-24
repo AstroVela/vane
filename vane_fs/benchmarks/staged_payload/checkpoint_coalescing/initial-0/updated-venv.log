@@ -1,0 +1,3 @@
+Using CPython 3.12.13 interpreter at: .venv/bin/python
+Creating virtual environment at: vane_fs/build/checkpoint-coalescing-20261012T040500Z/updated/venv
+Activate with: source vane_fs/build/checkpoint-coalescing-20261012T040500Z/updated/venv/bin/activate

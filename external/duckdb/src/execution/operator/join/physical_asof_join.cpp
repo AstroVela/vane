@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
@@ -134,6 +140,10 @@ public:
 	}
 
 	unique_ptr<LocalSinkState> local_partition;
+
+	void ResetBatchInput() override {
+		local_partition->ResetBatchInput();
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalAsOfJoin::GetGlobalSinkState(ClientContext &context) const {

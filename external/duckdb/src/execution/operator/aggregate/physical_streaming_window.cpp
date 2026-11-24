@@ -75,6 +75,17 @@ public:
 
 		void Execute(ExecutionContext &context, DataChunk &input, Vector &result);
 
+		void ResetInput() {
+			executor.ResetInput();
+			filter_executor.ResetInput();
+			arg_chunk.Reset();
+			arg_cursor.Reset();
+			distinct_args.Reset();
+			if (distinct) {
+				distinct->ResetInput();
+			}
+		}
+
 		//! The aggregate expression
 		BoundWindowExpression &wexpr;
 		//! The allocator to use for aggregate data structures
@@ -626,6 +637,16 @@ void PhysicalStreamingWindow::ExecuteFunctions(ExecutionContext &context, DataCh
 			break;
 		default:
 			throw NotImplementedException("%s for StreamingWindow", ExpressionTypeToString(expr.GetExpressionType()));
+		}
+		// Results and LEAD/LAG history own their values. Expression scratch must not
+		// retain consumed source buffers while the next batch waits for byte capacity.
+		if (state.aggregate_states[expr_idx]) {
+			state.aggregate_states[expr_idx]->ResetInput();
+		}
+		if (state.lead_lag_states[expr_idx]) {
+			auto &lead_lag = *state.lead_lag_states[expr_idx];
+			lead_lag.curr_chunk.Reset();
+			lead_lag.executor.ResetInput();
 		}
 	}
 	gstate.row_number += NumericCast<int64_t>(count);

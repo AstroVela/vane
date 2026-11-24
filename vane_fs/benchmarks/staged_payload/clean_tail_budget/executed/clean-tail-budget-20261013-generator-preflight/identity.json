@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "adaptation": "Same isolated non-editable builder; only uncopied CLEAN cap, no whole-generation cap",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_tail_budget/prepare.py": "570f77cd7225b6f1d9d92ab2ccc1cf16c4ca741d4f77abd9b2b05fb680ae6186",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/candidate.py": "f26a84a6b044c4d7311d2903b636cf9e5b2464956d747c029e35392a37980ebc",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_tail_budget/budget.patch": "36d42c038b0ecf7454250c3a3e482baf34022866c11db5d930a9832718616b55"
+  }
+}

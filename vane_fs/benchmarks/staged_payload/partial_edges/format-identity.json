@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "binaries": [
+    {
+      "label": "baseline-allocation",
+      "byte_identical": true,
+      "sha256": "d9a7ea8d2c58b7105d135910d65b5b3548be4dcbfaf5c523b2e6e3eefb40e8ba"
+    },
+    {
+      "label": "updated-allocation",
+      "byte_identical": true,
+      "sha256": "2439cb86fa4b1a43b0c14bb50380d5ac9df2da2df10dba53a827d7d4da988a2e"
+    }
+  ]
+}

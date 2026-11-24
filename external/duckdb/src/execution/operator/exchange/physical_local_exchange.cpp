@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/operator/exchange/physical_local_exchange.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
@@ -233,17 +234,22 @@ void PhysicalLocalExchange::BuildPipelines(Pipeline &current, MetaPipeline &meta
 	// single operator: the operator becomes the data source of the current pipeline
 	state.SetPipelineSource(current, *this);
 
-	auto &config = DBConfig::GetConfig(current.GetClientContext());
-	const bool user_streaming = config.options.local_exchange_streaming;
-	const bool bounded_buffer = config.options.local_exchange_buffer_bytes > 0;
-	// A bounded local exchange queue must let source/sink run concurrently.
-	const bool streaming = user_streaming || bounded_buffer;
-	const bool add_dependency = !streaming;
+	const bool add_dependency = !GetMaterializedInputChildren(current.GetClientContext()).empty();
 
 	// create a new pipeline starting from the child
 	auto &child_meta_pipeline =
 	    meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, add_dependency);
 	child_meta_pipeline.Build(children[0].get());
+}
+
+vector<const_reference<PhysicalOperator>>
+PhysicalLocalExchange::GetMaterializedInputChildren(ClientContext &context) const {
+	auto &config = DBConfig::GetConfig(context);
+	// A bounded local exchange queue must let source/sink run concurrently.
+	if (config.options.local_exchange_streaming || config.options.local_exchange_buffer_bytes > 0) {
+		return {};
+	}
+	return GetChildren();
 }
 
 idx_t PhysicalLocalExchange::ResolveNumPartitions(ClientContext &context) const {
@@ -455,8 +461,8 @@ SinkResultType PhysicalLocalExchange::SinkBatch(ExecutionContext &context, Execu
 	const auto repartition_type = repartition_spec ? repartition_spec->type() : RepartitionSpec::Type::Random;
 	if (repartition_type != RepartitionSpec::Type::Random &&
 	    repartition_type != RepartitionSpec::Type::IntoPartitions) {
-		auto barrier = MaterializeExternalBlockBarrier(context.client, *batch.lazy, GetName());
-		return Sink(context, *barrier.chunk, input);
+		// Retain the payload in the input batch if the queue budget blocks Sink.
+		return PhysicalOperator::SinkBatch(context, batch, input);
 	}
 
 	auto &gstate = input.global_state.Cast<LocalExchangeGlobalSinkState>();
@@ -540,7 +546,8 @@ static idx_t LocalExchangeCoalesceRows() {
 	if (!resolved) {
 		resolved = true;
 		cached = 64; // default
-		auto *value = std::getenv("VANE_LOCAL_EXCHANGE_COALESCE_ROWS");
+		const duckdb::EnvironmentVariable value_env("VANE_LOCAL_EXCHANGE_COALESCE_ROWS");
+		const char *value = value_env.GetValue();
 		if (value && *value) {
 			char *endptr = nullptr;
 			auto parsed = std::strtoll(value, &endptr, 10);

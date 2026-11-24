@@ -242,6 +242,10 @@ public:
 	}
 
 	unique_ptr<LocalSinkState> local_group;
+
+	void ResetBatchInput() override {
+		local_group->ResetBatchInput();
+	}
 };
 
 // this implements a sorted window functions variant

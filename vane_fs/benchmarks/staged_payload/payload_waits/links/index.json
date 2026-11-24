@@ -1,0 +1,32 @@
+{
+  "status": "PASS",
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/payload_waits/analyze.py": "4d5905a2d21a15a1d04ed3aa9eb3c5fcd31eab86018065b730fbedeba6887273",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/analyze.py": "02975ff94a67b857d9733494afea41e16cb047ee3af0867b25030d3aa1d5adee",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/analysis.json": "18f45e49a839a2a1e5283e5c3cf3c551fbb30cfc9fbeb8c8c7f69dfa66d10f62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/analysis-command.json": "1c73c40cc35da448428a61b5202d97509b22dafaae8a7601a04226048408368a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/plan.json": "fc1a71d90f8bd5d1fd9ea481285b8577d22eacd8518914fb7c663e5a547a8e4c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/input-check.json": "e4ecc5b4f3e10fa20421efb59f01e40cd80689694404558d914c25210937262b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/run.py": "7020ea9c6456872684697c03bc8e0562f5986f887572144a7a166c56f345afa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/wrapper-proof.json": "63f362cace515805ca116ad8069fcb1a72d6f3af705b6de29aff824320e5b39a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-2jybo_qx-waits.json": "61ad94ba1e5211f139333e3a3e984f450de688b875e3fdd76cc498128d2704f9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-ja6b4tfb-waits.json": "fb20ebcdc82fd19a707c4fb6e3215ec1f8c2df54fd7d6a27db04b7ed33fd63b8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-0kxfz96l-waits.json": "4489d16e749eda2e9cbec3f5b1265ce19d4de81da279c1ad9ef92512961096d9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-dz8td_g9-waits.json": "243783c49e8e262eabc2ca7eac84483da261db4017de1af3e36c38a2d1102e94",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-klv0bxh1-waits.json": "ba134de4cd8b5c498bc2b981b576a31b5bf168a42cd64ac7b510af62ad317923",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-od8lwid3-waits.json": "f4f1dc8dc5409f7c6a61fdb93175c22603d15aec51ddd87d33563de33a1a7544",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-mwtbhoh8-waits.json": "9df9f1d6476791f15219a6c35a4d0723a64ee68aecd6a4f3a72191e74de7c1b1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-fuse-gy85tgpd-waits.json": "a8fe8d15944caa5d2a6b058957d72a91e4c834f2553f45f0970fb56f4900d624",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-he1vddjq-waits.json": "445fd88712b653139e5b9d97dc00d421865d8a9b948c447a75465eb375b34442",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-vhhhw5bv-waits.json": "3dc33ff53df2ebc6003c6eb1540f244a1bda48f0c2b00e5373bc8f0acb7937c8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-n8pwom4r-waits.json": "a0a1289f1ef9c6aa9538b892c6d732e46d37eb569a0b9a597a7d3bc286497384",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-isv9d8me-waits.json": "e47079e833677dfe3a2d91e8be8dbe2c5e604e21c8c70659067b4541711aa4d6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-9o96ch85-waits.json": "23b74b97012e4f5181350d530b1d585ae05bfb0aaa75e9d2284b94f8d2ef199e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-p4_rbygz-waits.json": "54103ad2e710d6192336bcc4bfee440a1c4e967530b5f5c3cae436eafca8d463",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-col11lpq-waits.json": "790bf41299458dfa0f91b6940a8426a5dd8579cebea753dbc75f34c86ae9fa1d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-gh7wl1yj-waits.json": "828f3f856ce7dcba624e33ad1037d1b77a478e1aa99e69a880742c84b76212ab"
+  },
+  "links": [
+    "links/000.json"
+  ]
+}

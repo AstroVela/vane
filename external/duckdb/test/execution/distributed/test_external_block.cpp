@@ -68,12 +68,24 @@ struct ExternalBlockBackendGuard {
 
 class TestExternalBlockBackend : public ExternalBlockBackendInterface {
 public:
+	explicit TestExternalBlockBackend(idx_t *destroyed_p = nullptr) : destroyed(destroyed_p) {
+	}
+
+	~TestExternalBlockBackend() override {
+		if (destroyed) {
+			(*destroyed)++;
+		}
+	}
+
 	bool CanMaterialize(const ExternalBlockDescriptor &desc) override {
 		return desc.object_ref != nullptr;
 	}
 
 	unique_ptr<DataChunk> Materialize(ClientContext &context, const LazyDataChunk &chunk) override {
 		materialize_calls++;
+		if (return_null) {
+			return nullptr;
+		}
 		auto result = make_uniq<DataChunk>();
 		result->Initialize(context, chunk.logical_types);
 		result->SetCardinality(chunk.cardinality);
@@ -88,6 +100,10 @@ public:
 	}
 
 	idx_t materialize_calls = 0;
+	bool return_null = false;
+
+private:
+	idx_t *destroyed;
 };
 
 } // namespace
@@ -306,15 +322,23 @@ TEST_CASE("LazyDataChunk descriptor helpers reject invalid projection and slice"
 	REQUIRE_THROWS_AS(SliceLazyDataChunk(*chunk, 11, 0), InvalidInputException);
 }
 
-TEST_CASE("MaterializeExternalBlock dispatches through registered backend", "[execution][external_block]") {
+TEST_CASE("MaterializeExternalBlock uses the bound reader after registry replacement", "[execution][external_block]") {
 	ExternalBlockBackendGuard guard;
 	auto backend = make_shared_ptr<TestExternalBlockBackend>();
 	auto backend_raw = backend.get();
-	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	auto replacement = make_shared_ptr<TestExternalBlockBackend>();
+	SECTION("empty registry") {
+		SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, nullptr);
+	}
+	SECTION("different registered reader") {
+		SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, replacement);
+	}
 
 	DuckDB db(nullptr);
 	Connection con(db);
-	auto chunk = MakeLazyChunk({MakeDescriptor(128, 1280, 16, 20)});
+	auto descriptor = MakeDescriptor(128, 1280, 16, 20);
+	descriptor.materializer = backend;
+	auto chunk = MakeLazyChunk({std::move(descriptor)});
 
 	auto materialized = MaterializeExternalBlock(*con.context, *chunk);
 	REQUIRE(materialized);
@@ -322,6 +346,7 @@ TEST_CASE("MaterializeExternalBlock dispatches through registered backend", "[ex
 	REQUIRE(materialized->GetValue(0, 0).GetValue<int64_t>() == 16);
 	REQUIRE(materialized->GetValue(0, 3).GetValue<int64_t>() == 19);
 	REQUIRE(backend_raw->materialize_calls == 1);
+	REQUIRE(replacement->materialize_calls == 0);
 }
 
 TEST_CASE("MaterializeExternalBlockBarrier reports standard barrier stats", "[execution][external_block]") {
@@ -333,6 +358,9 @@ TEST_CASE("MaterializeExternalBlockBarrier reports standard barrier stats", "[ex
 	DuckDB db(nullptr);
 	Connection con(db);
 	auto chunk = MakeLazyChunk({MakeDescriptor(128, 1280, 16, 20), MakeDescriptor(64, 640, 4, 8)});
+	for (auto &block : chunk->blocks) {
+		block.materializer = backend;
+	}
 
 	auto barrier = MaterializeExternalBlockBarrier(*con.context, *chunk, "unit_test");
 	REQUIRE(barrier.chunk);
@@ -343,4 +371,100 @@ TEST_CASE("MaterializeExternalBlockBarrier reports standard barrier stats", "[ex
 	REQUIRE(barrier.stats.rows == 8);
 	REQUIRE(barrier.stats.estimated_bytes == 80);
 	REQUIRE(backend_raw->materialize_calls == 1);
+}
+
+TEST_CASE("External block materialization rejects invalid bindings without a registry fallback",
+          "[execution][external_block]") {
+	ExternalBlockBackendGuard guard;
+	auto backend = make_shared_ptr<TestExternalBlockBackend>();
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+	auto chunk = MakeLazyChunk({MakeDescriptor(2, 16), MakeDescriptor(2, 16)});
+	for (auto &block : chunk->blocks) {
+		block.materializer = backend;
+	}
+	SECTION("missing first binding") {
+		chunk->blocks[0].materializer.reset();
+	}
+	SECTION("missing later binding") {
+		chunk->blocks[1].materializer.reset();
+	}
+	SECTION("different materializer object") {
+		chunk->blocks[1].materializer = make_shared_ptr<TestExternalBlockBackend>();
+	}
+	SECTION("different backend") {
+		chunk->blocks[1].backend = static_cast<ExternalBlockBackend>(255);
+	}
+	SECTION("reader rejects descriptor") {
+		chunk->blocks[1].object_ref.reset();
+	}
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_THROWS_AS(MaterializeExternalBlock(*con.context, *chunk), InvalidInputException);
+	REQUIRE(backend->materialize_calls == 0);
+	REQUIRE(chunk->blocks.size() == 2);
+}
+
+TEST_CASE("External block materialization rejects null output and accepts an empty bundle",
+          "[execution][external_block]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto backend = make_shared_ptr<TestExternalBlockBackend>();
+	backend->return_null = true;
+	auto descriptor = MakeDescriptor(2, 16);
+	descriptor.materializer = backend;
+	auto chunk = MakeLazyChunk({std::move(descriptor)});
+	REQUIRE_THROWS_AS(MaterializeExternalBlock(*con.context, *chunk), InternalException);
+	REQUIRE(chunk->blocks.size() == 1);
+	REQUIRE(backend->materialize_calls == 1);
+
+	auto empty = MakeLazyChunk({});
+	auto result = MaterializeExternalBlock(*con.context, *empty);
+	REQUIRE(result);
+	REQUIRE(result->size() == 0);
+	REQUIRE(result->GetTypes() == empty->logical_types);
+}
+
+TEST_CASE("External block reader and ownership survive projection slicing bundling and queue transfer",
+          "[execution][external_block]") {
+	idx_t reader_releases = 0;
+	idx_t object_releases = 0;
+	idx_t token_releases = 0;
+	auto backend = make_shared_ptr<TestExternalBlockBackend>(&reader_releases);
+	auto descriptor = MakeDescriptor(128, 1024);
+	descriptor.materializer = backend;
+	descriptor.object_ref = shared_ptr<void>(new int(1), [&object_releases](void *ptr) {
+		delete static_cast<int *>(ptr);
+		object_releases++;
+	});
+	descriptor.ownership_tokens.push_back(shared_ptr<void>(new int(1), [&token_releases](void *ptr) {
+		delete static_cast<int *>(ptr);
+		token_releases++;
+	}));
+	auto original = MakeLazyChunk({std::move(descriptor)});
+	auto projected = ProjectLazyDataChunk(*original, {0});
+	auto sliced = SliceLazyDataChunk(*projected, 8, 112);
+	original.reset();
+	projected.reset();
+	backend.reset();
+
+	LazyDataChunkBundler bundler(100);
+	bundler.Add(std::move(sliced));
+	std::deque<unique_ptr<LazyDataChunk>> queue;
+	queue.push_back(bundler.PopReady());
+	bundler.Finish();
+	auto tail = bundler.PopReady();
+	REQUIRE(queue.front()->blocks[0].materializer == tail->blocks[0].materializer);
+	REQUIRE(queue.front()->blocks[0].object_ref == tail->blocks[0].object_ref);
+	REQUIRE(queue.front()->blocks[0].ownership_tokens == tail->blocks[0].ownership_tokens);
+	REQUIRE(reader_releases == 0);
+	REQUIRE(object_releases == 0);
+	REQUIRE(token_releases == 0);
+	queue.pop_front();
+	REQUIRE(reader_releases == 0);
+	REQUIRE(object_releases == 0);
+	REQUIRE(token_releases == 0);
+	tail.reset();
+	REQUIRE(reader_releases == 1);
+	REQUIRE(object_releases == 1);
+	REQUIRE(token_releases == 1);
 }

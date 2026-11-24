@@ -25,11 +25,9 @@ from typing import TYPE_CHECKING, Any, Literal
 from typing_extensions import Unpack
 
 from vane import DuckDBPyRelation, Expression
+from vane.ai.embedding import EmbeddingInput
 from vane.ai.options import (
-    EmbedAudioOptions,
-    EmbedImageOptions,
     EmbedOptions,
-    EmbedVideoOptions,
     JevOptions,
     PromptOptions,
 )
@@ -44,12 +42,13 @@ else:
 
 def _embed(
     self: DuckDBPyRelation,
-    text: Expression,
+    input: EmbeddingInput,
     *,
     provider: str | Provider = "openai",
     model: str | None = None,
     dimensions: int | None = None,
     on_error: Literal["raise", "ignore"] = "raise",
+    where: Expression | None = None,
     output_column: str = "embedding",
     **options: Unpack[EmbedOptions],
 ) -> DuckDBPyRelation:
@@ -58,89 +57,12 @@ def _embed(
 
     return embed(
         self,
-        text,
+        input,
         provider=provider,
         model=model,
         dimensions=dimensions,
         on_error=on_error,
-        output_column=output_column,
-        **options,
-    )
-
-
-def _embed_image(
-    self: DuckDBPyRelation,
-    image: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedImageOptions],
-) -> DuckDBPyRelation:
-    """Append a fixed-size embedding column. See :func:`vane.ai.embed_image`."""
-    from vane.ai.functions import embed_image
-
-    return embed_image(
-        self,
-        image,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
-        output_column=output_column,
-        **options,
-    )
-
-
-def _embed_video(
-    self: DuckDBPyRelation,
-    frames: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedVideoOptions],
-) -> DuckDBPyRelation:
-    """Append a fixed-size embedding column. See :func:`vane.ai.embed_video`."""
-    from vane.ai.functions import embed_video
-
-    return embed_video(
-        self,
-        frames,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
-        output_column=output_column,
-        **options,
-    )
-
-
-def _embed_audio(
-    self: DuckDBPyRelation,
-    audio: Expression,
-    *,
-    provider: str | Provider = "transformers",
-    model: str | None = None,
-    dimensions: int | None = None,
-    on_error: Literal["raise", "ignore"] = "raise",
-    output_column: str = "embedding",
-    **options: Unpack[EmbedAudioOptions],
-) -> DuckDBPyRelation:
-    """Append a fixed-size embedding column. See :func:`vane.ai.embed_audio`."""
-    from vane.ai.functions import embed_audio
-
-    return embed_audio(
-        self,
-        audio,
-        provider=provider,
-        model=model,
-        dimensions=dimensions,
-        on_error=on_error,
+        where=where,
         output_column=output_column,
         **options,
     )
@@ -196,12 +118,6 @@ def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
     if not hasattr(DuckDBPyRelation, "embed"):
         setattr(DuckDBPyRelation, "embed", _embed)
-    if not hasattr(DuckDBPyRelation, "embed_image"):
-        setattr(DuckDBPyRelation, "embed_image", _embed_image)
-    if not hasattr(DuckDBPyRelation, "embed_audio"):
-        setattr(DuckDBPyRelation, "embed_audio", _embed_audio)
-    if not hasattr(DuckDBPyRelation, "embed_video"):
-        setattr(DuckDBPyRelation, "embed_video", _embed_video)
     if not hasattr(DuckDBPyRelation, "prompt"):
         setattr(DuckDBPyRelation, "prompt", _prompt)
     if not hasattr(DuckDBPyRelation, "jev"):

@@ -233,8 +233,10 @@ input: the builder copies its verified libraries and notices into the provider.
 Install only the combined provider wheel. See the runtime guide's
 [loading model](packages/vane-media-runtime/README.md#loading-model) for library
 verification, prepared directories and direct SQL loading. Provider versions
-bind the exact Vane version and descriptor hash; runtime versions and source
-identities are described in the [runtime guide](packages/vane-media-runtime/README.md).
+use `X.Y.Z.N`, combining the exact Vane version with the independent counter in
+[native-media-release.toml](native-media-release.toml). Descriptors retain the
+complete artifact hashes. Internal runtime versions and source identities are
+described in the [runtime guide](packages/vane-media-runtime/README.md).
 
 The older static media build is available only with explicit
 `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON`, using the optional root vcpkg features.
@@ -261,6 +263,8 @@ After signing the final dynamic extension, pass both the exact runtime wheel
 and its corresponding source archive to the provider wheel builder. These must
 be the runtime artifacts used when preparing the extension's trailer. The
 license expression and complete dependency notices follow the profile above.
+Use the configured `native_media.release_number` for `--release-number` and
+increment it when the provider bytes or metadata change.
 Set the paths to the signed extension, runtime artifacts, and matching base
 wheel before running:
 
@@ -270,7 +274,9 @@ wheel before running:
 : "${VANE_MEDIA_RUNTIME_SOURCE:?Set the matching runtime source archive path}"
 : "${VANE_BASE_WHEEL:?Set the matching Vane base wheel path}"
 : "${media_wheel_license_expression:?Set the reviewed binary SPDX expression}"
+: "${VANE_MEDIA_RELEASE_NUMBER:?Set providers.native_media.release_number from native-media-release.toml}"
 python -I scripts/build_extension_wheel.py \
+  --release-number "$VANE_MEDIA_RELEASE_NUMBER" \
   --artifact "$VANE_MEDIA_SIGNED_EXTENSION" \
   --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \
@@ -393,6 +399,7 @@ the directory to the ordinary wheel builder:
 ```bash
 # Set this to the reviewed expression covering the binary and all materials.
 : "${media_wheel_license_expression:?Set the complete wheel SPDX expression}"
+: "${VANE_MEDIA_RELEASE_NUMBER:?Set providers.native_media.release_number from native-media-release.toml}"
 python -I scripts/prepare_extension_materials.py \
   --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
   --extension-name native_media \
@@ -401,6 +408,7 @@ python -I scripts/prepare_extension_materials.py \
   --inventory build/media-release-materials/inventory.json
 
 python -I scripts/build_extension_wheel.py \
+  --release-number "$VANE_MEDIA_RELEASE_NUMBER" \
   --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
   --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \

@@ -202,3 +202,29 @@ def test_duckdb_manifest_injection_replaces_stale_manifests_once(tmp_path):
     names, contents, _ = _read_sdist_file(archive_path, "/DUCKDB_FORK_REVISION")
     assert names.count("project-1.0/DUCKDB_FORK_REVISION") == 1
     assert contents == (current_fork_revision + "\n").encode("ascii")
+
+
+def test_manifest_injection_closes_source_before_replacing_archive(tmp_path, monkeypatch):
+    archive_path = tmp_path / "project.tar.gz"
+    _write_sdist(archive_path, {"project-1.0/pyproject.toml": b"[build-system]\n"})
+    source_archives = []
+    original_open = tarfile.open
+    original_replace = build_backend.os.replace
+
+    def open_archive(*args, **kwargs):
+        archive = original_open(*args, **kwargs)
+        if kwargs.get("mode") == "r:gz":
+            source_archives.append(archive)
+        return archive
+
+    def replace_archive(source, destination):
+        # Model Windows sharing restrictions on POSIX test hosts as well.
+        assert source_archives
+        assert all(archive.fileobj.closed for archive in source_archives)
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(build_backend.tarfile, "open", open_archive)
+    monkeypatch.setattr(build_backend.os, "replace", replace_archive)
+    build_backend._inject_duckdb_manifests(archive_path, "a" * 40, "b" * 40)
+    _, contents, _ = _read_sdist_file(archive_path, "/DUCKDB_SOURCE_ID")
+    assert contents == b"a" * 40 + b"\n"

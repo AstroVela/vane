@@ -1,0 +1,192 @@
+{
+  "status": "FAIL",
+  "runs": [
+    {
+      "label": "blob-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705287.4363554,
+      "ended_epoch": 1791705296.7774317
+    },
+    {
+      "label": "blob-bounded-scan",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob/regression",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-blob"
+      ],
+      "returncode": 1,
+      "expected": 1,
+      "started_epoch": 1791705296.7782362,
+      "ended_epoch": 1791705296.8430712
+    },
+    {
+      "label": "blob_point-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705296.84643,
+      "ended_epoch": 1791705306.4394116
+    },
+    {
+      "label": "blob_point-bounded-scan",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/regression",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-blob_point"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705306.4402869,
+      "ended_epoch": 1791705306.5050395
+    },
+    {
+      "label": "blob_point-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705306.5062244,
+      "ended_epoch": 1791705306.5713036
+    },
+    {
+      "label": "blob_point-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-python-blob_point",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/tests",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/test_corruption.py"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705306.5722158,
+      "ended_epoch": 1791705403.1030931
+    },
+    {
+      "label": "external-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705403.2386587,
+      "ended_epoch": 1791705429.1770403
+    },
+    {
+      "label": "external-bounded-scan",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/regression",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-external"
+      ],
+      "returncode": 1,
+      "expected": 1,
+      "started_epoch": 1791705429.17811,
+      "ended_epoch": 1791705429.2428021
+    },
+    {
+      "label": "external_point-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705429.2468514,
+      "ended_epoch": 1791705456.8894799
+    },
+    {
+      "label": "external_point-bounded-scan",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/regression",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-external_point"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705456.8906167,
+      "ended_epoch": 1791705456.9553828
+    },
+    {
+      "label": "external_point-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791705456.956778,
+      "ended_epoch": 1791705457.0218468
+    },
+    {
+      "label": "external_point-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-python-external_point",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/tests",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/test_corruption.py"
+      ],
+      "returncode": 1,
+      "expected": 0,
+      "started_epoch": 1791705457.0229921,
+      "ended_epoch": 1791705558.3688157
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-blob",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-python-blob_point",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-regression-external",
+      "removed": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/owned-python-external_point",
+      "removed": true
+    }
+  ],
+  "started_epoch": 1791705287.436321,
+  "error": "AssertionError(('external_point-python', 1))",
+  "ended_epoch": 1791705558.5915716
+}

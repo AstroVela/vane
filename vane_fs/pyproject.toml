@@ -19,7 +19,7 @@ test = ["pytest>=8.2", "pytest-timeout>=2.3", "fsspec>=2022.11.0"]
 minimum-version = "0.11"
 cmake.version = ">=3.29"
 wheel.packages = ["python/vane_fs"]
-sdist.include = ["/CMakeLists.txt", "/vcpkg.json", "/include/**/*.hpp", "/include/**/*.h", "/src/*.cpp", "/src/*.hpp", "/python/vane_fs/*.py", "/tests/*.py", "/tests/*.cpp", "/benchmarks/*.py", "/benchmarks/*.md", "/benchmarks/*.json", "/LICENSE", "/LICENSES/*.txt"]
+sdist.include = ["/CMakeLists.txt", "/vcpkg.json", "/triplets/*.cmake", "/include/**/*.hpp", "/include/**/*.h", "/src/*.cpp", "/src/*.hpp", "/python/vane_fs/*.py", "/tests/*.py", "/tests/*.cpp", "/benchmarks/*.py", "/benchmarks/*.md", "/benchmarks/*.json", "/LICENSE", "/LICENSES/*.txt"]
 sdist.exclude = ["build/**", "vcpkg_installed/**", ".venv/**", ".cache/**", "**/__pycache__/**", "**/*.pyc"]
 
 [tool.pytest.ini_options]

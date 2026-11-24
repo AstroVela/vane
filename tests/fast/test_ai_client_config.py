@@ -94,7 +94,8 @@ def _sdk_state(payload):
         runtime = descriptor.instantiate()
         client = runtime._client
         try:
-            if descriptor.get_provider() == "google":
+            family = descriptor.get_provider()
+            if family == "google":
                 return {
                     "api_key": client._api_client.api_key,
                     "vertexai": client.vertexai,
@@ -102,14 +103,18 @@ def _sdk_state(payload):
                     "project": client._api_client.project,
                     "location": client._api_client.location,
                 }
-            return {
+            state = {
                 "api_key": client.api_key,
                 "base_url": str(client.base_url),
-                "organization": getattr(client, "organization", None),
-                "project": getattr(client, "project", None),
-                "auth_token": getattr(client, "auth_token", None),
                 "headers": dict(client.default_headers),
             }
+            if family == "openai":
+                state.update(organization=client.organization, project=client.project)
+            else:
+                # Anthropic's organization accessor returns an API resource.
+                # Its client identity uses API key or auth token instead.
+                state["auth_token"] = client.auth_token
+            return state
         finally:
             if descriptor.get_provider() == "google" and not hasattr(client.aio, "aclose"):
                 # SDK 1.22 supports construction but predates the public close
@@ -143,7 +148,8 @@ def test_descriptor_pins_application_identity_under_conflicting_sdk_environment(
         if family == "openai":
             assert state["project"] is None
             assert state["organization"] is None
-        assert state["auth_token"] is None
+        else:
+            assert state["auth_token"] is None
         assert "worker" not in repr(state["headers"])
         assert state["base_url"].startswith("https://api." + family + ".com")
 
@@ -384,6 +390,42 @@ def test_anthropic_auth_token_isolated_from_worker_api_key(monkeypatch):
     assert state["api_key"] is None
     assert state["auth_token"] == "application-token"
     assert state["headers"]["Authorization"] == "Bearer application-token"
+
+
+@pytest.mark.parametrize(
+    "settings,expected_auth",
+    [
+        (
+            {"api_key": "application-key"},
+            ({"x-api-key": "application-key"}, {"authorization": "Bearer application-key"}),
+        ),
+        ({"auth_token": "application-token"}, ({"authorization": "Bearer application-token"},)),
+    ],
+)
+def test_anthropic_requests_use_only_captured_application_credentials(monkeypatch, settings, expected_auth):
+    pytest.importorskip("anthropic")
+
+    async def request(payload):
+        runtime = pickle.loads(payload).instantiate()
+        try:
+            assert await runtime.prompt(("hello",)) == "ok"
+        finally:
+            await runtime.aclose()
+
+    with _model_server() as (endpoint, requests):
+        payload = pickle.dumps(_descriptor("anthropic", "prompt", base_url=endpoint, **settings))
+        for key, value in WORKER_ENV.items():
+            monkeypatch.setenv(key, value)
+        before = dict(os.environ)
+        asyncio.run(request(payload))
+        assert dict(os.environ) == before
+
+    assert len(requests) == 1
+    path, headers, _ = requests[0]
+    assert path == "/v1/messages"
+    headers = {key.lower(): value for key, value in headers.items()}
+    assert {key: headers[key] for key in ("authorization", "x-api-key") if key in headers} in expected_auth
+    assert "worker" not in repr(headers)
 
 
 def test_concurrent_sdk_construction_keeps_credentials_and_organization_isolated(monkeypatch):
@@ -668,8 +710,12 @@ def _run_existing_cluster_case(monkeypatch, conflicting_workers):
                     assert headers["x-goog-api-key"] == "application-google-key"
                     assert "projects/" not in path
                 elif "messages" in path:
-                    assert headers["x-api-key"] == "application-anthropic-key"
-                    assert "authorization" not in headers
+                    # SDK 2.x sends API keys as Bearer tokens; older SDKs use
+                    # x-api-key. Both must carry only the application key.
+                    assert {key: headers[key] for key in ("authorization", "x-api-key") if key in headers} in (
+                        {"x-api-key": "application-anthropic-key"},
+                        {"authorization": "Bearer application-anthropic-key"},
+                    )
                 else:
                     if headers["authorization"].startswith("Bearer account-"):
                         account = headers["authorization"].split("-")[1]

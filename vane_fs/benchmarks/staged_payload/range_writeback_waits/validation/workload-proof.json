@@ -1,0 +1,35 @@
+{
+  "status": "PASS",
+  "exact_reverse": true,
+  "original_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+  "changes": [
+    [
+      "        latencies = []",
+      "        latencies, diagnostic_intervals = [], []"
+    ],
+    [
+      "            t2 = time.perf_counter()\n            assert os.pwrite(fd, replacement, off) == 4096\n            latencies.append(time.perf_counter() - t2)",
+      "            begin_ns = time.monotonic_ns()\n            t2 = time.perf_counter()\n            assert os.pwrite(fd, replacement, off) == 4096\n            latencies.append(time.perf_counter() - t2)\n            diagnostic_intervals.append(dict(kind=\"write\", begin_ns=begin_ns, end_ns=time.monotonic_ns(), offset=off, bytes=4096))"
+    ],
+    [
+      "        t2 = time.perf_counter()\n        os.fsync(fd)\n        sync = time.perf_counter() - t2",
+      "        begin_ns = time.monotonic_ns()\n        t2 = time.perf_counter()\n        os.fsync(fd)\n        sync = time.perf_counter() - t2\n        diagnostic_intervals.append(dict(kind=\"fsync\", begin_ns=begin_ns, end_ns=time.monotonic_ns()))"
+    ],
+    [
+      "            \"workload\": \"random_write_4k\",",
+      "            \"workload\": \"random_write_4k\",\n            \"diagnostic_intervals\": diagnostic_intervals,\n            \"application_pid\": os.getpid(),"
+    ],
+    [
+      "        for i in range(128):\n            t = time.perf_counter()\n            fd = os.open(point / f\"small-{i}\",",
+      "        diagnostic_intervals = []\n        for i in range(128):\n            begin_ns = time.monotonic_ns()\n            t = time.perf_counter()\n            fd = os.open(point / f\"small-{i}\","
+    ],
+    [
+      "            finally:\n                os.close(fd)\n            samples.append(time.perf_counter() - t)",
+      "            finally:\n                os.close(fd)\n            samples.append(time.perf_counter() - t)\n            diagnostic_intervals.append(dict(kind=\"small_file\", index=i, begin_ns=begin_ns, end_ns=time.monotonic_ns()))"
+    ],
+    [
+      "                \"workload\": \"small_file_fsync\",",
+      "                \"workload\": \"small_file_fsync\",\n                \"diagnostic_intervals\": diagnostic_intervals,\n                \"application_pid\": os.getpid(),"
+    ]
+  ]
+}

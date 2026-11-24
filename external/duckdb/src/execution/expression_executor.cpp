@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/expression_executor.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -71,6 +77,29 @@ void ExpressionExecutor::ClearExpressions() {
 	expressions.clear();
 }
 
+static void ResetExpressionInput(ExpressionState &state) {
+	state.intermediate_chunk.Reset();
+	for (idx_t i = 0; i < state.initialize.size(); i++) {
+		if (!state.initialize[i]) {
+			// Reference/constant/parameter arguments have no VectorCache, so
+			// DataChunk::Reset alone leaves their borrowed buffers alive.
+			state.intermediate_chunk.data[i].Reference(Vector(state.types[i], nullptr));
+		}
+	}
+	for (auto &child : state.child_states) {
+		ResetExpressionInput(*child);
+	}
+}
+
+void ExpressionExecutor::ResetInput() {
+	chunk = nullptr;
+	for (auto &state : states) {
+		if (state->root_state) {
+			ResetExpressionInput(*state->root_state);
+		}
+	}
+}
+
 void ExpressionExecutor::Initialize(const Expression &expression, ExpressionExecutorState &state) {
 	state.executor = this;
 	state.root_state = InitializeState(expression, state);
@@ -130,7 +159,9 @@ Value ExpressionExecutor::EvaluateScalar(ClientContext &context, const Expressio
 	// use an ExpressionExecutor to execute the expression
 	ExpressionExecutor executor(context, expr);
 
-	Vector result(expr.return_type);
+	// Scalar folding produces one row. A full vector of nested ARRAY values
+	// can reserve gigabytes before the constant expression replaces its data.
+	Vector result(expr.return_type, idx_t(1));
 	executor.ExecuteExpression(result);
 
 	D_ASSERT(allow_unfoldable || result.GetVectorType() == VectorType::CONSTANT_VECTOR);

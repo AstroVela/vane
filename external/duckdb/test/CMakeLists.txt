@@ -64,6 +64,9 @@ else()
 endif()
 
 add_executable(unittest unittest.cpp ${ALL_OBJECT_FILES})
+if(TARGET loadable_extension_batch_demo_loadable_extension)
+  add_dependencies(unittest loadable_extension_batch_demo_loadable_extension)
+endif()
 set_target_properties(
   unittest
   PROPERTIES CXX_STANDARD 11

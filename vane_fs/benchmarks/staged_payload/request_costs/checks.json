@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "production_native_logic_changed": false,
+  "component_suites": "Inherited only; original source hashes match. No rerun claimed.",
+  "diagnostic_mounts_validated": 64,
+  "short_request_analysis": "PASS: 32 mounts, exact request/byte/VM count checks",
+  "cpu_analysis": "PASS: 16 original-binary and 16 idle/warm mounts",
+  "format_root_changed": "PASS",
+  "ruff_check": "PASS after import whitespace fix",
+  "copyleft": "PASS"
+}

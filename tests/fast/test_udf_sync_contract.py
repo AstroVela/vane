@@ -127,7 +127,6 @@ def _runtime_payload(target, call_mode, *, execution_backend="subprocess_task"):
         "function_pickle": cloudpickle.dumps(target),
         "call_mode": call_mode,
         "execution_backend": execution_backend,
-        "udf_worker_slots": 1,
     }
     if execution_backend.endswith("actor"):
         payload["actor_number"] = 1

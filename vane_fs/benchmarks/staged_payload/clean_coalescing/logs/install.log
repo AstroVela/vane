@@ -1,0 +1,18 @@
+Using CPython 3.12.13 interpreter at: .venv/bin/python
+Creating virtual environment at: vane_fs/build/lookup-read-20261013T012000Z/baseline/venv
+Activate with: source vane_fs/build/lookup-read-20261013T012000Z/baseline/venv/bin/activate
+Using Python 3.12.13 environment at: venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline
+Prepared 1 package in 22.43s
+Installed 1 package in 0.98ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline)
+Using Python 3.12.13 environment at: /home/kaka/astrovela_vane-fs/.venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs
+Prepared 1 package in 22.30s
+Uninstalled 1 package in 1ms
+Installed 1 package in 1ms
+ ~ vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs)

@@ -12,6 +12,8 @@
 
 namespace duckdb {
 
-void RegisterVLLMExecutorFactory();
+class DatabaseInstance;
+
+void RegisterVLLMExecutorFactory(DatabaseInstance &db);
 
 } // namespace duckdb

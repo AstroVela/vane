@@ -1,0 +1,434 @@
+{
+  "status": "PASS",
+  "selection": "Longest candidate post-GC subsequent-64 final fsync; all 32 final fsyncs remain in findings.",
+  "trace_file": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-holds-20261018/ext4-diagnostic/vane-partial-owned-aged-col11lpq-waits.json",
+  "trace_sha256": "790bf41299458dfa0f91b6940a8426a5dd8579cebea753dbc75f34c86ae9fa1d",
+  "label": {
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 3,
+    "workload": "write_64"
+  },
+  "final_fsync": {
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 3,
+    "workload": "write_64",
+    "tid": 4049450,
+    "root_id": 5348,
+    "wall_ns": 3989036553,
+    "cpu_ns": 776405,
+    "exclusive_wall_ns": {
+      "root": 39092,
+      "database_wait": 3350,
+      "admission": 0,
+      "checkpoint_wait": 0,
+      "publication_wait": 3910083796,
+      "lease_wait": 0,
+      "payload_guard": 9302,
+      "flock": 46962,
+      "begin": 9610,
+      "commit": 8392,
+      "publish": 0,
+      "before_full": 3339,
+      "after_full": 3402,
+      "begin_batch": 0,
+      "prepare_external": 0,
+      "write_bytes": 0,
+      "step": 274461,
+      "exec": 143334,
+      "notify": 0,
+      "pwrite": 31836,
+      "pread": 61714,
+      "fsync": 78279316,
+      "fdatasync": 0,
+      "checkpoint": 0,
+      "publication_hold": 38647,
+      "checkpoint_hold": 0
+    },
+    "syncs": [
+      [
+        "fsync",
+        "wal",
+        5348,
+        192320039667401,
+        192320117942875,
+        72328,
+        0,
+        0,
+        8,
+        -1,
+        0,
+        -1,
+        -1,
+        -1
+      ]
+    ]
+  },
+  "original_slow_root": {
+    "tid": 4049450,
+    "root": [
+      "fsync",
+      5348,
+      192316129072666,
+      192320118109219,
+      776405,
+      -1,
+      -1,
+      4,
+      4043016,
+      92,
+      [
+        [
+          1,
+          3989036553,
+          39092,
+          776405,
+          50663
+        ],
+        [
+          2,
+          3350,
+          3350,
+          1740,
+          1740
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          3910083796,
+          3910083796,
+          22606,
+          22606
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          2,
+          22262,
+          9302,
+          19897,
+          9365
+        ],
+        [
+          6,
+          46962,
+          46962,
+          38662,
+          38662
+        ],
+        [
+          2,
+          177430,
+          9610,
+          175019,
+          9606
+        ],
+        [
+          2,
+          78419479,
+          8392,
+          217415,
+          8651
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          3339,
+          3339,
+          1761,
+          1761
+        ],
+        [
+          1,
+          3402,
+          3402,
+          1748,
+          1748
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          9,
+          78602249,
+          274461,
+          393328,
+          271963
+        ],
+        [
+          3,
+          155544,
+          143334,
+          150629,
+          140396
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          2,
+          31836,
+          31836,
+          28636,
+          28636
+        ],
+        [
+          4,
+          61714,
+          61714,
+          54632,
+          54632
+        ],
+        [
+          1,
+          78279316,
+          78279316,
+          77941,
+          77941
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          78863780,
+          38647,
+          662308,
+          58035
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    ],
+    "events": [
+      [
+        "publication_wait",
+        "none",
+        5348,
+        192316129138645,
+        192320039222441,
+        22606,
+        0,
+        0,
+        -1,
+        -1,
+        0,
+        -1,
+        -1,
+        -1
+      ],
+      [
+        "fsync",
+        "wal",
+        5348,
+        192320039667401,
+        192320117942875,
+        72328,
+        0,
+        0,
+        8,
+        -1,
+        0,
+        -1,
+        -1,
+        -1
+      ],
+      [
+        "publication_hold",
+        "none",
+        5348,
+        192320039223389,
+        192320118087169,
+        662308,
+        0,
+        0,
+        -1,
+        -1,
+        0,
+        -1,
+        -1,
+        -1
+      ]
+    ],
+    "waits": [
+      {
+        "event": [
+          "publication_wait",
+          "none",
+          5348,
+          192316129138645,
+          192320039222441,
+          22606,
+          0,
+          0,
+          -1,
+          -1,
+          0,
+          -1,
+          -1,
+          -1
+        ],
+        "concurrent_other_thread_syncs": [
+          [
+            4049452,
+            [
+              "fdatasync",
+              "payload",
+              2208,
+              192316129904636,
+              192319619530523,
+              22721979,
+              0,
+              0,
+              17,
+              -1,
+              0,
+              -1,
+              -1,
+              -1
+            ]
+          ],
+          [
+            4049452,
+            [
+              "fsync",
+              "wal",
+              2208,
+              192319619644236,
+              192320038102907,
+              2245189,
+              0,
+              0,
+              13,
+              -1,
+              0,
+              -1,
+              -1,
+              -1
+            ]
+          ],
+          [
+            4049452,
+            [
+              "fdatasync",
+              "fence",
+              2208,
+              192320038197019,
+              192320039118985,
+              75209,
+              0,
+              0,
+              10,
+              -1,
+              0,
+              -1,
+              -1,
+              -1
+            ]
+          ]
+        ],
+        "concurrent_sync_covered_ns": 3909006524
+      }
+    ],
+    "scheduler": {
+      "complete_sample_intervals": 644,
+      "covered_wall_ns": 3983702147,
+      "scheduler_runtime_ns_observed": 520402,
+      "scheduler_runqueue_ns_observed": 19008,
+      "background_runtime_ns_observed": 23026550,
+      "migrated_intervals": 0,
+      "cpus": [
+        16
+      ],
+      "same_cpu_frequency_weight_ns": 520402,
+      "runtime_weighted_frequency_khz": 1199633.0,
+      "frequency_khz_runtime_weights_ns": {
+        "1199633": 520402
+      }
+    }
+  },
+  "overlapping_publication_holders": [
+    {
+      "tid": 4049452,
+      "event": [
+        "publication_hold",
+        "none",
+        2208,
+        192316128496394,
+        192320039191480,
+        25652180,
+        0,
+        0,
+        -1,
+        -1,
+        0,
+        -1,
+        -1,
+        -1
+      ]
+    }
+  ]
+}

@@ -1,47 +1,20 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local FTE runner sub-package."""
+"""Native local execution configuration."""
 
 from __future__ import annotations
 
-import os
-from typing import Any
+from vane._env import env
 
-from vane.runners.local.runner import (
-    LocalRunner,
-    _normalize_execution_mode,
-    _normalize_max_running_tasks,
-    _normalize_num_workers,
-)
-from vane.runners.runner import Runner
-
-__all__ = ["LocalRunner", "set_runner_local"]
+__all__ = ["set_runner_local"]
 
 
-def set_runner_local(
-    num_workers: int | None = 1,
-    *,
-    max_running_tasks: Any = None,
-    execution_mode: str | None = "in_process",
-) -> Runner:
-    """Configure Vane to use the local FTE plan runner."""
-    from vane import _native
+def set_runner_local() -> None:
+    """Select native local execution for new connections.
 
-    normalized_num_workers = _normalize_num_workers(num_workers)
-    normalized_max_running_tasks = _normalize_max_running_tasks(max_running_tasks)
-    normalized_execution_mode = _normalize_execution_mode(execution_mode)
-    previous_runner = os.environ.get("VANE_RUNNER")
-    os.environ["VANE_RUNNER"] = "local"
-    try:
-        return _native.set_runner_local(
-            normalized_num_workers,
-            normalized_max_running_tasks,
-            normalized_execution_mode,
-        )
-    except BaseException:
-        if previous_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = previous_runner
-        raise
+    Existing connections keep their execution mode. Configure connection threads
+    through ``vane.connect(config={"threads": ...})`` and shared admission through
+    ``connection.configure_local_runtime()``.
+    """
+    env.runner = "local"

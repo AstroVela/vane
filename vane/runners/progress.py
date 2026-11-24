@@ -10,6 +10,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, TextIO
 
+from vane._env import _normalize_runner
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -22,7 +24,7 @@ def progress_enabled(runner_type: str | None = None) -> bool:
     value = os.getenv("VANE_PROGRESS", "auto").strip().lower()
     if value in _FALSE_VALUES:
         return False
-    runner = (runner_type or os.getenv("VANE_RUNNER") or "").strip().lower() or "ray"
+    runner = _normalize_runner(runner_type or os.getenv("VANE_RUNNER"))
     return runner in {"local", "ray"} or value not in ("", "auto")
 
 

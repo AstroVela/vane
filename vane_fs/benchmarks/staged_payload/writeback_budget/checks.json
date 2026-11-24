@@ -1,0 +1,12 @@
+{
+  "status": "PASS",
+  "checked_epoch": 1791740054.8672876,
+  "affected_file_formatting": "scripts/format root --changed",
+  "ruff": "Seven affected Python files; the publication helper was checked again after its frozen-input assertion was added.",
+  "copyleft": {
+    "source_inventory": "passed",
+    "native_profile": "passed",
+    "installed_notices": []
+  },
+  "scope": "Only related component/fixture suites ran; no full release or Ray suite. Formatting and static checks ran after all measurement windows stopped."
+}

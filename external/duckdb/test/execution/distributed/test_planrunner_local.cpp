@@ -333,8 +333,10 @@ public:
 		    DuckDBError::invalid_state_error("DataSink must use streaming result validation"));
 	}
 
-	DuckDBResult<std::vector<MaterializedOutput>>
-	wait_fte_query_streaming(const string &, double, MaterializedOutputCallback on_output) override {
+	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query_streaming(const string &, double,
+	                                                                       MaterializedOutputCallback on_output,
+	                                                                       bool preserve_task_order) override {
+		REQUIRE(preserve_task_order);
 		if (task_contexts.empty() || task_contexts.front().node_ids().empty()) {
 			return DuckDBResult<std::vector<MaterializedOutput>>::err(
 			    DuckDBError::invalid_state_error("DataSink test task has no pipeline node identity"));
@@ -415,8 +417,10 @@ public:
 		    DuckDBError::invalid_state_error("DataSink must use streaming result validation"));
 	}
 
-	DuckDBResult<std::vector<MaterializedOutput>>
-	wait_fte_query_streaming(const string &, double, MaterializedOutputCallback on_output) override {
+	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query_streaming(const string &, double,
+	                                                                       MaterializedOutputCallback on_output,
+	                                                                       bool preserve_task_order) override {
+		REQUIRE(preserve_task_order);
 		if (task_contexts.empty() || task_contexts.front().node_ids().empty()) {
 			return DuckDBResult<std::vector<MaterializedOutput>>::err(
 			    DuckDBError::invalid_state_error("DataSink test task has no pipeline node identity"));
@@ -524,7 +528,7 @@ public:
 	}
 
 	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query_streaming(const string &, double,
-	                                                                       MaterializedOutputCallback) override {
+	                                                                       MaterializedOutputCallback, bool) override {
 		return DuckDBResult<std::vector<MaterializedOutput>>::err(
 		    DuckDBError::external_error("oversized-worker-error:" + string(100000, 'x')));
 	}

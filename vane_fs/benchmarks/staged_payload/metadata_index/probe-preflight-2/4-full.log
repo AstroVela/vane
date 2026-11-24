@@ -1,0 +1,9 @@
+mode=full seconds=0.120281 calls=736 steps=1484809 wal_bytes=5582632
+page_count=1170 
+freelist_count=0 
+id=2 parent=0 notused=47 detail=SEARCH block_versions USING PRIMARY KEY (inode=? AND block=? AND low<?) 
+id=2 parent=0 notused=47 detail=SEARCH block_versions USING PRIMARY KEY (inode=? AND block>? AND block<?) 
+id=4 parent=0 notused=47 detail=SEARCH b USING PRIMARY KEY (inode=? AND block>? AND block<?) 
+id=22 parent=0 notused=45 detail=SEARCH p USING INTEGER PRIMARY KEY (rowid=?) 
+quick_check=ok 
+freelist_count=342 

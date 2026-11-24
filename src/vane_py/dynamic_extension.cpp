@@ -187,6 +187,35 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 #endif
 }
 
+#ifdef DUCKDB_WINDOWS
+static bool DynamicExtensionCacheIsVolumeRoot(const std::wstring &path) {
+	const idx_t offset = path.compare(0, 4, L"\\\\?\\") == 0 ? 4 : 0;
+	const auto length = std::wstring(path.c_str()).size();
+	if (length != offset + 3 || path[offset + 1] != L':' || (path[offset + 2] != L'\\' && path[offset + 2] != L'/')) {
+		return false;
+	}
+	// SUBST drive roots can name ordinary, replaceable directories. Resolve
+	// the opened directory to its volume GUID before exempting root DELETE.
+	auto handle =
+	    CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+	                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	wchar_t final_path[MAX_PATH];
+	auto final_length =
+	    GetFinalPathNameByHandleW(handle, final_path, MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+	CloseHandle(handle);
+	if (!final_length || final_length >= MAX_PATH) {
+		return false;
+	}
+	const std::wstring resolved(final_path, final_length);
+	const auto volume_end = resolved.find(L'}');
+	return resolved.compare(0, 11, L"\\\\?\\Volume{") == 0 && volume_end != std::wstring::npos &&
+	       volume_end + 2 == resolved.size() && resolved.back() == L'\\';
+}
+#endif
+
 static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 #ifdef DUCKDB_WINDOWS
 	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
@@ -237,7 +266,13 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 	}
 
 	GENERIC_MAPPING file_mapping {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
-	constexpr ACCESS_MASK replacement_rights = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
+	// DuckDB undefines the Windows DELETE macro to protect its SQL enum names.
+	constexpr ACCESS_MASK delete_access = 0x00010000L;
+	const bool drive_root = DynamicExtensionCacheIsVolumeRoot(windows_path);
+	// DELETE cannot remove a drive root. Keep checking rights that can replace
+	// its children or change its ACL, including on a root with a trusted owner.
+	const ACCESS_MASK replacement_rights =
+	    FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | (drive_root ? 0 : delete_access);
 	for (ULONG index = 0; !replaceable && index < entry_count; index++) {
 		auto &entry = entries[index];
 		if ((entry.grfAccessMode != GRANT_ACCESS && entry.grfAccessMode != SET_ACCESS) ||
@@ -336,8 +371,9 @@ static bool VerifyNativeRuntimeSignature(const py::bytes &contents, const py::by
 	if (payload.empty() || payload.size() > 64 * 1024 || signature_bytes.size() != 256) {
 		return false;
 	}
-	static constexpr char DOMAIN[] = "VANE_NATIVE_RUNTIME_MANIFEST_V1\0";
-	auto hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(string(DOMAIN, sizeof(DOMAIN) - 1) + payload);
+	static constexpr char SIGNATURE_DOMAIN[] = "VANE_NATIVE_RUNTIME_MANIFEST_V1\0";
+	auto hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(
+	    string(SIGNATURE_DOMAIN, sizeof(SIGNATURE_DOMAIN) - 1) + payload);
 	for (auto &key : ExtensionHelper::GetPublicKeys(allow_community)) {
 		if (duckdb_mbedtls::MbedTlsWrapper::IsValidSha256Signature(key, signature_bytes, hash)) {
 			return true;

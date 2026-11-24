@@ -4,6 +4,7 @@
 // Distributed COPY sink node
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/copy_to_file.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
@@ -20,7 +21,8 @@ namespace duckdb {
 namespace distributed {
 
 inline bool DistributedCopyReadBoolEnv(const char *name, bool &result) {
-	auto raw = std::getenv(name);
+	const duckdb::EnvironmentVariable raw_env(name);
+	const char *raw = raw_env.GetValue();
 	if (!raw || !*raw) {
 		return false;
 	}

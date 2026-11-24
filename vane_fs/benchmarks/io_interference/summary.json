@@ -1,0 +1,4428 @@
+{
+  "direct": {
+    "direct": {
+      "status": "PASS",
+      "runs": 36,
+      "variants": {
+        "framed-concurrent": {
+          "seconds": {
+            "count": 6,
+            "min": 1.784621983,
+            "median": 1.821433699,
+            "p95": 1.850963316,
+            "p99": 1.850963316,
+            "max": 1.850963316,
+            "sum": 10.910075001000001
+          },
+          "seconds_samples": [1.815861763,1.800540374,1.784621983,1.827005635,1.83108193,1.850963316],
+          "combined_mib_s": 140.78729979942509,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.038421172,
+            "median": 0.108764064,
+            "p95": 0.172491476,
+            "p99": 0.183578439,
+            "max": 0.183578439,
+            "sum": 7.449148167
+          },
+          "syncs_over_one_second": 0
+        },
+        "framed-serial": {
+          "seconds": {
+            "count": 6,
+            "min": 1.950317383,
+            "median": 2.047653272,
+            "p95": 8.12173971,
+            "p99": 8.12173971,
+            "max": 8.12173971,
+            "sum": 18.269645017
+          },
+          "seconds_samples": [1.950317383,2.127067386,1.992965851,2.102340693,1.975213994,8.12173971],
+          "combined_mib_s": 84.0738831307748,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.037875342,
+            "median": 0.1109131455,
+            "p95": 0.174607223,
+            "p99": 3.577482854,
+            "max": 3.577482854,
+            "sum": 13.544560266
+          },
+          "syncs_over_one_second": 2
+        },
+        "large-concurrent": {
+          "seconds": {
+            "count": 6,
+            "min": 1.578116249,
+            "median": 1.6068133439999999,
+            "p95": 1.63914375,
+            "p99": 1.63914375,
+            "max": 1.63914375,
+            "sum": 9.653816787
+          },
+          "seconds_samples": [1.63914375,1.607148589,1.578116249,1.606478099,1.589756919,1.633173181],
+          "combined_mib_s": 159.10805372527938,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.038440139,
+            "median": 0.108493994,
+            "p95": 0.169897804,
+            "p99": 0.178050813,
+            "max": 0.178050813,
+            "sum": 7.40187584
+          },
+          "syncs_over_one_second": 0
+        },
+        "large-serial": {
+          "seconds": {
+            "count": 6,
+            "min": 1.6661585,
+            "median": 1.754289772,
+            "p95": 7.425688416,
+            "p99": 7.425688416,
+            "max": 7.425688416,
+            "sum": 21.477070623
+          },
+          "seconds_samples": [1.746506425,1.6661585,7.425688416,1.762073119,7.186398233,1.69024593],
+          "combined_mib_s": 71.51813331353871,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.037499187,
+            "median": 0.11913366,
+            "p95": 2.006798091,
+            "p99": 2.857954918,
+            "max": 2.857954918,
+            "sum": 18.536566304
+          },
+          "syncs_over_one_second": 5
+        },
+        "paced-concurrent": {
+          "seconds": {
+            "count": 6,
+            "min": 3.997729863,
+            "median": 4.0393496445,
+            "p95": 9.639300936,
+            "p99": 9.639300936,
+            "max": 9.639300936,
+            "sum": 35.153805925
+          },
+          "seconds_samples": [9.639300936,4.060389606,4.018309683,9.428470357,4.00960548,3.997729863],
+          "combined_mib_s": 43.69370426852295,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.039055723,
+            "median": 0.112911659,
+            "p95": 2.323793085,
+            "p99": 3.44659759,
+            "max": 3.44659759,
+            "sum": 19.131891269
+          },
+          "syncs_over_one_second": 4
+        },
+        "paced-serial": {
+          "seconds": {
+            "count": 6,
+            "min": 4.29585679,
+            "median": 4.388185464499999,
+            "p95": 10.894519471,
+            "p99": 10.894519471,
+            "max": 10.894519471,
+            "sum": 38.699287093
+          },
+          "seconds_samples": [4.359764176,4.29585679,10.894519471,4.361340909,10.372775727,4.41503002],
+          "combined_mib_s": 39.690653636816855,
+          "sync_seconds": {
+            "count": 72,
+            "min": 0.038778793,
+            "median": 0.1122148985,
+            "p95": 2.761643542,
+            "p99": 4.023791338,
+            "max": 4.023791338,
+            "sum": 20.240871757
+          },
+          "syncs_over_one_second": 4
+        }
+      },
+      "slow_syncs": [
+        {
+          "variant": "paced-concurrent",
+          "rep": 0,
+          "pid": 1660126,
+          "tid": 1660126,
+          "file": "db.raw",
+          "seconds": 3.446504303,
+          "begin_epoch": 1791650984.4215162,
+          "end_epoch": 1791650987.8680208,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67813376,
+            "writes_completed": 158,
+            "write_ms": 39705,
+            "flushes_completed": 2,
+            "flush_ms": 383
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 114,
+            "D:__lock_buffer": 15,
+            "D:folio_wait_bit_common": 15,
+            "D:jbd2_log_wait_commit": 19
+          }
+        },
+        {
+          "variant": "paced-concurrent",
+          "rep": 0,
+          "pid": 1660126,
+          "tid": 1660225,
+          "file": "wal.raw",
+          "seconds": 2.616347995,
+          "begin_epoch": 1791650988.0301692,
+          "end_epoch": 1791650990.6465173,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 44691456,
+            "writes_completed": 42,
+            "write_ms": 15009,
+            "flushes_completed": 4,
+            "flush_ms": 2218
+          },
+          "wait_samples": {
+            "D:folio_wait_bit_common": 21,
+            "D:jbd2_log_wait_commit": 84
+          }
+        },
+        {
+          "variant": "large-serial",
+          "rep": 2,
+          "pid": 1661175,
+          "tid": 1661175,
+          "file": "wal.raw",
+          "seconds": 1.096652686,
+          "begin_epoch": 1791651019.4168823,
+          "end_epoch": 1791651020.5135348,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 18153472,
+            "writes_completed": 85,
+            "write_ms": 17601,
+            "flushes_completed": 2,
+            "flush_ms": 162
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 12,
+            "D:folio_wait_bit_common": 26,
+            "D:jbd2_log_wait_commit": 8
+          }
+        },
+        {
+          "variant": "large-serial",
+          "rep": 2,
+          "pid": 1661175,
+          "tid": 1661175,
+          "file": "wal.raw",
+          "seconds": 2.857847828,
+          "begin_epoch": 1791651020.5703523,
+          "end_epoch": 1791651023.4282002,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 50855936,
+            "writes_completed": 118,
+            "write_ms": 40506,
+            "flushes_completed": 6,
+            "flush_ms": 2112
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 70,
+            "D:do_get_write_access": 1,
+            "D:folio_wait_bit_common": 25,
+            "D:jbd2_log_wait_commit": 22
+          }
+        },
+        {
+          "variant": "large-serial",
+          "rep": 2,
+          "pid": 1661175,
+          "tid": 1661175,
+          "file": "db.raw",
+          "seconds": 2.006710969,
+          "begin_epoch": 1791651023.4964695,
+          "end_epoch": 1791651025.5031805,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67448832,
+            "writes_completed": 99,
+            "write_ms": 32925,
+            "flushes_completed": 8,
+            "flush_ms": 1319
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 60,
+            "D:folio_wait_bit_common": 2
+          }
+        },
+        {
+          "variant": "paced-serial",
+          "rep": 2,
+          "pid": 1661632,
+          "tid": 1661632,
+          "file": "wal.raw",
+          "seconds": 2.804105816,
+          "begin_epoch": 1791651041.1807857,
+          "end_epoch": 1791651043.9848914,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51175424,
+            "writes_completed": 135,
+            "write_ms": 36314,
+            "flushes_completed": 2,
+            "flush_ms": 560
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 96,
+            "D:folio_wait_bit_common": 12,
+            "D:jbd2_log_wait_commit": 27
+          }
+        },
+        {
+          "variant": "paced-serial",
+          "rep": 2,
+          "pid": 1661632,
+          "tid": 1661632,
+          "file": "db.raw",
+          "seconds": 4.023691583,
+          "begin_epoch": 1791651044.0711184,
+          "end_epoch": 1791651048.0948098,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 57847808,
+            "writes_completed": 59,
+            "write_ms": 35641,
+            "flushes_completed": 2,
+            "flush_ms": 533
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 82,
+            "D:folio_wait_bit_common": 62,
+            "D:jbd2_log_wait_commit": 46
+          }
+        },
+        {
+          "variant": "paced-concurrent",
+          "rep": 3,
+          "pid": 1662064,
+          "tid": 1662064,
+          "file": "wal.raw",
+          "seconds": 2.830596797,
+          "begin_epoch": 1791651057.4126177,
+          "end_epoch": 1791651060.2432144,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51900416,
+            "writes_completed": 110,
+            "write_ms": 29502,
+            "flushes_completed": 2,
+            "flush_ms": 404
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 70,
+            "D:folio_wait_bit_common": 42,
+            "D:jbd2_log_wait_commit": 20
+          }
+        },
+        {
+          "variant": "paced-concurrent",
+          "rep": 3,
+          "pid": 1662064,
+          "tid": 1662064,
+          "file": "db.raw",
+          "seconds": 2.323704052,
+          "begin_epoch": 1791651060.3318403,
+          "end_epoch": 1791651062.6555443,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67432448,
+            "writes_completed": 100,
+            "write_ms": 26489,
+            "flushes_completed": 4,
+            "flush_ms": 22
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 100,
+            "D:folio_wait_bit_common": 5,
+            "D:jbd2_log_wait_commit": 1
+          }
+        },
+        {
+          "variant": "large-serial",
+          "rep": 4,
+          "pid": 1662996,
+          "tid": 1662996,
+          "file": "wal.raw",
+          "seconds": 2.512953612,
+          "begin_epoch": 1791651087.597683,
+          "end_epoch": 1791651090.1106365,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 50778112,
+            "writes_completed": 51,
+            "write_ms": 19327,
+            "flushes_completed": 2,
+            "flush_ms": 373
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 48,
+            "D:folio_wait_bit_common": 51,
+            "D:jbd2_log_wait_commit": 18
+          }
+        },
+        {
+          "variant": "large-serial",
+          "rep": 4,
+          "pid": 1662996,
+          "tid": 1662996,
+          "file": "db.raw",
+          "seconds": 2.295104332,
+          "begin_epoch": 1791651090.180916,
+          "end_epoch": 1791651092.4760203,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67960832,
+            "writes_completed": 118,
+            "write_ms": 37030,
+            "flushes_completed": 8,
+            "flush_ms": 2145
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 101,
+            "D:folio_wait_bit_common": 1
+          }
+        },
+        {
+          "variant": "paced-serial",
+          "rep": 4,
+          "pid": 1663470,
+          "tid": 1663470,
+          "file": "wal.raw",
+          "seconds": 2.761533858,
+          "begin_epoch": 1791651108.39342,
+          "end_epoch": 1791651111.1549537,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51871744,
+            "writes_completed": 144,
+            "write_ms": 33262,
+            "flushes_completed": 4,
+            "flush_ms": 957
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 112,
+            "D:folio_wait_bit_common": 17
+          }
+        },
+        {
+          "variant": "paced-serial",
+          "rep": 4,
+          "pid": 1663470,
+          "tid": 1663470,
+          "file": "db.raw",
+          "seconds": 3.596198412,
+          "begin_epoch": 1791651111.228541,
+          "end_epoch": 1791651114.8247392,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67981312,
+            "writes_completed": 95,
+            "write_ms": 37113,
+            "flushes_completed": 8,
+            "flush_ms": 2650
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 37,
+            "D:folio_wait_bit_common": 73,
+            "D:do_get_write_access": 1,
+            "D:jbd2_log_wait_commit": 21
+          }
+        },
+        {
+          "variant": "framed-serial",
+          "rep": 5,
+          "pid": 1664297,
+          "tid": 1664297,
+          "file": "db.raw",
+          "seconds": 3.577380151,
+          "begin_epoch": 1791651138.879599,
+          "end_epoch": 1791651142.4569793,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 68329472,
+            "writes_completed": 163,
+            "write_ms": 38020,
+            "flushes_completed": 2,
+            "flush_ms": 530
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 129,
+            "D:folio_wait_bit_common": 4,
+            "D:jbd2_log_wait_commit": 26
+          }
+        },
+        {
+          "variant": "framed-serial",
+          "rep": 5,
+          "pid": 1664297,
+          "tid": 1664297,
+          "file": "wal.raw",
+          "seconds": 1.865818605,
+          "begin_epoch": 1791651143.5122764,
+          "end_epoch": 1791651145.378095,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 65515520,
+            "writes_completed": 100,
+            "write_ms": 15754,
+            "flushes_completed": 2,
+            "flush_ms": 31
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 51,
+            "D:folio_wait_bit_common": 36,
+            "D:jbd2_log_wait_commit": 2
+          }
+        }
+      ]
+    },
+    "bounded": {
+      "status": "PASS",
+      "runs": 32,
+      "variants": {
+        "concurrent-16": {
+          "seconds": {
+            "count": 8,
+            "min": 4.17322833,
+            "median": 4.217397412,
+            "p95": 9.777112865,
+            "p99": 9.777112865,
+            "max": 9.777112865,
+            "sum": 48.875648197
+          },
+          "seconds_samples": [9.777112865,4.223698178,9.3596949,4.17322833,4.185579645,8.735243314,4.211096646,4.209994319],
+          "combined_mib_s": 41.90225757713239,
+          "sync_seconds": {
+            "count": 384,
+            "min": 0.009329693,
+            "median": 0.0310128395,
+            "p95": 0.300347515,
+            "p99": 0.93511937,
+            "max": 1.109232998,
+            "sum": 27.363536646
+          },
+          "syncs_over_one_second": 2
+        },
+        "concurrent-64": {
+          "seconds": {
+            "count": 8,
+            "min": 4.012612225,
+            "median": 4.061871492,
+            "p95": 10.101805624,
+            "p99": 10.101805624,
+            "max": 10.101805624,
+            "sum": 48.44252078
+          },
+          "seconds_samples": [4.012612225,4.030554382,4.042840805,4.080902179,9.612547959,4.022852189,10.101805624,8.538405417],
+          "combined_mib_s": 42.27690811757959,
+          "sync_seconds": {
+            "count": 96,
+            "min": 0.037988424,
+            "median": 0.11067824600000001,
+            "p95": 2.674610552,
+            "p99": 3.655142349,
+            "max": 3.655142349,
+            "sum": 26.705698359
+          },
+          "syncs_over_one_second": 7
+        },
+        "serial-16": {
+          "seconds": {
+            "count": 8,
+            "min": 4.483021805,
+            "median": 4.5178395295,
+            "p95": 5.081090764,
+            "p99": 5.081090764,
+            "max": 5.081090764,
+            "sum": 36.718508091
+          },
+          "seconds_samples": [4.528099311,4.499865481,4.515318473,4.509602685,5.081090764,4.581148986,4.520360586,4.483021805],
+          "combined_mib_s": 55.77568660808366,
+          "sync_seconds": {
+            "count": 384,
+            "min": 0.011189796,
+            "median": 0.0306252825,
+            "p95": 0.041648563,
+            "p99": 0.068060119,
+            "max": 0.646625668,
+            "sum": 11.688302927
+          },
+          "syncs_over_one_second": 0
+        },
+        "serial-64": {
+          "seconds": {
+            "count": 8,
+            "min": 4.332828139,
+            "median": 4.623593117,
+            "p95": 10.469109502,
+            "p99": 10.469109502,
+            "max": 10.469109502,
+            "sum": 52.616691861
+          },
+          "seconds_samples": [4.870618307,10.469109502,4.376567927,10.333694614,4.351837102,9.5128475,4.332828139,4.36918877],
+          "combined_mib_s": 38.923009553894005,
+          "sync_seconds": {
+            "count": 96,
+            "min": 0.037970882,
+            "median": 0.11296919750000001,
+            "p95": 2.610850918,
+            "p99": 3.574149498,
+            "max": 3.574149498,
+            "sum": 27.88892194
+          },
+          "syncs_over_one_second": 6
+        }
+      },
+      "slow_syncs": [
+        {
+          "variant": "concurrent-16",
+          "rep": 0,
+          "pid": 1666938,
+          "tid": 1666938,
+          "file": "db.raw",
+          "seconds": 1.109104973,
+          "begin_epoch": 1791651233.2852044,
+          "end_epoch": 1791651234.3943093,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 16834560,
+            "writes_completed": 24,
+            "write_ms": 4100,
+            "flushes_completed": 2,
+            "flush_ms": 627
+          },
+          "wait_samples": {
+            "D:folio_wait_bit_common": 19,
+            "D:jbd2_log_wait_commit": 31
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 1,
+          "pid": 1667674,
+          "tid": 1667674,
+          "file": "wal.raw",
+          "seconds": 2.825342953,
+          "begin_epoch": 1791651262.1044323,
+          "end_epoch": 1791651264.929775,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51212288,
+            "writes_completed": 60,
+            "write_ms": 28964,
+            "flushes_completed": 2,
+            "flush_ms": 528
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 62,
+            "D:folio_wait_bit_common": 22,
+            "D:jbd2_log_wait_commit": 25
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 1,
+          "pid": 1667674,
+          "tid": 1667674,
+          "file": "db.raw",
+          "seconds": 3.574035687,
+          "begin_epoch": 1791651265.0166457,
+          "end_epoch": 1791651268.5906813,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 68112384,
+            "writes_completed": 179,
+            "write_ms": 37731,
+            "flushes_completed": 5,
+            "flush_ms": 2010
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 98,
+            "D:__lock_buffer": 22,
+            "D:folio_wait_bit_common": 28,
+            "D:jbd2_log_wait_commit": 13
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 3,
+          "pid": 1669136,
+          "tid": 1669136,
+          "file": "wal.raw",
+          "seconds": 2.766145226,
+          "begin_epoch": 1791651314.45782,
+          "end_epoch": 1791651317.2239652,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51130368,
+            "writes_completed": 125,
+            "write_ms": 35927,
+            "flushes_completed": 2,
+            "flush_ms": 83
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 105,
+            "D:folio_wait_bit_common": 20,
+            "D:jbd2_log_wait_commit": 4
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 3,
+          "pid": 1669136,
+          "tid": 1669136,
+          "file": "db.raw",
+          "seconds": 3.468145246,
+          "begin_epoch": 1791651317.3156965,
+          "end_epoch": 1791651320.7838416,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67981312,
+            "writes_completed": 101,
+            "write_ms": 32171,
+            "flushes_completed": 6,
+            "flush_ms": 2015
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 17,
+            "D:folio_wait_bit_common": 78,
+            "D:do_get_write_access": 22,
+            "D:jbd2_log_wait_commit": 23,
+            "D:0": 1
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 4,
+          "pid": 1670207,
+          "tid": 1670207,
+          "file": "wal.raw",
+          "seconds": 2.680533883,
+          "begin_epoch": 1791651347.995641,
+          "end_epoch": 1791651350.6761749,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51179520,
+            "writes_completed": 57,
+            "write_ms": 26160,
+            "flushes_completed": 2,
+            "flush_ms": 497
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 65,
+            "D:folio_wait_bit_common": 1,
+            "D:jbd2_log_wait_commit": 23
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 4,
+          "pid": 1670207,
+          "tid": 1670207,
+          "file": "db.raw",
+          "seconds": 3.211474444,
+          "begin_epoch": 1791651350.7683601,
+          "end_epoch": 1791651353.9798346,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67645440,
+            "writes_completed": 126,
+            "write_ms": 38760,
+            "flushes_completed": 8,
+            "flush_ms": 2385
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 43,
+            "D:folio_wait_bit_common": 71,
+            "D:jbd2_log_wait_commit": 7
+          }
+        },
+        {
+          "variant": "concurrent-16",
+          "rep": 5,
+          "pid": 1670786,
+          "tid": 1670786,
+          "file": "db.raw",
+          "seconds": 1.089472226,
+          "begin_epoch": 1791651372.6154253,
+          "end_epoch": 1791651373.7048976,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 16953344,
+            "writes_completed": 35,
+            "write_ms": 7742,
+            "flushes_completed": 5,
+            "flush_ms": 990
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 19,
+            "D:folio_wait_bit_common": 25,
+            "D:jbd2_log_wait_commit": 8
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 5,
+          "pid": 1671257,
+          "tid": 1671257,
+          "file": "wal.raw",
+          "seconds": 2.610743838,
+          "begin_epoch": 1791651387.2610967,
+          "end_epoch": 1791651389.8718405,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51093504,
+            "writes_completed": 60,
+            "write_ms": 20056,
+            "flushes_completed": 2,
+            "flush_ms": 448
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 87,
+            "D:folio_wait_bit_common": 13,
+            "D:jbd2_log_wait_commit": 22
+          }
+        },
+        {
+          "variant": "serial-64",
+          "rep": 5,
+          "pid": 1671257,
+          "tid": 1671257,
+          "file": "db.raw",
+          "seconds": 1.980257133,
+          "begin_epoch": 1791651389.959224,
+          "end_epoch": 1791651391.9394813,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 68247552,
+            "writes_completed": 158,
+            "write_ms": 25488,
+            "flushes_completed": 6,
+            "flush_ms": 719
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 82,
+            "D:folio_wait_bit_common": 2
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 6,
+          "pid": 1671759,
+          "tid": 1671759,
+          "file": "wal.raw",
+          "seconds": 2.674479525,
+          "begin_epoch": 1791651405.2218018,
+          "end_epoch": 1791651407.896281,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51191808,
+            "writes_completed": 128,
+            "write_ms": 31366,
+            "flushes_completed": 5,
+            "flush_ms": 1119
+          },
+          "wait_samples": {
+            "D:0": 1,
+            "D:rq_qos_wait": 88,
+            "D:folio_wait_bit_common": 25,
+            "D:submit_bio_wait": 11
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 6,
+          "pid": 1671759,
+          "tid": 1671759,
+          "file": "db.raw",
+          "seconds": 3.655041255,
+          "begin_epoch": 1791651407.9917686,
+          "end_epoch": 1791651411.6468098,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 64249856,
+            "writes_completed": 180,
+            "write_ms": 49088,
+            "flushes_completed": 8,
+            "flush_ms": 2504
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 27,
+            "D:folio_wait_bit_common": 100,
+            "D:jbd2_log_wait_commit": 25
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 7,
+          "pid": 1672821,
+          "tid": 1672821,
+          "file": "wal.raw",
+          "seconds": 2.803528058,
+          "begin_epoch": 1791651444.1986291,
+          "end_epoch": 1791651447.0021572,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 51519488,
+            "writes_completed": 122,
+            "write_ms": 27430,
+            "flushes_completed": 4,
+            "flush_ms": 1041
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 67,
+            "D:__lock_buffer": 18,
+            "D:folio_wait_bit_common": 24,
+            "D:jbd2_log_wait_commit": 23
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 7,
+          "pid": 1672821,
+          "tid": 1672821,
+          "file": "db.raw",
+          "seconds": 1.532150771,
+          "begin_epoch": 1791651447.0897143,
+          "end_epoch": 1791651448.621865,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 67702784,
+            "writes_completed": 107,
+            "write_ms": 18992,
+            "flushes_completed": 6,
+            "flush_ms": 425
+          },
+          "wait_samples": {
+            "D:rq_qos_wait": 59,
+            "D:do_get_write_access": 2
+          }
+        },
+        {
+          "variant": "concurrent-64",
+          "rep": 7,
+          "pid": 1672821,
+          "tid": 1672822,
+          "file": "wal.raw",
+          "seconds": 1.023942135,
+          "begin_epoch": 1791651443.1390426,
+          "end_epoch": 1791651444.1629846,
+          "device_deltas": {
+            "read_bytes": 0,
+            "write_bytes": 17231872,
+            "writes_completed": 21,
+            "write_ms": 3751,
+            "flushes_completed": 2,
+            "flush_ms": 546
+          },
+          "wait_samples": {
+            "D:folio_wait_bit_common": 19,
+            "D:jbd2_log_wait_commit": 26
+          }
+        }
+      ]
+    }
+  },
+  "fuse": {
+    "fuse": {
+      "baseline": {
+        "runs": 6,
+        "lifecycle_seconds": {
+          "count": 6,
+          "min": 22.6921241650125,
+          "median": 23.992225927475374,
+          "p95": 31.68881840899121,
+          "p99": 31.68881840899121,
+          "max": 31.68881840899121,
+          "sum": 151.53352282592095
+        },
+        "workloads": {
+          "write_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 20.01654557069754,
+              "median": 96.77504529012573,
+              "p95": 101.27147074718623,
+              "p99": 101.27147074718623,
+              "max": 101.27147074718623,
+              "sum": 507.98147591734823
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.631964753032662,
+              "median": 0.6613444010727108,
+              "p95": 3.1973548969253898,
+              "p99": 3.1973548969253898,
+              "max": 3.1973548969253898,
+              "sum": 6.479720255010761
+            },
+            "seconds_samples": [0.658002398093231,3.1973548969253898,0.6913146679289639,0.6646864040521905,0.631964753032662,0.6363971349783242],
+            "combined_rate": 59.26181762292179,
+            "request_seconds": {
+              "count": 384,
+              "min": 0.00383447902277112,
+              "median": 0.00456747499993071,
+              "p95": 0.0071215759962797165,
+              "p99": 0.31002917897421867,
+              "max": 2.814569420996122,
+              "sum": 6.218701145844534
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.03333354904316366,
+              "median": 0.03551755996886641,
+              "p95": 0.04268502502236515,
+              "p99": 0.04268502502236515,
+              "max": 0.04268502502236515,
+              "sum": 0.21973922499455512
+            },
+            "observed_wal_bytes": {
+              "count": 384,
+              "min": 1400832,
+              "median": 22660032.0,
+              "p95": 62006032,
+              "p99": 66220792,
+              "max": 66220792,
+              "sum": 11372960400
+            }
+          },
+          "stream_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 94.7747741003061,
+              "median": 95.49961857868365,
+              "p95": 97.20702645052151,
+              "p99": 97.20702645052151,
+              "max": 97.20702645052151,
+              "sum": 574.5250233258369
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.6583886200096458,
+              "median": 0.6701649994938634,
+              "p95": 0.6752851759083569,
+              "p99": 0.6752851759083569,
+              "max": 0.6752851759083569,
+              "sum": 4.010560156893916
+            },
+            "seconds_samples": [0.672041597077623,0.6642433049855754,0.6583886200096458,0.6682884019101039,0.6752851759083569,0.6723130570026115],
+            "combined_rate": 95.74722357422482,
+            "request_seconds": {
+              "count": 48,
+              "min": 0.039284031954593956,
+              "median": 0.04640072298934683,
+              "p95": 0.31132755405269563,
+              "p99": 0.32853221404366195,
+              "max": 0.32853221404366195,
+              "sum": 3.8170855020871386
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.026516866986639798,
+              "median": 0.02866789256222546,
+              "p95": 0.037318845046684146,
+              "p99": 0.037318845046684146,
+              "max": 0.037318845046684146,
+              "sum": 0.18376844003796577
+            },
+            "observed_wal_bytes": {
+              "count": 48,
+              "min": 16777216,
+              "median": 24645872.0,
+              "p95": 58730632,
+              "p99": 58730632,
+              "max": 58730632,
+              "sum": 1459628448
+            }
+          },
+          "write_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 92.16643881961964,
+              "median": 95.9866015453959,
+              "p95": 96.52068508271621,
+              "p99": 96.52068508271621,
+              "max": 96.52068508271621,
+              "sum": 571.9960502505376
+            },
+            "seconds": {
+              "count": 6,
+              "min": 2.6522812159964815,
+              "median": 2.6670389119535685,
+              "p95": 2.7775837200460956,
+              "p99": 2.7775837200460956,
+              "max": 2.7775837200460956,
+              "sum": 16.115926775033586
+            },
+            "seconds_samples": [2.6894063510699198,2.7775837200460956,2.662577664013952,2.6672324269311503,2.6668453969759867,2.6522812159964815],
+            "combined_rate": 95.3094427296316,
+            "request_seconds": {
+              "count": 1536,
+              "min": 0.0037671789759770036,
+              "median": 0.0043356179958209395,
+              "p95": 0.006534439977258444,
+              "p99": 0.2886232559103519,
+              "max": 0.3231034899363294,
+              "sum": 15.744010791298933
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.0369980699615553,
+              "median": 0.038062979525420815,
+              "p95": 0.04523923806846142,
+              "p99": 0.04523923806846142,
+              "max": 0.04523923806846142,
+              "sum": 0.23621117311995476
+            },
+            "observed_wal_bytes": {
+              "count": 1536,
+              "min": 16777216,
+              "median": 31925912.0,
+              "p95": 63930072,
+              "p99": 66702832,
+              "max": 66884112,
+              "sum": 53472094704
+            }
+          },
+          "stream_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 28.88960652281414,
+              "median": 89.01706880101307,
+              "p95": 95.49793845061008,
+              "p99": 95.49793845061008,
+              "max": 95.49793845061008,
+              "sum": 426.08202590689666
+            },
+            "seconds": {
+              "count": 6,
+              "min": 2.6806861399672925,
+              "median": 2.878941280534491,
+              "p95": 8.861318335984834,
+              "p99": 8.861318335984834,
+              "max": 8.861318335984834,
+              "sum": 28.85909601894673
+            },
+            "seconds_samples": [2.973234013072215,2.6806861399672925,2.784648547996767,8.857608258957043,2.7016007229685783,8.861318335984834],
+            "combined_rate": 53.22412036023502,
+            "request_seconds": {
+              "count": 192,
+              "min": 0.03803218202665448,
+              "median": 0.0467599454568699,
+              "p95": 0.3049637860385701,
+              "p99": 6.400342807988636,
+              "max": 6.4312836329918355,
+              "sum": 28.68440722010564
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.019198739086277783,
+              "median": 0.019468402082566172,
+              "p95": 0.03304374997969717,
+              "p99": 0.03304374997969717,
+              "max": 0.03304374997969717,
+              "sum": 0.13020492321811616
+            },
+            "observed_wal_bytes": {
+              "count": 192,
+              "min": 16777216,
+              "median": 32667512.0,
+              "p95": 65289672,
+              "p99": 65306152,
+              "max": 65306152,
+              "sum": 6765775920
+            }
+          },
+          "read_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 517.9364882818304,
+              "median": 525.2621349026122,
+              "p95": 531.2726287498324,
+              "p99": 531.2726287498324,
+              "max": 531.2726287498324,
+              "sum": 3153.8604012183596
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.12046545697376132,
+              "median": 0.12184397148666903,
+              "p95": 0.12356727407313883,
+              "p99": 0.12356727407313883,
+              "max": 0.12356727407313883,
+              "sum": 0.7305817201267928
+            },
+            "seconds_samples": [0.12176844896748662,0.12191949400585145,0.12082387902773917,0.12356727407313883,0.12046545697376132,0.1220371670788154],
+            "combined_rate": 525.6085519541286,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_read_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 70.6575923791332,
+              "median": 73.70750960729077,
+              "p95": 77.98768533749423,
+              "p99": 77.98768533749423,
+              "max": 77.98768533749423,
+              "sum": 443.4925938300705
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.20516059594228864,
+              "median": 0.21709599148016423,
+              "p95": 0.22644417197443545,
+              "p99": 0.22644417197443545,
+              "max": 0.22644417197443545,
+              "sum": 1.2999553069239482
+            },
+            "seconds_samples": [0.21927014901302755,0.20516059594228864,0.21450619702227414,0.2149218339473009,0.22644417197443545,0.21965235902462155],
+            "combined_rate": 73.84869271172283,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_write_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 9.837612497255233,
+              "median": 11.653943539326779,
+              "p95": 14.065073863080865,
+              "p99": 14.065073863080865,
+              "max": 14.065073863080865,
+              "sum": 70.22958047156621
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.1421961960149929,
+              "median": 0.171637402032502,
+              "p95": 0.20330136001575738,
+              "p99": 0.20330136001575738,
+              "max": 0.20330136001575738,
+              "sum": 1.0377038419246674
+            },
+            "seconds_samples": [0.18548755394294858,0.1634439278859645,0.16970863507594913,0.17356616898905486,0.20330136001575738,0.1421961960149929],
+            "combined_rate": 11.563993034605287,
+            "request_seconds": {
+              "count": 3072,
+              "min": 0.0001193119678646326,
+              "median": 0.00025095802266150713,
+              "p95": 0.0003547279629856348,
+              "p99": 0.00039128505159169436,
+              "max": 0.02469435497187078,
+              "sum": 0.8868964770808816
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.00920949096325785,
+              "median": 0.0211029130150564,
+              "p95": 0.04885494592599571,
+              "p99": 0.04885494592599571,
+              "max": 0.04885494592599571,
+              "sum": 0.1486797258257866
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "small_file_fsync": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 19.97420042085378,
+              "median": 249.64246328986775,
+              "p95": 271.39867157459577,
+              "p99": 271.39867157459577,
+              "max": 271.39867157459577,
+              "sum": 1299.931622182213
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.471630900981836,
+              "median": 0.5127944365376607,
+              "p95": 6.4082665289752185,
+              "p99": 6.4082665289752185,
+              "max": 6.4082665289752185,
+              "sum": 8.91193689906504
+            },
+            "seconds_samples": [0.5071945490781218,0.5183943239971995,0.5198431329336017,6.4082665289752185,0.471630900981836,0.48660746309906244],
+            "combined_rate": 86.17655271780163,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.002644834923557937,
+              "median": 0.0036345695261843503,
+              "p95": 0.07887081999797374,
+              "p99": 0.08400618797168136,
+              "max": 0.23512187006417662,
+              "sum": 8.910944151575677
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "mkdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1920.2469261865429,
+              "median": 2067.8250104697718,
+              "p95": 2232.9240941758912,
+              "p99": 2232.9240941758912,
+              "max": 2232.9240941758912,
+              "sum": 12433.007058244242
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.057323936955071986,
+              "median": 0.06192814151290804,
+              "p95": 0.06665809394326061,
+              "p99": 0.06665809394326061,
+              "max": 0.06665809394326061,
+              "sum": 0.37175929092336446
+            },
+            "seconds_samples": [0.058554760995320976,0.06322963302955031,0.0653662160038948,0.06665809394326061,0.057323936955071986,0.06062664999626577],
+            "combined_rate": 2065.852875102233,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00033979001455008984,
+              "median": 0.00043632450979202986,
+              "p95": 0.0005601280136033893,
+              "p99": 0.0006476750131696463,
+              "max": 0.0007530699949711561,
+              "sum": 0.3447923563653603
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rename": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 2264.04366911258,
+              "median": 2381.342109428624,
+              "p95": 2522.591281640924,
+              "p99": 2522.591281640924,
+              "max": 2522.591281640924,
+              "sum": 14393.100639879332
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.050741474027745426,
+              "median": 0.053756265027914196,
+              "p95": 0.0565360119799152,
+              "p99": 0.0565360119799152,
+              "max": 0.0565360119799152,
+              "sum": 0.320599670172669
+            },
+            "seconds_samples": [0.050741474027745426,0.054588113096542656,0.0542779800016433,0.0565360119799152,0.05323455005418509,0.05122154101263732],
+            "combined_rate": 2395.510886166444,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0003136249724775553,
+              "median": 0.000377107469830662,
+              "p95": 0.00047859898768365383,
+              "p99": 0.0005965440068393946,
+              "max": 0.0012799690011888742,
+              "sum": 0.2983813217142597
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rmdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 2198.6796678803003,
+              "median": 2402.09338003228,
+              "p95": 2462.9055630946846,
+              "p99": 2462.9055630946846,
+              "max": 2462.9055630946846,
+              "sum": 14251.270301939614
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.05197113601025194,
+              "median": 0.053286897018551826,
+              "p95": 0.058216757024638355,
+              "p99": 0.058216757024638355,
+              "max": 0.058216757024638355,
+              "sum": 0.3238431999925524
+            },
+            "seconds_samples": [0.0551067809574306,0.053239196073263884,0.058216757024638355,0.05197113601025194,0.05333459796383977,0.05197473196312785],
+            "combined_rate": 2371.5180680578196,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0003202330553904176,
+              "median": 0.0003601369680836797,
+              "p95": 0.0004439100157469511,
+              "p99": 0.0005522669525817037,
+              "max": 0.0016883659409359097,
+              "sum": 0.28545348288025707
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          }
+        }
+      },
+      "updated": {
+        "runs": 6,
+        "lifecycle_seconds": {
+          "count": 6,
+          "min": 27.80615127691999,
+          "median": 31.26932476001093,
+          "p95": 34.30684859107714,
+          "p99": 34.30684859107714,
+          "max": 34.30684859107714,
+          "sum": 186.88244156807195
+        },
+        "workloads": {
+          "write_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 11.73224904908111,
+              "median": 40.56484817073797,
+              "p95": 71.74470011779367,
+              "p99": 71.74470011779367,
+              "max": 71.74470011779367,
+              "sum": 247.3995420324354
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.8920519549865276,
+              "median": 2.582335451443214,
+              "p95": 5.455049558891915,
+              "p99": 5.455049558891915,
+              "max": 5.455049558891915,
+              "sum": 16.856131086824462
+            },
+            "seconds_samples": [0.8920519549865276,0.9716671649366617,4.4069077640306205,4.193003737949766,0.9374509060289711,5.455049558891915],
+            "combined_rate": 22.78102834049222,
+            "request_seconds": {
+              "count": 384,
+              "min": 0.004472326021641493,
+              "median": 0.006696217984426767,
+              "p95": 0.12336648907512426,
+              "p99": 2.045148959965445,
+              "max": 2.1522561439778656,
+              "sum": 16.58321660652291
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.03691301203798503,
+              "median": 0.03721055050846189,
+              "p95": 0.041253497009165585,
+              "p99": 0.041253497009165585,
+              "max": 0.041253497009165585,
+              "sum": 0.2275877920910716
+            },
+            "observed_wal_bytes": {
+              "count": 384,
+              "min": 1400832,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 5877015936
+            }
+          },
+          "stream_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 56.3866338905251,
+              "median": 57.03941193750074,
+              "p95": 64.58884161363078,
+              "p99": 64.58884161363078,
+              "max": 64.58884161363078,
+              "sum": 351.7979103372969
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.9908832299988717,
+              "median": 1.1220325130270794,
+              "p95": 1.135020759073086,
+              "p99": 1.135020759073086,
+              "max": 1.135020759073086,
+              "sum": 6.5647553011076525
+            },
+            "seconds_samples": [1.135020759073086,1.064709787024185,1.1232448610244319,1.120820165029727,1.1300764989573509,0.9908832299988717],
+            "combined_rate": 58.49418331483106,
+            "request_seconds": {
+              "count": 48,
+              "min": 0.049963355995714664,
+              "median": 0.11616415047319606,
+              "p95": 0.19102377502713352,
+              "p99": 0.20194699196144938,
+              "max": 0.20194699196144938,
+              "sum": 5.856981510762125
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.037393167964182794,
+              "median": 0.03765543398912996,
+              "p95": 0.06545774603728205,
+              "p99": 0.06545774603728205,
+              "max": 0.06545774603728205,
+              "sum": 0.2672655099304393
+            },
+            "observed_wal_bytes": {
+              "count": 48,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 805306368
+            }
+          },
+          "write_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 60.78843422597495,
+              "median": 63.53091971038872,
+              "p95": 64.5874063770772,
+              "p99": 64.5874063770772,
+              "max": 64.5874063770772,
+              "sum": 378.8254672286869
+            },
+            "seconds": {
+              "count": 6,
+              "min": 3.9636209961026907,
+              "median": 4.0298038115142845,
+              "p95": 4.211327422061004,
+              "p99": 4.211327422061004,
+              "max": 4.211327422061004,
+              "sum": 24.338145674206316
+            },
+            "seconds_samples": [4.211327422061004,3.9959209880325943,3.9636209961026907,3.996828784001991,4.107668644981459,4.062778839026578],
+            "combined_rate": 63.1108064090462,
+            "request_seconds": {
+              "count": 1536,
+              "min": 0.003475570003502071,
+              "median": 0.006690850015729666,
+              "p95": 0.12529169104527682,
+              "p99": 0.1502297060796991,
+              "max": 0.16715944302268326,
+              "sum": 23.951050570467487
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.028095624991692603,
+              "median": 0.0294031944940798,
+              "p95": 0.07694338890723884,
+              "p99": 0.07694338890723884,
+              "max": 0.07694338890723884,
+              "sum": 0.22239309293217957
+            },
+            "observed_wal_bytes": {
+              "count": 1536,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 25769803776
+            }
+          },
+          "stream_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 23.313525580068802,
+              "median": 56.40486537763566,
+              "p95": 57.80827949948057,
+              "p99": 57.80827949948057,
+              "max": 57.80827949948057,
+              "sum": 307.42373482559117
+            },
+            "seconds": {
+              "count": 6,
+              "min": 4.428431398002431,
+              "median": 4.538651563518215,
+              "p95": 10.980750171002,
+              "p99": 10.980750171002,
+              "max": 10.980750171002,
+              "sum": 33.51069457014091
+            },
+            "seconds_samples": [4.428431398002431,4.551433593034744,10.980750171002,4.525869534001686,4.452717270003632,4.57149260409642],
+            "combined_rate": 45.83611350654082,
+            "request_seconds": {
+              "count": 192,
+              "min": 0.05173856799956411,
+              "median": 0.17698651552200317,
+              "p95": 0.21972855797503144,
+              "p99": 2.15288966789376,
+              "max": 2.27605256694369,
+              "sum": 32.74185702088289
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.027964705019257963,
+              "median": 0.028218199498951435,
+              "p95": 0.48970289598219097,
+              "p99": 0.48970289598219097,
+              "max": 0.48970289598219097,
+              "sum": 0.6323309070430696
+            },
+            "observed_wal_bytes": {
+              "count": 192,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 3221225472
+            }
+          },
+          "read_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 484.94403357188946,
+              "median": 505.50814071614826,
+              "p95": 531.8911105651291,
+              "p99": 531.8911105651291,
+              "max": 531.8911105651291,
+              "sum": 3039.7029252457173
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.12032538000494242,
+              "median": 0.1266195069765672,
+              "p95": 0.1319739919854328,
+              "p99": 0.1319739919854328,
+              "max": 0.1319739919854328,
+              "sum": 0.7585806258721277
+            },
+            "seconds_samples": [0.12796164595056325,0.12812546698842198,0.12032538000494242,0.1249167729401961,0.1319739919854328,0.12527736800257117],
+            "combined_rate": 506.20855173900793,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_read_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 69.65622659244524,
+              "median": 73.41650671037922,
+              "p95": 75.98559479291522,
+              "p99": 75.98559479291522,
+              "max": 75.98559479291522,
+              "sum": 439.38091683297836
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.210566226975061,
+              "median": 0.21798408101312816,
+              "p95": 0.229699493967928,
+              "p99": 0.229699493967928,
+              "max": 0.229699493967928,
+              "sum": 1.3120100520318374
+            },
+            "seconds_samples": [0.22126695094630122,0.22155883605591953,0.2147012110799551,0.21421733300667256,0.229699493967928,0.210566226975061],
+            "combined_rate": 73.17017110602934,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_write_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 0.7606388768323868,
+              "median": 5.974315353309066,
+              "p95": 6.136174047711674,
+              "p99": 6.136174047711674,
+              "max": 6.136174047711674,
+              "sum": 30.577321483870655
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.3259359960211441,
+              "median": 0.3347715375130065,
+              "p95": 2.6293686280259863,
+              "p99": 2.6293686280259863,
+              "max": 2.6293686280259863,
+              "sum": 4.3076122890925035
+            },
+            "seconds_samples": [0.35351098503451794,0.3360839090310037,0.33345916599500924,0.32925360498484224,0.3259359960211441,2.6293686280259863],
+            "combined_rate": 2.785766033397605,
+            "request_seconds": {
+              "count": 3072,
+              "min": 0.00017840100917965174,
+              "median": 0.0003599650808610022,
+              "p95": 0.0004277150146663189,
+              "p99": 0.0004963430110365152,
+              "max": 1.21429279493168,
+              "sum": 3.874319617054425
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.013706978992559016,
+              "median": 0.013872543000616133,
+              "p95": 0.36097782209981233,
+              "p99": 0.36097782209981233,
+              "max": 0.36097782209981233,
+              "sum": 0.4301178160822019
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "small_file_fsync": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 20.982646903694175,
+              "median": 237.46114482856512,
+              "p95": 248.3576549692613,
+              "p99": 248.3576549692613,
+              "max": 248.3576549692613,
+              "sum": 1027.6869592881733
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.5153857650002465,
+              "median": 0.5390437634778209,
+              "p95": 6.100278987083584,
+              "p99": 6.100278987083584,
+              "max": 6.100278987083584,
+              "sum": 11.07509311195463
+            },
+            "seconds_samples": [6.100278987083584,0.5368564549135044,0.5153857650002465,0.5369402630021796,0.5411472639534622,2.8444843780016527],
+            "combined_rate": 69.3447894511161,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0027588449884206057,
+              "median": 0.0036820645327679813,
+              "p95": 0.08113072707783431,
+              "p99": 0.11247070704121143,
+              "max": 0.5107931970851496,
+              "sum": 11.07405448157806
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "mkdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1102.8317169968313,
+              "median": 1133.6251456099035,
+              "p95": 1196.969863237934,
+              "p99": 1196.969863237934,
+              "max": 1196.969863237934,
+              "sum": 6830.2139656733
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.10693669400643557,
+              "median": 0.11291302897734568,
+              "p95": 0.11606485198717564,
+              "p99": 0.11606485198717564,
+              "max": 0.11606485198717564,
+              "sum": 0.6750684588914737
+            },
+            "seconds_samples": [0.10693669400643557,0.11606485198717564,0.11241827893536538,0.11382257600780576,0.11258980201091617,0.11323625594377518],
+            "combined_rate": 1137.6623953978367,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0004554189508780837,
+              "median": 0.000642611994408071,
+              "p95": 0.000786979915574193,
+              "p99": 0.0010208799503743649,
+              "max": 0.011558622005395591,
+              "sum": 0.5586865112418309
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rename": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1429.2274539208975,
+              "median": 1523.3782167283066,
+              "p95": 1607.7333178138629,
+              "p99": 1607.7333178138629,
+              "max": 1607.7333178138629,
+              "sum": 9154.521330906966
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.07961519400123507,
+              "median": 0.08402589050820097,
+              "p95": 0.08955887297634035,
+              "p99": 0.08955887297634035,
+              "max": 0.08955887297634035,
+              "sum": 0.504132162895985
+            },
+            "seconds_samples": [0.08075289591215551,0.08615341898985207,0.08360502903815359,0.08955887297634035,0.08444675197824836,0.07961519400123507],
+            "combined_rate": 1523.4100430891524,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00041837606113404036,
+              "median": 0.0005252575501799583,
+              "p95": 0.0006494129775092006,
+              "p99": 0.0008058010134845972,
+              "max": 0.005095369997434318,
+              "sum": 0.4168659377610311
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rmdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1227.8835156315317,
+              "median": 1324.1066505415433,
+              "p95": 1547.6994987746186,
+              "p99": 1547.6994987746186,
+              "max": 1547.6994987746186,
+              "sum": 8101.26171081227
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.08270339306909591,
+              "median": 0.09667577804066241,
+              "p95": 0.10424441599752754,
+              "p99": 0.10424441599752754,
+              "max": 0.10424441599752754,
+              "sum": 0.571701267035678
+            },
+            "seconds_samples": [0.08270339306909591,0.09860522695817053,0.09748822904657573,0.10424441599752754,0.09586332703474909,0.09279667492955923],
+            "combined_rate": 1343.3589258637617,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0003172949654981494,
+              "median": 0.0005219295271672308,
+              "p95": 0.0006590649718418717,
+              "p99": 0.0008659560699015856,
+              "max": 0.01649176306091249,
+              "sum": 0.4872728161280975
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          }
+        }
+      }
+    },
+    "aged_fuse": {
+      "baseline": {
+        "runs": 6,
+        "lifecycle_seconds": {
+          "count": 6,
+          "min": 25.257257223129272,
+          "median": 28.680671453475952,
+          "p95": 34.594786643981934,
+          "p99": 34.594786643981934,
+          "max": 34.594786643981934,
+          "sum": 176.84530091285706
+        },
+        "workloads": {
+          "write_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 90.92752608706084,
+              "median": 98.39628134359188,
+              "p95": 107.71274047862825,
+              "p99": 107.71274047862825,
+              "max": 107.71274047862825,
+              "sum": 589.7441470095217
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.5941729800542817,
+              "median": 0.6507606820086949,
+              "p95": 0.7038572669262066,
+              "p99": 0.7038572669262066,
+              "max": 0.7038572669262066,
+              "sum": 3.9190986360190436
+            },
+            "seconds_samples": [0.6654061250155792,0.5941729800542817,0.6336191890295595,0.6859278359916061,0.6361152390018106,0.7038572669262066],
+            "combined_rate": 97.981713568215,
+            "request_seconds": {
+              "count": 384,
+              "min": 0.0034885609056800604,
+              "median": 0.004736045491881669,
+              "p95": 0.007363974000327289,
+              "p99": 0.2886989089893177,
+              "max": 0.3369555299868807,
+              "sum": 3.6902679012855515
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.02751612407155335,
+              "median": 0.0319691525073722,
+              "p95": 0.03252986306324601,
+              "p99": 0.03252986306324601,
+              "max": 0.03252986306324601,
+              "sum": 0.18693624215666205
+            },
+            "observed_wal_bytes": {
+              "count": 384,
+              "min": 16777216,
+              "median": 37096512.0,
+              "p95": 62566352,
+              "p99": 66727552,
+              "max": 66727552,
+              "sum": 14091517680
+            }
+          },
+          "stream_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 91.68550696708265,
+              "median": 94.1055710806067,
+              "p95": 99.77029744647848,
+              "p99": 99.77029744647848,
+              "max": 99.77029744647848,
+              "sum": 570.8635333497987
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.6414734809659421,
+              "median": 0.6801264969981275,
+              "p95": 0.6980383499758318,
+              "p99": 0.6980383499758318,
+              "max": 0.6980383499758318,
+              "sum": 4.040583099937066
+            },
+            "seconds_samples": [0.6955275590298697,0.6749606449157,0.6414734809659421,0.6452907159691676,0.6852923490805551,0.6980383499758318],
+            "combined_rate": 95.03578827669227,
+            "request_seconds": {
+              "count": 48,
+              "min": 0.04191013891249895,
+              "median": 0.04792803950840607,
+              "p95": 0.3039931940147653,
+              "p99": 0.3202595909824595,
+              "max": 0.3202595909824595,
+              "sum": 3.8797225810121745
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.01761508802883327,
+              "median": 0.026399268477689475,
+              "p95": 0.02729686303064227,
+              "p99": 0.02729686303064227,
+              "max": 0.02729686303064227,
+              "sum": 0.1506700769532472
+            },
+            "observed_wal_bytes": {
+              "count": 48,
+              "min": 16777216,
+              "median": 24649992.0,
+              "p95": 58738872,
+              "p99": 58738872,
+              "max": 58738872,
+              "sum": 1459677888
+            }
+          },
+          "write_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 84.57823925110274,
+              "median": 94.44716722002647,
+              "p95": 96.5440820147435,
+              "p99": 96.5440820147435,
+              "max": 96.5440820147435,
+              "sum": 558.8739222929739
+            },
+            "seconds": {
+              "count": 6,
+              "min": 2.651638450101018,
+              "median": 2.710525853501167,
+              "p95": 3.0267832750687376,
+              "p99": 3.0267832750687376,
+              "max": 3.0267832750687376,
+              "sum": 16.52329529216513
+            },
+            "seconds_samples": [2.7170618609525263,3.0267832750687376,2.651638450101018,2.760451617068611,2.703989846049808,2.6633702429244295],
+            "combined_rate": 92.9596652992292,
+            "request_seconds": {
+              "count": 1536,
+              "min": 0.003525562002323568,
+              "median": 0.0044595354702323675,
+              "p95": 0.006843931041657925,
+              "p99": 0.28360729897394776,
+              "max": 0.570936782984063,
+              "sum": 16.105361963738687
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.03715451096650213,
+              "median": 0.042632760014384985,
+              "p95": 0.07114507409278303,
+              "p99": 0.07114507409278303,
+              "max": 0.07114507409278303,
+              "sum": 0.2784912430215627
+            },
+            "observed_wal_bytes": {
+              "count": 1536,
+              "min": 16777216,
+              "median": 31977412.0,
+              "p95": 63938312,
+              "p99": 66723432,
+              "max": 66950032,
+              "sum": 53531645184
+            }
+          },
+          "stream_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 31.755851553960618,
+              "median": 89.47840345942092,
+              "p95": 97.86386127500884,
+              "p99": 97.86386127500884,
+              "max": 97.86386127500884,
+              "sum": 440.9581146764341
+            },
+            "seconds": {
+              "count": 6,
+              "min": 2.61587880004663,
+              "median": 2.86503270897083,
+              "p95": 8.061506383004598,
+              "p99": 8.061506383004598,
+              "max": 8.061506383004598,
+              "sum": 25.945666439947672
+            },
+            "seconds_samples": [2.9721802360145375,2.757885181927122,2.61587880004663,6.842596421949565,8.061506383004598,2.6956194170052186],
+            "combined_rate": 59.200637746389596,
+            "request_seconds": {
+              "count": 192,
+              "min": 0.03943634103052318,
+              "median": 0.04716594249475747,
+              "p95": 0.30498333694413304,
+              "p99": 4.348802329972386,
+              "max": 5.549693427979946,
+              "sum": 25.742929653148167
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.01917791599407792,
+              "median": 0.021310830023139715,
+              "p95": 0.05296018405351788,
+              "p99": 0.05296018405351788,
+              "max": 0.05296018405351788,
+              "sum": 0.16761746199335903
+            },
+            "observed_wal_bytes": {
+              "count": 192,
+              "min": 16777216,
+              "median": 32677812.0,
+              "p95": 63930072,
+              "p99": 66690472,
+              "max": 66690472,
+              "sum": 6810604008
+            }
+          },
+          "read_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 518.9166233513128,
+              "median": 522.4062005696713,
+              "p95": 539.623394977982,
+              "p99": 539.623394977982,
+              "max": 539.623394977982,
+              "sum": 3148.948561012532
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.11860123299993575,
+              "median": 0.12251082400325686,
+              "p95": 0.12333387893158942,
+              "p99": 0.12333387893158942,
+              "max": 0.12333387893158942,
+              "sum": 0.7317970829317346
+            },
+            "seconds_samples": [0.12333387893158942,0.1229098989861086,0.12219919799827039,0.12193042400758713,0.11860123299993575,0.12282245000824332],
+            "combined_rate": 524.7356254299544,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_read_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 66.84686323571941,
+              "median": 75.2710595903692,
+              "p95": 79.73319794381624,
+              "p99": 79.73319794381624,
+              "max": 79.73319794381624,
+              "sum": 442.776636730624
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.20066923706326634,
+              "median": 0.2125775520107709,
+              "p95": 0.23935304104816169,
+              "p99": 0.23935304104816169,
+              "max": 0.23935304104816169,
+              "sum": 1.3069581331219524
+            },
+            "seconds_samples": [0.20066923706326634,0.2142047859961167,0.23711915500462055,0.20466159598436207,0.21095031802542508,0.23935304104816169],
+            "combined_rate": 73.45300325013719,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_write_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 0.6824046484297828,
+              "median": 11.99814061047995,
+              "p95": 16.01375478291177,
+              "p99": 16.01375478291177,
+              "max": 16.01375478291177,
+              "sum": 54.00728315886641
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.12489263305906206,
+              "median": 0.1667803135351278,
+              "p95": 2.930812392034568,
+              "p99": 2.930812392034568,
+              "max": 2.930812392034568,
+              "sum": 6.277920915163122
+            },
+            "seconds_samples": [2.930812392034568,2.7297000599792227,0.12489263305906206,0.15895520302001387,0.1629532630322501,0.17060736403800547],
+            "combined_rate": 1.9114608422377997,
+            "request_seconds": {
+              "count": 3072,
+              "min": 0.00010820606257766485,
+              "median": 0.00024728348944336176,
+              "p95": 0.0004125729901716113,
+              "p99": 0.00048706401139497757,
+              "max": 2.7395128840580583,
+              "sum": 6.13192296132911
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.0071426479844376445,
+              "median": 0.02204201399581507,
+              "p95": 0.05734394397586584,
+              "p99": 0.05734394397586584,
+              "max": 0.05734394397586584,
+              "sum": 0.14391858701128513
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "small_file_fsync": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 241.0757827754499,
+              "median": 256.5006955286802,
+              "p95": 267.46111201584205,
+              "p99": 267.46111201584205,
+              "max": 267.46111201584205,
+              "sum": 1530.5774754751956
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.47857424593530595,
+              "median": 0.4990479114931077,
+              "p95": 0.5309533729450777,
+              "p99": 0.5309533729450777,
+              "max": 0.5309533729450777,
+              "sum": 3.0151921458309516
+            },
+            "seconds_samples": [0.482775439042598,0.5025031949626282,0.5247932649217546,0.5309533729450777,0.49559262802358717,0.47857424593530595],
+            "combined_rate": 254.71013549232637,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0025366819463670254,
+              "median": 0.0036173254484310746,
+              "p95": 0.004764118930324912,
+              "p99": 0.016749191912822425,
+              "max": 0.03387283708434552,
+              "sum": 3.0142409428954124
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "mkdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1636.7472255991406,
+              "median": 2018.9185580149956,
+              "p95": 2061.5088521444545,
+              "p99": 2061.5088521444545,
+              "max": 2061.5088521444545,
+              "sum": 11758.658094122837
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.062090444029308856,
+              "median": 0.06342151801800355,
+              "p95": 0.07820389000698924,
+              "p99": 0.07820389000698924,
+              "max": 0.07820389000698924,
+              "sum": 0.39448628306854516
+            },
+            "seconds_samples": [0.07820389000698924,0.06458212400320917,0.062090444029308856,0.06226091203279793,0.062214607023634017,0.06513430597260594],
+            "combined_rate": 1946.8357531370839,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.000351003953255713,
+              "median": 0.000457880028989166,
+              "p95": 0.0006371659692376852,
+              "p99": 0.0007606679573655128,
+              "max": 0.0013146490091457963,
+              "sum": 0.36606913176365197
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rename": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 2048.716589756479,
+              "median": 2299.2073413264766,
+              "p95": 2491.720432060071,
+              "p99": 2491.720432060071,
+              "max": 2491.720432060071,
+              "sum": 13860.494844112403
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.051370128989219666,
+              "median": 0.05567917349981144,
+              "p95": 0.06247813906520605,
+              "p99": 0.06247813906520605,
+              "max": 0.06247813906520605,
+              "sum": 0.33384626905899495
+            },
+            "seconds_samples": [0.06247813906520605,0.0550195979885757,0.051370128989219666,0.051972751040011644,0.05666690296493471,0.056338749011047184],
+            "combined_rate": 2300.460035586872,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00033132999669760466,
+              "median": 0.00039272301364690065,
+              "p95": 0.0005045030266046524,
+              "p99": 0.00057647202629596,
+              "max": 0.0008871220052242279,
+              "sum": 0.31110258388798684
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rmdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 2048.011924813086,
+              "median": 2389.9657890064987,
+              "p95": 2444.7829546669923,
+              "p99": 2444.7829546669923,
+              "max": 2444.7829546669923,
+              "sum": 13947.60913955633
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.052356385975144804,
+              "median": 0.05355845351004973,
+              "p95": 0.06249963608570397,
+              "p99": 0.06249963608570397,
+              "max": 0.06249963608570397,
+              "sum": 0.33172456605825573
+            },
+            "seconds_samples": [0.05738887202460319,0.05381213000509888,0.052356385975144804,0.05236276495270431,0.06249963608570397,0.05330477701500058],
+            "combined_rate": 2315.1737271852453,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00032751099206507206,
+              "median": 0.00037377054104581475,
+              "p95": 0.00047417194582521915,
+              "p99": 0.0005882229888811707,
+              "max": 0.0008198919240385294,
+              "sum": 0.2976630141492933
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          }
+        }
+      },
+      "updated": {
+        "runs": 6,
+        "lifecycle_seconds": {
+          "count": 6,
+          "min": 31.864418745040894,
+          "median": 36.75862920284271,
+          "p95": 49.50907611846924,
+          "p99": 49.50907611846924,
+          "max": 49.50907611846924,
+          "sum": 230.9472165107727
+        },
+        "workloads": {
+          "write_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 9.513540114661385,
+              "median": 59.506100925095254,
+              "p95": 61.813427337844175,
+              "p99": 61.813427337844175,
+              "max": 61.813427337844175,
+              "sum": 308.80903652717933
+            },
+            "seconds": {
+              "count": 6,
+              "min": 1.0353737489786,
+              "median": 1.0757437414722517,
+              "p95": 6.727253916906193,
+              "p99": 6.727253916906193,
+              "max": 6.727253916906193,
+              "sum": 12.078219295828603
+            },
+            "seconds_samples": [1.0353737489786,1.060228631948121,1.0912588509963825,6.727253916906193,1.0403322710189968,1.1237718759803101],
+            "combined_rate": 31.792766019128354,
+            "request_seconds": {
+              "count": 384,
+              "min": 0.0035929089644923806,
+              "median": 0.006733968970365822,
+              "p95": 0.12620557402260602,
+              "p99": 0.16888118197675794,
+              "max": 2.263937223004177,
+              "sum": 11.967121061286889
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.011030927067622542,
+              "median": 0.011421357979997993,
+              "p95": 0.01160154608078301,
+              "p99": 0.01160154608078301,
+              "max": 0.01160154608078301,
+              "sum": 0.06811738200485706
+            },
+            "observed_wal_bytes": {
+              "count": 384,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 6442450944
+            }
+          },
+          "stream_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 54.51464255950183,
+              "median": 56.37231026151993,
+              "p95": 57.953111231607096,
+              "p99": 57.953111231607096,
+              "max": 57.953111231607096,
+              "sum": 336.7777986806562
+            },
+            "seconds": {
+              "count": 6,
+              "min": 1.1043410550337285,
+              "median": 1.135313459963072,
+              "p95": 1.1739965080050752,
+              "p99": 1.1739965080050752,
+              "max": 1.1739965080050752,
+              "sum": 6.844127363990992
+            },
+            "seconds_samples": [1.1652677840320393,1.1739965080050752,1.137523898971267,1.1298950969940051,1.1043410550337285,1.1331030209548771],
+            "combined_rate": 56.106495332091455,
+            "request_seconds": {
+              "count": 48,
+              "min": 0.056344036012887955,
+              "median": 0.16835137753514573,
+              "p95": 0.21216846897732466,
+              "p99": 0.2243835210101679,
+              "max": 0.2243835210101679,
+              "sum": 6.72904353775084
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.017020567087456584,
+              "median": 0.017370061483234167,
+              "p95": 0.017433778033591807,
+              "p99": 0.017433778033591807,
+              "max": 0.017433778033591807,
+              "sum": 0.10388958500698209
+            },
+            "observed_wal_bytes": {
+              "count": 48,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 805306368
+            }
+          },
+          "write_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 59.51024106956559,
+              "median": 60.287444971589935,
+              "p95": 62.9893556770998,
+              "p99": 62.9893556770998,
+              "max": 62.9893556770998,
+              "sum": 364.4253734829319
+            },
+            "seconds": {
+              "count": 6,
+              "min": 4.064178736996837,
+              "median": 4.246325496991631,
+              "p95": 4.301780591020361,
+              "p99": 4.301780591020361,
+              "max": 4.301780591020361,
+              "sum": 25.297567622968927
+            },
+            "seconds_samples": [4.249168217997067,4.2555767860030755,4.243482775986195,4.301780591020361,4.064178736996837,4.183380514965393],
+            "combined_rate": 60.71729989587571,
+            "request_seconds": {
+              "count": 1536,
+              "min": 0.0035974120255559683,
+              "median": 0.006915107020176947,
+              "p95": 0.12555925303604454,
+              "p99": 0.1519177999580279,
+              "max": 0.15850259689614177,
+              "sum": 25.01399302086793
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.017109021078795195,
+              "median": 0.01724839850794524,
+              "p95": 0.04640786105301231,
+              "p99": 0.04640786105301231,
+              "max": 0.04640786105301231,
+              "sum": 0.13256346806883812
+            },
+            "observed_wal_bytes": {
+              "count": 1536,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 25769803776
+            }
+          },
+          "stream_256": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 15.227999868243225,
+              "median": 25.197249373508047,
+              "p95": 56.6827076438819,
+              "p99": 56.6827076438819,
+              "max": 56.6827076438819,
+              "sum": 174.038141860177
+            },
+            "seconds": {
+              "count": 6,
+              "min": 4.5163685829611495,
+              "median": 10.174338321958203,
+              "p95": 16.811137523967773,
+              "p99": 16.811137523967773,
+              "max": 16.811137523967773,
+              "sum": 61.5543526498368
+            },
+            "seconds_samples": [10.58596346504055,4.5163685829611495,16.811137523967773,10.558421315974556,9.292206433950923,9.79025532794185],
+            "combined_rate": 24.953556229204732,
+            "request_seconds": {
+              "count": 192,
+              "min": 0.05005533806979656,
+              "median": 0.17539549648063257,
+              "p95": 2.0588171220151708,
+              "p99": 2.2597448480082676,
+              "max": 2.265693266992457,
+              "sum": 56.33878379478119
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.027728687040507793,
+              "median": 0.028432705032173544,
+              "p95": 0.04004616406746209,
+              "p99": 0.04004616406746209,
+              "max": 0.04004616406746209,
+              "sum": 0.18130489613395184
+            },
+            "observed_wal_bytes": {
+              "count": 192,
+              "min": 16777216,
+              "median": 16777216.0,
+              "p95": 16777216,
+              "p99": 16777216,
+              "max": 16777216,
+              "sum": 3221225472
+            }
+          },
+          "read_64": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 497.1697021774717,
+              "median": 537.1683683919325,
+              "p95": 736.5561040071977,
+              "p99": 736.5561040071977,
+              "max": 736.5561040071977,
+              "sum": 3355.921882242546
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.08689086907543242,
+              "median": 0.11914695549057797,
+              "p95": 0.12872868101112545,
+              "p99": 0.12872868101112545,
+              "max": 0.12872868101112545,
+              "sum": 0.6986689150799066
+            },
+            "seconds_samples": [0.11980893497820944,0.08689086907543242,0.1171428730012849,0.1184849760029465,0.12872868101112545,0.1276125810109079],
+            "combined_rate": 549.6165518628835,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_read_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 69.7300413121576,
+              "median": 75.2617029682513,
+              "p95": 80.08484949061359,
+              "p99": 80.08484949061359,
+              "max": 80.08484949061359,
+              "sum": 449.95719644693986
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.19978810101747513,
+              "median": 0.21265968756051734,
+              "p95": 0.2294563390314579,
+              "p99": 0.2294563390314579,
+              "max": 0.2294563390314579,
+              "sum": 1.2826126682339236
+            },
+            "seconds_samples": [0.19978810101747513,0.2294563390314579,0.2088523240527138,0.20840196101926267,0.21964689204469323,0.21646705106832087],
+            "combined_rate": 74.84722580526662,
+            "request_seconds": {
+              "count": 0
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "random_write_4k": {
+            "rate_units": "mib_per_second",
+            "rate": {
+              "count": 6,
+              "min": 5.386626664691367,
+              "median": 6.400265529767198,
+              "p95": 6.935763155992083,
+              "p99": 6.935763155992083,
+              "max": 6.935763155992083,
+              "sum": 37.88630978323473
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.288360481034033,
+              "median": 0.31249035854125395,
+              "p95": 0.3712898859521374,
+              "p99": 0.3712898859521374,
+              "max": 0.3712898859521374,
+              "sum": 1.9151496370323002
+            },
+            "seconds_samples": [0.3135094300378114,0.3114712870446965,0.3712898859521374,0.29102515999693424,0.3394933929666877,0.288360481034033],
+            "combined_rate": 6.265828929479944,
+            "request_seconds": {
+              "count": 3072,
+              "min": 0.0001410050317645073,
+              "median": 0.00029278500005602837,
+              "p95": 0.00040630309376865625,
+              "p99": 0.00045586901251226664,
+              "max": 0.10022531799040735,
+              "sum": 1.8054603220662102
+            },
+            "fsync_seconds": {
+              "count": 6,
+              "min": 0.012890620972029865,
+              "median": 0.01296237506903708,
+              "p95": 0.04251158097758889,
+              "p99": 0.04251158097758889,
+              "max": 0.04251158097758889,
+              "sum": 0.10730671603232622
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "small_file_fsync": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 227.89074255927682,
+              "median": 243.48036901858006,
+              "p95": 272.9203854114066,
+              "p99": 272.9203854114066,
+              "max": 272.9203854114066,
+              "sum": 1478.7225866186375
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.46900124300736934,
+              "median": 0.5257328205625527,
+              "p95": 0.5616726619191468,
+              "p99": 0.5616726619191468,
+              "max": 0.5616726619191468,
+              "sum": 3.1262713810428977
+            },
+            "seconds_samples": [0.5039496510289609,0.5401821839623153,0.5222489390289411,0.46900124300736934,0.5616726619191468,0.5292167020961642],
+            "combined_rate": 245.66005518810772,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.0026005139807239175,
+              "median": 0.0036447184975259006,
+              "p95": 0.0039379780646413565,
+              "p99": 0.03341559402178973,
+              "max": 0.06515010294970125,
+              "sum": 3.125281224027276
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "mkdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 1209.1745584049384,
+              "median": 1430.5035732623758,
+              "p95": 1938.2961002536572,
+              "p99": 1938.2961002536572,
+              "max": 1938.2961002536572,
+              "sum": 9048.923326392252
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.06603738199919462,
+              "median": 0.08981087902793661,
+              "p95": 0.10585733805783093,
+              "p99": 0.10585733805783093,
+              "max": 0.10585733805783093,
+              "sum": 0.5264477781020105
+            },
+            "seconds_samples": [0.08435119199566543,0.09527056606020778,0.07056030200328678,0.06603738199919462,0.10585733805783093,0.10437099798582494],
+            "combined_rate": 1458.8341559135304,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00030058901757001877,
+              "median": 0.0005270185647532344,
+              "p95": 0.000724024954251945,
+              "p99": 0.0007965569384396076,
+              "max": 0.0011441030073910952,
+              "sum": 0.40126242651604116
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rename": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 296.0638587506832,
+              "median": 1549.1690220694425,
+              "p95": 2159.2188760747354,
+              "p99": 2159.2188760747354,
+              "max": 2159.2188760747354,
+              "sum": 8828.262156263298
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.05928069702349603,
+              "median": 0.08268017607042566,
+              "p95": 0.4323391600046307,
+              "p99": 0.4323391600046307,
+              "max": 0.4323391600046307,
+              "sum": 0.8153328662738204
+            },
+            "seconds_samples": [0.08054317010100931,0.08481718203984201,0.07027898100204766,0.05928069702349603,0.4323391600046307,0.0880736761027947],
+            "combined_rate": 941.9465739310401,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00025068200193345547,
+              "median": 0.0005110480124130845,
+              "p95": 0.0006191639695316553,
+              "p99": 0.0007565440610051155,
+              "max": 0.0009727339493110776,
+              "sum": 0.380007320898585
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          },
+          "rmdir": {
+            "rate_units": "ops_per_second",
+            "rate": {
+              "count": 6,
+              "min": 184.62445251268073,
+              "median": 1345.2456513352067,
+              "p95": 1689.557842634197,
+              "p99": 1689.557842634197,
+              "max": 1689.557842634197,
+              "sum": 7269.462044800769
+            },
+            "seconds": {
+              "count": 6,
+              "min": 0.07575946603901684,
+              "median": 0.09526550146983936,
+              "p95": 0.6932992800138891,
+              "p99": 0.6932992800138891,
+              "max": 0.6932992800138891,
+              "sum": 1.1511684959987178
+            },
+            "seconds_samples": [0.0853284359909594,0.09858394495677203,0.0919470579829067,0.07575946603901684,0.6932992800138891,0.10625031101517379],
+            "combined_rate": 667.1482086848695,
+            "request_seconds": {
+              "count": 768,
+              "min": 0.00031062099151313305,
+              "median": 0.0005229549715295434,
+              "p95": 0.0006877139676362276,
+              "p99": 0.0008571960497647524,
+              "max": 0.30105299199931324,
+              "sum": 0.7724413300165907
+            },
+            "fsync_seconds": {
+              "count": 0
+            },
+            "observed_wal_bytes": {
+              "count": 0
+            }
+          }
+        }
+      }
+    }
+  },
+  "diagnostic": [
+    {
+      "phase": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "samples": [
+        {
+          "workload": "write_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 1.5735626220703125e-05,
+              "median": 1.5735626220703125e-05,
+              "p95": 1.5735626220703125e-05,
+              "p99": 1.5735626220703125e-05,
+              "max": 1.5735626220703125e-05,
+              "sum": 1.5735626220703125e-05
+            },
+            "fsync_wal": {
+              "count": 6,
+              "min": 0.0018987655639648438,
+              "median": 0.04362785816192627,
+              "p95": 0.060784101486206055,
+              "p99": 0.060784101486206055,
+              "max": 0.060784101486206055,
+              "sum": 0.23679280281066895
+            },
+            "fsync_db": {
+              "count": 2,
+              "min": 0.0017650127410888672,
+              "median": 0.06702840328216553,
+              "p95": 0.1322917938232422,
+              "p99": 0.1322917938232422,
+              "max": 0.1322917938232422,
+              "sum": 0.13405680656433105
+            },
+            "checkpoint_0": {
+              "count": 3,
+              "min": 0.08062243461608887,
+              "median": 0.09440970420837402,
+              "p95": 0.24660205841064453,
+              "p99": 0.24660205841064453,
+              "max": 0.24660205841064453,
+              "sum": 0.4216341972351074
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652676.2750208,
+              "end_epoch": 1791652676.3596337
+            }
+          ]
+        },
+        {
+          "workload": "stream_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 1.3113021850585938e-05,
+              "median": 1.3113021850585938e-05,
+              "p95": 1.3113021850585938e-05,
+              "p99": 1.3113021850585938e-05,
+              "max": 1.3113021850585938e-05,
+              "sum": 1.3113021850585938e-05
+            },
+            "fsync_wal": {
+              "count": 7,
+              "min": 0.001676321029663086,
+              "median": 0.038684844970703125,
+              "p95": 0.052342891693115234,
+              "p99": 0.052342891693115234,
+              "max": 0.052342891693115234,
+              "sum": 0.24067068099975586
+            },
+            "checkpoint_0": {
+              "count": 4,
+              "min": 0.07436633110046387,
+              "median": 0.07539999485015869,
+              "p95": 0.21457242965698242,
+              "p99": 0.21457242965698242,
+              "max": 0.21457242965698242,
+              "sum": 0.43973875045776367
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.14319825172424316,
+              "median": 0.14319825172424316,
+              "p95": 0.14319825172424316,
+              "p99": 0.14319825172424316,
+              "max": 0.14319825172424316,
+              "sum": 0.14319825172424316
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652677.7685268,
+              "end_epoch": 1791652677.858003
+            }
+          ]
+        },
+        {
+          "workload": "write_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.5497207641601562e-05,
+              "median": 2.4080276489257812e-05,
+              "p95": 2.5033950805664062e-05,
+              "p99": 2.5033950805664062e-05,
+              "max": 2.5033950805664062e-05,
+              "sum": 0.00011348724365234375
+            },
+            "fsync_wal": {
+              "count": 23,
+              "min": 0.0018198490142822266,
+              "median": 0.04304766654968262,
+              "p95": 0.06888866424560547,
+              "p99": 0.08344626426696777,
+              "max": 0.08344626426696777,
+              "sum": 0.9489843845367432
+            },
+            "checkpoint_0": {
+              "count": 16,
+              "min": 0.0728750228881836,
+              "median": 0.10424232482910156,
+              "p95": 0.2745497226715088,
+              "p99": 0.2745497226715088,
+              "max": 0.2745497226715088,
+              "sum": 2.1963624954223633
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.044486045837402344,
+              "median": 0.14675188064575195,
+              "p95": 0.16349196434020996,
+              "p99": 0.16349196434020996,
+              "max": 0.16349196434020996,
+              "sum": 0.6447372436523438
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652682.1036787,
+              "end_epoch": 1791652682.1867275
+            }
+          ]
+        },
+        {
+          "workload": "stream_256",
+          "events": {
+            "fsync_wal": {
+              "count": 28,
+              "min": 0.0017256736755371094,
+              "median": 0.037950754165649414,
+              "p95": 0.05093812942504883,
+              "p99": 0.06618595123291016,
+              "max": 0.06618595123291016,
+              "sum": 0.8292765617370605
+            },
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.5974044799804688e-05,
+              "median": 2.4080276489257812e-05,
+              "p95": 6.67572021484375e-05,
+              "p99": 6.67572021484375e-05,
+              "max": 6.67572021484375e-05,
+              "sum": 0.0001552104949951172
+            },
+            "checkpoint_0": {
+              "count": 21,
+              "min": 0.07021164894104004,
+              "median": 0.08095645904541016,
+              "p95": 0.23546075820922852,
+              "p99": 0.4678192138671875,
+              "max": 0.4678192138671875,
+              "sum": 2.4938507080078125
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.1336686611175537,
+              "median": 0.1363067626953125,
+              "p95": 0.4228227138519287,
+              "p99": 0.4228227138519287,
+              "max": 0.4228227138519287,
+              "sum": 0.9933881759643555
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "read_64",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_read_4k",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_write_4k",
+          "events": {
+            "fsync_wal": {
+              "count": 4,
+              "min": 0.005505561828613281,
+              "median": 0.012830376625061035,
+              "p95": 0.038086652755737305,
+              "p99": 0.038086652755737305,
+              "max": 0.038086652755737305,
+              "sum": 0.06925296783447266
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.04806351661682129,
+              "median": 0.04806351661682129,
+              "p95": 0.04806351661682129,
+              "p99": 0.04806351661682129,
+              "max": 0.04806351661682129,
+              "sum": 0.04806351661682129
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652697.7113879,
+              "end_epoch": 1791652697.720838
+            }
+          ]
+        },
+        {
+          "workload": "small_file_fsync",
+          "events": {
+            "fsync_wal": {
+              "count": 135,
+              "min": 9.608268737792969e-05,
+              "median": 0.0020453929901123047,
+              "p95": 0.002466917037963867,
+              "p99": 0.0053637027740478516,
+              "max": 0.011909008026123047,
+              "sum": 0.28947925567626953
+            },
+            "checkpoint_0": {
+              "count": 6,
+              "min": 0.0005745887756347656,
+              "median": 0.0024639368057250977,
+              "p95": 0.02168726921081543,
+              "p99": 0.02168726921081543,
+              "max": 0.02168726921081543,
+              "sum": 0.04205584526062012
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.02130413055419922,
+              "median": 0.02130413055419922,
+              "p95": 0.02130413055419922,
+              "p99": 0.02130413055419922,
+              "max": 0.02130413055419922,
+              "sum": 0.02130413055419922
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.2362285,
+              "end_epoch": 1791652699.2387288
+            }
+          ]
+        },
+        {
+          "workload": "mkdir",
+          "events": {
+            "fsync_wal": {
+              "count": 19,
+              "min": 8.845329284667969e-05,
+              "median": 0.0032417774200439453,
+              "p95": 0.00389862060546875,
+              "p99": 0.00389862060546875,
+              "max": 0.00389862060546875,
+              "sum": 0.060143470764160156
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.002634286880493164,
+              "median": 0.002634286880493164,
+              "p95": 0.002634286880493164,
+              "p99": 0.002634286880493164,
+              "max": 0.002634286880493164,
+              "sum": 0.002634286880493164
+            },
+            "checkpoint_0": {
+              "count": 18,
+              "min": 0.0029985904693603516,
+              "median": 0.0036879777908325195,
+              "p95": 0.0044231414794921875,
+              "p99": 0.0044231414794921875,
+              "max": 0.0044231414794921875,
+              "sum": 0.06663155555725098
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.383425,
+              "end_epoch": 1791652699.3913279
+            },
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652699.4581625,
+              "end_epoch": 1791652699.461235
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.458109,
+              "end_epoch": 1791652699.461435
+            }
+          ]
+        },
+        {
+          "workload": "rename",
+          "events": {
+            "fsync_wal": {
+              "count": 11,
+              "min": 0.002222776412963867,
+              "median": 0.002537965774536133,
+              "p95": 0.007561206817626953,
+              "p99": 0.007561206817626953,
+              "max": 0.007561206817626953,
+              "sum": 0.03378653526306152
+            },
+            "checkpoint_0": {
+              "count": 9,
+              "min": 0.0024466514587402344,
+              "median": 0.0027348995208740234,
+              "p95": 0.007921457290649414,
+              "p99": 0.007921457290649414,
+              "max": 0.007921457290649414,
+              "sum": 0.029644489288330078
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652699.4581625,
+              "end_epoch": 1791652699.461235
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.458109,
+              "end_epoch": 1791652699.461435
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.5111675,
+              "end_epoch": 1791652699.5153832
+            }
+          ]
+        },
+        {
+          "workload": "rmdir",
+          "events": {
+            "fsync_wal": {
+              "count": 16,
+              "min": 0.001688241958618164,
+              "median": 0.0035146474838256836,
+              "p95": 0.003649473190307617,
+              "p99": 0.003649473190307617,
+              "max": 0.003649473190307617,
+              "sum": 0.05321073532104492
+            },
+            "checkpoint_0": {
+              "count": 14,
+              "min": 0.0020711421966552734,
+              "median": 0.00397181510925293,
+              "p95": 0.004157304763793945,
+              "p99": 0.004157304763793945,
+              "max": 0.004157304763793945,
+              "sum": 0.05270719528198242
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.5111675,
+              "end_epoch": 1791652699.5153832
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652699.568119,
+              "end_epoch": 1791652699.571401
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "samples": [
+        {
+          "workload": "write_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 4,
+              "min": 2.0742416381835938e-05,
+              "median": 2.1338462829589844e-05,
+              "p95": 2.4318695068359375e-05,
+              "p99": 2.4318695068359375e-05,
+              "max": 2.4318695068359375e-05,
+              "sum": 8.7738037109375e-05
+            },
+            "fsync_wal": {
+              "count": 9,
+              "min": 0.0018684864044189453,
+              "median": 0.03978919982910156,
+              "p95": 0.903043270111084,
+              "p99": 0.903043270111084,
+              "max": 0.903043270111084,
+              "sum": 1.5406935214996338
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.0017096996307373047,
+              "median": 0.03698325157165527,
+              "p95": 0.985898494720459,
+              "p99": 0.985898494720459,
+              "max": 0.985898494720459,
+              "sum": 1.1260771751403809
+            },
+            "checkpoint_0": {
+              "count": 4,
+              "min": 0.11566901206970215,
+              "median": 0.31608545780181885,
+              "p95": 1.9302451610565186,
+              "p99": 1.9302451610565186,
+              "max": 1.9302451610565186,
+              "sum": 2.6780850887298584
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "stream_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 6,
+              "min": 8.58306884765625e-06,
+              "median": 1.633167266845703e-05,
+              "p95": 2.4080276489257812e-05,
+              "p99": 2.4080276489257812e-05,
+              "max": 2.4080276489257812e-05,
+              "sum": 0.00010180473327636719
+            },
+            "fsync_wal": {
+              "count": 10,
+              "min": 0.0017580986022949219,
+              "median": 0.0197831392288208,
+              "p95": 0.04061579704284668,
+              "p99": 0.04061579704284668,
+              "max": 0.04061579704284668,
+              "sum": 0.20557713508605957
+            },
+            "fsync_db": {
+              "count": 4,
+              "min": 0.03273320198059082,
+              "median": 0.03712260723114014,
+              "p95": 0.03817152976989746,
+              "p99": 0.03817152976989746,
+              "max": 0.03817152976989746,
+              "sum": 0.14514994621276855
+            },
+            "checkpoint_0": {
+              "count": 4,
+              "min": 0.11439847946166992,
+              "median": 0.11526978015899658,
+              "p95": 0.11774086952209473,
+              "p99": 0.11774086952209473,
+              "max": 0.11774086952209473,
+              "sum": 0.4626789093017578
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite",
+              "begin_epoch": 1791652710.7145684,
+              "end_epoch": 1791652710.7589974
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652710.662106,
+              "end_epoch": 1791652710.759058
+            }
+          ]
+        },
+        {
+          "workload": "write_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 21,
+              "min": 1.430511474609375e-05,
+              "median": 2.193450927734375e-05,
+              "p95": 2.47955322265625e-05,
+              "p99": 2.8133392333984375e-05,
+              "max": 2.8133392333984375e-05,
+              "sum": 0.0004582405090332031
+            },
+            "fsync_wal": {
+              "count": 40,
+              "min": 0.0017061233520507812,
+              "median": 0.025206685066223145,
+              "p95": 0.04195547103881836,
+              "p99": 0.06931662559509277,
+              "max": 0.06931662559509277,
+              "sum": 0.9231417179107666
+            },
+            "fsync_db": {
+              "count": 19,
+              "min": 0.03818821907043457,
+              "median": 0.03869438171386719,
+              "p95": 0.040010929107666016,
+              "p99": 0.040010929107666016,
+              "max": 0.040010929107666016,
+              "sum": 0.7358753681182861
+            },
+            "checkpoint_0": {
+              "count": 19,
+              "min": 0.09867739677429199,
+              "median": 0.11899638175964355,
+              "p95": 0.14613938331604004,
+              "p99": 0.14613938331604004,
+              "max": 0.14613938331604004,
+              "sum": 2.2877371311187744
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "stream_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 21,
+              "min": 6.9141387939453125e-06,
+              "median": 1.7404556274414062e-05,
+              "p95": 3.838539123535156e-05,
+              "p99": 3.933906555175781e-05,
+              "max": 3.933906555175781e-05,
+              "sum": 0.0004246234893798828
+            },
+            "fsync_wal": {
+              "count": 40,
+              "min": 0.0016627311706542969,
+              "median": 0.01691126823425293,
+              "p95": 0.04294610023498535,
+              "p99": 0.0669240951538086,
+              "max": 0.0669240951538086,
+              "sum": 0.8575866222381592
+            },
+            "fsync_db": {
+              "count": 19,
+              "min": 0.037103891372680664,
+              "median": 0.03787112236022949,
+              "p95": 0.06857156753540039,
+              "p99": 0.06857156753540039,
+              "max": 0.06857156753540039,
+              "sum": 0.7774677276611328
+            },
+            "checkpoint_0": {
+              "count": 19,
+              "min": 0.11483502388000488,
+              "median": 0.11785268783569336,
+              "p95": 0.14769363403320312,
+              "p99": 0.14769363403320312,
+              "max": 0.14769363403320312,
+              "sum": 2.307556390762329
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite",
+              "begin_epoch": 1791652720.5393302,
+              "end_epoch": 1791652720.611354
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652720.4610076,
+              "end_epoch": 1791652720.6113858
+            }
+          ]
+        },
+        {
+          "workload": "read_64",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_read_4k",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_write_4k",
+          "events": {
+            "fsync_wal": {
+              "count": 5,
+              "min": 0.0017769336700439453,
+              "median": 0.003726959228515625,
+              "p95": 0.03762006759643555,
+              "p99": 0.03762006759643555,
+              "max": 0.03762006759643555,
+              "sum": 0.05853867530822754
+            },
+            "fsync_db": {
+              "count": 2,
+              "min": 0.01607680320739746,
+              "median": 0.025309324264526367,
+              "p95": 0.03454184532165527,
+              "p99": 0.03454184532165527,
+              "max": 0.03454184532165527,
+              "sum": 0.050618648529052734
+            },
+            "checkpoint_2": {
+              "count": 2,
+              "min": 1.8835067749023438e-05,
+              "median": 0.03160977363586426,
+              "p95": 0.06320071220397949,
+              "p99": 0.06320071220397949,
+              "max": 0.06320071220397949,
+              "sum": 0.06321954727172852
+            },
+            "checkpoint_0": {
+              "count": 2,
+              "min": 1.8358230590820312e-05,
+              "median": 0.03174722194671631,
+              "p95": 0.0634760856628418,
+              "p99": 0.0634760856628418,
+              "max": 0.0634760856628418,
+              "sum": 0.06349444389343262
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "small_file_fsync",
+          "events": {
+            "fsync_wal": {
+              "count": 130,
+              "min": 0.0016982555389404297,
+              "median": 0.002103447914123535,
+              "p95": 0.0022478103637695312,
+              "p99": 0.01248621940612793,
+              "max": 0.030777454376220703,
+              "sum": 0.31164979934692383
+            },
+            "checkpoint_2": {
+              "count": 1,
+              "min": 2.288818359375e-05,
+              "median": 2.288818359375e-05,
+              "p95": 2.288818359375e-05,
+              "p99": 2.288818359375e-05,
+              "max": 2.288818359375e-05,
+              "sum": 2.288818359375e-05
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.017390966415405273,
+              "median": 0.017390966415405273,
+              "p95": 0.017390966415405273,
+              "p99": 0.017390966415405273,
+              "max": 0.017390966415405273,
+              "sum": 0.017390966415405273
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.03136301040649414,
+              "median": 0.03136301040649414,
+              "p95": 0.03136301040649414,
+              "p99": 0.03136301040649414,
+              "max": 0.03136301040649414,
+              "sum": 0.03136301040649414
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "mkdir",
+          "events": {
+            "checkpoint_2": {
+              "count": 2,
+              "min": 1.3113021850585938e-05,
+              "median": 1.6689300537109375e-05,
+              "p95": 2.0265579223632812e-05,
+              "p99": 2.0265579223632812e-05,
+              "max": 2.0265579223632812e-05,
+              "sum": 3.337860107421875e-05
+            },
+            "fsync_wal": {
+              "count": 3,
+              "min": 0.0017597675323486328,
+              "median": 0.0028488636016845703,
+              "p95": 0.020737409591674805,
+              "p99": 0.020737409591674805,
+              "max": 0.020737409591674805,
+              "sum": 0.025346040725708008
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.004007816314697266,
+              "median": 0.004007816314697266,
+              "p95": 0.004007816314697266,
+              "p99": 0.004007816314697266,
+              "max": 0.004007816314697266,
+              "sum": 0.004007816314697266
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.008600711822509766,
+              "median": 0.008600711822509766,
+              "p95": 0.008600711822509766,
+              "p99": 0.008600711822509766,
+              "max": 0.008600711822509766,
+              "sum": 0.008600711822509766
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "rename",
+          "events": {
+            "fsync_wal": {
+              "count": 1,
+              "min": 0.014113664627075195,
+              "median": 0.014113664627075195,
+              "p95": 0.014113664627075195,
+              "p99": 0.014113664627075195,
+              "max": 0.014113664627075195,
+              "sum": 0.014113664627075195
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "rmdir",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 2.0503997802734375e-05,
+              "median": 2.0503997802734375e-05,
+              "p95": 2.0503997802734375e-05,
+              "p99": 2.0503997802734375e-05,
+              "max": 2.0503997802734375e-05,
+              "sum": 2.0503997802734375e-05
+            },
+            "fsync_wal": {
+              "count": 3,
+              "min": 0.0019032955169677734,
+              "median": 0.009701013565063477,
+              "p95": 0.014057636260986328,
+              "p99": 0.014057636260986328,
+              "max": 0.014057636260986328,
+              "sum": 0.025661945343017578
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.002592325210571289,
+              "median": 0.002592325210571289,
+              "p95": 0.002592325210571289,
+              "p99": 0.002592325210571289,
+              "max": 0.002592325210571289,
+              "sum": 0.002592325210571289
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.013148069381713867,
+              "median": 0.013148069381713867,
+              "p95": 0.013148069381713867,
+              "p99": 0.013148069381713867,
+              "max": 0.013148069381713867,
+              "sum": 0.013148069381713867
+            }
+          },
+          "crossing_events": []
+        }
+      ]
+    },
+    {
+      "phase": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "samples": [
+        {
+          "workload": "write_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 2.1219253540039062e-05,
+              "median": 2.1219253540039062e-05,
+              "p95": 2.1219253540039062e-05,
+              "p99": 2.1219253540039062e-05,
+              "max": 2.1219253540039062e-05,
+              "sum": 2.1219253540039062e-05
+            },
+            "fsync_wal": {
+              "count": 8,
+              "min": 0.0025482177734375,
+              "median": 0.030104637145996094,
+              "p95": 0.05486917495727539,
+              "p99": 0.05486917495727539,
+              "max": 0.05486917495727539,
+              "sum": 0.23443913459777832
+            },
+            "checkpoint_0": {
+              "count": 5,
+              "min": 0.04721236228942871,
+              "median": 0.06353402137756348,
+              "p95": 0.18639111518859863,
+              "p99": 0.18639111518859863,
+              "max": 0.18639111518859863,
+              "sum": 0.4313786029815674
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.16776347160339355,
+              "median": 0.16776347160339355,
+              "p95": 0.16776347160339355,
+              "p99": 0.16776347160339355,
+              "max": 0.16776347160339355,
+              "sum": 0.16776347160339355
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652745.7143815,
+              "end_epoch": 1791652745.806132
+            }
+          ]
+        },
+        {
+          "workload": "stream_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 2.2172927856445312e-05,
+              "median": 2.2172927856445312e-05,
+              "p95": 2.2172927856445312e-05,
+              "p99": 2.2172927856445312e-05,
+              "max": 2.2172927856445312e-05,
+              "sum": 2.2172927856445312e-05
+            },
+            "fsync_wal": {
+              "count": 7,
+              "min": 0.0018012523651123047,
+              "median": 0.03979659080505371,
+              "p95": 0.06477546691894531,
+              "p99": 0.06477546691894531,
+              "max": 0.06477546691894531,
+              "sum": 0.26210784912109375
+            },
+            "checkpoint_0": {
+              "count": 4,
+              "min": 0.06571435928344727,
+              "median": 0.08594095706939697,
+              "p95": 0.22515511512756348,
+              "p99": 0.22515511512756348,
+              "max": 0.22515511512756348,
+              "sum": 0.4627513885498047
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.1397097110748291,
+              "median": 0.1397097110748291,
+              "p95": 0.1397097110748291,
+              "p99": 0.1397097110748291,
+              "max": 0.1397097110748291,
+              "sum": 0.1397097110748291
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652747.1986723,
+              "end_epoch": 1791652747.2862942
+            }
+          ]
+        },
+        {
+          "workload": "write_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.3828277587890625e-05,
+              "median": 2.384185791015625e-05,
+              "p95": 2.9802322387695312e-05,
+              "p99": 2.9802322387695312e-05,
+              "max": 2.9802322387695312e-05,
+              "sum": 0.00011777877807617188
+            },
+            "fsync_wal": {
+              "count": 23,
+              "min": 0.0018122196197509766,
+              "median": 0.045806884765625,
+              "p95": 0.0752568244934082,
+              "p99": 0.07572507858276367,
+              "max": 0.07572507858276367,
+              "sum": 0.9589753150939941
+            },
+            "checkpoint_0": {
+              "count": 17,
+              "min": 8.106231689453125e-06,
+              "median": 0.10522794723510742,
+              "p95": 0.2494821548461914,
+              "p99": 0.2494821548461914,
+              "max": 0.2494821548461914,
+              "sum": 2.2275946140289307
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.13072514533996582,
+              "median": 0.1317441463470459,
+              "p95": 0.15027832984924316,
+              "p99": 0.15027832984924316,
+              "max": 0.15027832984924316,
+              "sum": 0.684518575668335
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652751.5977619,
+              "end_epoch": 1791652751.688756
+            }
+          ]
+        },
+        {
+          "workload": "stream_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.4066696166992188e-05,
+              "median": 2.2172927856445312e-05,
+              "p95": 3.457069396972656e-05,
+              "p99": 3.457069396972656e-05,
+              "max": 3.457069396972656e-05,
+              "sum": 0.00011515617370605469
+            },
+            "fsync_wal": {
+              "count": 25,
+              "min": 0.0017864704132080078,
+              "median": 0.03724813461303711,
+              "p95": 0.05059385299682617,
+              "p99": 0.06694388389587402,
+              "max": 0.06694388389587402,
+              "sum": 0.7695367336273193
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.1339881420135498,
+              "median": 0.13470816612243652,
+              "p95": 0.7576334476470947,
+              "p99": 0.7576334476470947,
+              "max": 0.7576334476470947,
+              "sum": 1.3250675201416016
+            },
+            "checkpoint_0": {
+              "count": 18,
+              "min": 0.05013084411621094,
+              "median": 0.08552932739257812,
+              "p95": 0.8992002010345459,
+              "p99": 0.8992002010345459,
+              "max": 0.8992002010345459,
+              "sum": 2.6762430667877197
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652754.5897942,
+              "end_epoch": 1791652758.3296683
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652754.5892863,
+              "end_epoch": 1791652758.36083
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652761.5436816,
+              "end_epoch": 1791652761.6229799
+            }
+          ]
+        },
+        {
+          "workload": "read_64",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_read_4k",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_write_4k",
+          "events": {
+            "fsync_wal": {
+              "count": 4,
+              "min": 0.004329681396484375,
+              "median": 0.00978851318359375,
+              "p95": 0.037479400634765625,
+              "p99": 0.037479400634765625,
+              "max": 0.037479400634765625,
+              "sum": 0.0613861083984375
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.0474240779876709,
+              "median": 0.0474240779876709,
+              "p95": 0.0474240779876709,
+              "p99": 0.0474240779876709,
+              "max": 0.0474240779876709,
+              "sum": 0.0474240779876709
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652766.4144423,
+              "end_epoch": 1791652766.4221153
+            }
+          ]
+        },
+        {
+          "workload": "small_file_fsync",
+          "events": {
+            "fsync_wal": {
+              "count": 134,
+              "min": 6.461143493652344e-05,
+              "median": 0.002093672752380371,
+              "p95": 0.0023899078369140625,
+              "p99": 0.005457639694213867,
+              "max": 0.04248929023742676,
+              "sum": 0.32744431495666504
+            },
+            "checkpoint_0": {
+              "count": 6,
+              "min": 0.0018339157104492188,
+              "median": 0.0021839141845703125,
+              "p95": 0.022614717483520508,
+              "p99": 0.022614717483520508,
+              "max": 0.022614717483520508,
+              "sum": 0.043950796127319336
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.022314786911010742,
+              "median": 0.022314786911010742,
+              "p95": 0.022314786911010742,
+              "p99": 0.022314786911010742,
+              "max": 0.022314786911010742,
+              "sum": 0.022314786911010742
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.022163,
+              "end_epoch": 1791652768.0251877
+            }
+          ]
+        },
+        {
+          "workload": "mkdir",
+          "events": {
+            "fsync_wal": {
+              "count": 20,
+              "min": 0.002271890640258789,
+              "median": 0.002981424331665039,
+              "p95": 0.0034942626953125,
+              "p99": 0.0037856101989746094,
+              "max": 0.0037856101989746094,
+              "sum": 0.060654401779174805
+            },
+            "checkpoint_0": {
+              "count": 18,
+              "min": 0.0027208328247070312,
+              "median": 0.003409147262573242,
+              "p95": 0.004256010055541992,
+              "p99": 0.004256010055541992,
+              "max": 0.004256010055541992,
+              "sum": 0.06235766410827637
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652768.1718717,
+              "end_epoch": 1791652768.1747231
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.1717181,
+              "end_epoch": 1791652768.1749122
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.2373133,
+              "end_epoch": 1791652768.2401733
+            }
+          ]
+        },
+        {
+          "workload": "rename",
+          "events": {
+            "fsync_wal": {
+              "count": 14,
+              "min": 0.001659393310546875,
+              "median": 0.0025238990783691406,
+              "p95": 0.035242319107055664,
+              "p99": 0.035242319107055664,
+              "max": 0.035242319107055664,
+              "sum": 0.08248329162597656
+            },
+            "checkpoint_0": {
+              "count": 13,
+              "min": 0.0018603801727294922,
+              "median": 0.0027153491973876953,
+              "p95": 0.03556942939758301,
+              "p99": 0.03556942939758301,
+              "max": 0.03556942939758301,
+              "sum": 0.06766009330749512
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.2373133,
+              "end_epoch": 1791652768.2401733
+            },
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652768.3080146,
+              "end_epoch": 1791652768.3109996
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.3078866,
+              "end_epoch": 1791652768.3112566
+            }
+          ]
+        },
+        {
+          "workload": "rmdir",
+          "events": {
+            "fsync_wal": {
+              "count": 17,
+              "min": 0.0023946762084960938,
+              "median": 0.0034928321838378906,
+              "p95": 0.0038933753967285156,
+              "p99": 0.0038933753967285156,
+              "max": 0.0038933753967285156,
+              "sum": 0.05652189254760742
+            },
+            "checkpoint_0": {
+              "count": 15,
+              "min": 0.00273895263671875,
+              "median": 0.0038645267486572266,
+              "p95": 0.004212856292724609,
+              "p99": 0.004212856292724609,
+              "max": 0.004212856292724609,
+              "sum": 0.05527758598327637
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652768.3080146,
+              "end_epoch": 1791652768.3109996
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.3078866,
+              "end_epoch": 1791652768.3112566
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652768.366771,
+              "end_epoch": 1791652768.369664
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "samples": [
+        {
+          "workload": "write_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.9073486328125e-05,
+              "median": 2.002716064453125e-05,
+              "p95": 2.384185791015625e-05,
+              "p99": 2.384185791015625e-05,
+              "max": 2.384185791015625e-05,
+              "sum": 0.00010418891906738281
+            },
+            "fsync_wal": {
+              "count": 11,
+              "min": 0.001771688461303711,
+              "median": 0.01083230972290039,
+              "p95": 0.04403328895568848,
+              "p99": 0.04403328895568848,
+              "max": 0.04403328895568848,
+              "sum": 0.2206413745880127
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.037709712982177734,
+              "median": 0.051859378814697266,
+              "p95": 0.06624054908752441,
+              "p99": 0.06624054908752441,
+              "max": 0.06624054908752441,
+              "sum": 0.26109743118286133
+            },
+            "checkpoint_0": {
+              "count": 5,
+              "min": 0.11838245391845703,
+              "median": 0.12700796127319336,
+              "p95": 0.14467477798461914,
+              "p99": 0.14467477798461914,
+              "max": 0.14467477798461914,
+              "sum": 0.6408519744873047
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "stream_64",
+          "events": {
+            "checkpoint_2": {
+              "count": 5,
+              "min": 1.3589859008789062e-05,
+              "median": 1.5974044799804688e-05,
+              "p95": 2.2411346435546875e-05,
+              "p99": 2.2411346435546875e-05,
+              "max": 2.2411346435546875e-05,
+              "sum": 9.012222290039062e-05
+            },
+            "fsync_wal": {
+              "count": 11,
+              "min": 0.0018761157989501953,
+              "median": 0.03263568878173828,
+              "p95": 0.04666447639465332,
+              "p99": 0.04666447639465332,
+              "max": 0.04666447639465332,
+              "sum": 0.24967479705810547
+            },
+            "fsync_db": {
+              "count": 5,
+              "min": 0.037008047103881836,
+              "median": 0.03790545463562012,
+              "p95": 0.04455113410949707,
+              "p99": 0.04455113410949707,
+              "max": 0.04455113410949707,
+              "sum": 0.1951007843017578
+            },
+            "checkpoint_0": {
+              "count": 5,
+              "min": 0.11292839050292969,
+              "median": 0.1159508228302002,
+              "p95": 0.11948800086975098,
+              "p99": 0.11948800086975098,
+              "max": 0.11948800086975098,
+              "sum": 0.5810627937316895
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "write_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 20,
+              "min": 1.239776611328125e-05,
+              "median": 2.193450927734375e-05,
+              "p95": 2.384185791015625e-05,
+              "p99": 3.0994415283203125e-05,
+              "max": 3.0994415283203125e-05,
+              "sum": 0.00042510032653808594
+            },
+            "fsync_wal": {
+              "count": 41,
+              "min": 0.0016934871673583984,
+              "median": 0.039803266525268555,
+              "p95": 0.9478228092193604,
+              "p99": 1.1154983043670654,
+              "max": 1.1154983043670654,
+              "sum": 4.223594665527344
+            },
+            "fsync_db": {
+              "count": 20,
+              "min": 0.03700137138366699,
+              "median": 0.03800761699676514,
+              "p95": 0.8894715309143066,
+              "p99": 0.951915979385376,
+              "max": 0.951915979385376,
+              "sum": 3.303260326385498
+            },
+            "checkpoint_0": {
+              "count": 20,
+              "min": 0.10063934326171875,
+              "median": 0.12159132957458496,
+              "p95": 1.9402601718902588,
+              "p99": 2.105893850326538,
+              "max": 2.105893850326538,
+              "sum": 8.020148038864136
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "stream_256",
+          "events": {
+            "checkpoint_2": {
+              "count": 21,
+              "min": 7.867813110351562e-06,
+              "median": 2.2649765014648438e-05,
+              "p95": 3.457069396972656e-05,
+              "p99": 4.0531158447265625e-05,
+              "max": 4.0531158447265625e-05,
+              "sum": 0.0004589557647705078
+            },
+            "fsync_wal": {
+              "count": 40,
+              "min": 0.0016825199127197266,
+              "median": 0.015144824981689453,
+              "p95": 0.04332304000854492,
+              "p99": 0.06768655776977539,
+              "max": 0.06768655776977539,
+              "sum": 0.8605301380157471
+            },
+            "fsync_db": {
+              "count": 20,
+              "min": 0.025987863540649414,
+              "median": 0.0380481481552124,
+              "p95": 0.06730890274047852,
+              "p99": 0.06743240356445312,
+              "max": 0.06743240356445312,
+              "sum": 0.8342039585113525
+            },
+            "checkpoint_0": {
+              "count": 19,
+              "min": 0.10644030570983887,
+              "median": 0.11807823181152344,
+              "p95": 0.14721250534057617,
+              "p99": 0.14721250534057617,
+              "max": 0.14721250534057617,
+              "sum": 2.307305097579956
+            }
+          },
+          "crossing_events": [
+            {
+              "event": "fsync",
+              "file": "db.sqlite-wal",
+              "begin_epoch": 1791652796.0938084,
+              "end_epoch": 1791652796.1294875
+            },
+            {
+              "event": "checkpoint_0",
+              "file": "",
+              "begin_epoch": 1791652796.0931773,
+              "end_epoch": 1791652796.2355626
+            }
+          ]
+        },
+        {
+          "workload": "read_64",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_read_4k",
+          "events": {},
+          "crossing_events": []
+        },
+        {
+          "workload": "random_write_4k",
+          "events": {
+            "checkpoint_2": {
+              "count": 2,
+              "min": 2.3126602172851562e-05,
+              "median": 2.3603439331054688e-05,
+              "p95": 2.4080276489257812e-05,
+              "p99": 2.4080276489257812e-05,
+              "max": 2.4080276489257812e-05,
+              "sum": 4.7206878662109375e-05
+            },
+            "fsync_wal": {
+              "count": 5,
+              "min": 0.0017440319061279297,
+              "median": 0.0031499862670898438,
+              "p95": 0.037474870681762695,
+              "p99": 0.037474870681762695,
+              "max": 0.037474870681762695,
+              "sum": 0.05685925483703613
+            },
+            "fsync_db": {
+              "count": 2,
+              "min": 0.016185283660888672,
+              "median": 0.026218414306640625,
+              "p95": 0.03625154495239258,
+              "p99": 0.03625154495239258,
+              "max": 0.03625154495239258,
+              "sum": 0.05243682861328125
+            },
+            "checkpoint_0": {
+              "count": 2,
+              "min": 0.06425237655639648,
+              "median": 0.0722118616104126,
+              "p95": 0.08017134666442871,
+              "p99": 0.08017134666442871,
+              "max": 0.08017134666442871,
+              "sum": 0.1444237232208252
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "small_file_fsync",
+          "events": {
+            "fsync_wal": {
+              "count": 130,
+              "min": 0.0016384124755859375,
+              "median": 0.001985788345336914,
+              "p95": 0.0021054744720458984,
+              "p99": 0.012232303619384766,
+              "max": 0.594965934753418,
+              "sum": 0.859393835067749
+            },
+            "checkpoint_2": {
+              "count": 1,
+              "min": 2.0265579223632812e-05,
+              "median": 2.0265579223632812e-05,
+              "p95": 2.0265579223632812e-05,
+              "p99": 2.0265579223632812e-05,
+              "max": 2.0265579223632812e-05,
+              "sum": 2.0265579223632812e-05
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.016108274459838867,
+              "median": 0.016108274459838867,
+              "p95": 0.016108274459838867,
+              "p99": 0.016108274459838867,
+              "max": 0.016108274459838867,
+              "sum": 0.016108274459838867
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.025609731674194336,
+              "median": 0.025609731674194336,
+              "p95": 0.025609731674194336,
+              "p99": 0.025609731674194336,
+              "max": 0.025609731674194336,
+              "sum": 0.025609731674194336
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "mkdir",
+          "events": {
+            "fsync_wal": {
+              "count": 1,
+              "min": 0.02161383628845215,
+              "median": 0.02161383628845215,
+              "p95": 0.02161383628845215,
+              "p99": 0.02161383628845215,
+              "max": 0.02161383628845215,
+              "sum": 0.02161383628845215
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "rename",
+          "events": {
+            "fsync_wal": {
+              "count": 1,
+              "min": 0.013042926788330078,
+              "median": 0.013042926788330078,
+              "p95": 0.013042926788330078,
+              "p99": 0.013042926788330078,
+              "max": 0.013042926788330078,
+              "sum": 0.013042926788330078
+            }
+          },
+          "crossing_events": []
+        },
+        {
+          "workload": "rmdir",
+          "events": {
+            "checkpoint_2": {
+              "count": 1,
+              "min": 1.5735626220703125e-05,
+              "median": 1.5735626220703125e-05,
+              "p95": 1.5735626220703125e-05,
+              "p99": 1.5735626220703125e-05,
+              "max": 1.5735626220703125e-05,
+              "sum": 1.5735626220703125e-05
+            },
+            "fsync_wal": {
+              "count": 3,
+              "min": 0.0017833709716796875,
+              "median": 0.008130550384521484,
+              "p95": 0.014924287796020508,
+              "p99": 0.014924287796020508,
+              "max": 0.014924287796020508,
+              "sum": 0.02483820915222168
+            },
+            "fsync_db": {
+              "count": 1,
+              "min": 0.00273895263671875,
+              "median": 0.00273895263671875,
+              "p95": 0.00273895263671875,
+              "p99": 0.00273895263671875,
+              "max": 0.00273895263671875,
+              "sum": 0.00273895263671875
+            },
+            "checkpoint_0": {
+              "count": 1,
+              "min": 0.011692523956298828,
+              "median": 0.011692523956298828,
+              "p95": 0.011692523956298828,
+              "p99": 0.011692523956298828,
+              "max": 0.011692523956298828,
+              "sum": 0.011692523956298828
+            }
+          },
+          "crossing_events": []
+        }
+      ]
+    }
+  ],
+  "units": "durations in seconds; nearest-rank percentiles; combined throughput = total work / total elapsed; thread durations may overlap",
+  "fuse_status": "PASS"
+}

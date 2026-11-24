@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inspect and relocate media ELF libraries without executing their constructors."""
+"""Inspect and relocate media libraries without executing their constructors."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ import ast
 import hashlib
 import importlib.util
 import io
+import platform as host_platform
 import re
 import shutil
 import struct
 import subprocess
+import sys
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
@@ -31,6 +33,28 @@ PROJECT_NOTICES = {
     PROJECT_LICENSE_FILE: PROJECT_LICENSE_SHA256,
     "NOTICE": "aaf87a040547c1e9df715bc84d4d19474821d460f204a577eb83b944ab2c74d6",
 }
+
+
+def component_notice(path: Path, expected_sha256: str) -> bytes:
+    """Retain reviewed text when vcpkg combines notices with host line endings."""
+    contents = path.read_bytes()
+    if hashlib.sha256(contents).hexdigest() == expected_sha256:
+        return contents
+    canonical = contents.replace(b"\r\n", b"\n")
+    if hashlib.sha256(canonical).hexdigest() != expected_sha256:
+        raise ValueError(f"unreviewed media component notice: {path}")
+    return canonical
+
+
+def runtime_triplet() -> str:
+    machine = host_platform.machine().casefold()
+    if sys.platform == "win32" and machine in {"amd64", "x86_64"}:
+        return "x64-windows-vane-media"
+    if sys.platform == "darwin" and machine in {"aarch64", "arm64"}:
+        return "arm64-osx-vane-media"
+    if sys.platform == "linux" and machine in {"amd64", "x86_64"}:
+        return "x64-linux-vane-media"
+    raise ValueError("media SDK requires Linux x86-64, macOS arm64 or Windows x64")
 
 
 def runtime_license_expression(components) -> str:
@@ -71,7 +95,15 @@ def _read_runtime_wheel_snapshot(snapshot, *, test_only):
     tag = next(iter(tags))
     if tag.interpreter != "py3" or tag.abi != "none":
         raise ValueError("media runtime must use a Python-independent native-library wheel tag")
-    _policy(tag.platform)
+    from vane_packaging.extension_wheel import _wheel_platform_policy
+
+    policy = _wheel_platform_policy(tag.platform)
+    if not (
+        (policy.family == "manylinux" and policy.architecture == "x86_64")
+        or (policy.family == "macosx" and policy.architecture in {"arm64", "x86_64"})
+        or (policy.family == "windows" and policy.architecture == "amd64")
+    ):
+        raise ValueError("unsupported native media runtime wheel platform")
     with open_zip_snapshot(snapshot, max_members=512, description="runtime wheel") as wheel:
         entries = wheel.infolist()
         if not 1 <= len(entries) <= 512 or sum(item.file_size for item in entries) > fmt.MAX_TOTAL_BYTES:
@@ -166,7 +198,7 @@ def _read_runtime_wheel_snapshot(snapshot, *, test_only):
         graph = validate_library_graph(libraries, tag.platform)
         for name, needed in graph.items():
             if list(needed) != manifest["files"][name]["needed"]:
-                raise ValueError(f"runtime manifest dependency graph differs from ELF metadata: {name}")
+                raise ValueError(f"runtime manifest dependency graph differs from binary metadata: {name}")
         _validate_wheel_record(wheel, names=names, record_name=f"{info}/RECORD")
     return fmt.reference(document), manifest, libraries, document, signature
 
@@ -257,6 +289,16 @@ def exported_versions(contents: bytes) -> frozenset[str]:
 
 def validate_library_graph(libraries: dict[str, bytes], platform: str) -> dict[str, tuple[str, ...]]:
     """Check every object, including recursive dependencies and symbol versions."""
+    if platform.startswith(("win_", "macosx_")):
+        from vane_packaging.media_binary import validate_non_elf_graph
+
+        if (
+            not 1 <= len(libraries) <= 128
+            or sum(map(len, libraries.values())) > 512 * 1024**2
+            or any(not 0 < len(contents) <= 128 * 1024**2 for contents in libraries.values())
+        ):
+            raise ValueError("runtime library graph exceeds its bound")
+        return validate_non_elf_graph(libraries, platform)
     policy = _policy(platform)
     if not 1 <= len(libraries) <= 128 or sum(map(len, libraries.values())) > 512 * 1024 * 1024:
         raise ValueError("runtime library graph exceeds its bound")
@@ -289,6 +331,10 @@ def stage_libraries(
     """
     if re.fullmatch(r"vane_media_[a-z0-9_]{1,64}", namespace) is None:
         raise ValueError("invalid media runtime SONAME namespace")
+    if platform.startswith(("win_", "macosx_")):
+        from vane_packaging.media_binary import stage_non_elf
+
+        return stage_non_elf(prefix, destination, namespace=namespace, platform=platform)
     policy = _policy(platform)
     sources: dict[str, Path] = {}
     for candidate in sorted((prefix / "lib").glob("*.so*")):

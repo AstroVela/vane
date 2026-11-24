@@ -1,0 +1,167 @@
+{
+  "status": "PASS",
+  "rows": [
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "hint_calls": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3589302,
+        3589304
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 0,
+      "hint_calls": 20,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3589692
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3589678,
+        3589680
+      ],
+      "hint_max_seconds": 2.479855964,
+      "maximum_hint_range_bytes": 50331648,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "updated",
+      "rep": 1,
+      "hint_calls": 22,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3590191
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3590162,
+        3590164
+      ],
+      "hint_max_seconds": 0.046229486,
+      "maximum_hint_range_bytes": 16777216,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "hint_calls": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3590699,
+        3590701
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 0,
+      "hint_calls": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3590931,
+        3590934
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 0,
+      "hint_calls": 22,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3591508
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3591503,
+        3591506
+      ],
+      "hint_max_seconds": 1.8469349,
+      "maximum_hint_range_bytes": 50331648,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "updated",
+      "rep": 1,
+      "hint_calls": 24,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [
+        3591981
+      ],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3591972,
+        3591974
+      ],
+      "hint_max_seconds": 0.033764449,
+      "maximum_hint_range_bytes": 16777216,
+      "enqueue_max_seconds_upper_bound": 0.001,
+      "shutdown_max_seconds_upper_bound": 0.001,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    },
+    {
+      "state": "aged_fuse",
+      "variant": "baseline",
+      "rep": 1,
+      "hint_calls": 0,
+      "retained_enqueue_calls": 0,
+      "hint_threads": [],
+      "enqueue_threads": [],
+      "observed_foreground_threads": [
+        3592404,
+        3592406
+      ],
+      "hint_max_seconds": 0,
+      "maximum_hint_range_bytes": 0,
+      "enqueue_max_seconds_upper_bound": null,
+      "shutdown_max_seconds_upper_bound": null,
+      "hints_with_overlapping_retained_enqueue": 0,
+      "syscall_errors": []
+    }
+  ],
+  "span_filter_threshold_seconds": 0.001,
+  "scope": "Separate instrumented window; thread separation compares retained markers; short spans below 1 ms are filtered; blocking isolation is independently verified by fault tests; no throughput adoption inference"
+}

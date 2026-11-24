@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -40,6 +46,15 @@ class Logger;
 class ClientContext;
 class QueryContext;
 class MultiFileList;
+struct CopyInfo;
+
+//! Coordinator-only COPY destination binding. Providers may attach diagnostic
+//! properties; credentials must never be stored in this result.
+struct FileWriteTarget {
+	string path;
+	bool requires_rebind = false;
+	unordered_map<string, string> properties;
+};
 
 enum class FileType {
 	//! Regular file
@@ -321,6 +336,11 @@ public:
 
 	//! Canonicalize a path
 	DUCKDB_API virtual string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener = nullptr);
+
+	//! Validate and resolve a COPY destination before format binding or storage
+	//! strategy selection. Binding must not create files or other remote state.
+	DUCKDB_API virtual FileWriteTarget ResolveWriteTarget(const string &path, const CopyInfo &info,
+	                                                      optional_ptr<FileOpener> opener = nullptr);
 
 protected:
 	DUCKDB_API virtual unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &path, FileOpenFlags flags,

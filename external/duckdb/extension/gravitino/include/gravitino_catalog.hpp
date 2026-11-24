@@ -35,6 +35,7 @@ public:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 	void RequireMutation(ClientContext &context) const;
 	static GravitinoCatalog &Get(ClientContext &context, const string &alias);
+	static GravitinoCatalog &GetMetalake(ClientContext &context, const string &alias);
 
 private:
 	mutex lock;

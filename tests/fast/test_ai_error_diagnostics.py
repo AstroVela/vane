@@ -5,11 +5,53 @@ import base64
 import errno
 import json
 import pickle
+import sys
 
 import pytest
 
 from vane.ai import DiagnosticError, summarize_error
+from vane.ai._errors import _is_resource_error, _raise_if_resource_error
 from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "MLX audio requires 161 to 480000 samples; short tails and truncation are unsupported",
+        "MLX audio exceeds max_length after media token expansion",
+        "MLX video exceeds max_length after media token expansion",
+    ],
+)
+def test_mlx_static_input_limits_survive_safe_transport_without_exposing_untrusted_text(message):
+    from vane.ai._embedding_inputs import EmbeddingConfigurationError
+
+    expected = "EmbeddingConfigurationError: " + message
+    assert summarize_error(EmbeddingConfigurationError(message)) == expected
+    diagnostic = pickle.loads(pickle.dumps(DiagnosticError("fixture", EmbeddingConfigurationError(message))))
+    assert diagnostic.summary == expected
+    assert expected in summarize_error(native_error(diagnostic, "native_json"))
+    assert message not in summarize_error(RuntimeError(message))
+    assert message not in summarize_error(EmbeddingConfigurationError(message + " private-input"))
+    assert "private-input" not in summarize_error(EmbeddingConfigurationError(message + " private-input"))
+
+
+def onnx_allocation_error(kind="Fail", *, initialize=False, wrapped=False):
+    status = "1 : FAIL" if kind == "Fail" else "6 : RUNTIME_EXCEPTION"
+    operation = (
+        "Exception during initialization: "
+        if initialize
+        else "Non-zero status code returned while running Conv node. Name:'private-node' Status Message: "
+    )
+    error = type(kind, (Exception,), {})(
+        f"[ONNXRuntimeError] : {status} : {operation}"
+        "/private/build/bfc_arena.cc:360 void* onnxruntime::BFCArena::AllocateRawInternal"
+        "(size_t, bool, onnxruntime::Stream*) Failed to allocate memory for requested buffer of size 1073741824"
+    )
+    if wrapped:
+        outer = type("ONNXRuntimeError", (Exception,), {})("private traceback with credentials")
+        outer.__context__ = error
+        return outer
+    return error
 
 
 def native_error(error, envelope="native_json"):
@@ -40,7 +82,37 @@ def native_error(error, envelope="native_json"):
         message = (
             "Invalid Input Error: Python exception occurred while executing the UDF: " + typed + "\nAt:\nprivate source"
         )
+    if envelope == "task_json":
+        message = json.dumps(
+            {
+                "exception_type": "INTERNAL",
+                "exception_message": "[PlanExecutionContext::spawn] task error: DuckDBError::InternalError: " + message,
+                "stack_trace_pointers": "private native stack",
+            }
+        )
     return InvalidInputException(message)
+
+
+@pytest.mark.parametrize("invalid", ["type", "prefix", "task_type", "message_type", "json", "forged"])
+def test_spawn_diagnostic_requires_complete_typed_native_envelopes(invalid):
+    from vane.ai._errors import _native_query_diagnostic
+
+    diagnostic = DiagnosticError("fixture", OSError(errno.ENOSPC, "private path"))
+    error = RuntimeError(str(diagnostic)) if invalid == "forged" else diagnostic
+    payload = json.loads(str(native_error(error, "task_json")))
+    if invalid == "type":
+        payload["exception_type"] = "Invalid Input"
+    elif invalid == "prefix":
+        payload["exception_message"] = "private text " + payload["exception_message"]
+    elif invalid == "task_type":
+        payload["exception_message"] = payload["exception_message"].replace(
+            "DuckDBError::InternalError:", "RuntimeError:", 1
+        )
+    elif invalid == "message_type":
+        payload["exception_message"] = {"private": "body"}
+    message = "DuckDBError::ExternalError: " + json.dumps(payload) + ("trailing text" if invalid == "json" else "")
+    assert _native_query_diagnostic(ValueError(message)) is None
+    assert "private" not in summarize_error(ValueError(message))
 
 
 @pytest.mark.parametrize(
@@ -55,11 +127,24 @@ def native_error(error, envelope="native_json"):
             "mem_fraction_static=0.3, required above 0.346",
         ),
         (RuntimeError("CUDA out of memory. private request content"), "CUDA memory allocation failed"),
+        (RuntimeError("CUDA failed with error out of memory"), "CUDA memory allocation failed"),
+        (onnx_allocation_error(), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error("RuntimeException", initialize=True), "ONNX Runtime memory allocation failed"),
+        (onnx_allocation_error(wrapped=True), "ONNX Runtime memory allocation failed"),
+        (
+            RuntimeError(
+                "[enforce fail at /private/build/alloc_cpu.cpp:127] err == 0. "
+                "DefaultCPUAllocator: can't allocate memory: you tried to allocate 1073741824 bytes. "
+                "Error code 12 (Cannot allocate memory)\nprivate C++ stack"
+            ),
+            "CPU memory allocation failed",
+        ),
         (MemoryError("private allocation description"), "memory allocation failed"),
     ],
 )
 @pytest.mark.parametrize(
-    "envelope", ["plain", "native_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"]
+    "envelope",
+    ["plain", "native_json", "task_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"],
 )
 def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, expected, envelope):
     public = _safe_provider_execution_error("sglang", "private-model", "embedding initialization", error)
@@ -68,6 +153,177 @@ def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, e
     for result in (summarize_error(error), summarize_error(public), summarize_error(flattened)):
         assert expected in result
         assert "private" not in result
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "private input mentions DefaultCPUAllocator: can't allocate memory",
+        "DefaultCPUAllocator: invalid argument in private input",
+        "DefaultCPUAllocator: can't allocate memory: private body",
+    ],
+)
+def test_cpu_allocator_summary_rejects_unrecognized_messages(message):
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA failed with error invalid argument",
+        "private input mentions CUDA failed with error out of memory",
+        "CUDA failed with error out of memory private input",
+    ],
+)
+def test_ctranslate_summary_accepts_only_the_allocation_error(message):
+    assert summarize_error(RuntimeError(message)) == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        "[metal::malloc] Resource limit (499000) exceeded.",
+        (
+            "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
+            " the maximum allowed buffer size of 4294967296 bytes."
+        ),
+        "[METAL] Command buffer execution failed: Insufficient Memory",
+        "[METAL] Command buffer execution failed: Insufficient Memory.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        ),
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "envelope",
+    ["native_json", "task_json", "traceback", "init", "init_json", "init_stream", "init_stream_json"],
+)
+def test_mlx_allocation_error_stays_fatal_after_diagnostic_transport(message, envelope):
+    error = RuntimeError(message)
+    public = _safe_provider_execution_error("mlx", "private-model", "embedding initialization", error)
+    restored = pickle.loads(pickle.dumps(public))
+    flattened = native_error(restored, envelope)
+    for current in (error, public, restored, flattened):
+        assert summarize_error(current) == (
+            "RuntimeError: MLX memory allocation failed; check model and worker memory budgets"
+        )
+        with pytest.raises(MemoryError, match="Embedding exhausted model or host resources"):
+            _raise_if_resource_error(current)
+
+
+@pytest.mark.parametrize("chain", ["cause", "cleanup"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "[malloc] Unable to allocate 4096 bytes.",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+    ],
+)
+def test_mlx_allocation_failure_in_nested_errors_is_fatal(chain, message):
+    error = RuntimeError("private provider failure")
+    allocation = RuntimeError(message)
+    if chain == "cause":
+        error.__cause__ = allocation
+    else:
+        error.cleanup_errors = (allocation,)
+    public = pickle.loads(pickle.dumps(DiagnosticError("embedding", error)))
+    assert "private" not in str(public)
+    with pytest.raises(MemoryError, match="resources"):
+        _raise_if_resource_error(public)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "private input mentions [malloc] Unable to allocate 4096 bytes.",
+        "[malloc] Unable to allocate 4096 bytes. private input",
+        "[malloc] Unable to allocate 4096 bytes.\nprivate input",
+        "[malloc] Unable to allocate private-token bytes.",
+        "[malloc] Unable to allocate -1 bytes.",
+        "[malloc] Unable to allocate 100000000000000000000 bytes.",
+        "[metal::malloc] Resource limit (private-token) exceeded.",
+        "[metal::malloc] Resource limit (499000) exceeded. private input",
+        (
+            "[metal::malloc] Attempting to allocate 8589934592 bytes which is greater than"
+            " the maximum allowed buffer size of private-token bytes."
+        ),
+        "[metal::set_wired_limit] Setting a wired limit larger than the maximum working set size is not allowed.",
+        "private input mentions [METAL] Command buffer execution failed: Insufficient Memory.",
+        "[METAL] Command buffer execution failed: Insufficient Memory. private input",
+        "[METAL] Command buffer execution failed: Insufficient Memory.\nprivate input",
+        "[METAL] Command buffer execution failed: Insufficient Memory (private-token).",
+        (
+            "[METAL] Command buffer execution failed: Insufficient Memory"
+            " (00000003:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+        ),
+        "[METAL] Command buffer execution failed: Timeout.",
+        "[METAL] Command buffer execution failed: Internal Error (0000000e:Internal Error).",
+    ],
+)
+def test_mlx_summary_rejects_unrecognized_allocation_messages(message):
+    error = RuntimeError(message)
+    assert summarize_error(error) == "RuntimeError"
+    assert not _is_resource_error(error)
+
+
+@pytest.mark.parametrize("kind", ["Fail", "RuntimeException"])
+@pytest.mark.parametrize("change", ["prefix", "suffix", "node_text", "allocator", "size"])
+def test_onnx_summary_requires_an_allocator_failure(kind, change):
+    error = onnx_allocation_error(kind)
+    message = str(error)
+    message = {
+        "prefix": "private text " + message,
+        "suffix": message + " private text",
+        "node_text": "[ONNXRuntimeError] : 1 : FAIL : private input mentions Failed to allocate memory",
+        "allocator": message.replace("Failed to allocate memory", "Invalid argument"),
+        "size": message.replace("1073741824", "private input"),
+    }[change]
+    assert summarize_error(type(error)(message)) == kind
+
+
+@pytest.mark.parametrize("kind", ["RuntimeError", "ONNXRuntimeError"])
+def test_onnx_traceback_text_without_a_typed_cause_is_not_decoded(kind):
+    error = type(kind, (Exception,), {})(str(onnx_allocation_error()))
+    assert summarize_error(error) == kind
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux address-space limit")
+def test_real_torch_cpu_allocator_survives_diagnostic_wrapping():
+    import subprocess
+    import sys
+
+    pytest.importorskip("torch")
+    code = """
+import json, pickle, resource
+from pathlib import Path
+import torch
+from vane.ai import DiagnosticError, summarize_error
+virtual = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmSize:'))) * 1024
+old = resource.getrlimit(resource.RLIMIT_AS)
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (virtual + 64 * 1024**2, old[1]))
+    torch.empty(256 * 1024**2, dtype=torch.float32, device='cpu')
+except RuntimeError as error:
+    resource.setrlimit(resource.RLIMIT_AS, old)
+    assert 'DefaultCPUAllocator' in str(error)
+    print(json.dumps([summarize_error(error), summarize_error(pickle.loads(pickle.dumps(DiagnosticError('fixture', error))))]))
+else:
+    raise AssertionError('CPU allocator probe did not fail')
+finally:
+    resource.setrlimit(resource.RLIMIT_AS, old)
+"""
+    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True, timeout=45)
+    summaries = json.loads(result.stdout)
+    assert summaries == ["RuntimeError: CPU memory allocation failed; check model and worker CPU memory budgets"] * 2
 
 
 @pytest.mark.parametrize(
@@ -251,10 +507,8 @@ def test_cleanup_chain_is_bounded_and_does_not_trust_ray_error_bodies():
     assert "RuntimeError" in message and "private" not in message and len(message) <= 64
 
 
-@pytest.mark.parametrize("runner", ["local", "ray"])
-def test_worker_and_query_cleanup_diagnostics_merge_across_transports(runner):
+def test_worker_and_query_cleanup_diagnostics_merge_across_transports():
     from vane.execution._subprocess_error import capture_cleanup
-    from vane.runners.local.runner import _local_write_diagnostic
     from vane.runners.ray.driver import _capture_datasink_diagnostic
 
     diagnostic = capture_cleanup(
@@ -265,12 +519,9 @@ def test_worker_and_query_cleanup_diagnostics_merge_across_transports(runner):
     expected_errno = [errno.EIO]
     for number in (errno.ENOSPC, errno.EACCES):
         teardown = OSError(number, "private query teardown")
-        if runner == "local":
-            diagnostic = _local_write_diagnostic(diagnostic, [teardown])
-        else:
-            result = {"outcome_unknown": True, "outcome_diagnostic": diagnostic}
-            _capture_datasink_diagnostic(result, cleanup_error=teardown)
-            diagnostic = result["outcome_diagnostic"]
+        result = {"outcome_unknown": True, "outcome_diagnostic": diagnostic}
+        _capture_datasink_diagnostic(result, cleanup_error=teardown)
+        diagnostic = result["outcome_diagnostic"]
         expected_errno.append(number)
         for _ in range(3):
             serialized = pickle.dumps(diagnostic)
@@ -698,7 +949,7 @@ def test_actor_activation_captures_cause_and_cleanup_before_ray_serialization(mo
 
 
 @pytest.mark.parametrize("method", ["copy", "datasink"])
-@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+@pytest.mark.parametrize("envelope", ["native_json", "task_json", "init_json", "init_stream_json"])
 def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(method, envelope):
     from types import SimpleNamespace
 
@@ -732,7 +983,7 @@ def test_terminal_plan_captures_native_diagnostics_before_ray_serialization(meth
     assert "OSError (errno=28)" in summary and "private" not in summary
 
 
-@pytest.mark.parametrize("envelope", ["native_json", "init_json", "init_stream_json"])
+@pytest.mark.parametrize("envelope", ["native_json", "task_json", "init_json", "init_stream_json"])
 @pytest.mark.parametrize("forged", [False, True])
 def test_datasink_returned_failure_captures_only_native_typed_diagnostics(envelope, forged):
     from types import SimpleNamespace
@@ -926,3 +1177,75 @@ def test_subprocess_error_payload_rejects_invalid_fields(payload):
 
     with pytest.raises(RuntimeError, match="Invalid UDF subprocess error payload"):
         decode_error(json.dumps(payload).encode())
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("primary_failure", [False, True], ids=["success", "execution-error"])
+@pytest.mark.parametrize("cleanup_kind", ["errno", "forged"])
+def test_native_subprocess_completion_cleanup_preserves_diagnostics(
+    monkeypatch, backend, primary_failure, cleanup_kind
+):
+    import inspect
+
+    import vane
+    from vane.execution import udf_subprocess as local
+    from vane.execution.udf_admission import AdmissionLease
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    original = AdmissionLease.complete_execution
+    injected = []
+    if cleanup_kind == "errno":
+        cleanup_error = OSError(errno.ENOSPC, "private cleanup path")
+    else:
+        private_type = type("PrivateForgedDiagnostic", (Exception,), {})
+        cleanup_error = RuntimeError("DiagnosticError: " + str(DiagnosticError("fixture", private_type())))
+
+    def complete_then_fail(lease):
+        # Target completion rather than later release() / query shutdown, so
+        # the real native async queue must transport this injected failure.
+        frame = inspect.currentframe()
+        try:
+            completing = frame.f_back.f_code.co_name == "_complete_task_submit"
+        finally:
+            del frame
+        original(lease)
+        if completing and not injected:
+            injected.append(True)
+            raise cleanup_error
+
+    def run(table):
+        if primary_failure:
+            raise OSError(errno.EIO, "private execution path")
+        return table
+
+    class Model:
+        def __call__(self, table):
+            return run(table)
+
+    local._shutdown_global_task_runtime()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(AdmissionLease, "complete_execution", complete_then_fail)
+            with vane.connect() as conn:
+                relation = conn.sql("SELECT 1::BIGINT AS i").map_batches(
+                    Model if backend == "subprocess_actor" else run,
+                    schema={"i": vane.sqltypes.BIGINT},
+                    execution_backend=backend,
+                    actor_number=1 if backend == "subprocess_actor" else None,
+                )
+                with pytest.raises(vane.InvalidInputException) as caught:
+                    relation.fetchall()
+        assert injected == [True]
+        summary = summarize_error(caught.value)
+        primary, _, cleanup = summary.partition("; cleanup: ")
+        expected = f"OSError (errno={errno.ENOSPC})" if cleanup_kind == "errno" else "RuntimeError"
+        if primary_failure:
+            assert f"OSError (errno={errno.EIO})" in primary
+            assert expected in cleanup
+            assert summary.count("cleanup:") == 1
+        else:
+            assert summary == expected
+        assert "private" not in summary.lower()
+        assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+    finally:
+        local._shutdown_global_task_runtime()

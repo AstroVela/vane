@@ -1,0 +1,8 @@
+{
+  "status": "PASS",
+  "completed_epoch": 1791710399.994432,
+  "published_analyzer_reproduces_measured_summary": true,
+  "all_gate_decisions_preserved": true,
+  "related_helpers_load": true,
+  "decision": "REJECT"
+}

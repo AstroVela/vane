@@ -1,0 +1,144 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "../checkpoint_progress/fixture.hpp"
+#include <fstream>
+#include <iomanip>
+#ifdef VANE_WAL_TRACE
+#include "trace.hpp"
+#else
+namespace request_trace {
+static const auto epoch = std::chrono::steady_clock::now();
+inline long long Now() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - epoch).count();
+}
+inline void Install(const char *) {
+}
+struct Scope {
+	explicit Scope(const char *, long long = -1, long long = 0) {
+	}
+};
+} // namespace request_trace
+#endif
+
+static sqlite3 *writer = nullptr;
+using WalHook = int (*)(void *, sqlite3 *, const char *, int);
+extern "C" void *__real_sqlite3_wal_hook(sqlite3 *, WalHook, void *);
+extern "C" void *__wrap_sqlite3_wal_hook(sqlite3 *db, WalHook hook, void *context) {
+	if (hook == Checkpointer::OnCommit) {
+		Require(writer == nullptr, "Expected one writer");
+		writer = db;
+	}
+	if (!hook && db == writer)
+		writer = nullptr;
+	return __real_sqlite3_wal_hook(db, hook, context);
+}
+static std::pair<int, int> Status() {
+	int frames = -1, copied = -1;
+	auto code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+	Require(code == SQLITE_OK || code == SQLITE_BUSY, "Read WAL status");
+	return {frames, copied};
+}
+int main(int argc, char **argv) {
+	try {
+		Require(argc == 4, "Expected database, small128|write64, output JSON");
+		std::string path = argv[1], workload = argv[2];
+		Require(workload == "small128" || workload == "write64", "Unknown workload");
+		std::string payload(workload == "small128" ? 4096 : 1048576, 'w');
+		request_trace::Install(path.c_str());
+		std::unique_ptr<Workspace> workspace;
+		std::shared_ptr<Session> session;
+		int64_t root;
+		long long start = request_trace::Now(), initialized, begin, end, first;
+		{
+			request_trace::Scope scope("initialization");
+			workspace = std::make_unique<Workspace>(path, 5000, Durability::Fsync);
+			session = workspace->Checkout();
+			workspace->AcquireMount("main");
+			root = session->OpenDirectory("/").inode;
+			initialized = request_trace::Now();
+		}
+		Require(writer, "Writer hook not observed");
+		auto before = Status();
+		auto initial_bytes = std::filesystem::file_size(path + "-wal");
+		std::vector<int64_t> inodes;
+		std::vector<long long> operations;
+		{
+			request_trace::Scope phase(workload == "small128" ? "phase_small_file_fsync" : "phase_write_64");
+			begin = request_trace::Now();
+			int files = workload == "small128" ? 128 : 1;
+			for (int i = 0; i < files; ++i) {
+				auto operation_start = request_trace::Now();
+				int64_t inode;
+				{
+					request_trace::Scope scope("create");
+					inode = session->CreateNode(root, "file-" + std::to_string(i), false, 0600, true, false, 2).inode;
+				}
+				for (int j = 0; j < (workload == "small128" ? 1 : 64); ++j) {
+					request_trace::Scope scope("write", j * int64_t(payload.size()), payload.size());
+					session->WriteInode(inode, payload, j * int64_t(payload.size()));
+				}
+				{
+					request_trace::Scope scope("fsync");
+					session->StatInode(inode);
+					workspace->Sync();
+				}
+				{
+					request_trace::Scope scope("flush");
+					session->StatInode(inode);
+				}
+				{
+					request_trace::Scope scope("release");
+					session->CloseFile(inode);
+				}
+				if (!i)
+					first = request_trace::Now();
+				inodes.push_back(inode);
+				operations.push_back(request_trace::Now() - operation_start);
+			}
+			end = request_trace::Now();
+		}
+		auto after = Status();
+		auto final_bytes = std::filesystem::file_size(path + "-wal");
+		{
+			request_trace::Scope scope("validation");
+			for (size_t i = 0; i < inodes.size(); ++i) {
+				Require(session->Read("/file-" + std::to_string(i)) ==
+				            std::string(workload == "small128" ? 4096 : 64 * 1048576, 'w'),
+				        "Content differs");
+				session->CloseFile(inodes[i]);
+			}
+			session->CloseFile(root);
+			workspace->ReleaseMount("main");
+			session->Close();
+		}
+		auto close_start = request_trace::Now();
+		{
+			request_trace::Scope scope("close");
+			workspace->Close();
+		}
+		auto close_end = request_trace::Now();
+		SQL inspect(path);
+		Require(inspect.Text("PRAGMA quick_check") == "ok", "Integrity failed");
+		Require(inspect.Text("SELECT version FROM format") == "1004", "Format changed");
+		std::ofstream result(argv[3]);
+		result << std::setprecision(17) << "{\"status\":\"PASS\",\"workload\":\"" << workload
+		       << "\",\"total_begin_ns\":" << start << ",\"phase_begin_ns\":" << begin << ",\"phase_end_ns\":" << end
+		       << ",\"initialization_seconds\":" << double(initialized - start) / 1e9
+		       << ",\"phase_seconds\":" << double(end - begin) / 1e9
+		       << ",\"total_seconds\":" << double(end - start) / 1e9
+		       << ",\"first_durable_seconds\":" << double(first - start) / 1e9
+		       << ",\"close_seconds\":" << double(close_end - close_start) / 1e9 << ",\"wal_before\":[" << before.first
+		       << ',' << before.second << "],\"wal_after\":[" << after.first << ',' << after.second
+		       << "],\"initial_wal_bytes\":" << initial_bytes << ",\"final_wal_bytes\":" << final_bytes
+		       << ",\"content_and_integrity\":true,\"operation_ns\":[";
+		for (size_t i = 0; i < operations.size(); ++i)
+			result << (i ? "," : "") << operations[i];
+		result << "]}\n";
+		std::cout << "PASS " << workload << '\n';
+		return 0;
+	} catch (const std::exception &error) {
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

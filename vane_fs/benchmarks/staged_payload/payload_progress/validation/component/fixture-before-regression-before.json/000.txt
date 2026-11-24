@@ -1,0 +1,52 @@
+{
+  "status": "FAIL",
+  "returncode": 1,
+  "started_epoch": 1792304230.3339431,
+  "ended_epoch": 1792304230.8067162,
+  "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/regression-before.log",
+  "text": "Fixture reached the WAL-based wake threshold\n",
+  "cleanup": {
+    "path": "/dev/shm/owned-payload-before-vfneft7y",
+    "removed": true,
+    "process_stopped": true,
+    "mount_absent": true,
+    "files": {
+      "reset.sqlite.stage-checkpoint": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-fence": {
+        "bytes": 8192,
+        "sha256": "d5a96754461bb7f944212748c0413c35d1bae479e73ee3716b1110207a5cebb6"
+      },
+      "reset.sqlite-shm": {
+        "bytes": 32768,
+        "sha256": "b9b0dab4cc30515463e04a2727b09da656555c3374033845a91621cf550ccfd2"
+      },
+      "reset.sqlite-wal": {
+        "bytes": 284312,
+        "sha256": "bc84c408f419ac9f7499bacc144fea00f1bb3fb4d7e778825fd1ea94c46800f9"
+      },
+      "reset.sqlite.payload": {
+        "bytes": 66064384,
+        "sha256": "2069655a326401358889fed62bc3d4c4337e130bce4b897597151e32bd79910c"
+      },
+      "reset.sqlite": {
+        "bytes": 4096,
+        "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+      },
+      "reset.sqlite.stage-publish": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-live": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-init": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  }
+}

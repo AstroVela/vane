@@ -12,6 +12,9 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+
+#include <mutex>
 
 namespace duckdb {
 
@@ -39,14 +42,35 @@ public:
 
 class PythonFileHandle : public FileHandle {
 public:
-	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags);
+	//! Serialize an entire handle operation, including Python callbacks that
+	//! release the GIL. Python input callbacks cannot enter connection APIs;
+	//! direct same-thread handle reentry is rejected by io_active.
+	class Operation {
+	public:
+		explicit Operation(FileHandle &handle);
+		~Operation();
+
+		Operation(const Operation &) = delete;
+		Operation &operator=(const Operation &) = delete;
+
+	private:
+		PythonFileHandle &file;
+		std::unique_lock<std::recursive_mutex> lock;
+	};
+
+	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags,
+	                 const shared_ptr<const ClientContext> &callback_context);
 	~PythonFileHandle() override;
 	void Close() override;
 
 	static const py::object &GetHandle(const FileHandle &handle);
+	static shared_ptr<const ClientContext> GetCallbackContext(const FileHandle &handle);
 
 private:
 	py::object handle;
+	weak_ptr<const ClientContext> callback_context;
+	std::recursive_mutex io_lock;
+	bool io_active = false;
 };
 
 class PythonFilesystem : public FileSystem {
@@ -55,7 +79,7 @@ private:
 	AbstractFileSystem filesystem;
 	const bool directory_semantics;
 	std::string DecodeFlags(FileOpenFlags flags);
-	bool Exists(const string &filename, const char *func_name) const;
+	bool Exists(const string &filename, const char *func_name, optional_ptr<FileOpener> opener) const;
 	string RestoreCallerPath(const string &locator, const string &returned_path, const string &fallback_path,
 	                         bool glob_pattern) const;
 

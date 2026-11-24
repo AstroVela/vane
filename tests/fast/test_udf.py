@@ -760,9 +760,17 @@ def test_streaming_udf_waits_for_tail_events_without_source_finalize_spin():
         timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    source_calls = [int(value) for value in re.findall(r"source_calls=(\d+)", result.stderr)]
-    assert source_calls
-    assert max(source_calls) <= 8, result.stderr[-4000:]
+    states = re.findall(r"completed_batches=(\d+).*?source_calls=(\d+)", result.stderr)
+    assert states
+    calls_by_completion = {}
+    for completed, calls in states:
+        calls_by_completion.setdefault(int(completed), []).append(int(calls))
+    assert max(calls_by_completion) == 2
+    # Concurrent batches can each wake admission, output and terminal paths.
+    # A source/finalize spin repeats calls without any batch completing; bound
+    # that interval instead of assuming a fixed total for a serial worker.
+    for calls in calls_by_completion.values():
+        assert max(calls) - min(calls) <= 8, result.stderr[-4000:]
 
 
 def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap():
@@ -846,13 +854,13 @@ def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_in
     assert "execution_width" not in plan
 
 
-def test_map_batches_subprocess_task_streaming_width_resolves_from_pipeline(tmp_path):
+def test_map_batches_subprocess_task_pipeline_width_does_not_set_worker_count(tmp_path):
     log = _run_udf_width_probe(tmp_path)
     assert "streaming_ctor_unresolved udf_name=ident initial_config_width=1" in log
     assert "streaming_ctor_initial_resolve" not in log
     assert "streaming_resolve_commit udf_name=ident width=4 operator_width_resolved=true" in log
-    assert "payload_udf_worker_slots=4" in log
-    assert "executor_init mode=task backend='subprocess_task' pool_size=4" in log
+    assert "udf_worker_slots" not in log
+    assert "executor_init mode=task backend='subprocess_task'" in log
 
 
 @pytest.mark.timeout(60)
@@ -1068,7 +1076,8 @@ def test_map_batches_lazy_ref_submit_uses_byte_threshold_before_user_batch_size(
 def test_map_batches_subprocess_actor_uses_actor_pool_size(tmp_path):
     log = _run_udf_actor_width_probe(tmp_path)
     assert "streaming_resolve_commit udf_name=Ident width=4 operator_width_resolved=true" in log
-    assert "payload_udf_worker_slots=2" in log
+    assert "udf_worker_slots" not in log
+    assert "executor_init mode=actor backend='subprocess_actor' pool_size=2" in log
 
 
 @pytest.mark.timeout(30)
@@ -1078,12 +1087,15 @@ def test_map_batches_subprocess_task_partial_tail_consumed_once(tmp_path, row_co
 
     import vane
 
-    seen_path = tmp_path / f"seen-{row_count}.txt"
+    seen_dir = tmp_path / f"seen-{row_count}"
+    seen_dir.mkdir()
 
     def ident(table):
+        from uuid import uuid4
+
         values = table.column("x").to_pylist()
-        with seen_path.open("a") as handle:
-            handle.write(f"{len(values)}:{min(values)}:{max(values)}\n")
+        # Windows append writes from different processes can overwrite records.
+        (seen_dir / uuid4().hex).write_text(f"{len(values)}:{min(values)}:{max(values)}", encoding="utf-8")
         return pa.table({"x": table.column("x")})
 
     con = vane.connect()
@@ -1096,7 +1108,7 @@ def test_map_batches_subprocess_task_partial_tail_consumed_once(tmp_path, row_co
     )
 
     assert rel.aggregate("count(*)").fetchone() == (row_count,)
-    seen = seen_path.read_text().splitlines()
+    seen = [path.read_text(encoding="utf-8") for path in seen_dir.iterdir()]
     assert len(seen) == (row_count + 63) // 64
     assert seen.count(f"1:{row_count - 1}:{row_count - 1}") == 1
 
@@ -1216,27 +1228,44 @@ def test_map_batches_accepts_ray_actor_memory_bytes():
     assert payload["memory_bytes"] == 1073741824
 
 
-def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
+@pytest.mark.parametrize("backend", ["ray_task", "subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("memory_bytes", [0, -1, 1.5, True])
+def test_map_batches_rejects_invalid_memory_bytes(backend, memory_bytes):
     import vane
 
     def identity(table):
         return table
 
-    con = vane.connect()
-    with pytest.raises(Exception, match="memory_bytes"):
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as con, pytest.raises(Exception, match="memory_bytes must be a positive integer"):
         con.sql("select 1 as x").map_batches(
-            identity,
+            Identity if backend == "subprocess_actor" else identity,
             schema={"x": vane.sqltypes.INTEGER},
-            execution_backend="ray_task",
-            memory_bytes=0,
+            execution_backend=backend,
+            actor_number=1 if backend == "subprocess_actor" else None,
+            memory_bytes=memory_bytes,
         )
-    with pytest.raises(Exception, match="Ray UDF backend"):
-        con.sql("select 1 as x").map_batches(
+
+
+def test_map_batches_preserves_heap_declarations_for_subprocess_tasks():
+    import vane
+
+    def identity(table):
+        return table
+
+    with vane.connect() as con:
+        relation = con.sql("select 1 as x").map_batches(
             identity,
             schema={"x": vane.sqltypes.INTEGER},
             execution_backend="subprocess_task",
             memory_bytes=536870912,
         )
+        logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "local-task-memory")
+        payload = logical.to_physical_plan(con).collect_udf_nodes(conn=con)[0]["payload"]
+        assert payload["memory_bytes"] == 536870912
 
 
 def test_map_batches_rejects_invalid_byte_batching_params():
@@ -1324,6 +1353,34 @@ def test_local_shm_ref_bundle_result_has_block_metadata():
     finally:
         for ref in refs:
             ref.release()
+
+
+@pytest.mark.parametrize("backend", ["local", "ray"])
+@pytest.mark.parametrize("duplicate_names", [False, True])
+@pytest.mark.parametrize("null_first_block", [False, True])
+def test_ref_bundle_concatenates_repeated_source_columns_with_logical_names(backend, duplicate_names, null_first_block):
+    import pyarrow as pa
+
+    if backend == "local":
+        from vane.execution.ref_bundle import _apply_ref_bundle_slices as apply_slices
+    else:
+        from vane.execution.udf_ray_ref_bundle import apply_ref_bundle_slices as apply_slices
+
+    blocks = [
+        pa.table({"path": ["a", "b"], "page": [None, None] if null_first_block else [0, 1]}),
+        pa.table({"path": ["c", "d"], "page": [2, 3]}),
+    ]
+    names = ["path", "page", "path", "page"] if duplicate_names else ["path", "page", "#0", "#1"]
+    result = apply_slices(
+        blocks,
+        [None, {"start": 1, "end": 2}],
+        [{"column_ids": [0, 1, 0, 1]}] * 2,
+        names=names,
+    )
+
+    assert result.column_names == names
+    pages = [None, None, 3] if null_first_block else [0, 1, 3]
+    assert [column.to_pylist() for column in result.columns] == [["a", "b", "d"], pages, ["a", "b", "d"], pages]
 
 
 def test_map_batches_rejects_invalid_target_max_batch_bytes_env(monkeypatch):
@@ -1414,7 +1471,8 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
 
     tensor_shape = (64, 64)
     tensor_type = vane.tensor_type(vane.sqltypes.FLOAT, tensor_shape)
-    seen_path = tmp_path / "downstream_batches.txt"
+    seen_dir = tmp_path / "downstream-batches"
+    seen_dir.mkdir()
 
     def make_tensor(table):
         xs = table.column("x").to_pylist()
@@ -1427,8 +1485,9 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
         )
 
     def record_downstream_batch(table):
-        with seen_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{table.num_rows}\n")
+        from uuid import uuid4
+
+        (seen_dir / uuid4().hex).write_text(str(table.num_rows), encoding="utf-8")
         return pa.table({"x": table.column("x")})
 
     con = vane.connect()
@@ -1452,7 +1511,8 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
 
     rows = rel.order("x").fetchall()
     assert [row[0] for row in rows] == list(range(8))
-    batch_rows = [int(line) for line in seen_path.read_text(encoding="utf-8").splitlines()]
+    batch_rows = [int(path.read_text(encoding="utf-8")) for path in seen_dir.iterdir()]
+    assert sum(batch_rows) == 8
     assert len(batch_rows) >= 3
     assert max(batch_rows) <= 3
 
@@ -1622,46 +1682,27 @@ def test_map_batches_subprocess_actor_fetches_rows():
     assert sorted(rel.fetchall()) == [(0,), (1,), (2,)]
 
 
-def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tmp_path):
+def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(tmp_path):
     import json
 
     import vane
 
-    state_path = tmp_path / "counter.json"
-    monkeypatch.setenv("VANE_TEST_UDF_COUNTER_PATH", str(state_path))
+    intervals_dir = tmp_path / "actor-intervals"
+    intervals_dir.mkdir()
 
     class Probe:
         def __call__(self, table):
-            import fcntl
             import json
-            import os
             import time
+            from uuid import uuid4
 
-            path = os.environ["VANE_TEST_UDF_COUNTER_PATH"]
-            lock_path = path + ".lock"
-
-            def update(delta):
-                with open(lock_path, "w") as lock_file:
-                    fcntl.flock(lock_file, fcntl.LOCK_EX)
-                    try:
-                        if os.path.exists(path):
-                            with open(path) as state_file:
-                                state = json.load(state_file)
-                        else:
-                            state = {"current": 0, "max": 0}
-                        state["current"] += delta
-                        state["max"] = max(state["max"], state["current"])
-                        with open(path, "w") as state_file:
-                            json.dump(state, state_file)
-                    finally:
-                        fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-            update(1)
+            started = time.monotonic_ns()
             try:
                 time.sleep(0.05)
                 return table
             finally:
-                update(-1)
+                finished = time.monotonic_ns()
+                (intervals_dir / uuid4().hex).write_text(json.dumps([started, finished]), encoding="utf-8")
 
     con = vane.connect()
     con.execute("SET threads=4")
@@ -1674,9 +1715,16 @@ def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tm
         batch_size=1,
     )
     assert sorted(rel.fetchall()) == [(idx,) for idx in range(8)]
-    with open(state_path) as state_file:
-        state = json.load(state_file)
-    assert 1 <= state["max"] <= 2
+    intervals = [json.loads(path.read_text(encoding="utf-8")) for path in intervals_dir.iterdir()]
+    assert len(intervals) == 8
+    events = [(started, 1) for started, _ in intervals] + [(finished, -1) for _, finished in intervals]
+    current = maximum = 0
+    for _, delta in sorted(events):
+        current += delta
+        assert current >= 0
+        maximum = max(maximum, current)
+    assert current == 0
+    assert 1 <= maximum <= 2
 
 
 def test_map_batches_rejects_bare_subprocess_backend():
@@ -2082,11 +2130,13 @@ def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
     pytest.importorskip("pyarrow")
     import vane
 
-    seen_path = tmp_path / "seen-batches.txt"
+    seen_dir = tmp_path / "seen-batches"
+    seen_dir.mkdir()
 
     def identity(table):
-        with seen_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{table.num_rows}\n")
+        from uuid import uuid4
+
+        (seen_dir / uuid4().hex).write_text(str(table.num_rows), encoding="utf-8")
         return table
 
     con = vane.connect()
@@ -2097,8 +2147,8 @@ def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
         execution_backend="subprocess_task",
     )
 
-    assert rel.fetchall() == [(idx,) for idx in range(25)]
-    assert seen_path.read_text(encoding="utf-8").splitlines() == ["10", "10", "5"]
+    assert sorted(rel.fetchall()) == [(idx,) for idx in range(25)]
+    assert sorted(int(path.read_text(encoding="utf-8")) for path in seen_dir.iterdir()) == [5, 10, 10]
 
 
 def test_map_batches_basic():

@@ -1,0 +1,134 @@
+check yaml...............................................................Passed
+check toml...............................................................Passed
+check for added large files..............................................Passed
+detect private key.......................................................Passed
+check for merge conflicts................................................Passed
+forbid new submodules................................(no files to check)Skipped
+ruff check...............................................................Failed
+- hook id: ruff-check
+- exit code: 1
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> vane_fs/benchmarks/lookup_reads/run.py:6:1
+   |
+ 4 |   """Measure misses, retained pins and first pins without concurrent owned builds/tests."""
+ 5 |
+ 6 | / import argparse
+ 7 | | import hashlib
+ 8 | | import json
+ 9 | | import shutil
+10 | | import statistics
+11 | | import subprocess
+12 | | import tempfile
+13 | | import time
+14 | | from contextlib import closing
+15 | | from pathlib import Path
+16 | | import sqlite3
+   | |______________^
+help: Organize imports
+   |
+9  | import shutil
+10 + import sqlite3
+11 | import statistics
+--------------------------------------------------------------------------------
+16 | from pathlib import Path
+   - import sqlite3
+17 |
+   |
+
+F401 [*] `sys` imported but unused
+  --> vane_fs/benchmarks/performance_closeout/shipping.py:12:8
+   |
+10 | import shutil
+11 | import subprocess
+12 | import sys
+   |        ^^^
+13 | import tempfile
+14 | import time
+   |
+help: Remove unused import: `sys`
+   |
+11 | import subprocess
+   - import sys
+12 | import tempfile
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py:6:1
+   |
+ 4 |   """Keep the original gate analysis and expose incremental paired effects."""
+ 5 |
+ 6 | / import json
+ 7 | | import statistics
+ 8 | | import sys
+ 9 | | import time
+10 | | from pathlib import Path
+11 | |
+12 | | from prepare import digest, save
+   | |________________________________^
+help: Organize imports
+   |
+13 |
+   -
+14 | if __name__ == "__main__":
+   |
+
+F401 [*] `struct` imported but unused
+ --> vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py:7:8
+  |
+6 | import importlib.util
+7 | import struct
+  |        ^^^^^^
+8 | import time
+9 | from pathlib import Path
+  |
+help: Remove unused import: `struct`
+  |
+6 | import importlib.util
+  - import struct
+7 | import time
+  |
+
+I001 [*] Import block is un-sorted or un-formatted
+ --> vane_fs/benchmarks/staged_payload/paced_request_waits/run.py:6:1
+  |
+4 |   """Preserve complete workloads and four AB/BA pairs for the paced diagnosis."""
+5 |
+6 | / from pathlib import Path
+7 | |
+8 | | from prepare import digest, save
+  | |________________________________^
+help: Organize imports
+   |
+9  |
+   -
+10 | if __name__ == "__main__":
+   |
+
+E731 Do not assign a `lambda` expression, use a `def`
+   --> vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py:242:5
+    |
+240 |               )
+241 |           )
+242 | /     selected = lambda field: [
+243 | |         dict(rank=index, **row)
+244 | |         for index, row in enumerate(sorted(field, key=lambda c: c["wall_ns"], reverse=True)[:12])
+245 | |     ]
+    | |_____^
+246 |       report = dict(
+247 |           status="PASS",
+    |
+help: Rewrite `selected` as a `def`
+
+Found 6 errors.
+[*] 5 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).
+
+ruff format.............................................................Skipped
+clang-format............................................................Skipped
+cmake-format............................................................Skipped
+Validate Dependabot Config (v2)......................(no files to check)Skipped
+Validate GitHub issue config.........................(no files to check)Skipped
+Validate GitHub issue forms..........................(no files to check)Skipped
+Validate GitHub Workflows................................................Passed
+mypy.................................................(no files to check)Skipped
+shfmt...................................................................Skipped

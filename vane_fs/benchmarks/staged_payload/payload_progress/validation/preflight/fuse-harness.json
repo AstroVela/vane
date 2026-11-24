@@ -1,0 +1,41 @@
+{
+  "status": "FAIL",
+  "started_epoch": 1792304477.685631,
+  "commands": [
+    {
+      "window": "full",
+      "argv": [
+        "/home/kaka/miniconda3/bin/python3",
+        "-u",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full/run_fuse.py",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full",
+        "--medium",
+        "ext4"
+      ],
+      "started_epoch": 1792304477.6857657,
+      "ended_epoch": 1792304477.8000703,
+      "returncode": 1,
+      "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full.log",
+      "log_sha256": "d5a3e788e1ffe6df2b71932cadec38eb5443aff5212405329dfdb379396bc18c"
+    }
+  ],
+  "error": "AssertionError(PosixPath('/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full.log'))",
+  "ended_epoch": 1792304477.8003707,
+  "reason": "New harness omitted inherited build/tests PASS markers; runner stopped at its first precondition, before any mount or measurement.",
+  "measurement_started": false,
+  "owned_mounts": 0,
+  "owned_daemons": 0,
+  "log": "Traceback (most recent call last):\n  File \"/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full/run_fuse.py\", line 247, in <module>\n    main()\n    ~~~~^^\n  File \"/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full/run_fuse.py\", line 32, in main\n    assert json.loads((out / \"tests.json\").read_text())[\"status\"] == \"PASS\"\n                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/kaka/miniconda3/lib/python3.13/pathlib/_local.py\", line 546, in read_text\n    return PathBase.read_text(self, encoding, errors, newline)\n           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kaka/miniconda3/lib/python3.13/pathlib/_abc.py\", line 632, in read_text\n    with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/kaka/miniconda3/lib/python3.13/pathlib/_local.py\", line 537, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFileNotFoundError: [Errno 2] No such file or directory: '/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse/full/tests.json'\n",
+  "archived_path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/fuse-preflight-000",
+  "files": {
+    "full.log": "d5a3e788e1ffe6df2b71932cadec38eb5443aff5212405329dfdb379396bc18c",
+    "run.json": "2884ae000951bdbed9d6790e758899eed89010a79129658d425703a25e98a73d",
+    "build.json": "9cc71d3f28d6a6e15e92f29be54caa2d862e2adfc2a93cecd1535c7111095dc1",
+    "full/run_fuse.py": "68739156779deca83fa67ebcc31a7eb3882e12fd3eeb6f329af2176a27379df5",
+    "full/plan.json": "b16b51582cb3222144c90c5d4a7df516810c8f1d84e03077388872854dcd850e",
+    "full/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+    "sustained/run_fuse.py": "8ba43bfa39429745905faf1cf7a8f01028672f9dcfa85d69e187b5871cc66fb5",
+    "sustained/plan.json": "a9e486a9f08a165ca77ec67d9d2bf5e4b294305f1c3f6544e6fbcdcbce04e9e6",
+    "sustained/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+  }
+}

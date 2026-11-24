@@ -1,0 +1,19 @@
+{
+  "status": "PASS",
+  "exact_reverse": true,
+  "changes": [
+    [
+      "        count = 0\n        while b := os.read(fd, MIB):",
+      "        read_begin_ns = time.monotonic_ns()\n        count = 0\n        while b := os.read(fd, MIB):"
+    ],
+    [
+      "            count += len(b)\n        seconds = time.perf_counter() - t",
+      "            count += len(b)\n        read_end_ns = time.monotonic_ns()\n        seconds = time.perf_counter() - t"
+    ],
+    [
+      "                \"workload\": \"read_64\",",
+      "                \"workload\": \"read_64\",\n                \"application_begin_ns\": read_begin_ns,\n                \"application_end_ns\": read_end_ns,\n                \"application_pid\": os.getpid(),"
+    ]
+  ],
+  "original_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+}

@@ -25,17 +25,17 @@ pytestmark = [
 _FAULT_RAY_CLUSTER = None
 
 import vane.runners.ray.worker_handle as worker_handle_mod
+from vane.execution.query_resource_spec import (
+    QueryAllocation,
+    QueryResourceGraph,
+    ResourceUnitSpec,
+    ResourceVector,
+)
 from vane.runners.ray import driver as ray_driver
 from vane.runners.ray import worker as worker_mod
 from vane.runners.ray.fte_fragment_scheduler import (
     _stop_fte_status_watchers,
     ensure_fte_fragment_progress_topology,
-)
-from vane.runners.ray.query_resource_graph import (
-    QueryAllocation,
-    QueryResourceGraph,
-    ResourceUnitSpec,
-    ResourceVector,
 )
 from vane.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
 from vane.runners.ray.query_resource_runtime import (

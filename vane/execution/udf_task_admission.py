@@ -335,7 +335,7 @@ class TaskAdmissionController:
     def _driver_actor(self) -> Any:
         return self._driver
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         with self._lock:
             self._wakeup = callback
 

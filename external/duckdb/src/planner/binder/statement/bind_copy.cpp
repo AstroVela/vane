@@ -94,6 +94,16 @@ case_insensitive_map_t<CopyOption> Binder::GetFullCopyOptionsList(const CopyFunc
 }
 
 BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &function, CopyToType copy_to_type) {
+	auto target = FileSystem::GetFileSystem(context).ResolveWriteTarget(stmt.info->file_path, *stmt.info);
+	if (target.requires_rebind) {
+		SetAlwaysRequireRebind();
+	}
+	if (target.path != stmt.info->file_path) {
+		stmt.info->file_path = std::move(target.path);
+		// A transported bound COPY must not retain an attachment-dependent
+		// path expression that could be rebound on a worker.
+		stmt.info->file_path_expression.reset();
+	}
 	if (function.plan) {
 		auto &copy_info = *stmt.info;
 		if (copy_info.select_relation) {

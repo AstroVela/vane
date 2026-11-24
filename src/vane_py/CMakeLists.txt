@@ -28,6 +28,10 @@ add_library(
   query_parameters.cpp
   dynamic_extension.cpp
   vane_python.cpp
+  module_connection.cpp
+  module_types.cpp
+  module_results.cpp
+  module_relations.cpp
   importer.cpp
   merge_relation.cpp
   ai_sql_functions.cpp
@@ -52,7 +56,9 @@ add_library(
   pystatement.cpp
   python_dependency.cpp
   python_import_cache.cpp
+  python_input_callback.cpp
   python_replacement_scan.cpp
+  native_resource_graph.cpp
   python_udf_actor_resources.cpp
   python_udf_utils.cpp
   python_udf.cpp

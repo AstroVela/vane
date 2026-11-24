@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/fdatasync
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/fdatasync
+Prepared 1 package in 28.43s
+Installed 1 package in 0.91ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/fdatasync)

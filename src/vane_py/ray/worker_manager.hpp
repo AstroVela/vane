@@ -50,7 +50,8 @@ public:
 	               duckdb::distributed::MaterializedOutputCallback on_output) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query_streaming(const string &query_id, double timeout_s,
-	                         duckdb::distributed::MaterializedOutputCallback on_output) override;
+	                         duckdb::distributed::MaterializedOutputCallback on_output,
+	                         bool preserve_task_order = true) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> wait_fte_query(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
@@ -182,11 +183,12 @@ private:
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	        *task_context_filter = nullptr,
 	    bool release_payloads = true, duckdb::distributed::MaterializedOutputCallback on_output = {},
-	    bool selected_only = false);
+	    bool selected_only = false, bool preserve_task_order = true);
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
-	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs);
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs,
+	    bool preserve_task_order = true);
 	DuckDBResult<RayWorkerRuntime::QueryStatus>
 	FteQueryStatus(const string &query_id,
 	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>

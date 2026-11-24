@@ -747,6 +747,9 @@ class LocalEngineExecutor(LLMExecutor):
 
     def all_tasks_finished(self) -> bool:
         with self.task_count_lock:
+            # Generation records failures before decrementing the task count.
+            # Check under the same lock so an error cannot become successful completion.
+            self._raise_if_task_failed()
             return self._finished_submitting and self.running_task_count == 0 and len(self.completed_tasks) == 0
 
     def _wakeup_ready(self) -> bool:

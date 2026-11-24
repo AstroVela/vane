@@ -27,6 +27,11 @@ from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _ORIGINAL_SYS_PATH = sys.path.copy()
 try:
@@ -44,7 +49,6 @@ try:
         ENTRY_POINT_GROUP,
         _current_musl_version,
         _entry_points,
-        _extension_distribution_version_from_digest,
         _extension_interpreter_tag,
         _extension_material_members,
         _is_macos_binary,
@@ -58,6 +62,7 @@ try:
         _validate_artifact_platform_tag,
         _validate_dependency_platform_tag,
         _validate_exact_requirements,
+        _validate_extension_distribution_version,
         _validate_extension_wheel_archive_size,
         _validate_linux_elf_platform,
         _validate_macos_wheel_binary_platform,
@@ -233,6 +238,7 @@ def _assert_base_wheel(
     expected_vane_version: str,
     required_interpreter_tag: str,
     required_platform_tag: str,
+    base_project_metadata: Path | None = None,
 ) -> None:
     try:
         with _wheel_snapshot(base_wheel, description="base Vane wheel") as snapshot:
@@ -241,6 +247,7 @@ def _assert_base_wheel(
                 expected_vane_version=expected_vane_version,
                 required_interpreter_tag=required_interpreter_tag,
                 required_platform_tag=required_platform_tag,
+                base_project_metadata=base_project_metadata,
             )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
@@ -252,6 +259,7 @@ def _assert_base_wheel_snapshot(
     expected_vane_version: str,
     required_interpreter_tag: str,
     required_platform_tag: str,
+    base_project_metadata: Path | None = None,
 ) -> None:
     base_wheel = snapshot.source_path
     try:
@@ -490,7 +498,13 @@ def _assert_base_wheel_snapshot(
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
     try:
-        _check_release_artifact(snapshot, expected_version=expected_vane_version)
+        project_metadata = None
+        if base_project_metadata is not None:
+            document = tomllib.loads(base_project_metadata.read_text(encoding="utf-8"))
+            project_metadata = document.get("project")
+            if not isinstance(project_metadata, dict):
+                raise ValueError("base project metadata must contain a [project] table")
+        _check_release_artifact(snapshot, expected_version=expected_vane_version, project_metadata=project_metadata)
     except (ValueError, zipfile.BadZipFile) as exception:
         raise RuntimeError(f"base Vane wheel failed release-artifact validation: {exception}") from exception
 
@@ -644,7 +658,11 @@ def _assert_extension_wheel_snapshot_layout(
         raise RuntimeError("extension wheel descriptor must contain a non-empty trust identity")
     descriptor_digest = hashlib.sha256(canonical_descriptor).hexdigest()
     expected_package_root = f"vane_extensions/{extension_name}_{descriptor_digest}/"
-    distribution_version = _extension_distribution_version_from_digest(vane_version, descriptor_digest)
+    distribution_version = str(parse_wheel_filename(snapshot.source_path.name)[1])
+    try:
+        _validate_extension_distribution_version(distribution_version, vane_version, descriptor_digest)
+    except ValueError as exception:
+        raise RuntimeError(str(exception)) from exception
     distribution_root = f"vane_extension_{extension_name}-{distribution_version}"
     expected_metadata = f"{distribution_root}.dist-info/METADATA"
     expected_platform_build_details = f"{distribution_root}.dist-info/{_PLATFORM_BUILD_DETAILS_FILENAME}"
@@ -948,6 +966,7 @@ def verify_extension_wheel(
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
     runtime_source: str | Path | None = None,
+    base_project_metadata: str | Path | None = None,
 ) -> None:
     """Verify clean installation, metadata discovery, and local artifact loading."""
     if isinstance(dependency_wheels, (str, os.PathLike)):
@@ -964,6 +983,9 @@ def verify_extension_wheel(
         raise RuntimeError("dependency wheels must contain only wheel paths")
 
     resolved_base_wheel = Path(base_wheel).expanduser().resolve(strict=True)
+    resolved_base_project_metadata = (
+        None if base_project_metadata is None else Path(base_project_metadata).expanduser().resolve(strict=True)
+    )
     resolved_extension_wheel = Path(extension_wheel).expanduser().resolve(strict=True)
     resolved_dependency_wheels = tuple(
         Path(dependency_wheel).expanduser().resolve(strict=True) for dependency_wheel in unresolved_dependency_wheels
@@ -995,6 +1017,7 @@ def verify_extension_wheel(
                 expected_vane_version=root_layout.vane_version,
                 required_interpreter_tag=root_layout.interpreter_tag,
                 required_platform_tag=root_layout.platform_tag,
+                base_project_metadata=resolved_base_project_metadata,
             )
 
             dependency_snapshots = []
@@ -1227,6 +1250,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-source", type=Path)
     parser.add_argument("--base-wheel", required=True, type=Path)
+    parser.add_argument(
+        "--base-project-metadata",
+        type=Path,
+        help="Matching runtime checkout's pyproject.toml; defaults to this packaging checkout",
+    )
     parser.add_argument("--extension-wheel", required=True, type=Path)
     parser.add_argument("--extension-name", required=True)
     parser.add_argument("--trust-identity", required=True)
@@ -1252,6 +1280,7 @@ def main() -> int:
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
         runtime_source=arguments.runtime_source,
+        base_project_metadata=arguments.base_project_metadata,
     )
     return 0
 

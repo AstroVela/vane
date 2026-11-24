@@ -146,6 +146,15 @@ A limited audio shard or video directory can be run directly by all three system
 
 Run commands from the corresponding benchmark directory. `NUM_GPU_NODES=1` uses one GPU actor. `VANE_RUNNER=ray` explicitly selects Vane's local Ray runner.
 
+The original audio entrypoint also supports `VANE_RUNNER=local-fast` with one
+whole GPU per actor. Both runners use its table UDFs and native Parquet writer.
+For a runner comparison, use the same installed Vane revision, environment,
+input files, model snapshot and batch size, and run them serially with distinct
+output directories. Change only `VANE_RUNNER` and `OUTPUT_PATH`; an explicit
+local model runtime or a rewritten expression/PyArrow pipeline is unnecessary.
+See [query-owned GPU actors](../LOCAL_MODEL_RUNTIME.md#query-owned-gpu-table-udfs)
+for device discovery, residency and supported GPU configurations.
+
 Before running:
 
 ```bash

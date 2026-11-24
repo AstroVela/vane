@@ -1,0 +1,120 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -2178,6 +2178,26 @@
+ 		Fail(ErrorCode::Storage, "Directory has multiple parents");
+ 	return result;
+ }
++
++Record LookupChild(sqlite3 *db, int64_t parent, const std::string &name, const View &view) {
++	if (name == "." || name == "..") {
++		auto directory = OpenedInode(db, parent, view);
++		if (!directory.fields[0])
++			Fail(ErrorCode::NotDirectory, "Parent is not a directory");
++		return Inode(db, name == "." ? parent : ParentInode(db, parent, view), view);
++	}
++	auto key = ChildKey(db, parent, name, view);
++	Record entry;
++	if (!Get(db, DIRENTS, key, view.point, entry))
++		Fail(ErrorCode::NotFound, "Entry does not exist");
++	return Inode(db, entry.fields[0], view);
++}
++
++unsigned DataVersion(sqlite3 *db) {
++	unsigned version = 0;
++	Check(db, sqlite3_file_control(db, "main", SQLITE_FCNTL_DATA_VERSION, &version));
++	return version;
++}
+ } // namespace
+ 
+ FileStat Session::OpenInode(int64_t inode, bool directory, bool truncate, bool synchronous) {
+@@ -2196,20 +2216,47 @@
+ }
+ 
+ FileStat Session::LookupInode(int64_t parent, const std::string &name) {
+-	Transaction tx(*database, !snapshot);
+-	auto view = SessionView(database->db, id, snapshot, closed);
+ 	Record node;
+-	if (name == "." || name == "..") {
+-		auto directory = OpenedInode(database->db, parent, view);
+-		if (!directory.fields[0])
+-			Fail(ErrorCode::NotDirectory, "Parent is not a directory");
+-		node = Inode(database->db, name == "." ? parent : ParentInode(database->db, parent, view), view);
+-	} else {
+-		auto key = ChildKey(database->db, parent, name, view);
+-		Record entry;
+-		if (!Get(database->db, DIRENTS, key, view.point, entry))
+-			Fail(ErrorCode::NotFound, "Entry does not exist");
+-		node = Inode(database->db, entry.fields[0], view);
++	View view;
++	unsigned version;
++	int64_t changes;
++	{
++		// A miss needs no pin and must not wait for SQLite's writer lock.
++		Transaction tx(*database, false);
++		view = SessionView(database->db, id, snapshot, closed);
++		node = LookupChild(database->db, parent, name, view);
++		if (!snapshot) {
++			// Existing connection-local references imply a durable pin. The
++			// database mutex prevents its last release while we increment the
++			// temporary count; this does not acquire the main database write lock.
++			Statement retain(database->db, "UPDATE temp.inode_references SET refs=refs+1 WHERE branch=? AND inode=?");
++			retain.Bind(1, view.branch);
++			retain.Bind(2, node.key.inode);
++			retain.Step();
++			if (sqlite3_changes64(database->db)) {
++				RequireOwnMount(database->db, view);
++				tx.Commit();
++				return Describe(node);
++			}
++		} else {
++			tx.Commit();
++			return Describe(node);
++		}
++		version = DataVersion(database->db);
++		changes = sqlite3_total_changes64(database->db);
++		tx.Commit();
++	}
++	// A first reference still needs an atomic durable pin. Check both other
++	// connections' commits and this connection's intervening writes (including
++	// local reference releases). Reuse the result only if neither changed;
++	// otherwise resolve again under the writer lock. Never upgrade a stale
++	// SQLite read snapshot, which could fail with SQLITE_BUSY_SNAPSHOT.
++	Transaction tx(*database, true);
++	if (closed)
++		Fail(ErrorCode::Closed, "Session is closed");
++	if (version != DataVersion(database->db) || changes != sqlite3_total_changes64(database->db)) {
++		view = SessionView(database->db, id, snapshot, closed);
++		node = LookupChild(database->db, parent, name, view);
+ 	}
+ 	PinInode(database->db, node.key.inode, view);
+ 	tx.Commit();
+--- a/include/vane_fs/workspace.hpp
++++ b/include/vane_fs/workspace.hpp
+@@ -77,7 +77,7 @@
+ 
+ class Database;
+ 
+-// Sessions are thread-safe. Every method is one transaction. Live branch
++// Sessions are thread-safe. Mutations are atomic transactions. Live branch
+ // sessions refresh their writable interval under the database writer lock.
+ class Session {
+ public:
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,6 +91,16 @@
+     set_tests_properties(vane_fs_crash PROPERTIES TIMEOUT 60)
+   endif()
+   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    add_executable(vane_fs_lookup_validation_test
++                   tests/test_lookup_validation.cpp)
++    target_link_libraries(vane_fs_lookup_validation_test
++                          PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++    target_link_options(
++      vane_fs_lookup_validation_test PRIVATE "LINKER:--wrap=sqlite3_exec"
++      "LINKER:--wrap=sqlite3_step")
++    add_test(NAME vane_fs_lookup_validation
++             COMMAND vane_fs_lookup_validation_test)
++    set_tests_properties(vane_fs_lookup_validation PROPERTIES TIMEOUT 30)
+     set(VANE_FS_TEST_SQLITE_SYNC
+         "auto"
+         CACHE STRING

@@ -839,6 +839,7 @@ def _build_sample_wheel(
     license_expression: str = "Apache-2.0 AND MIT",
     release_materials: Path | None = None,
     test_only: bool = False,
+    release_number: int = 1,
 ):
     resolved_platform_tag = platform_tag or _wheel_platform_tag()
     if artifact_path is None:
@@ -876,6 +877,7 @@ def _build_sample_wheel(
         dependency_trust_identities=(TEST_TRUST_IDENTITY,) if dependencies else (),
         release_materials=release_materials,
         test_only=test_only,
+        release_number=release_number,
     )
 
 
@@ -1051,7 +1053,7 @@ def test_platform_wheel_contains_one_verified_artifact_descriptor_and_provider(
     descriptor_digest = _descriptor_digest(built.descriptor)
     interpreter_tag = _extension_interpreter_tag()
     assert built.distribution_name == "vane-extension-sample"
-    _assert_public_descriptor_version(built.distribution_version, vane.__version__, built.descriptor)
+    assert built.distribution_version == extension_wheel_module._extension_release_version(vane.__version__, 1)
     assert built.wheel_tag == f"{interpreter_tag}-none-{platform_tag}"
     assert built.path.name == (
         f"vane_extension_sample-{built.distribution_version}-{interpreter_tag}-none-{platform_tag}.whl"
@@ -1260,8 +1262,11 @@ def test_platform_wheel_rejects_names_that_cannot_form_normalized_wheel_names(
 
 
 def test_platform_wheel_rejects_names_that_exceed_generated_component_limits(tmp_path, monkeypatch):
-    extension_name = "a" * 100
-    artifact_path = _write_artifact(tmp_path / f"{extension_name}.duckdb_extension")
+    extension_name = "a" * 191
+    artifact_path = tmp_path / f"{extension_name}.duckdb_extension"
+    if sys.platform == "win32":
+        artifact_path = Path("\\\\?\\" + str(artifact_path))
+    artifact_path = _write_artifact(artifact_path)
 
     def create_descriptor(path, *, name, trust_identity, dependencies):
         return _descriptor(
@@ -1357,7 +1362,6 @@ def test_platform_wheel_rejects_an_invalid_license_expression(tmp_path):
 def test_platform_wheel_rejects_an_unsafe_license_file_path(tmp_path, synthetic_descriptor_factory):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
     license_path = tmp_path / "license\ninjected.txt"
-    license_path.write_text("license", encoding="utf-8")
 
     with pytest.raises(ValueError, match="safe ASCII relative path"):
         build_extension_wheel(
@@ -1388,6 +1392,7 @@ def test_platform_wheel_rejects_windows_unsafe_license_paths(member_name):
 def test_platform_wheel_rejects_case_insensitive_license_path_collisions(
     tmp_path,
     synthetic_descriptor_factory,
+    monkeypatch,
 ):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
     first_license = tmp_path / "licenses" / "Foo.txt"
@@ -1395,6 +1400,15 @@ def test_platform_wheel_rejects_case_insensitive_license_path_collisions(
     first_license.parent.mkdir()
     first_license.write_text("first", encoding="utf-8")
     second_license.write_text("second", encoding="utf-8")
+    resolve = Path.resolve
+
+    def preserve_archive_case(path, *args, **kwargs):
+        # Model the two archive names even on a filesystem that aliases them.
+        if path in (first_license, second_license):
+            return path
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", preserve_archive_case)
 
     with pytest.raises(ValueError, match="case-insensitive wheel path collisions"):
         build_extension_wheel(
@@ -1495,6 +1509,77 @@ def test_extension_distribution_version_binds_the_complete_descriptor(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "base,number,expected",
+    [
+        ("0.2.0", 1, "0.2.0.1"),
+        ("0.2.0", 12, "0.2.0.12"),
+        ("0.2.1", 1, "0.2.1.1"),
+        ("0.2.0.dev663", 2, "0.2.0.2.dev663"),
+        ("0.2.0rc1", 1, "0.2.0.1rc1"),
+        ("0.2.0.post2", 3, "0.2.0.3.post2"),
+    ],
+)
+def test_extension_release_version_tracks_the_exact_vane_stage(base, number, expected):
+    assert extension_wheel_module._extension_release_version(base, number) == expected
+
+
+@pytest.mark.parametrize("number", [0, -1, True, 1.0, "1", None])
+def test_extension_release_version_rejects_invalid_numbers(number):
+    with pytest.raises(ValueError, match="positive integer"):
+        extension_wheel_module._extension_release_version("0.2.0", number)
+
+
+def test_numbered_release_sorts_after_legacy_and_increments_independently(tmp_path):
+    descriptor = _descriptor(_write_artifact(tmp_path / "sample.duckdb_extension"), vane_version="0.2.0")
+    legacy = extension_wheel_module._extension_distribution_version("0.2.0", descriptor)
+    first = extension_wheel_module._extension_release_version("0.2.0", 1)
+    second = extension_wheel_module._extension_release_version("0.2.0", 2)
+    upgraded = extension_wheel_module._extension_release_version("0.2.1", 1)
+    assert Version(legacy) < Version(first) < Version(second) < Version(upgraded)
+
+
+def test_numbered_releases_keep_the_counter_across_vane_stage_changes():
+    releases = [
+        ("0.2.0.dev663", 1),
+        ("0.2.0.dev663", 2),
+        ("0.2.0.dev664", 3),
+        ("0.2.0rc1", 4),
+        ("0.2.0rc1", 5),
+        ("0.2.0", 6),
+        ("0.2.0.post1", 7),
+        ("0.3.0", 1),
+    ]
+    versions = [Version(extension_wheel_module._extension_release_version(base, number)) for base, number in releases]
+    assert all(previous < candidate for previous, candidate in zip(versions, versions[1:]))
+    assert str(versions[-1]) == "0.3.0.1"
+
+
+def test_numbered_release_accepts_a_legacy_dependency(tmp_path, synthetic_descriptor_factory, monkeypatch):
+    artifact = _write_artifact(tmp_path / "sample.duckdb_extension")
+    descriptor = _descriptor(artifact)
+    legacy_version = extension_wheel_module._extension_distribution_version(vane.__version__, descriptor)
+    with monkeypatch.context() as legacy_builder:
+        legacy_builder.setattr(extension_wheel_module, "_extension_release_version", lambda *args: legacy_version)
+        legacy = _build_sample_wheel(tmp_path, artifact_path=artifact)
+    assert extension_wheel_module._read_dependency_wheel(legacy.path).distribution_version == legacy_version
+    verify_extension_wheel_module._assert_extension_wheel_layout(legacy.path, "sample")
+    parent = build_extension_wheel(
+        artifact=_write_artifact(tmp_path / "parent.duckdb_extension", b"parent"),
+        extension_name="parent",
+        output_directory=tmp_path / "parent-dist",
+        platform_tag=_wheel_platform_tag(),
+        trust_identity=TEST_TRUST_IDENTITY,
+        license_expression="Apache-2.0",
+        license_files=[REPOSITORY_ROOT / "LICENSE"],
+        dependency_wheels=(legacy.path,),
+        dependency_trust_identities=(TEST_TRUST_IDENTITY,),
+        release_number=3,
+    )
+    layout = verify_extension_wheel_module._assert_extension_wheel_layout(parent.path, "parent")
+    assert any(str(requirement) == f"vane-extension-sample==={legacy_version}" for requirement in layout.requirements)
+
+
+@pytest.mark.parametrize(
     "vane_version",
     [
         "1.2.3",
@@ -1562,7 +1647,7 @@ def test_extension_distribution_version_preserves_vane_version_order(tmp_path):
 
 def test_platform_wheel_escapes_license_paths_in_record_csv(tmp_path, synthetic_descriptor_factory):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
-    license_path = tmp_path / 'license,"quoted".txt'
+    license_path = tmp_path / "license,quoted.txt"
     license_path.write_text("license", encoding="utf-8")
     built = build_extension_wheel(
         artifact=artifact_path,
@@ -1579,8 +1664,18 @@ def test_platform_wheel_escapes_license_paths_in_record_csv(tmp_path, synthetic_
         record_name = f"{distribution_root}-{built.distribution_version}.dist-info/RECORD"
         record_rows = list(csv.reader(io.StringIO(wheel.read(record_name).decode("utf-8"))))
 
-    assert any(row[0].endswith('licenses/license,"quoted".txt') for row in record_rows)
+    assert any(row[0].endswith("licenses/license,quoted.txt") for row in record_rows)
     assert all(len(row) == 3 for row in record_rows)
+
+
+def test_wheel_record_escapes_embedded_quotes_without_host_filename_constraints():
+    name = 'licenses/license,"quoted".txt'
+    record = extension_wheel_module._record({name: b"license"}, "package.dist-info/RECORD")
+    rows = list(csv.reader(io.StringIO(record)))
+    assert rows[0][0] == name
+    assert rows[0][1].startswith("sha256=")
+    assert rows[0][2] == "7"
+    assert rows[1] == ["package.dist-info/RECORD", "", ""]
 
 
 def test_platform_wheel_rejects_a_tag_for_a_different_artifact_platform(
@@ -1622,6 +1717,117 @@ def test_windows_pe_platform_accepts_policy_imports_and_delay_imports():
         "api-ms-win-crt-runtime-l1-1-0.dll",
         "vcruntime140.dll",
     )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize("library", ["api-ms-win-core-synch-l1-2-0.dll", "pdh.dll"])
+def test_windows_pe_platform_accepts_system_synchronization_and_performance_imports(import_kind, library):
+    contents = _synthetic_pe(architecture="amd64", **{import_kind: (library,)})
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == (library,)
+
+
+@pytest.mark.parametrize("library", ["api-ms-win-core-synch-l1-2-999.dll", "pdh-private.dll"])
+def test_windows_pe_platform_requires_exact_system_dll_names(library):
+    contents = _synthetic_pe(architecture="amd64", imports=(library,))
+
+    with pytest.raises(ValueError, match=rf"non-policy Windows DLLs.*{re.escape(library)}"):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize("duplicate_name", ["KERNEL32.DLL", "kernel32.dll"])
+def test_windows_pe_platform_accepts_repeated_dll_descriptors(import_kind, duplicate_name):
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "VCRUNTIME140.dll", duplicate_name)},
+    )
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == ("kernel32.dll", "vcruntime140.dll")
+
+
+def test_windows_pe_platform_coalesces_repeated_normal_and_delay_imports():
+    contents = _synthetic_pe(
+        architecture="amd64",
+        imports=("KERNEL32.DLL", "kernel32.dll"),
+        delay_imports=("kernel32.dll", "VCRUNTIME140.dll", "KERNEL32.DLL"),
+    )
+
+    assert extension_wheel_module._validate_windows_pe_platform(
+        contents,
+        "win_amd64",
+        description="test PE binary",
+        interpreter_tag=_extension_interpreter_tag(),
+    ) == ("kernel32.dll", "vcruntime140.dll")
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+@pytest.mark.parametrize(
+    ("library", "error"),
+    [
+        ("publisher-private.dll", "non-policy Windows DLLs.*publisher-private.dll"),
+        ("C:\\private\\library.dll", "invalid PE import-library name"),
+    ],
+)
+def test_windows_pe_platform_checks_imports_after_repeated_descriptors(import_kind, library, error):
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "kernel32.dll", library)},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+@pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
+def test_windows_pe_platform_counts_repeated_descriptors_towards_the_limit(monkeypatch, import_kind):
+    monkeypatch.setattr(extension_wheel_module, "_MAX_PE_IMPORT_LIBRARIES", 2)
+    contents = _synthetic_pe(
+        architecture="amd64",
+        **{import_kind: ("KERNEL32.DLL", "kernel32.dll", "kernel32.dll")},
+    )
+
+    with pytest.raises(ValueError, match="too many PE import libraries"):
+        extension_wheel_module._validate_windows_pe_platform(
+            contents,
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
+
+
+def test_windows_pe_platform_validates_repeated_delay_import_descriptors():
+    contents = bytearray(_synthetic_pe(architecture="amd64", delay_imports=("kernel32.dll", "kernel32.dll")))
+    raw_section_offset = 0x200
+    struct.pack_into("<I", contents, raw_section_offset + 32, 0)
+
+    with pytest.raises(ValueError, match="non-RVA PE delay-import descriptor"):
+        extension_wheel_module._validate_windows_pe_platform(
+            bytes(contents),
+            "win_amd64",
+            description="test PE binary",
+            interpreter_tag=_extension_interpreter_tag(),
+        )
 
 
 @pytest.mark.parametrize("import_kind", ["imports", "delay_imports"])
@@ -4141,6 +4347,91 @@ def test_clean_verifier_requires_the_base_wheel_complete_dependency_metadata(
         )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_message"),
+    [
+        (None, None),
+        ("dependency", "Requires-Dist must match project metadata exactly"),
+        ("extra", "Provides-Extra must match project metadata exactly"),
+        ("entry-point", "entry_points.txt must match project metadata exactly"),
+        ("record", "invalid RECORD entry for vane/py.typed"),
+        ("project-name", "base project metadata must describe 'vane-ai'"),
+        ("project-table", "base project metadata must contain a \\[project\\] table"),
+    ],
+)
+def test_clean_verifier_validates_base_metadata_against_its_matching_runtime(
+    tmp_path, monkeypatch, synthetic_descriptor_factory, mutation, expected_message
+):
+    project_metadata = tmp_path / "runtime-pyproject.toml"
+    project_metadata.write_text(
+        '[project]\nname = "vane-ai"\ndependencies = ["numpy"]\n'
+        '[project.optional-dependencies]\nruntime-extra = ["requests"]\n'
+        '[project.scripts]\nvane = "vane:main"\n',
+        encoding="utf-8",
+    )
+    base = _write_minimal_base_wheel(tmp_path)
+
+    def runtime_metadata(metadata):
+        lines = [line for line in metadata.splitlines() if not line.startswith(("Requires-Dist:", "Provides-Extra:"))]
+        lines += [
+            "Requires-Dist: numpy",
+            'Requires-Dist: requests; extra == "runtime-extra"',
+            "Provides-Extra: runtime-extra",
+        ]
+        if mutation == "dependency":
+            lines.remove("Requires-Dist: numpy")
+        elif mutation == "extra":
+            lines.remove("Provides-Extra: runtime-extra")
+        return "\n".join(lines) + "\n"
+
+    base = _rewrite_wheel_metadata(base, tmp_path / "runtime-base", runtime_metadata)
+    with zipfile.ZipFile(base) as wheel:
+        metadata_member = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+    entry_point = "other:main" if mutation == "entry-point" else "vane:main"
+    (tmp_path / "base-with-entry-points").mkdir()
+    base = _rewrite_wheel(
+        base,
+        tmp_path / "base-with-entry-points" / base.name,
+        extra_members={
+            metadata_member.removesuffix("METADATA") + "entry_points.txt": (
+                f"[console_scripts]\nvane = {entry_point}\n".encode()
+            )
+        },
+    )
+    if mutation == "record":
+        (tmp_path / "bad-record").mkdir()
+        base = _rewrite_wheel(
+            base,
+            tmp_path / "bad-record" / base.name,
+            transforms={"vane/py.typed": lambda _contents: b"changed\n"},
+            update_record=False,
+        )
+    elif mutation == "project-name":
+        project_metadata.write_text('[project]\nname = "other"\n', encoding="utf-8")
+    elif mutation == "project-table":
+        project_metadata.write_text('[tool.example]\nname = "vane-ai"\n', encoding="utf-8")
+
+    extension = _build_sample_wheel(tmp_path)
+    commands = []
+    monkeypatch.setattr(verify_extension_wheel_module, "_run", lambda command, **kwargs: commands.append(command))
+    arguments = dict(
+        base_wheel=base,
+        extension_wheel=extension.path,
+        extension_name="sample",
+        trust_identity=TEST_TRUST_IDENTITY,
+        base_project_metadata=project_metadata,
+    )
+    if expected_message is not None:
+        with pytest.raises(RuntimeError, match=expected_message):
+            verify_extension_wheel(**arguments)
+        assert commands == []
+    else:
+        with pytest.raises(RuntimeError, match="Requires-Dist must match project metadata exactly"):
+            verify_extension_wheel(**{**arguments, "base_project_metadata": None})
+        verify_extension_wheel(**arguments)
+        assert len(commands) == 4
+
+
 def test_clean_verifier_rejects_contents_that_do_not_match_record(tmp_path, synthetic_descriptor_factory):
     built = _build_sample_wheel(tmp_path)
     with zipfile.ZipFile(built.path) as wheel:
@@ -5392,7 +5683,7 @@ def test_clean_verifier_rejects_an_oversized_dependency_before_opening_it(
         )
 
 
-def test_platform_wheel_uses_distinct_versions_for_changed_artifacts(
+def test_platform_wheel_requires_a_new_release_number_for_changed_artifacts(
     tmp_path,
     synthetic_descriptor_factory,
 ):
@@ -5401,7 +5692,9 @@ def test_platform_wheel_uses_distinct_versions_for_changed_artifacts(
     first_contents = first.path.read_bytes()
     _write_artifact(artifact_path, b"changed extension wheel test payload")
 
-    second = _build_sample_wheel(tmp_path, artifact_path=artifact_path)
+    with pytest.raises(FileExistsError, match="refusing to replace a different extension wheel"):
+        _build_sample_wheel(tmp_path, artifact_path=artifact_path)
+    second = _build_sample_wheel(tmp_path, artifact_path=artifact_path, release_number=2)
 
     assert second.path != first.path
     assert second.distribution_version != first.distribution_version

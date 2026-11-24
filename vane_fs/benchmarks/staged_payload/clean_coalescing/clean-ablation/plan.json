@@ -1,0 +1,143 @@
+{
+  "media": [
+    "ext4"
+  ],
+  "orders": [
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "updated"
+    ],
+    [
+      "updated",
+      "baseline"
+    ]
+  ],
+  "states": [
+    "fresh",
+    "post_gc"
+  ],
+  "large_sequence": [
+    {
+      "mib": 256,
+      "application_mib": 8
+    },
+    {
+      "mib": 64,
+      "application_mib": 1
+    }
+  ],
+  "buffer_page_offset": 48,
+  "durability": "fsync",
+  "gc_preparation": "Identical CollectGarbage code/format; candidate wheel supplies GC for both daemons.",
+  "primary_gates": {
+    "ext4_combined_large_write_aggregate_ratio_minimum": 1.1,
+    "ext4_combined_large_write_paired_wins_minimum": 5
+  },
+  "regression_gates": {
+    "all_workloads_median_and_aggregate_ratio_minimum": 0.95,
+    "pooled_p99_ratio_maximum": 1.2,
+    "pooled_p99_absolute_increase_allowance_seconds": 0.001,
+    "lifecycle_median_ratio_maximum": 1.05
+  },
+  "owned_build_or_test_overlap": false,
+  "global_cache_eviction": false,
+  "measurement_scope": "Complete first-256 plus subsequent-64 writes are the combined ext4 target; tmpfs only checks software regressions; all other gates include every slow sample",
+  "runner_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/run_fuse.py",
+  "runner_source_sha256": "bc166378c43f9a76db24f9fa5f6be71616048117ee2b1ff08c9a1d46cd717948",
+  "prepared_runner_sha256": "d556c34026b2f3c56019fc198f6018089a7b47a49b57425afcc1d2f3fefe722b",
+  "workload_source": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/partial_write/acceptance/workload.py",
+  "workload_source_sha256": "b3929b6c91e02047c1c32c3de8ad5c3a1655b3766d43339fcf972bcfb2babe37",
+  "prepared_workload_sha256": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578",
+  "original_prepared_runner_sha256": "6e4ee94b5658ce6cd5e4b4bbfa22d0f5108a7e7146be48331c3c261cf69a433b",
+  "variant_gc_python_modules": {
+    "baseline": {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "4e56206eedd93280633ed15513c32814efc90c4430cb2d949978aff75984ae1c"
+    },
+    "updated": {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4"
+    }
+  },
+  "schema_checked_outside_workload_timers": true,
+  "status": "FROZEN_BEFORE_PLAIN_COMPARISON",
+  "frozen_epoch": 1791855989.625376,
+  "baseline": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup",
+  "candidate": "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced",
+  "full_adoption_eligible": false,
+  "original_protocol_subset": "ext4 fresh/post-GC only; original workload and gate constants",
+  "publication_presync": false,
+  "block_high_index_removed": false,
+  "checkpoint_restart_busy_timeout_ms": 0,
+  "restart_still_performs_real_io": true,
+  "row_layout_and_format_unchanged": true,
+  "causal_comparison": {
+    "medium": "ext4",
+    "pairs_per_state": 6,
+    "baseline": "Preceding orphan batching",
+    "adoption_gates_replaced": false
+  },
+  "writeback_hints": false,
+  "wal_checkpoint_thresholds_unchanged": true,
+  "post_reuse_clean_progress_enabled": true,
+  "payload_publication_coalescing_and_admission_unchanged": true,
+  "commit_wake_latched_after_large_generation": true,
+  "final_barriers_unchanged": true,
+  "timing_boundaries_unchanged": true,
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/screen.py": "c079262beea141ceb6ee1c417c8c1944ec29511dd0534d7080e4df9eb10ba5de",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/tests.json": "dd5bccd107137ff315d3cb50852eaabea1ec4ce347da1b3b20f62247ca7008ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/build/python-release/vane-fs-mount": "bfea1cb005a4dde631efff35bf131e1ab8aec54e24aaa95a438ca14a9737c6a8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "4e56206eedd93280633ed15513c32814efc90c4430cb2d949978aff75984ae1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/checkpoint.hpp": "c28b2d3647f5f084b766bd956fe17095def5a882cf01fc61ff062c0607a47628",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/workspace.cpp": "8ef0f04764bfb9fb5d2b31f09df8b10c06496f78b02e5a7c8e5932c9902e465a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/lookup/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/build/python-release/vane-fs-mount": "fb3798267ce0794a498cfaa821318d619ad14d43d7f4e20d06e6e2d1e14be000",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "0d5be77c2dafbbc91b3692709ef520b2da52e9bc4f497fbf25b245fb5fbb78d4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/checkpoint.hpp": "7176de3758454758777114e7ef24400615895972052f047af47425a0ba4bc6be",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/workspace.cpp": "8ef0f04764bfb9fb5d2b31f09df8b10c06496f78b02e5a7c8e5932c9902e465a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/coalesced/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/clean-ablation/run_fuse.py": "d556c34026b2f3c56019fc198f6018089a7b47a49b57425afcc1d2f3fefe722b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/clean-ablation/workload.py": "be2148a31f891ec38be41782552a55cb26cb4c9e14e358d3c841bfe68f73c578"
+  },
+  "role": "clean-ablation",
+  "interpretation": "Original ext4 subset and unchanged gates; ablations isolate mechanisms, not overall adoption",
+  "lookup_reads_enabled": true,
+  "small_clean_fixed_deferral_ms": 5
+}

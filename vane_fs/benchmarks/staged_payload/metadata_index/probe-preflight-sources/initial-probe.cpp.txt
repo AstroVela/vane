@@ -1,0 +1,78 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "vane_fs/workspace.hpp"
+#include <sqlite3.h>
+#include <chrono>
+#include <iostream>
+#include <filesystem>
+
+using namespace vane_fs;
+static thread_local bool counting = false;
+static thread_local long long calls = 0, steps = 0;
+extern "C" int __real_sqlite3_step(sqlite3_stmt *);
+extern "C" int __wrap_sqlite3_step(sqlite3_stmt *statement) {
+	if (counting)
+		sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1);
+	auto result = __real_sqlite3_step(statement);
+	if (counting) {
+		++calls;
+		steps += sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1);
+	}
+	return result;
+}
+static int Print(void *, int n, char **values, char **names) {
+	for (int i = 0; i < n; ++i)
+		std::cout << names[i] << '=' << (values[i] ? values[i] : "NULL") << ' ';
+	std::cout << '\n';
+	return 0;
+}
+int main(int argc, char **argv) {
+	try {
+		if (argc != 3)
+			throw std::runtime_error("Expected database and full/primary mode");
+		std::string path = argv[1], mode = argv[2];
+		Workspace workspace(path, 5000, Durability::Fsync);
+		auto session = workspace.Checkout();
+		sqlite3 *db = nullptr;
+		if (sqlite3_open(path.c_str(), &db) != SQLITE_OK)
+			throw std::runtime_error("Cannot open inspector");
+		sqlite3_busy_timeout(db, 5000);
+		auto query = [&](const char *sql) {
+			char *message = nullptr;
+			if (sqlite3_exec(db, sql, Print, nullptr, &message) != SQLITE_OK) {
+				std::string text = message ? message : sqlite3_errmsg(db);
+				sqlite3_free(message);
+				throw std::runtime_error(text);
+			}
+		};
+		if (mode == "primary")
+			query("DROP INDEX block_versions_high");
+		session->WriteFile("/file", "");
+		auto bytes = std::string(8 * 1024 * 1024, 'v');
+		counting = true;
+		auto start = std::chrono::steady_clock::now();
+		for (int i = 0; i < 8; ++i)
+			session->Write("/file", bytes, 48 + int64_t(i) * bytes.size());
+		workspace.Sync();
+		auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		counting = false;
+		std::cout << "mode=" << mode << " seconds=" << seconds << " calls=" << calls << " steps=" << steps
+		          << " wal_bytes=" << std::filesystem::file_size(path + "-wal") << '\n';
+		query("PRAGMA page_count; PRAGMA freelist_count");
+		query("EXPLAIN QUERY PLAN SELECT * FROM block_versions WHERE inode=2 AND block=1 AND low<=zeroblob(32) AND high>zeroblob(32) AND deleted=0");
+		query("EXPLAIN QUERY PLAN SELECT * FROM block_versions WHERE inode=2 AND block>=0 AND block<=2000 AND low<X'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' AND high>zeroblob(32)");
+		query("EXPLAIN QUERY PLAN SELECT b.block,p.data FROM block_versions b JOIN block_payloads p ON p.id=b.payload WHERE b.inode=2 AND b.block>=0 AND b.block<=2000 AND b.low<=zeroblob(32) AND b.high>zeroblob(32) AND b.deleted=0 ORDER BY b.block");
+		query("PRAGMA quick_check");
+		if (mode == "full")
+			query("SAVEPOINT index_size; DROP INDEX block_versions_high; PRAGMA freelist_count; ROLLBACK TO index_size; RELEASE index_size");
+		sqlite3_close(db);
+		if (session->Read("/file", 48, int64_t(bytes.size()) * 8) != std::string(64 * 1024 * 1024, 'v'))
+			throw std::runtime_error("Content mismatch");
+		workspace.Close();
+		return 0;
+	} catch (const std::exception &error) {
+		std::cerr << error.what() << '\n';
+		return 1;
+	}
+}

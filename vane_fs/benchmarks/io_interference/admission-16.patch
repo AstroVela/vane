@@ -1,0 +1,13 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -25 +25 @@
+-	static constexpr int64_t LIMIT_BYTES = 64 * 1024 * 1024;
++	static constexpr int64_t LIMIT_BYTES = 16 * 1024 * 1024;
+--- a/tests/test_checkpoint.cpp
++++ b/tests/test_checkpoint.cpp
+@@ -176 +176 @@
+-	Require(std::filesystem::file_size(path + "-wal") < 67 * MIB, "WAL budget not enforced");
++	Require(std::filesystem::file_size(path + "-wal") < 19 * MIB, "WAL budget not enforced");
+@@ -204 +204 @@
+-	Require(bytes >= 64 * MIB && bytes < 68 * MIB, "Wrong WAL byte budget for page size");
++	Require(bytes >= 16 * MIB && bytes < 20 * MIB, "Wrong WAL byte budget for page size");

@@ -79,8 +79,8 @@ class ImageFileLimitError(ImageFileError):
 @dataclass(slots=True)
 class _PillowLimitHook:
     image_module: Any
-    original: Callable[[tuple[int, int]], None]
-    wrapper: Callable[[tuple[int, int]], None]
+    original: Callable[..., None]
+    wrapper: Callable[..., None]
     users: int = 0
 
 
@@ -279,14 +279,16 @@ def _load_pillow() -> tuple[Any, type[Exception]]:
 
 
 def _pillow_limit_wrapper(
-    original: Callable[[tuple[int, int]], None],
-) -> Callable[[tuple[int, int]], None]:
+    original: Callable[..., None],
+) -> Callable[..., None]:
     @functools.wraps(original)
-    def check(size: tuple[int, int]) -> None:
+    def check(size: tuple[int, int], **options: Any) -> None:
         max_pixels = _PILLOW_PIXEL_LIMIT.get()
         if max_pixels is None:
-            original(size)
+            original(size, **options)
             return
+        # Plugins can suppress a duplicate Pillow warning with error_only;
+        # Vane's per-call pixel limit remains a hard cap for every check.
         pixels = max(1, int(size[0])) * max(1, int(size[1]))
         if pixels > max_pixels:
             raise ImageFileLimitError(f"image contains {pixels} pixels, exceeding max_pixels={max_pixels}")

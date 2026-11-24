@@ -1,0 +1,22 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -63,7 +63,10 @@
+ 		auto &self = *static_cast<Checkpointer *>(context);
+-		if (self.Bytes(frames) >= START_BYTES) {
++		if (self.Bytes(frames) >= START_BYTES)
++			self.warmed.store(true, std::memory_order_relaxed);
++		// Generation reuse must not turn off progress for later CLEAN commits.
++		if (self.warmed.load(std::memory_order_relaxed)) {
+ 			{
+ 				std::lock_guard<std::mutex> lock(self.mutex);
+ 				self.requested = true;
+ 			}
+ 			self.wake.notify_one();
+@@ -214,6 +217,7 @@
+ 	const int page_size, timeout_ms;
+ 	const std::string wal_path;
+ 	std::atomic<int> error {SQLITE_OK};
++	std::atomic<bool> warmed {false};
+ 	std::mutex mutex;
+ 	std::mutex checkpoint_mutex;
+ 	std::condition_variable wake;

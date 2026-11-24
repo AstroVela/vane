@@ -1,0 +1,52 @@
+[
+  {
+    "window": "whole-generation",
+    "state": "fresh",
+    "variant": "updated",
+    "rep": 2,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.2310519301099703
+  },
+  {
+    "window": "whole-generation",
+    "state": "post_gc",
+    "variant": "updated",
+    "rep": 4,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 24,
+    "seconds": 6.687066302052699
+  },
+  {
+    "window": "tail",
+    "state": "fresh",
+    "variant": "updated",
+    "rep": 1,
+    "workload": "write_64",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 5.22633750399109
+  },
+  {
+    "window": "tail",
+    "state": "post_gc",
+    "variant": "updated",
+    "rep": 1,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 7.724104098044336
+  },
+  {
+    "window": "tail",
+    "state": "post_gc",
+    "variant": "baseline",
+    "rep": 3,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 24,
+    "seconds": 7.224228074075654
+  }
+]

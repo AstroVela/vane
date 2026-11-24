@@ -82,7 +82,11 @@ static void InitializeCurl() {
 void GravitinoConfig::Validate() {
 	InitializeCurl();
 	GravitinoClient::Identifier(metalake);
-	GravitinoClient::Identifier(catalog);
+	if (scope == GravitinoScope::CATALOG) {
+		GravitinoClient::Identifier(catalog);
+	} else if (!catalog.empty() || !location_name.empty()) {
+		throw InvalidInputException("Metalake discovery does not select a catalog or storage location");
+	}
 	if (endpoint.empty() || endpoint.size() > 8192 || endpoint.find('\0') != string::npos || token.size() > 16384 ||
 	    token.find_first_of("\r\n") != string::npos || token.find('\0') != string::npos) {
 		throw InvalidInputException("Invalid Gravitino endpoint or bearer token");
@@ -207,6 +211,9 @@ static void SetCurlOption(CURL *curl, CURLoption option, T value) {
 }
 GravitinoResponse GravitinoClient::Request(ClientContext &context, const string &method, const string &suffix,
                                            const string &body, long allowed_error_status) const {
+	if (config.scope == GravitinoScope::METALAKE && method != "GET") {
+		throw PermissionException("Gravitino metalake discovery is read-only");
+	}
 	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 		throw PermissionException("Gravitino requires enable_external_access");
 	}
@@ -221,8 +228,11 @@ GravitinoResponse GravitinoClient::Request(ClientContext &context, const string 
 	if (!curl) {
 		throw OutOfMemoryException("Could not allocate Gravitino HTTP client");
 	}
-	string url =
-	    config.endpoint + "/api/metalakes/" + Encode(config.metalake) + "/catalogs/" + Encode(config.catalog) + suffix;
+	string url = config.endpoint + "/api/metalakes/" + Encode(config.metalake);
+	if (config.scope == GravitinoScope::CATALOG) {
+		url += "/catalogs/" + Encode(config.catalog);
+	}
+	url += suffix;
 	GravitinoTransfer transfer {context, config.max_response_bytes};
 	curl_slist *headers = nullptr;
 	std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_owner(nullptr, curl_slist_free_all);
@@ -314,6 +324,16 @@ GravitinoResponse GravitinoClient::Request(ClientContext &context, const string 
 GravitinoJson GravitinoClient::Get(ClientContext &context, const string &suffix) const {
 	return GravitinoJson(Request(context, "GET", suffix).body);
 }
+GravitinoJson GravitinoClient::GetDiscovery(ClientContext &context, const string &suffix) const {
+	if (config.scope != GravitinoScope::METALAKE) {
+		throw InvalidInputException("Discovery requires a Gravitino metalake attachment");
+	}
+	auto response = Request(context, "GET", suffix, "", 404);
+	if (response.status == 404) {
+		throw CatalogException("Gravitino discovery resource was not found");
+	}
+	return GravitinoJson(response.body);
+}
 vector<string> GravitinoClient::List(ClientContext &context, const string &suffix) const {
 	auto response = Get(context, suffix);
 	auto values = yyjson_obj_get(response.Root(), "identifiers");
@@ -357,7 +377,7 @@ static string LocalHadoopPath(const string &location) {
 	return path;
 }
 string GravitinoClient::Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
-                                string *root) const {
+                                string *root, string *selected_location) const {
 	if (path.size() > 8192 || path.find('\0') != string::npos || path.find('\\') != string::npos ||
 	    (!path.empty() && path.front() == '/')) {
 		throw InvalidInputException("Fileset paths must be relative paths without NUL or backslashes");
@@ -386,6 +406,9 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 		location_name = default_name ? GravitinoJson::String(properties, "default-location-name") : "unknown";
 	}
 	location = GravitinoJson::String(locations, location_name.c_str());
+	if (selected_location) {
+		*selected_location = location_name;
+	}
 	if (StringUtil::StartsWith(location, "s3a://")) {
 		location.replace(0, 6, "s3://");
 	} else if (StringUtil::CIEquals(location.substr(0, 5), "file:")) {
@@ -401,15 +424,32 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	} else if (!FileSystem::GetFileSystem(context).IsPathAbsolute(location)) {
 		throw NotImplementedException("Gravitino Fileset reads currently support absolute local paths and S3");
 	}
+#ifdef _WIN32
+	const bool local_path = !StringUtil::StartsWith(location, "s3://");
+	if (local_path) {
+		location = FileSystem::GetFileSystem(context).ConvertSeparators(location);
+	}
+#endif
 	if (root) {
 		*root = location;
 	}
 	if (!path.empty()) {
-		if (location.back() != '/') {
-			location += '/';
+		auto separator = '/';
+#ifdef _WIN32
+		if (local_path) {
+			separator = '\\';
+		}
+#endif
+		if (location.back() != separator) {
+			location += separator;
 		}
 		location += path;
 	}
+#ifdef _WIN32
+	if (local_path) {
+		location = FileSystem::GetFileSystem(context).ConvertSeparators(location);
+	}
+#endif
 	return location;
 }
 
@@ -417,11 +457,13 @@ vector<OpenFileInfo> GravitinoClient::Glob(ClientContext &context, const string 
                                            const string &path) const {
 	string root;
 	auto resolved = Resolve(context, schema, fileset, path, &root);
+#ifndef _WIN32
 	if (root.find('\\') != string::npos) {
 		// DuckDB's local glob parser treats backslashes as separators even on
 		// POSIX. Do not silently glob another directory for a literal backslash.
 		throw NotImplementedException("Fileset globbing does not support backslashes in storage locations");
 	}
+#endif
 	// Escape only the registered root. The caller's relative path retains its
 	// glob syntax, including bracket expressions and recursive ** components.
 	string pattern;
@@ -473,6 +515,11 @@ vector<OpenFileInfo> GravitinoClient::Glob(ClientContext &context, const string 
 		}
 #endif
 		if (matches_root) {
+#ifdef _WIN32
+			if (!StringUtil::StartsWith(root, "s3://")) {
+				file.path = std::move(normalized_path);
+			}
+#endif
 			result.push_back(std::move(file));
 		}
 	}

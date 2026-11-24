@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "/home/kaka/miniconda3/bin/python3",
+    "-u",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/fuse_waits/analyze.py",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/prewriteback-waits-20261018"
+  ],
+  "started_epoch": 1792324349.709072,
+  "ended_epoch": 1792324361.26,
+  "returncode": 0,
+  "stdout": "fuse baseline 0 roots 10520 slow roots 5 slow syscalls 5\nfuse updated 0 roots 10699 slow roots 7 slow syscalls 7\nfuse updated 1 roots 10670 slow roots 6 slow syscalls 6\nfuse baseline 1 roots 10712 slow roots 5 slow syscalls 5\nfuse baseline 2 roots 10667 slow roots 3 slow syscalls 3\nfuse updated 2 roots 10594 slow roots 7 slow syscalls 7\nfuse updated 3 roots 10597 slow roots 6 slow syscalls 6\nfuse baseline 3 roots 10614 slow roots 6 slow syscalls 6\naged_fuse baseline 0 roots 17462 slow roots 4 slow syscalls 4\naged_fuse updated 0 roots 17043 slow roots 11 slow syscalls 13\naged_fuse updated 1 roots 16335 slow roots 14 slow syscalls 15\naged_fuse baseline 1 roots 17533 slow roots 3 slow syscalls 3\naged_fuse baseline 2 roots 17044 slow roots 6 slow syscalls 6\naged_fuse updated 2 roots 17365 slow roots 7 slow syscalls 7\naged_fuse updated 3 roots 17080 slow roots 10 slow syscalls 11\naged_fuse baseline 3 roots 16969 slow roots 7 slow syscalls 8\n",
+  "stderr": ""
+}

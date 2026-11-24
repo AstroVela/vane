@@ -1,111 +1,89 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Included by ray_module.cpp before namespace duckdb.
+#include "ray_binding_internal.hpp"
 
-namespace {
+namespace duckdb {
+namespace ray_bindings {
+namespace py = ::duckdb::py;
 
-struct DuckDBPyTransactionGuard {
-	duckdb::ClientContext &context;
-	bool started = false;
-	bool finished = false;
+DuckDBPyTransactionGuard::DuckDBPyTransactionGuard(duckdb::ClientContext &ctx) : context(ctx) {
+	if (!context.transaction.HasActiveTransaction()) {
+		context.transaction.BeginTransaction();
+		started = true;
+	}
+}
 
-	explicit DuckDBPyTransactionGuard(duckdb::ClientContext &ctx) : context(ctx) {
-		if (!context.transaction.HasActiveTransaction()) {
-			context.transaction.BeginTransaction();
-			started = true;
+auto DuckDBPyTransactionGuard::Commit() -> void {
+	if (started && !finished) {
+		context.transaction.Commit();
+		finished = true;
+	}
+}
+
+auto DuckDBPyTransactionGuard::Rollback() -> void {
+	if (started && !finished) {
+		try {
+			context.transaction.Rollback(nullptr);
+		} catch (...) {
+		}
+		finished = true;
+	}
+}
+
+DuckDBPyTransactionGuard::~DuckDBPyTransactionGuard() {
+	if (started && !finished) {
+		try {
+			context.transaction.Rollback(nullptr);
+		} catch (...) {
 		}
 	}
+}
 
-	void Commit() {
-		if (started && !finished) {
-			context.transaction.Commit();
-			finished = true;
-		}
-	}
+NativePartitionMetadata::NativePartitionMetadata(size_t num_rows_p, size_t size_bytes_p)
+    : num_rows(num_rows_p), size_bytes(size_bytes_p) {
+}
 
-	void Rollback() {
-		if (started && !finished) {
-			try {
-				context.transaction.Rollback(nullptr);
-			} catch (...) {
-			}
-			finished = true;
-		}
-	}
+NativeDistributedTaskResult::NativeDistributedTaskResult(pybind11::iterable payloads, pybind11::iterable metadatas,
+                                                         pybind11::object result_schema_p, pybind11::object stats_p,
+                                                         std::string completion_status_p, int flight_port_p,
+                                                         pybind11::object exchange_sink_instance_p,
+                                                         pybind11::object task_stats_p)
+    : partition_payloads(duckdb::distributed::python::ray::SafePyObject(pybind11::list(payloads))),
+      partition_metadatas(duckdb::distributed::python::ray::SafePyObject(pybind11::list(metadatas))),
+      result_schema(duckdb::distributed::python::ray::SafePyObject(std::move(result_schema_p))),
+      stats(duckdb::distributed::python::ray::SafePyObject(std::move(stats_p))),
+      task_stats(duckdb::distributed::python::ray::SafePyObject(std::move(task_stats_p))),
+      completion_status(std::move(completion_status_p)), flight_port(flight_port_p),
+      exchange_sink_instance(duckdb::distributed::python::ray::SafePyObject(std::move(exchange_sink_instance_p))) {
+}
 
-	~DuckDBPyTransactionGuard() {
-		if (started && !finished) {
-			try {
-				context.transaction.Rollback(nullptr);
-			} catch (...) {
-			}
-		}
-	}
-};
+auto NativeDistributedTaskResult::PartitionPayloads() const -> pybind11::object {
+	return partition_payloads.get();
+}
 
-} // namespace
+auto NativeDistributedTaskResult::PartitionMetadatas() const -> pybind11::object {
+	return partition_metadatas.get();
+}
 
-struct NativePartitionMetadata {
-	size_t num_rows;
-	size_t size_bytes;
+auto NativeDistributedTaskResult::ResultSchema() const -> pybind11::object {
+	return result_schema.get();
+}
 
-	NativePartitionMetadata(size_t num_rows_p = 0, size_t size_bytes_p = 0)
-	    : num_rows(num_rows_p), size_bytes(size_bytes_p) {
-	}
-};
+auto NativeDistributedTaskResult::Stats() const -> pybind11::object {
+	return stats.get();
+}
 
-struct NativeDistributedTaskResult {
-	duckdb::distributed::python::ray::SafePyObject partition_payloads;
-	duckdb::distributed::python::ray::SafePyObject partition_metadatas;
-	duckdb::distributed::python::ray::SafePyObject result_schema;
-	duckdb::distributed::python::ray::SafePyObject stats;
-	duckdb::distributed::python::ray::SafePyObject task_stats;
-	std::string completion_status;
-	int flight_port;
-	duckdb::distributed::python::ray::SafePyObject exchange_sink_instance;
+auto NativeDistributedTaskResult::TaskStats() const -> pybind11::object {
+	return task_stats.get();
+}
 
-	NativeDistributedTaskResult(pybind11::iterable payloads, pybind11::iterable metadatas,
-	                            pybind11::object result_schema_p, pybind11::object stats_p,
-	                            std::string completion_status_p, int flight_port_p = 0,
-	                            pybind11::object exchange_sink_instance_p = pybind11::none(),
-	                            pybind11::object task_stats_p = pybind11::none())
-	    : partition_payloads(duckdb::distributed::python::ray::SafePyObject(pybind11::list(payloads))),
-	      partition_metadatas(duckdb::distributed::python::ray::SafePyObject(pybind11::list(metadatas))),
-	      result_schema(duckdb::distributed::python::ray::SafePyObject(std::move(result_schema_p))),
-	      stats(duckdb::distributed::python::ray::SafePyObject(std::move(stats_p))),
-	      task_stats(duckdb::distributed::python::ray::SafePyObject(std::move(task_stats_p))),
-	      completion_status(std::move(completion_status_p)), flight_port(flight_port_p),
-	      exchange_sink_instance(duckdb::distributed::python::ray::SafePyObject(std::move(exchange_sink_instance_p))) {
-	}
+auto NativeDistributedTaskResult::ExchangeSinkInstance() const -> pybind11::object {
+	return exchange_sink_instance.get();
+}
 
-	pybind11::object PartitionPayloads() const {
-		return partition_payloads.get();
-	}
-
-	pybind11::object PartitionMetadatas() const {
-		return partition_metadatas.get();
-	}
-
-	pybind11::object ResultSchema() const {
-		return result_schema.get();
-	}
-
-	pybind11::object Stats() const {
-		return stats.get();
-	}
-
-	pybind11::object TaskStats() const {
-		return task_stats.get();
-	}
-
-	pybind11::object ExchangeSinkInstance() const {
-		return exchange_sink_instance.get();
-	}
-};
-
-static pybind11::dict BuildNativeResultSchema(const duckdb::vector<string> &names,
-                                              const duckdb::vector<duckdb::LogicalType> &types) {
+pybind11::dict BuildNativeResultSchema(const duckdb::vector<string> &names,
+                                       const duckdb::vector<duckdb::LogicalType> &types) {
 	pybind11::list py_names;
 	pybind11::list py_types;
 	for (auto &name : names) {
@@ -120,7 +98,7 @@ static pybind11::dict BuildNativeResultSchema(const duckdb::vector<string> &name
 	return schema;
 }
 
-static size_t GetPyPayloadSizeBytes(const pybind11::object &payload) {
+size_t GetPyPayloadSizeBytes(const pybind11::object &payload) {
 	try {
 		if (pybind11::hasattr(payload, "nbytes")) {
 			return payload.attr("nbytes").cast<size_t>();
@@ -130,35 +108,34 @@ static size_t GetPyPayloadSizeBytes(const pybind11::object &payload) {
 	return 0;
 }
 
-static pybind11::object BuildNativeTaskResult(pybind11::iterable payloads, pybind11::iterable metadatas,
-                                              pybind11::object result_schema, pybind11::object stats,
-                                              pybind11::object task_stats, const std::string &completion_status,
-                                              int flight_port = 0,
-                                              pybind11::object exchange_sink_instance = pybind11::none()) {
+pybind11::object BuildNativeTaskResult(pybind11::iterable payloads, pybind11::iterable metadatas,
+                                       pybind11::object result_schema, pybind11::object stats,
+                                       pybind11::object task_stats, const std::string &completion_status,
+                                       int flight_port, pybind11::object exchange_sink_instance) {
 	return pybind11::cast(NativeDistributedTaskResult(payloads, metadatas, std::move(result_schema), std::move(stats),
 	                                                  completion_status, flight_port, std::move(exchange_sink_instance),
 	                                                  std::move(task_stats)));
 }
 
-static idx_t SaturatingAddIdx(idx_t lhs, idx_t rhs) {
+idx_t SaturatingAddIdx(idx_t lhs, idx_t rhs) {
 	if (std::numeric_limits<idx_t>::max() - lhs < rhs) {
 		return std::numeric_limits<idx_t>::max();
 	}
 	return lhs + rhs;
 }
 
-static bool PipelineSnapshotSourceIs(const duckdb::PipelineProgressSnapshot &snapshot, const char *needle) {
+bool PipelineSnapshotSourceIs(const duckdb::PipelineProgressSnapshot &snapshot, const char *needle) {
 	return !snapshot.operators.empty() && snapshot.operators.front() == needle;
 }
 
-static bool IsCompletionOnlyRemoteExchangeSinkPipeline(const duckdb::PipelineProgressSnapshot &snapshot) {
+bool IsCompletionOnlyRemoteExchangeSinkPipeline(const duckdb::PipelineProgressSnapshot &snapshot) {
 	// PhysicalRemoteExchangeSink implements IsSource() only to let DuckDB close
 	// the sink pipeline. That singleton source pipeline always returns zero rows
 	// and is not user-visible work. Keep the child -> EXCHANGE_SINK data pipeline.
 	return snapshot.operators.size() == 1 && snapshot.operators.front() == "EXCHANGE_SINK";
 }
 
-static bool IsInternalRemoteExchangeResultCollectorPipeline(const duckdb::PipelineProgressSnapshot &snapshot) {
+bool IsInternalRemoteExchangeResultCollectorPipeline(const duckdb::PipelineProgressSnapshot &snapshot) {
 	if (snapshot.operators.size() == 1) {
 		return snapshot.operators.front() == "RESULT_COLLECTOR";
 	}
@@ -166,7 +143,7 @@ static bool IsInternalRemoteExchangeResultCollectorPipeline(const duckdb::Pipeli
 	       snapshot.operators[1] == "RESULT_COLLECTOR";
 }
 
-static std::string PipelineSnapshotName(const duckdb::PipelineProgressSnapshot &snapshot) {
+std::string PipelineSnapshotName(const duckdb::PipelineProgressSnapshot &snapshot) {
 	std::string result;
 	for (idx_t i = 0; i < snapshot.operators.size(); i++) {
 		if (i > 0) {
@@ -177,28 +154,28 @@ static std::string PipelineSnapshotName(const duckdb::PipelineProgressSnapshot &
 	return result.empty() ? "Pipeline" : result;
 }
 
-static py::list OperatorsToPyList(const duckdb::vector<std::string> &operators) {
-	py::list out;
+pybind11::list OperatorsToPyList(const duckdb::vector<std::string> &operators) {
+	pybind11::list out;
 	for (const auto &op : operators) {
-		out.append(py::str(op));
+		out.append(pybind11::str(op));
 	}
 	return out;
 }
 
-static py::list
+pybind11::list
 OperatorDetailsToPyList(const duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> &operator_details) {
-	py::list out;
+	pybind11::list out;
 	for (const auto &details : operator_details) {
-		py::dict item;
+		pybind11::dict item;
 		for (const auto &entry : details) {
-			item[py::str(entry.first)] = py::str(entry.second);
+			item[pybind11::str(entry.first)] = pybind11::str(entry.second);
 		}
 		out.append(std::move(item));
 	}
 	return out;
 }
 
-static std::string OperatorListName(const duckdb::vector<std::string> &operators) {
+std::string OperatorListName(const duckdb::vector<std::string> &operators) {
 	std::string result;
 	for (idx_t i = 0; i < operators.size(); i++) {
 		if (i > 0) {
@@ -209,7 +186,7 @@ static std::string OperatorListName(const duckdb::vector<std::string> &operators
 	return result.empty() ? "Result" : result;
 }
 
-static duckdb::InsertionOrderPreservingMap<std::string> ProgressOperatorDetails(const duckdb::PhysicalOperator &op) {
+duckdb::InsertionOrderPreservingMap<std::string> ProgressOperatorDetails(const duckdb::PhysicalOperator &op) {
 	duckdb::InsertionOrderPreservingMap<std::string> details;
 	if (op.type != duckdb::PhysicalOperatorType::STREAMING_UDF &&
 	    op.type != duckdb::PhysicalOperatorType::INOUT_FUNCTION) {
@@ -228,9 +205,9 @@ static duckdb::InsertionOrderPreservingMap<std::string> ProgressOperatorDetails(
 	return details;
 }
 
-static void CollectPrimaryPipelineOperators(
+void CollectPrimaryPipelineOperators(
     const duckdb::PhysicalOperator &op, duckdb::vector<std::string> &operators,
-    duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> *operator_details = nullptr) {
+    duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> *operator_details) {
 	auto children = op.GetChildren();
 	if (!children.empty()) {
 		CollectPrimaryPipelineOperators(children[0].get(), operators, operator_details);
@@ -241,8 +218,7 @@ static void CollectPrimaryPipelineOperators(
 	}
 }
 
-static idx_t OperatorDetailIdxValue(const duckdb::InsertionOrderPreservingMap<std::string> &details,
-                                    const std::string &key) {
+idx_t OperatorDetailIdxValue(const duckdb::InsertionOrderPreservingMap<std::string> &details, const std::string &key) {
 	auto entry = details.find(key);
 	if (entry == details.end() || entry->second.empty()) {
 		return 0;
@@ -258,7 +234,7 @@ static idx_t OperatorDetailIdxValue(const duckdb::InsertionOrderPreservingMap<st
 	}
 }
 
-static idx_t SnapshotUDFCounterMax(const duckdb::PipelineProgressSnapshot &snapshot, const std::string &key) {
+idx_t SnapshotUDFCounterMax(const duckdb::PipelineProgressSnapshot &snapshot, const std::string &key) {
 	idx_t value = 0;
 	for (const auto &details : snapshot.operator_details) {
 		value = duckdb::MaxValue<idx_t>(value, OperatorDetailIdxValue(details, key));
@@ -266,9 +242,8 @@ static idx_t SnapshotUDFCounterMax(const duckdb::PipelineProgressSnapshot &snaps
 	return value;
 }
 
-static idx_t
-OperatorDetailsCounterMax(const duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> &operator_details,
-                          const std::string &key) {
+idx_t OperatorDetailsCounterMax(
+    const duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> &operator_details, const std::string &key) {
 	idx_t value = 0;
 	for (const auto &details : operator_details) {
 		value = duckdb::MaxValue<idx_t>(value, OperatorDetailIdxValue(details, key));
@@ -276,8 +251,7 @@ OperatorDetailsCounterMax(const duckdb::vector<duckdb::InsertionOrderPreservingM
 	return value;
 }
 
-static idx_t
-ScanSplitInputRows(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
+idx_t ScanSplitInputRows(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
 	idx_t rows = 0;
 	if (!scan_split_batch_map) {
 		return rows;
@@ -288,8 +262,7 @@ ScanSplitInputRows(const std::unordered_map<idx_t, duckdb::distributed::ScanSpli
 	return rows;
 }
 
-static idx_t
-ScanSplitInputBytes(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
+idx_t ScanSplitInputBytes(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
 	idx_t bytes = 0;
 	if (!scan_split_batch_map) {
 		return bytes;
@@ -300,7 +273,7 @@ ScanSplitInputBytes(const std::unordered_map<idx_t, duckdb::distributed::ScanSpl
 	return bytes;
 }
 
-static idx_t ExchangeSourceInputBytes(
+idx_t ExchangeSourceInputBytes(
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map) {
 	idx_t bytes = 0;
 	if (!exchange_source_task_map) {
@@ -316,7 +289,7 @@ static idx_t ExchangeSourceInputBytes(
 	return bytes;
 }
 
-static idx_t ExchangeSourceInputRows(
+idx_t ExchangeSourceInputRows(
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map) {
 	idx_t rows = 0;
 	if (!exchange_source_task_map) {
@@ -332,8 +305,8 @@ static idx_t ExchangeSourceInputRows(
 	return rows;
 }
 
-static idx_t
-FteQueueConsumedRows(const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *queue_map) {
+idx_t FteQueueConsumedRows(
+    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *queue_map) {
 	idx_t rows = 0;
 	if (!queue_map) {
 		return rows;
@@ -346,8 +319,8 @@ FteQueueConsumedRows(const std::unordered_map<idx_t, std::shared_ptr<duckdb::dis
 	return rows;
 }
 
-static idx_t
-FteQueueConsumedBytes(const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *queue_map) {
+idx_t FteQueueConsumedBytes(
+    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *queue_map) {
 	idx_t bytes = 0;
 	if (!queue_map) {
 		return bytes;
@@ -360,24 +333,7 @@ FteQueueConsumedBytes(const std::unordered_map<idx_t, std::shared_ptr<duckdb::di
 	return bytes;
 }
 
-struct FteQueueProgressStats {
-	idx_t submitted_split_count = 0;
-	idx_t consumed_split_count = 0;
-	idx_t completed_split_count = 0;
-	idx_t submitted_split_bytes = 0;
-	idx_t consumed_split_bytes = 0;
-	idx_t completed_split_bytes = 0;
-	idx_t queue_wait_ms = 0;
-	py::dict submitted_split_count_by_source;
-	py::dict consumed_split_count_by_source;
-	py::dict completed_split_count_by_source;
-	py::dict submitted_split_bytes_by_source;
-	py::dict consumed_split_bytes_by_source;
-	py::dict completed_split_bytes_by_source;
-	py::dict queue_wait_ms_by_source;
-};
-
-static void AddFteQueueProgressStats(
+void AddFteQueueProgressStats(
     FteQueueProgressStats &stats,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *queue_map) {
 	if (!queue_map) {
@@ -387,7 +343,7 @@ static void AddFteQueueProgressStats(
 		if (!entry.second) {
 			continue;
 		}
-		const auto source_id = py::str(std::to_string(entry.first));
+		const auto source_id = pybind11::str(std::to_string(entry.first));
 		const auto submitted_count = entry.second->SubmittedSplits();
 		const auto consumed_count = entry.second->ConsumedSplits();
 		const auto completed_count = entry.second->CompletedSplits();
@@ -402,45 +358,46 @@ static void AddFteQueueProgressStats(
 		stats.consumed_split_bytes = SaturatingAddIdx(stats.consumed_split_bytes, consumed_bytes);
 		stats.completed_split_bytes = SaturatingAddIdx(stats.completed_split_bytes, completed_bytes);
 		stats.queue_wait_ms = SaturatingAddIdx(stats.queue_wait_ms, wait_ms);
-		stats.submitted_split_count_by_source[source_id] = py::int_(submitted_count);
-		stats.consumed_split_count_by_source[source_id] = py::int_(consumed_count);
-		stats.completed_split_count_by_source[source_id] = py::int_(completed_count);
-		stats.submitted_split_bytes_by_source[source_id] = py::int_(submitted_bytes);
-		stats.consumed_split_bytes_by_source[source_id] = py::int_(consumed_bytes);
-		stats.completed_split_bytes_by_source[source_id] = py::int_(completed_bytes);
-		stats.queue_wait_ms_by_source[source_id] = py::int_(wait_ms);
+		stats.submitted_split_count_by_source[source_id] = pybind11::int_(submitted_count);
+		stats.consumed_split_count_by_source[source_id] = pybind11::int_(consumed_count);
+		stats.completed_split_count_by_source[source_id] = pybind11::int_(completed_count);
+		stats.submitted_split_bytes_by_source[source_id] = pybind11::int_(submitted_bytes);
+		stats.consumed_split_bytes_by_source[source_id] = pybind11::int_(consumed_bytes);
+		stats.completed_split_bytes_by_source[source_id] = pybind11::int_(completed_bytes);
+		stats.queue_wait_ms_by_source[source_id] = pybind11::int_(wait_ms);
 	}
 }
 
-static void AppendFteQueueProgressStats(
-    py::dict &out, const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *scan_queue_map,
+void AppendFteQueueProgressStats(
+    pybind11::dict &out,
+    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *scan_queue_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *exchange_queue_map) {
 	FteQueueProgressStats stats;
 	AddFteQueueProgressStats(stats, scan_queue_map);
 	AddFteQueueProgressStats(stats, exchange_queue_map);
-	out["submitted_split_count"] = py::int_(stats.submitted_split_count);
-	out["consumed_split_count"] = py::int_(stats.consumed_split_count);
-	out["completed_split_count"] = py::int_(stats.completed_split_count);
+	out["submitted_split_count"] = pybind11::int_(stats.submitted_split_count);
+	out["consumed_split_count"] = pybind11::int_(stats.consumed_split_count);
+	out["completed_split_count"] = pybind11::int_(stats.completed_split_count);
 	out["submitted_split_count_by_source"] = std::move(stats.submitted_split_count_by_source);
 	out["consumed_split_count_by_source"] = std::move(stats.consumed_split_count_by_source);
 	out["completed_split_count_by_source"] = std::move(stats.completed_split_count_by_source);
-	out["submitted_split_bytes"] = py::int_(stats.submitted_split_bytes);
-	out["consumed_split_bytes"] = py::int_(stats.consumed_split_bytes);
-	out["completed_split_bytes"] = py::int_(stats.completed_split_bytes);
+	out["submitted_split_bytes"] = pybind11::int_(stats.submitted_split_bytes);
+	out["consumed_split_bytes"] = pybind11::int_(stats.consumed_split_bytes);
+	out["completed_split_bytes"] = pybind11::int_(stats.completed_split_bytes);
 	out["submitted_split_bytes_by_source"] = std::move(stats.submitted_split_bytes_by_source);
 	out["consumed_split_bytes_by_source"] = std::move(stats.consumed_split_bytes_by_source);
 	out["completed_split_bytes_by_source"] = std::move(stats.completed_split_bytes_by_source);
-	out["queue_wait_ms"] = py::int_(stats.queue_wait_ms);
+	out["queue_wait_ms"] = pybind11::int_(stats.queue_wait_ms);
 	out["queue_wait_ms_by_source"] = std::move(stats.queue_wait_ms_by_source);
 }
 
-static py::dict BuildNativeTaskStatsDict(
+pybind11::dict BuildNativeTaskStatsDict(
     const duckdb::vector<duckdb::PipelineProgressSnapshot> &snapshots,
     const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map,
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_scan_source_queue_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_exchange_source_queue_map,
-    bool hide_remote_exchange_result_collector = false) {
+    bool hide_remote_exchange_result_collector) {
 	idx_t scan_rows =
 	    SaturatingAddIdx(ScanSplitInputRows(scan_split_batch_map), FteQueueConsumedRows(fte_scan_source_queue_map));
 	idx_t scan_bytes =
@@ -452,7 +409,7 @@ static py::dict BuildNativeTaskStatsDict(
 	idx_t memory_rows = 0;
 	idx_t memory_bytes = 0;
 
-	py::list pipelines;
+	pybind11::list pipelines;
 	idx_t processed_rows = 0;
 	idx_t processed_bytes = 0;
 	idx_t physical_input_rows = 0;
@@ -521,7 +478,7 @@ static py::dict BuildNativeTaskStatsDict(
 		running_pipeline_tasks = SaturatingAddIdx(running_pipeline_tasks, snapshot.running_pipeline_tasks);
 		completed_pipeline_tasks = SaturatingAddIdx(completed_pipeline_tasks, snapshot.completed_pipeline_tasks);
 
-		py::dict pipeline;
+		pybind11::dict pipeline;
 		auto pipeline_index = snapshot.pipeline_index;
 		if (hide_remote_exchange_result_collector && pipeline_index > 0) {
 			// The managed query adds one collector pipeline ahead of the
@@ -529,107 +486,112 @@ static py::dict BuildNativeTaskStatsDict(
 			// exposed by describe_native_progress().
 			pipeline_index--;
 		}
-		pipeline["pipeline_id"] = py::int_(pipeline_index);
+		pipeline["pipeline_id"] = pybind11::int_(pipeline_index);
 		pipeline["name"] = PipelineSnapshotName(snapshot);
 		pipeline["operators"] = OperatorsToPyList(snapshot.operators);
 		pipeline["operator_details"] = OperatorDetailsToPyList(snapshot.operator_details);
-		pipeline["input_rows"] = py::int_(snapshot.input_rows);
-		pipeline["input_bytes"] = py::int_(snapshot.input_bytes);
-		pipeline["output_rows"] = py::int_(snapshot.output_rows);
-		pipeline["output_bytes"] = py::int_(snapshot.output_bytes);
-		pipeline["total_pipeline_tasks"] = py::int_(snapshot.total_pipeline_tasks);
-		pipeline["queued_pipeline_tasks"] = py::int_(snapshot.queued_pipeline_tasks);
-		pipeline["running_pipeline_tasks"] = py::int_(snapshot.running_pipeline_tasks);
-		pipeline["completed_pipeline_tasks"] = py::int_(snapshot.completed_pipeline_tasks);
+		pipeline["input_rows"] = pybind11::int_(snapshot.input_rows);
+		pipeline["input_bytes"] = pybind11::int_(snapshot.input_bytes);
+		pipeline["output_rows"] = pybind11::int_(snapshot.output_rows);
+		pipeline["output_bytes"] = pybind11::int_(snapshot.output_bytes);
+		pipeline["total_pipeline_tasks"] = pybind11::int_(snapshot.total_pipeline_tasks);
+		pipeline["queued_pipeline_tasks"] = pybind11::int_(snapshot.queued_pipeline_tasks);
+		pipeline["running_pipeline_tasks"] = pybind11::int_(snapshot.running_pipeline_tasks);
+		pipeline["completed_pipeline_tasks"] = pybind11::int_(snapshot.completed_pipeline_tasks);
 		pipelines.append(std::move(pipeline));
 	}
 
-	py::dict out;
+	pybind11::dict out;
 	out["schema"] = "task_stats";
-	out["processed_input_rows"] = py::int_(processed_rows);
-	out["processed_input_bytes"] = py::int_(processed_bytes);
-	out["processed_rows"] = py::int_(processed_rows);
-	out["processed_bytes"] = py::int_(processed_bytes);
-	out["physical_input_rows"] = py::int_(physical_input_rows);
-	out["physical_input_bytes"] = py::int_(physical_input_bytes);
-	out["internal_network_input_rows"] = py::int_(internal_network_input_rows);
-	out["internal_network_input_bytes"] = py::int_(internal_network_input_bytes);
-	out["memory_input_rows"] = py::int_(memory_input_rows);
-	out["memory_input_bytes"] = py::int_(memory_input_bytes);
-	out["estimated_physical_input_rows"] = py::int_(scan_rows);
-	out["estimated_physical_input_bytes"] = py::int_(scan_bytes);
-	out["estimated_internal_network_input_rows"] = py::int_(exchange_rows);
-	out["estimated_internal_network_input_bytes"] = py::int_(exchange_bytes);
-	out["estimated_memory_input_rows"] = py::int_(memory_rows);
-	out["estimated_memory_input_bytes"] = py::int_(memory_bytes);
-	out["total_pipeline_tasks"] = py::int_(total_pipeline_tasks);
-	out["queued_pipeline_tasks"] = py::int_(queued_pipeline_tasks);
-	out["running_pipeline_tasks"] = py::int_(running_pipeline_tasks);
-	out["completed_pipeline_tasks"] = py::int_(completed_pipeline_tasks);
-	out["udf_completed_rows"] = py::int_(udf_completed_rows);
-	out["udf_completed_bytes"] = py::int_(udf_completed_bytes);
-	out["udf_emitted_rows"] = py::int_(udf_emitted_rows);
-	out["udf_emitted_bytes"] = py::int_(udf_emitted_bytes);
-	out["udf_running_task_count"] = py::int_(udf_running_task_count);
-	out["udf_queued_task_count"] = py::int_(udf_queued_task_count);
-	out["udf_max_running_tasks"] = py::int_(udf_max_running_tasks);
+	out["processed_input_rows"] = pybind11::int_(processed_rows);
+	out["processed_input_bytes"] = pybind11::int_(processed_bytes);
+	out["processed_rows"] = pybind11::int_(processed_rows);
+	out["processed_bytes"] = pybind11::int_(processed_bytes);
+	out["physical_input_rows"] = pybind11::int_(physical_input_rows);
+	out["physical_input_bytes"] = pybind11::int_(physical_input_bytes);
+	out["internal_network_input_rows"] = pybind11::int_(internal_network_input_rows);
+	out["internal_network_input_bytes"] = pybind11::int_(internal_network_input_bytes);
+	out["memory_input_rows"] = pybind11::int_(memory_input_rows);
+	out["memory_input_bytes"] = pybind11::int_(memory_input_bytes);
+	out["estimated_physical_input_rows"] = pybind11::int_(scan_rows);
+	out["estimated_physical_input_bytes"] = pybind11::int_(scan_bytes);
+	out["estimated_internal_network_input_rows"] = pybind11::int_(exchange_rows);
+	out["estimated_internal_network_input_bytes"] = pybind11::int_(exchange_bytes);
+	out["estimated_memory_input_rows"] = pybind11::int_(memory_rows);
+	out["estimated_memory_input_bytes"] = pybind11::int_(memory_bytes);
+	out["total_pipeline_tasks"] = pybind11::int_(total_pipeline_tasks);
+	out["queued_pipeline_tasks"] = pybind11::int_(queued_pipeline_tasks);
+	out["running_pipeline_tasks"] = pybind11::int_(running_pipeline_tasks);
+	out["completed_pipeline_tasks"] = pybind11::int_(completed_pipeline_tasks);
+	out["udf_completed_rows"] = pybind11::int_(udf_completed_rows);
+	out["udf_completed_bytes"] = pybind11::int_(udf_completed_bytes);
+	out["udf_emitted_rows"] = pybind11::int_(udf_emitted_rows);
+	out["udf_emitted_bytes"] = pybind11::int_(udf_emitted_bytes);
+	out["udf_running_task_count"] = pybind11::int_(udf_running_task_count);
+	out["udf_queued_task_count"] = pybind11::int_(udf_queued_task_count);
+	out["udf_max_running_tasks"] = pybind11::int_(udf_max_running_tasks);
 	AppendFteQueueProgressStats(out, fte_scan_source_queue_map, fte_exchange_source_queue_map);
 	out["pipelines"] = std::move(pipelines);
 	return out;
 }
 
-static py::dict BuildOutputOnlyTaskStatsDict(
-    idx_t rows, idx_t bytes, const duckdb::vector<std::string> *operators = nullptr,
-    const duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> *operator_details = nullptr,
-    idx_t physical_rows = 0, idx_t physical_bytes = 0, idx_t network_rows = 0, idx_t network_bytes = 0,
-    idx_t memory_rows = 0, idx_t memory_bytes = 0) {
-	py::dict out;
+pybind11::dict
+BuildOutputOnlyTaskStatsDict(idx_t rows, idx_t bytes, const duckdb::vector<std::string> *operators,
+                             const duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> *operator_details,
+                             idx_t physical_rows, idx_t physical_bytes, idx_t network_rows, idx_t network_bytes,
+                             idx_t memory_rows, idx_t memory_bytes) {
+	pybind11::dict out;
 	out["schema"] = "task_stats";
-	out["processed_input_rows"] = py::int_(rows);
-	out["processed_input_bytes"] = py::int_(bytes);
-	out["processed_rows"] = py::int_(rows);
-	out["processed_bytes"] = py::int_(bytes);
-	out["physical_input_rows"] = py::int_(physical_rows);
-	out["physical_input_bytes"] = py::int_(physical_bytes);
-	out["internal_network_input_rows"] = py::int_(network_rows);
-	out["internal_network_input_bytes"] = py::int_(network_bytes);
-	out["memory_input_rows"] = py::int_(memory_rows);
-	out["memory_input_bytes"] = py::int_(memory_bytes);
-	out["total_pipeline_tasks"] = py::int_(1);
-	out["queued_pipeline_tasks"] = py::int_(0);
-	out["running_pipeline_tasks"] = py::int_(1);
-	out["completed_pipeline_tasks"] = py::int_(0);
+	out["processed_input_rows"] = pybind11::int_(rows);
+	out["processed_input_bytes"] = pybind11::int_(bytes);
+	out["processed_rows"] = pybind11::int_(rows);
+	out["processed_bytes"] = pybind11::int_(bytes);
+	out["physical_input_rows"] = pybind11::int_(physical_rows);
+	out["physical_input_bytes"] = pybind11::int_(physical_bytes);
+	out["internal_network_input_rows"] = pybind11::int_(network_rows);
+	out["internal_network_input_bytes"] = pybind11::int_(network_bytes);
+	out["memory_input_rows"] = pybind11::int_(memory_rows);
+	out["memory_input_bytes"] = pybind11::int_(memory_bytes);
+	out["total_pipeline_tasks"] = pybind11::int_(1);
+	out["queued_pipeline_tasks"] = pybind11::int_(0);
+	out["running_pipeline_tasks"] = pybind11::int_(1);
+	out["completed_pipeline_tasks"] = pybind11::int_(0);
 	if (operator_details) {
-		out["udf_completed_rows"] = py::int_(OperatorDetailsCounterMax(*operator_details, "udf_completed_input_rows"));
+		out["udf_completed_rows"] =
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_completed_input_rows"));
 		out["udf_completed_bytes"] =
-		    py::int_(OperatorDetailsCounterMax(*operator_details, "udf_completed_input_bytes"));
-		out["udf_emitted_rows"] = py::int_(OperatorDetailsCounterMax(*operator_details, "udf_emitted_output_rows"));
-		out["udf_emitted_bytes"] = py::int_(OperatorDetailsCounterMax(*operator_details, "udf_emitted_output_bytes"));
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_completed_input_bytes"));
+		out["udf_emitted_rows"] =
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_emitted_output_rows"));
+		out["udf_emitted_bytes"] =
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_emitted_output_bytes"));
 		out["udf_running_task_count"] =
-		    py::int_(OperatorDetailsCounterMax(*operator_details, "udf_running_task_count"));
-		out["udf_queued_task_count"] = py::int_(OperatorDetailsCounterMax(*operator_details, "udf_queued_task_count"));
-		out["udf_max_running_tasks"] = py::int_(OperatorDetailsCounterMax(*operator_details, "udf_max_running_tasks"));
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_running_task_count"));
+		out["udf_queued_task_count"] =
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_queued_task_count"));
+		out["udf_max_running_tasks"] =
+		    pybind11::int_(OperatorDetailsCounterMax(*operator_details, "udf_max_running_tasks"));
 	}
-	py::list pipelines;
-	py::dict pipeline;
-	pipeline["pipeline_id"] = py::int_(1);
+	pybind11::list pipelines;
+	pybind11::dict pipeline;
+	pipeline["pipeline_id"] = pybind11::int_(1);
 	pipeline["name"] = operators ? OperatorListName(*operators) : "Result";
-	pipeline["operators"] = operators ? OperatorsToPyList(*operators) : py::list();
-	pipeline["operator_details"] = operator_details ? OperatorDetailsToPyList(*operator_details) : py::list();
-	pipeline["input_rows"] = py::int_(rows);
-	pipeline["input_bytes"] = py::int_(bytes);
-	pipeline["output_rows"] = py::int_(rows);
-	pipeline["output_bytes"] = py::int_(bytes);
-	pipeline["total_pipeline_tasks"] = py::int_(1);
-	pipeline["queued_pipeline_tasks"] = py::int_(0);
-	pipeline["running_pipeline_tasks"] = py::int_(1);
-	pipeline["completed_pipeline_tasks"] = py::int_(0);
+	pipeline["operators"] = operators ? OperatorsToPyList(*operators) : pybind11::list();
+	pipeline["operator_details"] = operator_details ? OperatorDetailsToPyList(*operator_details) : pybind11::list();
+	pipeline["input_rows"] = pybind11::int_(rows);
+	pipeline["input_bytes"] = pybind11::int_(bytes);
+	pipeline["output_rows"] = pybind11::int_(rows);
+	pipeline["output_bytes"] = pybind11::int_(bytes);
+	pipeline["total_pipeline_tasks"] = pybind11::int_(1);
+	pipeline["queued_pipeline_tasks"] = pybind11::int_(0);
+	pipeline["running_pipeline_tasks"] = pybind11::int_(1);
+	pipeline["completed_pipeline_tasks"] = pybind11::int_(0);
 	pipelines.append(std::move(pipeline));
 	out["pipelines"] = std::move(pipelines);
 	return out;
 }
 
-static bool TryValueToIdx(const duckdb::Value &value, idx_t &out) {
+bool TryValueToIdx(const duckdb::Value &value, idx_t &out) {
 	if (value.IsNull()) {
 		return false;
 	}
@@ -647,8 +609,8 @@ static bool TryValueToIdx(const duckdb::Value &value, idx_t &out) {
 	return true;
 }
 
-static bool ExtractCopyResultProgressStats(duckdb::MaterializedQueryResult &result, idx_t fallback_bytes, idx_t &rows,
-                                           idx_t &bytes) {
+bool ExtractCopyResultProgressStats(duckdb::MaterializedQueryResult &result, idx_t fallback_bytes, idx_t &rows,
+                                    idx_t &bytes) {
 	const auto row_count = result.RowCount();
 	if (row_count == 0 || result.types.empty()) {
 		rows = 0;
@@ -692,13 +654,13 @@ static bool ExtractCopyResultProgressStats(duckdb::MaterializedQueryResult &resu
 	return false;
 }
 
-static py::dict BuildMaterializedInputTaskStats(
+pybind11::dict BuildMaterializedInputTaskStats(
     const duckdb::PhysicalOperator &root_op,
     const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map,
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_scan_source_queue_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_exchange_source_queue_map,
-    idx_t fallback_rows, idx_t fallback_bytes, duckdb::MaterializedQueryResult *copy_result = nullptr) {
+    idx_t fallback_rows, idx_t fallback_bytes, duckdb::MaterializedQueryResult *copy_result) {
 	duckdb::vector<std::string> progress_operators;
 	duckdb::vector<duckdb::InsertionOrderPreservingMap<std::string>> progress_operator_details;
 	CollectPrimaryPipelineOperators(root_op, progress_operators, &progress_operator_details);
@@ -739,57 +701,58 @@ static py::dict BuildMaterializedInputTaskStats(
 	return out;
 }
 
-static void MarkTaskStatsCompleted(py::dict &stats) {
+void MarkTaskStatsCompleted(pybind11::dict &stats) {
 	idx_t total_pipeline_tasks = 1;
 	if (stats.contains("total_pipeline_tasks")) {
 		total_pipeline_tasks = duckdb::MaxValue<idx_t>(1, stats["total_pipeline_tasks"].cast<idx_t>());
 	}
-	stats["total_pipeline_tasks"] = py::int_(total_pipeline_tasks);
-	stats["queued_pipeline_tasks"] = py::int_(0);
-	stats["running_pipeline_tasks"] = py::int_(0);
-	stats["completed_pipeline_tasks"] = py::int_(total_pipeline_tasks);
+	stats["total_pipeline_tasks"] = pybind11::int_(total_pipeline_tasks);
+	stats["queued_pipeline_tasks"] = pybind11::int_(0);
+	stats["running_pipeline_tasks"] = pybind11::int_(0);
+	stats["completed_pipeline_tasks"] = pybind11::int_(total_pipeline_tasks);
 	if (stats.contains("pipelines")) {
-		for (auto item : stats["pipelines"].cast<py::list>()) {
-			auto pipeline = py::reinterpret_borrow<py::dict>(item);
+		for (auto item : stats["pipelines"].cast<pybind11::list>()) {
+			auto pipeline = pybind11::reinterpret_borrow<pybind11::dict>(item);
 			idx_t pipeline_total = 1;
 			if (pipeline.contains("total_pipeline_tasks")) {
 				pipeline_total = duckdb::MaxValue<idx_t>(1, pipeline["total_pipeline_tasks"].cast<idx_t>());
 			}
-			pipeline["total_pipeline_tasks"] = py::int_(pipeline_total);
-			pipeline["queued_pipeline_tasks"] = py::int_(0);
-			pipeline["running_pipeline_tasks"] = py::int_(0);
-			pipeline["completed_pipeline_tasks"] = py::int_(pipeline_total);
+			pipeline["total_pipeline_tasks"] = pybind11::int_(pipeline_total);
+			pipeline["queued_pipeline_tasks"] = pybind11::int_(0);
+			pipeline["running_pipeline_tasks"] = pybind11::int_(0);
+			pipeline["completed_pipeline_tasks"] = pybind11::int_(pipeline_total);
 		}
 	}
 }
 
-static bool NativePipelineMatchesMaterializedOperators(const py::handle &native_obj,
-                                                       const py::handle &materialized_obj) {
-	if (!py::isinstance<py::list>(native_obj) || !py::isinstance<py::list>(materialized_obj)) {
+bool NativePipelineMatchesMaterializedOperators(const pybind11::handle &native_obj,
+                                                const pybind11::handle &materialized_obj) {
+	if (!pybind11::isinstance<pybind11::list>(native_obj) || !pybind11::isinstance<pybind11::list>(materialized_obj)) {
 		return false;
 	}
-	auto native = py::reinterpret_borrow<py::list>(native_obj);
-	auto materialized = py::reinterpret_borrow<py::list>(materialized_obj);
+	auto native = pybind11::reinterpret_borrow<pybind11::list>(native_obj);
+	auto materialized = pybind11::reinterpret_borrow<pybind11::list>(materialized_obj);
 	const bool has_appended_result_collector =
 	    native.size() == materialized.size() + 1 &&
-	    py::str(native[native.size() - 1]).cast<std::string>() == "RESULT_COLLECTOR";
+	    pybind11::str(native[native.size() - 1]).cast<std::string>() == "RESULT_COLLECTOR";
 	if (native.size() != materialized.size() && !has_appended_result_collector) {
 		return false;
 	}
-	for (py::ssize_t index = 0; index < materialized.size(); index++) {
-		if (py::str(native[index]).cast<std::string>() != py::str(materialized[index]).cast<std::string>()) {
+	for (pybind11::ssize_t index = 0; index < materialized.size(); index++) {
+		if (pybind11::str(native[index]).cast<std::string>() !=
+		    pybind11::str(materialized[index]).cast<std::string>()) {
 			return false;
 		}
 	}
 	return true;
 }
 
-static void OverlayMaterializedProgressStats(py::dict &native_stats, const py::dict &materialized_stats) {
+void OverlayMaterializedProgressStats(pybind11::dict &native_stats, const pybind11::dict &materialized_stats) {
 	// Materialized stats remain authoritative for source rows/bytes and queue
 	// counters. Native pipeline identity and task lifecycle remain authoritative
 	// in native_stats, so fast tasks cannot collapse back to one synthetic row.
 	for (auto item : materialized_stats) {
-		auto key = py::str(item.first).cast<std::string>();
+		auto key = pybind11::str(item.first).cast<std::string>();
 		if (key == "schema" || key == "pipelines" || key == "total_pipeline_tasks" || key == "queued_pipeline_tasks" ||
 		    key == "running_pipeline_tasks" || key == "completed_pipeline_tasks") {
 			continue;
@@ -800,16 +763,16 @@ static void OverlayMaterializedProgressStats(py::dict &native_stats, const py::d
 	if (!native_stats.contains("pipelines") || !materialized_stats.contains("pipelines")) {
 		return;
 	}
-	auto materialized_pipelines = materialized_stats["pipelines"].cast<py::list>();
+	auto materialized_pipelines = materialized_stats["pipelines"].cast<pybind11::list>();
 	if (materialized_pipelines.size() == 0) {
 		return;
 	}
-	auto materialized_pipeline = py::reinterpret_borrow<py::dict>(materialized_pipelines[0]);
+	auto materialized_pipeline = pybind11::reinterpret_borrow<pybind11::dict>(materialized_pipelines[0]);
 	if (!materialized_pipeline.contains("operators")) {
 		return;
 	}
-	for (auto item : native_stats["pipelines"].cast<py::list>()) {
-		auto native_pipeline = py::reinterpret_borrow<py::dict>(item);
+	for (auto item : native_stats["pipelines"].cast<pybind11::list>()) {
+		auto native_pipeline = pybind11::reinterpret_borrow<pybind11::dict>(item);
 		if (!native_pipeline.contains("operators") ||
 		    !NativePipelineMatchesMaterializedOperators(native_pipeline["operators"],
 		                                                materialized_pipeline["operators"])) {
@@ -817,32 +780,32 @@ static void OverlayMaterializedProgressStats(py::dict &native_stats, const py::d
 		}
 		for (auto key : {"input_rows", "input_bytes", "output_rows", "output_bytes"}) {
 			if (materialized_pipeline.contains(key)) {
-				native_pipeline[py::str(key)] = materialized_pipeline[py::str(key)];
+				native_pipeline[pybind11::str(key)] = materialized_pipeline[pybind11::str(key)];
 			}
 		}
 		break;
 	}
 }
 
-static py::dict BuildNativePipelineTopology(const duckdb::vector<duckdb::PipelineProgressSnapshot> &snapshots) {
-	py::list pipelines;
+pybind11::dict BuildNativePipelineTopology(const duckdb::vector<duckdb::PipelineProgressSnapshot> &snapshots) {
+	pybind11::list pipelines;
 	for (const auto &snapshot : snapshots) {
 		if (IsCompletionOnlyRemoteExchangeSinkPipeline(snapshot)) {
 			continue;
 		}
-		py::dict pipeline;
-		pipeline["pipeline_id"] = py::int_(snapshot.pipeline_index);
+		pybind11::dict pipeline;
+		pipeline["pipeline_id"] = pybind11::int_(snapshot.pipeline_index);
 		pipeline["operators"] = OperatorsToPyList(snapshot.operators);
 		pipeline["operator_details"] = OperatorDetailsToPyList(snapshot.operator_details);
 		pipelines.append(std::move(pipeline));
 	}
-	py::dict topology;
+	pybind11::dict topology;
 	topology["schema"] = "pipeline_topology";
 	topology["pipelines"] = std::move(pipelines);
 	return topology;
 }
 
-static bool NativePlanNeedsResultCollector(const duckdb::PhysicalOperator &root_op) {
+bool NativePlanNeedsResultCollector(const duckdb::PhysicalOperator &root_op) {
 	using duckdb::PhysicalOperatorType;
 
 	// A remote exchange sink exposes a source interface only so DuckDB can mark
@@ -870,8 +833,8 @@ static bool NativePlanNeedsResultCollector(const duckdb::PhysicalOperator &root_
 	return false;
 }
 
-static py::dict BuildNativeProgressTopology(duckdb::ClientContext &context,
-                                            const std::shared_ptr<duckdb::PhysicalPlan> &physical_plan) {
+pybind11::dict BuildNativeProgressTopology(duckdb::ClientContext &context,
+                                           const std::shared_ptr<duckdb::PhysicalPlan> &physical_plan) {
 	using namespace duckdb;
 	if (!physical_plan || !physical_plan->HasRoot()) {
 		throw pybind11::value_error("Physical plan is missing or has no root operator");
@@ -910,8 +873,8 @@ static py::dict BuildNativeProgressTopology(duckdb::ClientContext &context,
 	return build_topology(*collector);
 }
 
-static void AppendDistributedCopyResultMetadata(pybind11::dict &out,
-                                                const duckdb::distributed::DistributedCopyResult &result) {
+void AppendDistributedCopyResultMetadata(pybind11::dict &out,
+                                         const duckdb::distributed::DistributedCopyResult &result) {
 	out["copy_output_base_path"] = result.output_base_path;
 	out["copy_output_run_id"] = result.output_run_id;
 	out["copy_output_commit_dir"] = result.output_commit_dir;
@@ -927,8 +890,7 @@ static void AppendDistributedCopyResultMetadata(pybind11::dict &out,
 	out["copy_cleanup_ms"] = result.cleanup_ms;
 }
 
-static pybind11::object CollectionToArrowTable(duckdb::ColumnDataCollection &collection,
-                                               duckdb::ClientContext &context) {
+pybind11::object CollectionToArrowTable(duckdb::ColumnDataCollection &collection, duckdb::ClientContext &context) {
 	auto &types = collection.Types();
 	duckdb::vector<string> names;
 	names.reserve(types.size());
@@ -956,63 +918,50 @@ static pybind11::object CollectionToArrowTable(duckdb::ColumnDataCollection &col
 	return duckdb::pyarrow::ToArrowTable(types, names, batches, options);
 }
 
-using namespace duckdb::distributed::python::ray;
-
-static py::dict FteSplitQueueResultToDict(const duckdb::distributed::FteSplitQueue::GetNextResult &result) {
-	py::dict out;
+pybind11::dict FteSplitQueueResultToDict(const duckdb::distributed::FteSplitQueue::GetNextResult &result) {
+	pybind11::dict out;
 	out["state"] = duckdb::distributed::FteSplitQueueGetResultName(result.state);
 	if (result.HasSplit()) {
 		switch (result.input.kind) {
 		case duckdb::distributed::TaskInput::Kind::ScanSplitBatch:
 			out["kind"] = "scan_split_batch";
-			out["data"] = py::bytes(result.input.scan_split_batch_bytes);
+			out["data"] = pybind11::bytes(result.input.scan_split_batch_bytes);
 			break;
 		case duckdb::distributed::TaskInput::Kind::ExchangeSourceTask:
 			out["kind"] = "exchange_source_task";
-			out["data"] = py::bytes(result.input.exchange_source_task_bytes);
+			out["data"] = pybind11::bytes(result.input.exchange_source_task_bytes);
 			break;
 		}
 	}
 	return out;
 }
 
-static py::dict BuildFragmentStatsSummary(
+pybind11::dict BuildFragmentStatsSummary(
     const std::unordered_map<std::string, std::unordered_map<std::string, duckdb::idx_t>> &stats_by_worker) {
-	py::dict workers;
+	pybind11::dict workers;
 	std::unordered_map<std::string, duckdb::idx_t> totals;
 	for (const auto &worker_entry : stats_by_worker) {
-		py::dict worker_stats;
+		pybind11::dict worker_stats;
 		for (const auto &stat_entry : worker_entry.second) {
-			worker_stats[py::str(stat_entry.first)] = py::int_(stat_entry.second);
+			worker_stats[pybind11::str(stat_entry.first)] = pybind11::int_(stat_entry.second);
 			totals[stat_entry.first] += stat_entry.second;
 		}
-		workers[py::str(worker_entry.first)] = std::move(worker_stats);
+		workers[pybind11::str(worker_entry.first)] = std::move(worker_stats);
 	}
 
-	py::dict totals_dict;
+	pybind11::dict totals_dict;
 	for (const auto &entry : totals) {
-		totals_dict[py::str(entry.first)] = py::int_(entry.second);
+		totals_dict[pybind11::str(entry.first)] = pybind11::int_(entry.second);
 	}
 
-	py::dict result;
+	pybind11::dict result;
 	result["workers"] = std::move(workers);
 	result["totals"] = std::move(totals_dict);
 	return result;
 }
 
-namespace {
-struct CopyOutputInfo {
-	std::string base;        // staging_root_base (empty for direct-write COPY)
-	std::string run_id;      // staging_run_id (UUID)
-	std::string remote_base; // spec.file_path (for direct write)
-};
-
-/// Worker-side: generate a unique output directory and set copy.file_path.
-/// Called once per task execution. Each call generates a fresh UUID-based dir
-/// so task attempts assigned multiple scan splits still produce one unique
-/// output location.
-static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutputInfo *info,
-                                     duckdb::ClientContext *client_context) {
+void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutputInfo *info,
+                              duckdb::ClientContext *client_context) {
 	if (!plan.HasRoot()) {
 		return;
 	}
@@ -1123,18 +1072,18 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 	}
 }
 
-static bool PyDictContains(const py::dict &dict, const char *key) {
-	return dict.contains(py::str(key));
+bool PyDictContains(const pybind11::dict &dict, const char *key) {
+	return dict.contains(pybind11::str(key));
 }
 
-static py::object PyDictGet(const py::dict &dict, const char *key) {
+pybind11::object PyDictGet(const pybind11::dict &dict, const char *key) {
 	if (!PyDictContains(dict, key)) {
-		return py::none();
+		return pybind11::none();
 	}
-	return py::reinterpret_borrow<py::object>(dict[py::str(key)]);
+	return pybind11::reinterpret_borrow<pybind11::object>(dict[pybind11::str(key)]);
 }
 
-static bool PyObjectTruthy(const py::object &obj) {
+bool PyObjectTruthy(const pybind11::object &obj) {
 	if (obj.is_none()) {
 		return false;
 	}
@@ -1146,7 +1095,7 @@ static bool PyObjectTruthy(const py::object &obj) {
 	return truth != 0;
 }
 
-static bool IsDynamicFilterSpecDict(const py::dict &dict) {
+bool IsDynamicFilterSpecDict(const pybind11::dict &dict) {
 	static constexpr const char *keys[] = {
 	    "single_value", "value", "values", "range",       "min",          "max",
 	    "lower",        "upper", "column", "column_name", "column_index", "column_id",
@@ -1159,36 +1108,36 @@ static bool IsDynamicFilterSpecDict(const py::dict &dict) {
 	return false;
 }
 
-static py::dict CopyDynamicFilterSpecWithColumn(const py::dict &domain, py::handle column) {
-	py::dict copy;
+pybind11::dict CopyDynamicFilterSpecWithColumn(const pybind11::dict &domain, pybind11::handle column) {
+	pybind11::dict copy;
 	for (auto item : domain) {
 		copy[item.first] = item.second;
 	}
-	copy["column"] = py::reinterpret_borrow<py::object>(column);
+	copy["column"] = pybind11::reinterpret_borrow<pybind11::object>(column);
 	return copy;
 }
 
-static duckdb::Value PyObjectToDuckValue(const py::object &obj) {
+duckdb::Value PyObjectToDuckValue(const pybind11::object &obj) {
 	if (obj.is_none()) {
 		return duckdb::Value();
 	}
-	if (py::isinstance<py::bool_>(obj)) {
+	if (pybind11::isinstance<pybind11::bool_>(obj)) {
 		return duckdb::Value::BOOLEAN(obj.cast<bool>());
 	}
-	if (py::isinstance<py::int_>(obj)) {
+	if (pybind11::isinstance<pybind11::int_>(obj)) {
 		return duckdb::Value::BIGINT(obj.cast<int64_t>());
 	}
-	if (py::isinstance<py::float_>(obj)) {
+	if (pybind11::isinstance<pybind11::float_>(obj)) {
 		return duckdb::Value::DOUBLE(obj.cast<double>());
 	}
-	if (py::isinstance<py::bytes>(obj)) {
+	if (pybind11::isinstance<pybind11::bytes>(obj)) {
 		return duckdb::Value::BLOB(obj.cast<std::string>());
 	}
-	return duckdb::Value(py::str(obj).cast<std::string>());
+	return duckdb::Value(pybind11::str(obj).cast<std::string>());
 }
 
-static bool TryCastDynamicFilterValue(const py::object &obj, const duckdb::LogicalType &target_type,
-                                      duckdb::Value &out) {
+bool TryCastDynamicFilterValue(const pybind11::object &obj, const duckdb::LogicalType &target_type,
+                               duckdb::Value &out) {
 	if (obj.is_none()) {
 		return false;
 	}
@@ -1200,9 +1149,8 @@ static bool TryCastDynamicFilterValue(const py::object &obj, const duckdb::Logic
 	return value.DefaultTryCastAs(target_type, out, &error, false);
 }
 
-static bool TryResolveScanFilterIndexForColumn(const duckdb::PhysicalTableScan &scan,
-                                               duckdb::idx_t requested_column_index, duckdb::idx_t &filter_column_index,
-                                               duckdb::idx_t &base_column_index) {
+bool TryResolveScanFilterIndexForColumn(const duckdb::PhysicalTableScan &scan, duckdb::idx_t requested_column_index,
+                                        duckdb::idx_t &filter_column_index, duckdb::idx_t &base_column_index) {
 	for (duckdb::idx_t i = 0; i < scan.column_ids.size(); i++) {
 		if (!scan.column_ids[i].IsRowIdColumn() && scan.column_ids[i].GetPrimaryIndex() == requested_column_index) {
 			filter_column_index = i;
@@ -1222,8 +1170,8 @@ static bool TryResolveScanFilterIndexForColumn(const duckdb::PhysicalTableScan &
 	return false;
 }
 
-static bool TryGetScanColumnType(const duckdb::PhysicalTableScan &scan, duckdb::idx_t base_column_index,
-                                 duckdb::idx_t filter_column_index, duckdb::LogicalType &target_type) {
+bool TryGetScanColumnType(const duckdb::PhysicalTableScan &scan, duckdb::idx_t base_column_index,
+                          duckdb::idx_t filter_column_index, duckdb::LogicalType &target_type) {
 	if (base_column_index < scan.returned_types.size()) {
 		target_type = scan.returned_types[base_column_index];
 		return true;
@@ -1235,9 +1183,9 @@ static bool TryGetScanColumnType(const duckdb::PhysicalTableScan &scan, duckdb::
 	return false;
 }
 
-static bool TryResolveDynamicFilterColumn(const duckdb::PhysicalTableScan &scan, const py::dict &domain,
-                                          duckdb::idx_t &filter_column_index, duckdb::LogicalType &target_type) {
-	py::object column_index_obj = PyDictGet(domain, "column_index");
+bool TryResolveDynamicFilterColumn(const duckdb::PhysicalTableScan &scan, const pybind11::dict &domain,
+                                   duckdb::idx_t &filter_column_index, duckdb::LogicalType &target_type) {
+	pybind11::object column_index_obj = PyDictGet(domain, "column_index");
 	if (column_index_obj.is_none()) {
 		column_index_obj = PyDictGet(domain, "column_id");
 	}
@@ -1254,7 +1202,7 @@ static bool TryResolveDynamicFilterColumn(const duckdb::PhysicalTableScan &scan,
 		return TryGetScanColumnType(scan, base_column_index, filter_column_index, target_type);
 	}
 
-	py::object column_obj = PyDictGet(domain, "column");
+	pybind11::object column_obj = PyDictGet(domain, "column");
 	if (column_obj.is_none()) {
 		column_obj = PyDictGet(domain, "column_name");
 	}
@@ -1264,7 +1212,7 @@ static bool TryResolveDynamicFilterColumn(const duckdb::PhysicalTableScan &scan,
 	if (column_obj.is_none()) {
 		return false;
 	}
-	auto column_name = py::str(column_obj).cast<std::string>();
+	auto column_name = pybind11::str(column_obj).cast<std::string>();
 	for (duckdb::idx_t base_column_index = 0; base_column_index < scan.names.size(); base_column_index++) {
 		if (scan.names[base_column_index] != column_name) {
 			continue;
@@ -1279,7 +1227,7 @@ static bool TryResolveDynamicFilterColumn(const duckdb::PhysicalTableScan &scan,
 	return false;
 }
 
-static bool DynamicFilterSourceMatches(const duckdb::PhysicalTableScan &scan, const std::string &source_node_id) {
+bool DynamicFilterSourceMatches(const duckdb::PhysicalTableScan &scan, const std::string &source_node_id) {
 	if (source_node_id.empty()) {
 		return true;
 	}
@@ -1289,18 +1237,18 @@ static bool DynamicFilterSourceMatches(const duckdb::PhysicalTableScan &scan, co
 	return std::to_string(scan.extra_info.scan_node_id.GetIndex()) == source_node_id;
 }
 
-static std::string DynamicFilterSourceFromSpec(const std::string &fallback_source_id, const py::dict &domain) {
+std::string DynamicFilterSourceFromSpec(const std::string &fallback_source_id, const pybind11::dict &domain) {
 	for (auto key : {"source_node_id", "plan_node_id", "node_id", "source"}) {
 		auto value = PyDictGet(domain, key);
 		if (!value.is_none()) {
-			return py::str(value).cast<std::string>();
+			return pybind11::str(value).cast<std::string>();
 		}
 	}
 	return fallback_source_id;
 }
 
-static void PushDynamicTableFilter(duckdb::PhysicalTableScan &scan, duckdb::idx_t filter_column_index,
-                                   duckdb::unique_ptr<duckdb::TableFilter> filter) {
+void PushDynamicTableFilter(duckdb::PhysicalTableScan &scan, duckdb::idx_t filter_column_index,
+                            duckdb::unique_ptr<duckdb::TableFilter> filter) {
 	if (!filter) {
 		return;
 	}
@@ -1310,8 +1258,8 @@ static void PushDynamicTableFilter(duckdb::PhysicalTableScan &scan, duckdb::idx_
 	scan.table_filters->PushFilter(duckdb::ColumnIndex(filter_column_index), std::move(filter));
 }
 
-static duckdb::idx_t ApplyDynamicFilterSpecToScan(duckdb::PhysicalTableScan &scan,
-                                                  const std::string &fallback_source_id, const py::dict &domain) {
+duckdb::idx_t ApplyDynamicFilterSpecToScan(duckdb::PhysicalTableScan &scan, const std::string &fallback_source_id,
+                                           const pybind11::dict &domain) {
 	auto source_node_id = DynamicFilterSourceFromSpec(fallback_source_id, domain);
 	if (!DynamicFilterSourceMatches(scan, source_node_id)) {
 		return 0;
@@ -1337,12 +1285,13 @@ static duckdb::idx_t ApplyDynamicFilterSpecToScan(duckdb::PhysicalTableScan &sca
 	}
 
 	auto values_obj = PyDictGet(domain, "values");
-	if (PyObjectTruthy(values_obj) && py::isinstance<py::sequence>(values_obj) &&
-	    !py::isinstance<py::str>(values_obj) && !py::isinstance<py::bytes>(values_obj)) {
+	if (PyObjectTruthy(values_obj) && pybind11::isinstance<pybind11::sequence>(values_obj) &&
+	    !pybind11::isinstance<pybind11::str>(values_obj) && !pybind11::isinstance<pybind11::bytes>(values_obj)) {
 		std::vector<duckdb::Value> values;
-		for (py::handle item : values_obj.cast<py::sequence>()) {
+		for (pybind11::handle item : values_obj.cast<pybind11::sequence>()) {
 			duckdb::Value item_value;
-			if (TryCastDynamicFilterValue(py::reinterpret_borrow<py::object>(item), target_type, item_value)) {
+			if (TryCastDynamicFilterValue(pybind11::reinterpret_borrow<pybind11::object>(item), target_type,
+			                              item_value)) {
 				values.push_back(std::move(item_value));
 			}
 		}
@@ -1358,19 +1307,20 @@ static duckdb::idx_t ApplyDynamicFilterSpecToScan(duckdb::PhysicalTableScan &sca
 		}
 	}
 
-	py::object lower = PyDictGet(domain, "min");
+	pybind11::object lower = PyDictGet(domain, "min");
 	if (lower.is_none()) {
 		lower = PyDictGet(domain, "lower");
 	}
-	py::object upper = PyDictGet(domain, "max");
+	pybind11::object upper = PyDictGet(domain, "max");
 	if (upper.is_none()) {
 		upper = PyDictGet(domain, "upper");
 	}
 	auto range_obj = PyDictGet(domain, "range");
-	if (PyObjectTruthy(range_obj) && py::isinstance<py::sequence>(range_obj) && py::len(range_obj) >= 2) {
-		auto range = range_obj.cast<py::sequence>();
-		lower = py::reinterpret_borrow<py::object>(range[0]);
-		upper = py::reinterpret_borrow<py::object>(range[1]);
+	if (PyObjectTruthy(range_obj) && pybind11::isinstance<pybind11::sequence>(range_obj) &&
+	    pybind11::len(range_obj) >= 2) {
+		auto range = range_obj.cast<pybind11::sequence>();
+		lower = pybind11::reinterpret_borrow<pybind11::object>(range[0]);
+		upper = pybind11::reinterpret_borrow<pybind11::object>(range[1]);
 	}
 
 	duckdb::Value lower_value;
@@ -1391,40 +1341,41 @@ static duckdb::idx_t ApplyDynamicFilterSpecToScan(duckdb::PhysicalTableScan &sca
 	return applied;
 }
 
-static duckdb::idx_t ApplyDynamicFilterDomainsToScan(duckdb::PhysicalTableScan &scan, const py::dict &domains) {
+duckdb::idx_t ApplyDynamicFilterDomainsToScan(duckdb::PhysicalTableScan &scan, const pybind11::dict &domains) {
 	duckdb::idx_t applied = 0;
 	for (auto item : domains) {
-		auto key = py::str(item.first).cast<std::string>();
-		auto value_obj = py::reinterpret_borrow<py::object>(item.second);
-		if (!py::isinstance<py::dict>(value_obj)) {
+		auto key = pybind11::str(item.first).cast<std::string>();
+		auto value_obj = pybind11::reinterpret_borrow<pybind11::object>(item.second);
+		if (!pybind11::isinstance<pybind11::dict>(value_obj)) {
 			continue;
 		}
-		auto domain = value_obj.cast<py::dict>();
+		auto domain = value_obj.cast<pybind11::dict>();
 		if (IsDynamicFilterSpecDict(domain)) {
 			applied += ApplyDynamicFilterSpecToScan(scan, std::string(), domain);
 			continue;
 		}
 
 		auto columns_obj = PyDictGet(domain, "columns");
-		if (!columns_obj.is_none() && py::isinstance<py::dict>(columns_obj)) {
-			auto columns = columns_obj.cast<py::dict>();
+		if (!columns_obj.is_none() && pybind11::isinstance<pybind11::dict>(columns_obj)) {
+			auto columns = columns_obj.cast<pybind11::dict>();
 			for (auto column_item : columns) {
-				auto column_domain_obj = py::reinterpret_borrow<py::object>(column_item.second);
-				if (!py::isinstance<py::dict>(column_domain_obj)) {
+				auto column_domain_obj = pybind11::reinterpret_borrow<pybind11::object>(column_item.second);
+				if (!pybind11::isinstance<pybind11::dict>(column_domain_obj)) {
 					continue;
 				}
-				auto nested = CopyDynamicFilterSpecWithColumn(column_domain_obj.cast<py::dict>(), column_item.first);
+				auto nested =
+				    CopyDynamicFilterSpecWithColumn(column_domain_obj.cast<pybind11::dict>(), column_item.first);
 				applied += ApplyDynamicFilterSpecToScan(scan, key, nested);
 			}
 			continue;
 		}
 
 		for (auto column_item : domain) {
-			auto nested_obj = py::reinterpret_borrow<py::object>(column_item.second);
-			if (!py::isinstance<py::dict>(nested_obj)) {
+			auto nested_obj = pybind11::reinterpret_borrow<pybind11::object>(column_item.second);
+			if (!pybind11::isinstance<pybind11::dict>(nested_obj)) {
 				continue;
 			}
-			auto nested = nested_obj.cast<py::dict>();
+			auto nested = nested_obj.cast<pybind11::dict>();
 			if (!IsDynamicFilterSpecDict(nested)) {
 				continue;
 			}
@@ -1438,7 +1389,7 @@ static duckdb::idx_t ApplyDynamicFilterDomainsToScan(duckdb::PhysicalTableScan &
 	return applied;
 }
 
-static duckdb::idx_t ApplyDynamicFilterDomainsToOperator(duckdb::PhysicalOperator &op, const py::dict &domains) {
+duckdb::idx_t ApplyDynamicFilterDomainsToOperator(duckdb::PhysicalOperator &op, const pybind11::dict &domains) {
 	duckdb::idx_t applied = 0;
 	if (op.type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
 		applied += ApplyDynamicFilterDomainsToScan(op.Cast<duckdb::PhysicalTableScan>(), domains);
@@ -1457,19 +1408,18 @@ static duckdb::idx_t ApplyDynamicFilterDomainsToOperator(duckdb::PhysicalOperato
 	return applied;
 }
 
-static duckdb::idx_t ApplyDynamicFilterDomainsToPlan(duckdb::PhysicalPlan &plan,
-                                                     py::object dynamic_filter_domains_obj) {
+duckdb::idx_t ApplyDynamicFilterDomainsToPlan(duckdb::PhysicalPlan &plan, pybind11::object dynamic_filter_domains_obj) {
 	if (dynamic_filter_domains_obj.is_none() || !plan.HasRoot()) {
 		return 0;
 	}
-	if (!py::isinstance<py::dict>(dynamic_filter_domains_obj)) {
-		throw py::value_error("dynamic_filter_domains must be a dict");
+	if (!pybind11::isinstance<pybind11::dict>(dynamic_filter_domains_obj)) {
+		throw pybind11::value_error("dynamic_filter_domains must be a dict");
 	}
-	auto domains = dynamic_filter_domains_obj.cast<py::dict>();
-	if (py::len(domains) == 0) {
+	auto domains = dynamic_filter_domains_obj.cast<pybind11::dict>();
+	if (pybind11::len(domains) == 0) {
 		return 0;
 	}
 	return ApplyDynamicFilterDomainsToOperator(plan.Root(), domains);
 }
-
-} // namespace
+} // namespace ray_bindings
+} // namespace duckdb

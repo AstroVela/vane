@@ -1,0 +1,1048 @@
+{
+  "status": "PASS",
+  "runs": [
+    {
+      "label": "previous-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous/build/python-release",
+        "--output-on-failure"
+      ],
+      "start": 1791860375.5366204,
+      "end": 1791860400.408459,
+      "returncode": 0
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "start": 1791860400.4090185,
+      "end": 1791860433.7088633,
+      "returncode": 0
+    },
+    {
+      "label": "updated-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-pytest-data",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/tests"
+      ],
+      "start": 1791860433.7098198,
+      "end": 1791860524.9533973,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-configure",
+      "argv": [
+        "cmake",
+        "-S",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated",
+        "-B",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize",
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release",
+        "-DVANE_FS_BUILD_PYTHON=OFF",
+        "-DVANE_FS_BUILD_TOOLS=OFF",
+        "-DVANE_FS_BUILD_FUSE=OFF",
+        "-DVANE_FS_BUILD_TESTS=ON",
+        "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
+        "-DVANE_FS_TEST_SQLITE_SYNC=fsync"
+      ],
+      "start": 1791860525.130428,
+      "end": 1791860526.0470355,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-build",
+      "argv": [
+        "cmake",
+        "--build",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize",
+        "-j",
+        "2"
+      ],
+      "start": 1791860526.0475392,
+      "end": 1791860576.5416102,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-tests",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize",
+        "--output-on-failure"
+      ],
+      "start": 1791860576.5423198,
+      "end": 1791860613.6545324,
+      "returncode": 0
+    },
+    {
+      "label": "previous-budget-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/test_budget.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous-budget"
+      ],
+      "start": 1791860613.6554432,
+      "end": 1791860615.8254325,
+      "returncode": 0
+    },
+    {
+      "label": "previous-budget-generation",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous-budget",
+        "/dev/shm/owned-clean-coalescing-crnprr64/db.sqlite",
+        "generation"
+      ],
+      "start": 1791860615.8265157,
+      "end": 1791860615.9413137,
+      "returncode": 1
+    },
+    {
+      "label": "previous-budget-tail",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/previous-budget",
+        "/dev/shm/owned-clean-coalescing-cduoz86z/db.sqlite",
+        "tail"
+      ],
+      "start": 1791860615.9520772,
+      "end": 1791860616.0666986,
+      "returncode": 1
+    },
+    {
+      "label": "updated-progress-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/test_progress.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress"
+      ],
+      "start": 1791860616.0805054,
+      "end": 1791860618.4012527,
+      "returncode": 0
+    },
+    {
+      "label": "updated-progress-cold",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress",
+        "/dev/shm/owned-clean-coalescing-s8ya2yci/db.sqlite",
+        "cold"
+      ],
+      "start": 1791860618.4022114,
+      "end": 1791860618.467107,
+      "returncode": 0
+    },
+    {
+      "label": "updated-progress-reset",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress",
+        "/dev/shm/owned-clean-coalescing-g5v1ymuv/db.sqlite",
+        "reset"
+      ],
+      "start": 1791860618.4698374,
+      "end": 1791860618.584536,
+      "returncode": 0
+    },
+    {
+      "label": "updated-progress-live",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress",
+        "/dev/shm/owned-clean-coalescing-berni2vd/db.sqlite",
+        "live"
+      ],
+      "start": 1791860618.598205,
+      "end": 1791860618.713566,
+      "returncode": 0
+    },
+    {
+      "label": "updated-progress-reader",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress",
+        "/dev/shm/owned-clean-coalescing-xtvyvtsk/db.sqlite",
+        "reader"
+      ],
+      "start": 1791860618.7266445,
+      "end": 1791860618.8422372,
+      "returncode": 0
+    },
+    {
+      "label": "updated-progress-stream",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-progress",
+        "/dev/shm/owned-clean-coalescing-7pttei42/db.sqlite",
+        "stream"
+      ],
+      "start": 1791860618.856207,
+      "end": 1791860618.9714282,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_restart/test_restart.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=sqlite3_busy_timeout",
+        "-Wl,--wrap=flock",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart"
+      ],
+      "start": 1791860618.985938,
+      "end": 1791860621.6078222,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-progress",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-w8a77rdb/db.sqlite",
+        "progress"
+      ],
+      "start": 1791860621.608854,
+      "end": 1791860621.7238624,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-reader",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-4c78o23k/db.sqlite",
+        "reader"
+      ],
+      "start": 1791860621.7382336,
+      "end": 1791860621.8535414,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-partial",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-rxowtijh/db.sqlite",
+        "partial"
+      ],
+      "start": 1791860621.8684545,
+      "end": 1791860621.9835935,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-writer",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-gu4c3u11/db.sqlite",
+        "writer"
+      ],
+      "start": 1791860621.9979668,
+      "end": 1791860622.1130564,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-external",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-lo38zqcp/db.sqlite",
+        "external"
+      ],
+      "start": 1791860622.127866,
+      "end": 1791860622.2429936,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-error",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-35iiobmy/db.sqlite",
+        "error"
+      ],
+      "start": 1791860622.257579,
+      "end": 1791860622.3725584,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-small",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-jav6gm78/db.sqlite",
+        "small"
+      ],
+      "start": 1791860622.3869672,
+      "end": 1791860622.4197168,
+      "returncode": 0
+    },
+    {
+      "label": "updated-restart-crash",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-restart",
+        "/dev/shm/owned-clean-coalescing-nnsk8110/db.sqlite",
+        "crash"
+      ],
+      "start": 1791860622.4227936,
+      "end": 1791860622.5377102,
+      "returncode": 0
+    },
+    {
+      "label": "updated-policy-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_batching/test_batch.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=_ZNSt18condition_variable10notify_oneEv",
+        "-Wl,--wrap=_ZNSt18condition_variable10notify_allEv",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-policy"
+      ],
+      "start": 1791860622.5519671,
+      "end": 1791860624.872818,
+      "returncode": 0
+    },
+    {
+      "label": "updated-policy-clean",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-policy",
+        "/dev/shm/owned-clean-coalescing-lqj6lku1/db.sqlite",
+        "clean"
+      ],
+      "start": 1791860624.8739896,
+      "end": 1791860624.989096,
+      "returncode": 0
+    },
+    {
+      "label": "updated-policy-continuous",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-policy",
+        "/dev/shm/owned-clean-coalescing-_8fnbq_y/db.sqlite",
+        "continuous"
+      ],
+      "start": 1791860624.9979262,
+      "end": 1791860625.1629403,
+      "returncode": 0
+    },
+    {
+      "label": "updated-policy-no_query",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-policy",
+        "/dev/shm/owned-clean-coalescing-c088_4zg/db.sqlite",
+        "no_query"
+      ],
+      "start": 1791860625.1724827,
+      "end": 1791860625.287462,
+      "returncode": 0
+    },
+    {
+      "label": "updated-policy-stop",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-policy",
+        "/dev/shm/owned-clean-coalescing-aq7btwkv/db.sqlite",
+        "stop"
+      ],
+      "start": 1791860625.2971044,
+      "end": 1791860625.4121437,
+      "returncode": 0
+    },
+    {
+      "label": "updated-clean-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/test_clean.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-clean"
+      ],
+      "start": 1791860625.4322617,
+      "end": 1791860627.6028798,
+      "returncode": 0
+    },
+    {
+      "label": "updated-clean-burst",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-clean",
+        "/dev/shm/owned-clean-coalescing-nq5zimxd/db.sqlite",
+        "burst"
+      ],
+      "start": 1791860627.6041007,
+      "end": 1791860627.8191128,
+      "returncode": 0
+    },
+    {
+      "label": "updated-clean-stop",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-clean",
+        "/dev/shm/owned-clean-coalescing-7o6w0ht8/db.sqlite",
+        "stop"
+      ],
+      "start": 1791860627.8332868,
+      "end": 1791860627.9481006,
+      "returncode": 0
+    },
+    {
+      "label": "updated-budget-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/test_budget.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-budget"
+      ],
+      "start": 1791860627.9622371,
+      "end": 1791860630.132405,
+      "returncode": 0
+    },
+    {
+      "label": "updated-budget-generation",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-budget",
+        "/dev/shm/owned-clean-coalescing-ymex93z6/db.sqlite",
+        "generation"
+      ],
+      "start": 1791860630.1337223,
+      "end": 1791860630.298785,
+      "returncode": 0
+    },
+    {
+      "label": "updated-budget-tail",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-budget",
+        "/dev/shm/owned-clean-coalescing-yf8t45bp/db.sqlite",
+        "tail"
+      ],
+      "start": 1791860630.318502,
+      "end": 1791860630.4334497,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/test_progress.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=fsync",
+        "-Wl,--wrap=fdatasync",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress"
+      ],
+      "start": 1791860630.4519405,
+      "end": 1791860636.2316196,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-cold",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress",
+        "/dev/shm/owned-clean-coalescing-vya9rz1u/db.sqlite",
+        "cold"
+      ],
+      "start": 1791860636.232956,
+      "end": 1791860636.2975323,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-reset",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress",
+        "/dev/shm/owned-clean-coalescing-ptyo_pbt/db.sqlite",
+        "reset"
+      ],
+      "start": 1791860636.299618,
+      "end": 1791860636.4141223,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-live",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress",
+        "/dev/shm/owned-clean-coalescing-ijemivz9/db.sqlite",
+        "live"
+      ],
+      "start": 1791860636.4282072,
+      "end": 1791860636.5935078,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-reader",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress",
+        "/dev/shm/owned-clean-coalescing-34sdmkav/db.sqlite",
+        "reader"
+      ],
+      "start": 1791860636.6084957,
+      "end": 1791860636.7735972,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-progress-stream",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-progress",
+        "/dev/shm/owned-clean-coalescing-nz5bojm9/db.sqlite",
+        "stream"
+      ],
+      "start": 1791860636.7893765,
+      "end": 1791860636.9549656,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_restart/test_restart.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=sqlite3_busy_timeout",
+        "-Wl,--wrap=flock",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart"
+      ],
+      "start": 1791860636.970861,
+      "end": 1791860643.4024608,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-progress",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-m0kgwqxy/db.sqlite",
+        "progress"
+      ],
+      "start": 1791860643.403927,
+      "end": 1791860643.5188432,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-reader",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-mr53sv7u/db.sqlite",
+        "reader"
+      ],
+      "start": 1791860643.532081,
+      "end": 1791860643.646879,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-partial",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-it5c3xkb/db.sqlite",
+        "partial"
+      ],
+      "start": 1791860643.6620758,
+      "end": 1791860643.8272517,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-writer",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-g52h4ou2/db.sqlite",
+        "writer"
+      ],
+      "start": 1791860643.8424695,
+      "end": 1791860643.9575744,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-external",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-zzkmhdgr/db.sqlite",
+        "external"
+      ],
+      "start": 1791860643.9728148,
+      "end": 1791860644.1378224,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-error",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-be9albjl/db.sqlite",
+        "error"
+      ],
+      "start": 1791860644.153309,
+      "end": 1791860644.3184793,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-small",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-ut44bjxw/db.sqlite",
+        "small"
+      ],
+      "start": 1791860644.333493,
+      "end": 1791860644.3983812,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-restart-crash",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-restart",
+        "/dev/shm/owned-clean-coalescing-yqu2mbxx/db.sqlite",
+        "crash"
+      ],
+      "start": 1791860644.4022996,
+      "end": 1791860644.567296,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-policy-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_batching/test_batch.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-Wl,--wrap=sqlite3_step",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-Wl,--wrap=_ZNSt18condition_variable10notify_oneEv",
+        "-Wl,--wrap=_ZNSt18condition_variable10notify_allEv",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-policy"
+      ],
+      "start": 1791860644.5822136,
+      "end": 1791860649.8597062,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-policy-clean",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-policy",
+        "/dev/shm/owned-clean-coalescing-6lueq82u/db.sqlite",
+        "clean"
+      ],
+      "start": 1791860649.8608637,
+      "end": 1791860650.0754418,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-policy-continuous",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-policy",
+        "/dev/shm/owned-clean-coalescing-btlssb6w/db.sqlite",
+        "continuous"
+      ],
+      "start": 1791860650.08553,
+      "end": 1791860650.3508167,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-policy-no_query",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-policy",
+        "/dev/shm/owned-clean-coalescing-ibw2r07d/db.sqlite",
+        "no_query"
+      ],
+      "start": 1791860650.3605335,
+      "end": 1791860650.5758226,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-policy-stop",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-policy",
+        "/dev/shm/owned-clean-coalescing-tc66o06n/db.sqlite",
+        "stop"
+      ],
+      "start": 1791860650.5860417,
+      "end": 1791860650.7509747,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-clean-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/test_clean.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-clean"
+      ],
+      "start": 1791860650.7722852,
+      "end": 1791860655.9501767,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-clean-burst",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-clean",
+        "/dev/shm/owned-clean-coalescing-w3jdqigc/db.sqlite",
+        "burst"
+      ],
+      "start": 1791860655.951728,
+      "end": 1791860656.1667757,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-clean-stop",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-clean",
+        "/dev/shm/owned-clean-coalescing-68lqgmuq/db.sqlite",
+        "stop"
+      ],
+      "start": 1791860656.1819704,
+      "end": 1791860656.3471098,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-budget-build",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O2",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/src",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/test_budget.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-sanitize/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+        "-Wl,--wrap=sqlite3_wal_checkpoint_v2",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-budget"
+      ],
+      "start": 1791860656.3623033,
+      "end": 1791860661.389984,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-budget-generation",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-budget",
+        "/dev/shm/owned-clean-coalescing-w670klju/db.sqlite",
+        "generation"
+      ],
+      "start": 1791860661.3915772,
+      "end": 1791860661.6067998,
+      "returncode": 0
+    },
+    {
+      "label": "updated-asan-budget-tail",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-asan-budget",
+        "/dev/shm/owned-clean-coalescing-bhv2ahn5/db.sqlite",
+        "tail"
+      ],
+      "start": 1791860661.627702,
+      "end": 1791860661.7428968,
+      "returncode": 0
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-followthrough-20261013/budget/updated-pytest-data",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-crnprr64",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-cduoz86z",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-s8ya2yci",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-g5v1ymuv",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-berni2vd",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-xtvyvtsk",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-7pttei42",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-w8a77rdb",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-4c78o23k",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-rxowtijh",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-gu4c3u11",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-lo38zqcp",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-35iiobmy",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-jav6gm78",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-nnsk8110",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-lqj6lku1",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-_8fnbq_y",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-c088_4zg",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-aq7btwkv",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-nq5zimxd",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-7o6w0ht8",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-ymex93z6",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-yf8t45bp",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-vya9rz1u",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-ptyo_pbt",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-ijemivz9",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-34sdmkav",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-nz5bojm9",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-m0kgwqxy",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-mr53sv7u",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-it5c3xkb",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-g52h4ou2",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-zzkmhdgr",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-be9albjl",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-ut44bjxw",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-yqu2mbxx",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-6lueq82u",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-btlssb6w",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-ibw2r07d",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-tc66o06n",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-w3jdqigc",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-68lqgmuq",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-w670klju",
+      "removed": true
+    },
+    {
+      "path": "/dev/shm/owned-clean-coalescing-bhv2ahn5",
+      "removed": true
+    }
+  ],
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_followthrough/test_budget.cpp": "549b6f28aafdb03099853a63ae1d7008e27de0068d167734b205914239944179",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress/test_progress.cpp": "350bceb40850a2cc56829b08761ae034d0a37da136257afbd222bc9b311a255a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_restart/test_restart.cpp": "c2ab414e72c4a3947b380b5a4e602705f75c8692e384fe5ed1cdd54866408619",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_batching/test_batch.cpp": "72ba17e855b7404e2f00b10215225b6e9958bfd0de20de2c2f35138908ed6fde",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/clean_coalescing/test_clean.cpp": "e0ed44a41dc45d1edd367ccb735a1ee426121bb2b8e67a76c66b4af886a24572"
+  }
+}

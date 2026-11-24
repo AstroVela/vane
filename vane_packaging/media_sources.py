@@ -231,7 +231,9 @@ def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
 
 
 def _git_files(repository: Path, tree: str, paths: tuple[str, ...] = ()) -> dict[str, bytes]:
-    archive = subprocess.check_output(["git", "archive", tree, *paths], cwd=repository)
+    archive = subprocess.check_output(
+        ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "archive", tree, *paths], cwd=repository
+    )
     result = {}
     with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
         for member in stream:
@@ -292,7 +294,7 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
     files = _git_files(
         repository,
         baseline,
-        ("scripts", "triplets", "bootstrap-vcpkg.sh", "LICENSE.txt", ".vcpkg-root"),
+        ("scripts", "triplets", "bootstrap-vcpkg.sh", "bootstrap-vcpkg.bat", "LICENSE.txt", ".vcpkg-root"),
     )
     files = {f"sdk/vcpkg/{name}": contents for name, contents in files.items()}
     # All port versions become local overlays: rebuilding an exported SDK needs
@@ -366,6 +368,17 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
                 "upstream": resources[checksum]["downloadLocation"],
             }
         )
+    # Host tools differ by platform. Publish only the reviewed source records
+    # actually selected by this SDK, while retaining the exact-coverage check
+    # when its source archive is read or rebuilt.
+    project_files["source-licenses.json"] = (
+        json.dumps(
+            {record["filename"]: reviewed_sources[record["filename"]] for record in source_records},
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    ).encode()
     source_records.sort(key=lambda record: record["filename"])
     for name, tree in ports.items():
         port_files = _git_files(repository, tree)
@@ -387,7 +400,9 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
     components = json.loads(files["components.json"])
     for component in components:
         candidates = list(installed.glob(f"*/share/{component}/copyright"))
-        values = {candidate.read_bytes() for candidate in candidates}
+        from vane_packaging.media_runtime import component_notice
+
+        values = {component_notice(candidate, components[component]["notice_sha256"]) for candidate in candidates}
         if len(values) != 1:
             raise ValueError(f"missing or conflicting source SDK component notice: {component}")
         files[f"LICENSES/components/{component}.txt"] = values.pop()

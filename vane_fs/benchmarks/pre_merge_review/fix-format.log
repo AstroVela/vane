@@ -1,0 +1,14 @@
+ruff format..............................................................[41mFailed[m
+[2m- hook id: ruff-format[m
+[2m- files were modified by this hook[m
+
+1 file reformatted, 5 files left unchanged
+
+clang-format.........................................(no files to check)[46;30mSkipped[m
+cmake-format.........................................(no files to check)[46;30mSkipped[m
+shfmt................................................(no files to check)[46;30mSkipped[m
+Re-running root format hooks to verify after automatic edits...
+ruff format..............................................................[42mPassed[m
+clang-format.........................................(no files to check)[46;30mSkipped[m
+cmake-format.........................................(no files to check)[46;30mSkipped[m
+shfmt................................................(no files to check)[46;30mSkipped[m

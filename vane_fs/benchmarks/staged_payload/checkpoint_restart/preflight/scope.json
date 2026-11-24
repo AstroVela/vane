@@ -1,0 +1,1 @@
+{"status":"RETAINED","reason":"Uninitialized inspector reported no open WAL; initialize schema before status queries and assert nonnegative frames. Runtime binaries were unchanged."}

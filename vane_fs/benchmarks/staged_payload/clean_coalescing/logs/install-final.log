@@ -1,0 +1,8 @@
+Using Python 3.12.13 environment at: /home/kaka/astrovela_vane-fs/.venv
+Resolved 1 package in 4ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs
+Prepared 1 package in 12.46s
+Uninstalled 1 package in 0.55ms
+Installed 1 package in 1ms
+ ~ vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs)

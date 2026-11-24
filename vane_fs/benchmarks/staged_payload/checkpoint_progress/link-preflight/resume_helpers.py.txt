@@ -1,0 +1,53 @@
+import hashlib
+import json
+import subprocess
+import time
+from pathlib import Path
+
+out = Path(__file__).resolve().parent
+here = Path('/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/checkpoint_progress')
+build = json.loads((out / 'build.json').read_text())
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+initial = json.loads((out / 'link-preflight/build.json').read_text())
+assert digest(out / 'link-preflight/prepare.py.txt') == initial['inputs'][str(here / 'prepare.py')]
+for relative, expected in build['binaries'].items():
+    assert digest(out / relative) == expected
+build['helper_link_correction'] = dict(reason='Typed recorder also wraps pread64 and pwrite; restore both linker flags, runtime binaries unchanged',
+                                     original_prepare_sha256=digest(out / 'link-preflight/prepare.py.txt'))
+sdk = Path(build['sdk']['sqlite'])
+components = {'orphan-control': Path(build['orphan_parent']) / 'updated',
+              'restart-control': Path(build['restart_parent']) / 'updated', 'updated': out / 'updated'}
+for name, component in components.items():
+    for helper in ('test_progress', 'probe'):
+        target = out / name / helper
+        if name == 'orphan-control' and helper == 'test_progress':
+            continue
+        argv = ['c++', '-std=c++17', '-O3', '-DNDEBUG', '-I'+str(component/'include'),
+                '-I'+str(component/'src'), '-I'+str(sdk/'include')]
+        if helper == 'probe':
+            trace = here.parent / 'sync_costs'
+            argv += ['-I'+str(trace), str(trace/'trace.cpp')]
+            argv += ['-Wl,--wrap='+symbol for symbol in ('pread', 'pread64', 'pwrite', 'pwrite64', 'sync_file_range')]
+        argv += [str(here/(helper+'.cpp')), str(component/'build/python-release/libvane_fs.a'),
+                 str(sdk/'lib/libsqlite3.a'), '-ldl', '-pthread']
+        argv += ['-Wl,--wrap='+symbol for symbol in ('sqlite3_wal_checkpoint_v2', 'fsync', 'fdatasync')]
+        argv += ['-o', str(target)]
+        started = time.time()
+        with (out/(name+'-'+helper+'-link-rebuild.log')).open('w') as log:
+            done = subprocess.run(argv, stdout=log, stderr=log, timeout=120)
+        build['commands'].append(dict(label=name+'-'+helper+'-link-rebuild', argv=argv, returncode=done.returncode,
+                                      started_epoch=started, ended_epoch=time.time()))
+        done.check_returncode()
+        build['binaries'][str(target.relative_to(out))] = digest(target)
+build['inputs'][str(here/'prepare.py')] = digest(here/'prepare.py')
+build['inputs'][str(Path(__file__).resolve())] = digest(Path(__file__))
+build['inputs'][str(out/'link-preflight/prepare.py.txt')] = digest(out/'link-preflight/prepare.py.txt')
+identity_path = Path(build['generator'])/'identity.json'
+identity = json.loads(identity_path.read_text())
+identity['inputs'][str(here/'prepare.py')] = digest(here/'prepare.py')
+identity['inputs'][str(out/'link-preflight/prepare.py.txt')] = digest(out/'link-preflight/prepare.py.txt')
+identity['helper_link_correction'] = build['helper_link_correction']
+identity_path.write_text(json.dumps(identity, indent=2)+'\n')
+build['status'] = 'PASS'
+(out/'build.json').write_text(json.dumps(build, indent=2)+'\n')
+print('helper links PASS: existing runtime identities verified')

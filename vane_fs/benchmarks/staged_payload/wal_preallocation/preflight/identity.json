@@ -1,0 +1,32 @@
+{
+  "status": "RESOLVED_VALIDATION_PREFLIGHT",
+  "measured_comparisons": 0,
+  "reason": "ReleaseMount removes all inode references; the root handle must close before releasing the mount.",
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/preflight/build.json": {
+      "sha256": "28ccc44830ba873fe487044e2e8aac6abb7d9c99c803c5f0447e674142076166",
+      "bytes": 310002,
+      "original": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/build.json"
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/preflight/build.py.txt": {
+      "sha256": "be9e4ba3730b5dd47d5c6800b62952c240815f61353a794d674c14c1fc00cd87",
+      "bytes": 15969,
+      "original": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_preallocation/build.py"
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/preflight/probe.cpp.txt": {
+      "sha256": "789ff877609a2d27d08383f61d551a3ea874486c9abc13195b65c8001db16979",
+      "bytes": 5470,
+      "original": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_preallocation/probe.cpp"
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/preflight/probe-fsync-baseline-plain": {
+      "sha256": "61e070850cd06f426e6dc2b5f9e5917fcb1da907aecc820edb6217d12f947bf5",
+      "bytes": 1787664,
+      "original": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-plain"
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/preflight/probe-fsync-baseline-plain-small128.log": {
+      "sha256": "7ccdff7b01aa39c3203fbe555dc1ab36032cbc4fb20dfc9a12cf4cb2735fb63b",
+      "bytes": 23,
+      "original": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-preallocation-20261013/probe-fsync-baseline-plain-small128.log"
+    }
+  }
+}

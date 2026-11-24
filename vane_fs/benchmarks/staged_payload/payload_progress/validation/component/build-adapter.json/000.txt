@@ -1,0 +1,15 @@
+{
+  "parent": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/build.py",
+  "parent_sha256": "ce6779c60479b1f0ee985451be7a930c8fe43c3c37fca36818a631da3f9182a5",
+  "changes": [
+    [
+      "Path(source[\"original\"]) / \"venv/lib/python3.12/site-packages\"",
+      "Path(source[\"dependency_support\"]) / \"venv/lib/python3.12/site-packages\""
+    ],
+    [
+      "helper = here / \"test_extents.cpp\"",
+      "helper = Path('/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/versioned_extents/test_extents.cpp')"
+    ]
+  ],
+  "prepared_sha256": "4a0eefac22419bb8bfd4ca20507dae12af2fece705a587f19f070e10bca1656e"
+}

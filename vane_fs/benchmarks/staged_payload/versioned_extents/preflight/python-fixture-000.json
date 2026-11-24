@@ -1,0 +1,33 @@
+{
+  "status": "FAIL",
+  "log": {
+    "label": "python",
+    "argv": [
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/venv/bin/python",
+      "-I",
+      "-m",
+      "pytest",
+      "--rootdir",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate",
+      "--confcutdir",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate",
+      "--basetemp",
+      "/dev/shm/owned-extent-python-zsghct1w",
+      "-q",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/candidate/tests"
+    ],
+    "cwd": "/tmp",
+    "source_fingerprint": "9b04b5c73a0cd0f37b0172813c91923cd8ad36d158607831050ef7200df1ff83",
+    "started_epoch": 1792292324.0093653,
+    "ended_epoch": 1792292339.4667835,
+    "returncode": 1,
+    "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/versioned-extents-20261018/005-python.log",
+    "log_sha256": "ed7877f87343d3db002fa100d1927d9b3d964223bd075b24fd00ead84e525bdf"
+  },
+  "passed": 149,
+  "failed": 4,
+  "skipped": 2,
+  "reason": "Per-row fault threshold no longer crosses 100 inserts; count logical blocks for payload/extent records and preserve inode trigger plus rollback checks.",
+  "source_manifest": "vane_fs/build/versioned-extents-20261018/source.json",
+  "generator_sha256": "6ad0ee9b90a569dc8ca9809f287a0310ed16a57d2868763e6797f715f032fa00"
+}

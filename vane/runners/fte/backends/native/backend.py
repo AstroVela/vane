@@ -20,6 +20,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
 
+import psutil
+
 from vane._native import ray_cxx
 from vane.runners.exchange_sink import bind_exchange_sink_instance, normalize_exchange_sink_config
 from vane.runners.fte.backend import TaskResultPoll, TaskResultState
@@ -536,14 +538,19 @@ def _native_total_num_cpus() -> float:
 
 
 def _native_total_memory_bytes() -> int:
+    sysconf = getattr(os, "sysconf", None)
     try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if pages > 0 and page_size > 0:
-            return int(pages) * int(page_size)
+        if sysconf is not None:
+            pages = sysconf("SC_PHYS_PAGES")
+            page_size = sysconf("SC_PAGE_SIZE")
+            if pages > 0 and page_size > 0:
+                return int(pages) * int(page_size)
     except (AttributeError, OSError, ValueError):
         pass
-    return 0
+    try:
+        return max(0, int(psutil.virtual_memory().total))
+    except (OSError, ValueError):
+        return 0
 
 
 _TaskContextKey = tuple[int, int, int, tuple[int, ...]]

@@ -1,0 +1,42 @@
+[
+  {
+    "label": "baseline",
+    "argv": [
+      "uv",
+      "pip",
+      "install",
+      "--python",
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/lookup-read-20261013T012000Z/baseline/venv/bin/python",
+      ".",
+      "--no-build-isolation",
+      "-Ccmake.define.unofficial-sqlite3_DIR=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/share/unofficial-sqlite3",
+      "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+      "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+      "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+      "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=fsync"
+    ],
+    "start": 1791854412.5432408,
+    "end": 1791854435.087436,
+    "returncode": 0
+  },
+  {
+    "label": "updated",
+    "argv": [
+      "uv",
+      "pip",
+      "install",
+      "--python",
+      "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+      ".",
+      "--no-build-isolation",
+      "-Ccmake.define.unofficial-sqlite3_DIR=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/share/unofficial-sqlite3",
+      "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+      "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+      "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+      "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=fsync"
+    ],
+    "start": 1791854435.0879495,
+    "end": 1791854457.485234,
+    "returncode": 0
+  }
+]

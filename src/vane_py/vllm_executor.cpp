@@ -403,9 +403,9 @@ static unique_ptr<VLLMExecutor> CreatePythonSGLangExecutor(ClientContext &contex
 
 } // namespace
 
-void RegisterVLLMExecutorFactory() {
-	RegisterEngineExecutorFactory("vllm", CreatePythonVLLMExecutor);
-	RegisterEngineExecutorFactory("sglang", CreatePythonSGLangExecutor);
+void RegisterVLLMExecutorFactory(DatabaseInstance &db) {
+	RegisterEngineExecutorFactory(db, "vllm", CreatePythonVLLMExecutor);
+	RegisterEngineExecutorFactory(db, "sglang", CreatePythonSGLangExecutor);
 }
 
 } // namespace duckdb

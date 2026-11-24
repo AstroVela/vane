@@ -420,9 +420,11 @@ def test_python_video_scalar_cleanup_cannot_mask_pixel_allocation_failure(monkey
 
 
 def test_video_scalar_bounds_total_output_for_a_chunk(video_connection, video_path):
+    # Twelve 512x512 RGB frames per row cross the real 256 MiB batch limit
+    # within 32 rows, keeping repeated decoder opens bounded on Windows.
     with pytest.raises(vane.OutOfRangeException, match="batch exceeds 256 MiB"):
         video_connection.execute(
-            "SELECT sum(len(video_frames(video_file($1), width => 128, height => 128))) FROM range(512)",
+            "SELECT sum(len(video_frames(video_file($1), width => 512, height => 512))) FROM range(32)",
             [str(video_path)],
         )
     assert_image_equal(video_connection.execute("SELECT 42").fetchone(), (42,))

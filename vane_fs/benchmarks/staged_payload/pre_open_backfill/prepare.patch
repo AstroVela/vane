@@ -1,0 +1,60 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -78,10 +78,13 @@
+ 		if (code != SQLITE_OK)
+ 			throw Error(ErrorCode::Storage, std::string("Background WAL checkpoint: ") + sqlite3_errstr(code));
+ 	}
+-	void BeforeWrite(sqlite3 *writer) {
++	void BeforeWrite(sqlite3 *writer, bool external_payload = false) {
+ 		CheckError();
+ 		int frames = -1, copied = -1;
+ 		auto code = sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++		if (external_payload && code == SQLITE_OK && frames >= copied && copied >= 0 &&
++		    Bytes(frames - copied) > 256 * 1024)
++			PrepareExternal();
+ 		if (code == SQLITE_BUSY) {
+ 			// A running checkpoint owns the status lock. File length is only a
+ 			// conservative upper bound here, not our usual progress measure.
+@@ -129,6 +132,31 @@
+ 	}
+ 
+ private:
++	void PrepareExternal() {
++		// Copy an already committed CLEAN prefix before a large write turns it
++		// OPEN. Keep ordinary small-file/namespace coalescing unchanged. This
++		// runs before BEGIN IMMEDIATE and never publishes or restarts a batch.
++		std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
++		std::unique_ptr<Staging::CheckpointGuard> lease;
++		int frames = -1, copied = -1;
++		{
++			Staging::Guard publication(staging);
++			if (staging.Pending())
++				return;
++			auto code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++			if (code == SQLITE_BUSY)
++				return;
++			Check(code);
++			if (frames < copied || copied < 0 || Bytes(frames - copied) <= 256 * 1024)
++				return;
++			lease = std::make_unique<Staging::CheckpointGuard>(staging);
++		}
++		// The lease excludes OPEN publication while PASSIVE copies the prefix;
++		// releasing the publication guard still permits concurrent FULL barriers.
++		auto code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++		if (code != SQLITE_BUSY)
++			Check(code);
++	}
+ 	static void Check(int code) {
+ 		if (code != SQLITE_OK)
+ 			throw Error((code & 0xff) == SQLITE_BUSY ? ErrorCode::Busy : ErrorCode::Storage,
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -976,7 +976,7 @@
+ 			if (barrier)
+ 				database.checkpointer->CheckError();
+ 			else
+-				database.checkpointer->BeforeWrite(database.db);
++				database.checkpointer->BeforeWrite(database.db, external_payload);
+ 		}
+ 		// Inline NORMAL transactions cannot introduce unpublished external bytes.
+ 		// SQLite serializes them with the WAL-prefix capture and FULL barriers;

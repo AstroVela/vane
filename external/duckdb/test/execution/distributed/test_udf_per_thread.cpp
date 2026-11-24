@@ -103,9 +103,10 @@ void ExecutePullBasedUDFPlan(Connection &con, const Value &payload) {
 		if (result == PendingExecutionResult::BLOCKED || result == PendingExecutionResult::NO_TASKS_AVAILABLE) {
 			executor.WaitForTask();
 		}
-		if (executor.HasError()) {
-			executor.ThrowException();
-		}
+	}
+	// A worker error also makes ExecutionIsFinished() true, so check after the loop.
+	if (executor.HasError()) {
+		executor.ThrowException();
 	}
 }
 
@@ -122,6 +123,12 @@ TEST_CASE("Pull-based UDF physical plans fail instead of falling back", "[execut
 	DuckDB db(nullptr);
 	Connection con(db);
 
-	REQUIRE_THROWS_WITH(ExecutePullBasedUDFPlan(con, MakeStreamingPayload()),
-	                    Catch::Matchers::Contains("pull-based UDF plans are unsupported"));
+	for (auto thread_count : {1, 4}) {
+		DYNAMIC_SECTION("threads=" << thread_count) {
+			auto result = con.Query("SET threads=" + std::to_string(thread_count));
+			REQUIRE(!result->HasError());
+			REQUIRE_THROWS_WITH(ExecutePullBasedUDFPlan(con, MakeStreamingPayload()),
+			                    Catch::Matchers::Contains("pull-based UDF plans are unsupported"));
+		}
+	}
 }

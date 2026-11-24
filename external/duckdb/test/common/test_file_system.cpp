@@ -417,7 +417,7 @@ TEST_CASE("Test path canonicalization", "[file_system]") {
 	CanonicalizationTest::Test(test_cases);
 }
 
-void TestCreateSymlink(const string &source, const string &target, bool directory_link) {
+bool TestCreateSymlink(const string &source, const string &target, bool directory_link) {
 #ifdef TEST_HAVE_SYMLINK
 	if (symlink(target.c_str(), source.c_str()) != 0) {
 		perror("symlink");
@@ -425,11 +425,23 @@ void TestCreateSymlink(const string &source, const string &target, bool director
 	}
 #else
 	// windows - use native APIs
-	if (!CreateSymbolicLinkA(source.c_str(), target.c_str(), directory_link ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0)) {
-		std::cerr << "Error: " << GetLastError() << std::endl;
-		FAIL();
+	auto flags = directory_link ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+	if (!CreateSymbolicLinkA(source.c_str(), target.c_str(), flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+		auto error = GetLastError();
+		if (error == ERROR_INVALID_PARAMETER && CreateSymbolicLinkA(source.c_str(), target.c_str(), flags)) {
+			return true;
+		}
+		if (error == ERROR_INVALID_PARAMETER) {
+			error = GetLastError();
+		}
+		if (error == ERROR_PRIVILEGE_NOT_HELD) {
+			SKIP_TEST("Windows symlink privilege or Developer Mode required");
+			return false;
+		}
+		FAIL("CreateSymbolicLink failed: " << error);
 	}
 #endif
+	return true;
 }
 
 TEST_CASE("Test path canonicalization with symlinks", "[file_system]") {
@@ -449,9 +461,14 @@ TEST_CASE("Test path canonicalization with symlinks", "[file_system]") {
 		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl AS SELECT 42 i"));
 	}
 	// create symlink from fake_dir -> real_dir
-	TestCreateSymlink(fake_dir, fs->JoinPath(fs->GetWorkingDirectory(), real_dir), true);
+	if (!TestCreateSymlink(fake_dir, fs->JoinPath(fs->GetWorkingDirectory(), real_dir), true)) {
+		return;
+	}
 	// create symlink from fake_file -> real_file
-	TestCreateSymlink(fs->JoinPath(fake_dir, "fake_file"), fs->JoinPath(fs->GetWorkingDirectory(), real_file), false);
+	if (!TestCreateSymlink(fs->JoinPath(fake_dir, "fake_file"), fs->JoinPath(fs->GetWorkingDirectory(), real_file),
+	                       false)) {
+		return;
+	}
 
 	// all of these tests are in the test dir
 	std::vector<CanonicalizationTest> test_cases;
@@ -1004,6 +1021,32 @@ TEST_CASE("Path one-off tests", "[file_system]") {
 }
 
 #ifdef _WIN32
+TEST_CASE("Relative Windows paths include the working directory in length limits", "[file_system]") {
+	auto fs = FileSystem::CreateLocal();
+	auto directory = TestCreatePath("relative_long_paths");
+	fs->CreateDirectory(directory);
+	while (directory.size() < MAX_PATH - 20) {
+		auto remaining = MAX_PATH - 20 - directory.size();
+		if (remaining < 2) {
+			break;
+		}
+		auto component = string(MinValue<idx_t>(30, remaining - 1), 'x');
+		directory = fs->JoinPath(directory, component);
+		fs->CreateDirectory(directory);
+	}
+	REQUIRE(directory.size() < MAX_PATH - 12);
+	REQUIRE(fs->JoinPath(fs->GetWorkingDirectory(), directory).size() >= MAX_PATH - 12);
+	auto file = fs->JoinPath(directory, "long_relative_file.bin");
+	{
+		auto handle = fs->OpenFile(file, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+		const string contents = "relative path";
+		handle->Write(QueryContext(), const_cast<char *>(contents.data()), contents.size(), 0);
+	}
+	REQUIRE(fs->FileExists(file));
+	fs->RemoveFile(file);
+	REQUIRE(!fs->FileExists(file));
+}
+
 TEST_CASE("Check path canonicalization on Windows", "[file_system]") {
 	auto fs = FileSystem::CreateLocal();
 	auto canonical_work_dir = fs->CanonicalizePath(fs->GetWorkingDirectory());

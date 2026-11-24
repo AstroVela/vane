@@ -45,13 +45,13 @@ namespace duckdb {
 
 void ValidateRunnerStatement(SQLStatement &statement) {
 	if (statement.type == StatementType::CALL_STATEMENT) {
-		throw NotImplementedException("Runner execution does not support SQL CALL; use a local-fast connection");
+		throw NotImplementedException("Runner execution does not support SQL CALL; use a local connection");
 	}
 	if (statement.type == StatementType::PREPARE_STATEMENT || statement.type == StatementType::EXECUTE_STATEMENT ||
 	    (statement.type == StatementType::EXPLAIN_STATEMENT &&
 	     statement.Cast<ExplainStatement>().explain_type == ExplainType::EXPLAIN_ANALYZE)) {
 		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
-		                              "use direct SQL with bound parameters or a local-fast connection");
+		                              "use direct SQL with bound parameters or a local connection");
 	}
 	if (statement.type == StatementType::EXPLAIN_STATEMENT) {
 		ValidateRunnerStatement(*statement.Cast<ExplainStatement>().stmt);
@@ -217,7 +217,7 @@ public:
 			has_data |= !function.IsClientContextRead();
 			if (function.RequiresClientContext() && !(allow_metadata && function.IsClientContextRead())) {
 				throw NotImplementedException("Runner execution does not support client-context table function %s; "
-				                              "use a local-fast connection",
+				                              "use a local connection",
 				                              function.name);
 			}
 		}
@@ -291,7 +291,7 @@ private:
 			has_metadata = true;
 		} else if (expression.function.RequiresClientContext()) {
 			throw NotImplementedException("Runner execution does not support client-context function %s; "
-			                              "use a local-fast connection",
+			                              "use a local connection",
 			                              expression.function.name);
 		}
 		if (expression.function.HasModifiedDatabasesCallback()) {
@@ -425,7 +425,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	auto &context = planner.context;
 	const bool transport = admission == RunnerPlanAdmission::TRANSPORT;
 	const auto runner_type = transport ? "ray" : RunnerClientState::Get(context);
-	if (runner_type == "local-fast") {
+	if (runner_type == "local") {
 		return nullptr;
 	}
 	if (IsConnectionPlan(*plan)) {
@@ -438,12 +438,12 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 		// CALL is lowered to a SELECT-like GET, but its function can mutate a
 		// catalog (for example dbgen/checkpoint). No distributed effect contract
 		// exists for these calls, so never admit them as ordinary reads.
-		throw NotImplementedException("Runner execution does not support SQL CALL; use a local-fast connection");
+		throw NotImplementedException("Runner execution does not support SQL CALL; use a local connection");
 	}
 	if (plan->type == LogicalOperatorType::LOGICAL_PREPARE || plan->type == LogicalOperatorType::LOGICAL_EXECUTE ||
 	    plan->type == LogicalOperatorType::LOGICAL_EXPLAIN) {
 		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
-		                              "use direct SQL with bound parameters or a local-fast connection");
+		                              "use direct SQL with bound parameters or a local connection");
 	}
 	if (plan->type == LogicalOperatorType::LOGICAL_EXPORT || plan->type == LogicalOperatorType::LOGICAL_COPY_DATABASE) {
 		throw NotImplementedException("Runner execution does not support logical operator %s", plan->GetName());
@@ -452,11 +452,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
 	if (context.config.query_verification_enabled) {
-		throw NotImplementedException("Native query verification requires a local-fast connection");
-	}
-	if (runner_type == "local" && !write && !dynamic_cast<LogicalDataSink *>(plan.get())) {
-		// The local FTE backend only supports terminals; all reads stay native.
-		return nullptr;
+		throw NotImplementedException("Native query verification requires a local connection");
 	}
 	if (prepared.statement_type == StatementType::COPY_STATEMENT && write &&
 	    write->type == LogicalOperatorType::LOGICAL_INSERT) {
@@ -471,9 +467,6 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 		operation = kind == RunnerPlanKind::COPY                               ? "COPY TO"
 		            : write->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? "CTAS"
 		                                                                       : write->GetName();
-		if (kind == RunnerPlanKind::TABLE_WRITE && runner_type != "ray") {
-			throw InvalidInputException("%s requires a ray or local-fast connection", operation);
-		}
 	}
 	if (kind == RunnerPlanKind::READ && !prepared.properties.modified_databases.empty()) {
 		throw NotImplementedException("Runner reads do not support database-modifying expressions");

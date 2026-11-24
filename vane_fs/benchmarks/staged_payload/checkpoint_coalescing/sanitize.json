@@ -1,0 +1,1 @@
+{"status":"PASS","runs":[{"label":"sanitize-tests","argv":["ctest","--test-dir","/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T041450Z/updated/sanitize","--output-on-failure"],"returncode":0,"started_epoch":1791778837.7984052,"ended_epoch":1791778871.516379}]}

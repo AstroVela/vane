@@ -1,0 +1,74 @@
+{
+  "status": "PASS",
+  "started_epoch": 1791693464.785627,
+  "runs": [
+    {
+      "label": "baseline-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/baseline/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791693464.785682,
+      "ended_epoch": 1791693474.7293994
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791693474.7301943,
+      "ended_epoch": 1791693490.5408943
+    },
+    {
+      "label": "module-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791693490.5421505,
+      "ended_epoch": 1791693490.5750024
+    },
+    {
+      "label": "updated-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/owned-updated-python",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/updated/tests"
+      ],
+      "returncode": 0,
+      "expected": 0,
+      "started_epoch": 1791693490.5757258,
+      "ended_epoch": 1791693582.0860913
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/partial-acceptance-20261011T043725Z/owned-updated-python",
+      "removed": true,
+      "mounts_absent": true
+    }
+  ],
+  "ended_epoch": 1791693582.2429273
+}

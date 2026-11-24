@@ -253,8 +253,17 @@ def test_ai_embed_runtime_signature_matches_public_contract():
     signature = inspect.signature(vane.ai.embed, eval_str=True)
     parameters = signature.parameters
 
-    assert parameters["first"].annotation == vane.Expression | vane.Relation
-    assert parameters["text"].annotation is vane.Expression
+    input_type = (
+        vane.Expression
+        | vane.ai.TextInput
+        | vane.ai.ImageInput
+        | vane.ai.VideoInput
+        | vane.ai.AudioInput
+        | vane.ai.MultimodalInput
+    )
+    assert parameters["first"].annotation == input_type | vane.Relation
+    assert parameters["input"].annotation == input_type
+    assert "text" not in parameters
     assert parameters["rel"].annotation is vane.Relation
     assert parameters["provider"].annotation == str | Provider
     assert parameters["on_error"].annotation == Literal["raise", "ignore"]
@@ -398,7 +407,7 @@ def test_ai_embed_native_provider_requires_explicit_model(provider):
 def test_ai_embed_rejects_non_provider_objects_and_undocumented_first_keyword():
     with pytest.raises(TypeError, match="Provider object"):
         vane.ai.embed(vane.col("text"), provider=object())
-    with pytest.raises((TypeError, ValueError), match="first|text Expression"):
+    with pytest.raises((TypeError, ValueError), match="first|embedding input"):
         vane.ai.embed(first=vane.col("text"), provider=MockProvider())
 
 
@@ -493,7 +502,7 @@ def test_ai_embed_relation_rejects_non_string_output_column(output_column):
 def test_ai_embed_python_entries_reject_non_varchar_during_planning(relation_api, text_sql):
     rel = vane.connect().sql(f"SELECT {text_sql} AS text")
 
-    with pytest.raises(vane.BinderException, match="ai SQL input argument must be VARCHAR"):
+    with pytest.raises(vane.BinderException, match="ai_embed text input requires VARCHAR"):
         if relation_api:
             vane.ai.embed(
                 rel,

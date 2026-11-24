@@ -1,0 +1,89 @@
+{
+  "reason": "Snapshots require an unmounted branch. History setup closes/releases its inode lease, uses path writes during version creation, then reacquires and reopens the same inode before timing. Other measurements still use inode reads. No read measurements preceded this repair.",
+  "binaries": [
+    {
+      "label": "blob-probe",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob/probe"
+      ],
+      "sha256": "14fab900781906e8453922d5282401a3da599b8265c8d38783542b57a889384a",
+      "started_epoch": 1791705917.6588216,
+      "ended_epoch": 1791705919.141548
+    },
+    {
+      "label": "blob_point-probe",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/blob_point/probe"
+      ],
+      "sha256": "5c6c5e3addbd027e12417c323bffe75edd200f566b019811970d06dc155a61e9",
+      "started_epoch": 1791705919.1415575,
+      "ended_epoch": 1791705920.674307
+    },
+    {
+      "label": "external-probe",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external/probe"
+      ],
+      "sha256": "806c2ef8514a83edf26df9ab5149abd46f0ab8b0700802ce38fcffc2896547d9",
+      "started_epoch": 1791705920.6743164,
+      "ended_epoch": 1791705922.106022
+    },
+    {
+      "label": "external_point-probe",
+      "argv": [
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/include",
+        "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/point_read/probe.cpp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/build/python-release/libvane_fs.a",
+        "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+        "-ldl",
+        "-pthread",
+        "-o",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T075219Z/external_point/probe"
+      ],
+      "sha256": "963e2e200196a1eb820e8c8cd8837b33ec48f4e5012bf2230a38e2aa24e32fa8",
+      "started_epoch": 1791705922.1060297,
+      "ended_epoch": 1791705923.5379195
+    }
+  ]
+}

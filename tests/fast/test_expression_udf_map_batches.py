@@ -113,7 +113,7 @@ def test_vane_function_batch_expression_receives_arrow_columns():
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(5) t(i)")
 
-    assert rel.select(vane.col("x"), add_one(vane.col("x")).alias("y")).fetchall() == [
+    assert rel.select(vane.col("x"), add_one(vane.col("x")).alias("y")).order("x").fetchall() == [
         (0, 1),
         (1, 2),
         (2, 3),

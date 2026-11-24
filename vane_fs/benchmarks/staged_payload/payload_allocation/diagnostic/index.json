@@ -1,0 +1,371 @@
+{
+  "status": "PASS",
+  "started_epoch": 1791959178.2296865,
+  "runs": [
+    {
+      "file": "diagnostic/groups/fresh-64-delayed.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-64-reserve256k.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-64-reserve1m.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-64-reserve1m.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/fresh-64-reserve256k.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/fresh-64-delayed.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-delayed.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-reserve256k.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-reserve1m.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-reserve1m.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-reserve256k.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/fresh-256-delayed.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-delayed.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-reserve256k.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-reserve1m.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-reserve1m.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-reserve256k.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-64-delayed.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-delayed.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-reserve256k.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-reserve1m.json",
+      "index": 0
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-reserve1m.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-reserve256k.json",
+      "index": 1
+    },
+    {
+      "file": "diagnostic/groups/after_gc-256-delayed.json",
+      "index": 1
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-89o6nwwc",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-lpcyutq1",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-bvlt6x6i",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-6rip2ku1",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-cgc9t1hp",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-5bmfkxt3",
+      "files": {
+        "payload": {
+          "bytes": 67112960,
+          "sha256": "c7840d511b62b743220a381903ceeb0a6392ac1b7730817d0f1fba214c28d08d"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-lrm3m7ry",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-4iawzg2l",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-8ugxxrnq",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-tmi3ik7e",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-0amioigb",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-1pnjk09q",
+      "files": {
+        "payload": {
+          "bytes": 268439552,
+          "sha256": "dcf692309322eb1f13fa3fafc5556f5abf07b43d9ebc4e5e42374ebe5c5871e6"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-ok43xz7j",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-s48zrenr",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-jv1jna46",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-ebjp2xgo",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-0tguqrrg",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-ekoivt5c",
+      "files": {
+        "payload": {
+          "bytes": 117444608,
+          "sha256": "984edc9d4db69dded4179e35b33b984e9c06b2d0098c3713112b5325d60a0f0c"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-o68f6k_0",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-0_erwsq9",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-i0dh6acf",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-tydzhv_5",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-uc0b6bpj",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-allocation-20261014/diagnostic/owned-payload-allocation-s_bblxls",
+      "files": {
+        "payload": {
+          "bytes": 318771200,
+          "sha256": "2b425990b77ac2e99546b4095feba30b98f16621fecbf11e6b74660e20db9700"
+        }
+      },
+      "removed": true,
+      "processes_stopped": true
+    }
+  ],
+  "ended_epoch": 1791959276.4240632,
+  "inputs_unchanged": true,
+  "monitor_stopped": true
+}

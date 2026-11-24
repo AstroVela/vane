@@ -1,0 +1,32 @@
+{
+  "status": "RUNNING",
+  "started_epoch": 1792292861.6230953,
+  "commands": [
+    {
+      "argv": [
+        "scripts/format",
+        "root",
+        "--changed"
+      ],
+      "started_epoch": 1792292861.6230972,
+      "ended_epoch": 1792292862.8831606,
+      "returncode": 0,
+      "stdout": "ruff format..............................................................\u001b[42mPassed\u001b[m\nclang-format.............................................................\u001b[42mPassed\u001b[m\ncmake-format.........................................(no files to check)\u001b[46;30mSkipped\u001b[m\nshfmt................................................(no files to check)\u001b[46;30mSkipped\u001b[m\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "ruff",
+        "check",
+        "--no-fix",
+        "vane_fs/benchmarks/staged_payload/versioned_extents"
+      ],
+      "started_epoch": 1792292862.8831975,
+      "ended_epoch": 1792292862.9018629,
+      "returncode": 1,
+      "stdout": "F841 Local variable `here` is assigned to but never used\n  --> vane_fs/benchmarks/staged_payload/versioned_extents/analyze.py:43:10\n   |\n41 |     parser.add_argument(\"artifacts\", type=Path)\n42 |     args = parser.parse_args()\n43 |     out, here = args.artifacts.resolve(), Path(__file__).resolve().parent\n   |          ^^^^\n44 |     started = time.time()\n45 |     plan = json.loads((out / \"count-plan.json\").read_text())\n   |\nhelp: Remove assignment to unused variable `here`\n\nFound 1 error.\nNo fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).\n",
+      "stderr": ""
+    }
+  ],
+  "ended_epoch": 1792292862.9019122
+}

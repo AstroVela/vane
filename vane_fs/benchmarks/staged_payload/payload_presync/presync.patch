@@ -1,0 +1,65 @@
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -370,6 +370,13 @@
+ 		Sync(wal.fd);
+ 		Save(true);
+ 	}
++	// Preparatory only: concurrent appends may follow this sync. It changes
++	// no fence and never replaces the final sync under the publication guard.
++	void Presync() {
++		File data;
++		data.Open(path + ".payload", false);
++		Sync(data.fd);
++	}
+ 	void BeforeFullCommit() {
+ 		if (!Pending())
+ 			return;
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -134,6 +134,13 @@
+ 	int64_t Bytes(int frames) const {
+ 		return frames < 0 ? 0 : int64_t(frames) * (page_size + 24) + 32;
+ 	}
++	// Caller holds the publication guard; CLEAN tails retain prompt backfill.
++	bool DeferPublication(bool retry, int &code, int &frames, int &copied) {
++		if (retry || !staging.Pending())
++			return false;
++		code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++		return code == SQLITE_OK && frames >= copied && copied >= 0 && Bytes(frames - copied) < START_BYTES;
++	}
+ 	void Run() {
+ 		bool retry = false;
+ 		std::unique_lock<std::mutex> lock(mutex);
+@@ -156,16 +163,28 @@
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+ 				try {
+ 					std::unique_ptr<Staging::CheckpointGuard> lease;
++					bool presync = false;
+ 					{
+ 						Staging::Guard publication(staging);
+ 						// Only unpublished external data needs coalesced publication.
+ 						// Once CLEAN, promptly backfill inline/namespace commits using
+ 						// the original wake policy, even below the uncopied-byte budget.
+-						if (!retry && staging.Pending()) {
+-							code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
+-							deferred = code == SQLITE_OK && frames >= copied && copied >= 0 &&
+-							           Bytes(frames - copied) < START_BYTES;
++						deferred = DeferPublication(retry, code, frames, copied);
++						if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
++							presync = staging.Pending();
++							if (!presync) {
++								lease = std::make_unique<Staging::CheckpointGuard>(staging);
++								staging.Publish(db);
++							}
+ 						}
++					}
++					if (presync) {
++						// Let external writers append while the preparatory sync runs.
++						// The final protected sync still covers every published byte.
++						staging.Presync();
++						Staging::Guard publication(staging);
++						code = SQLITE_OK;
++						deferred = DeferPublication(retry, code, frames, copied);
+ 						if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {
+ 							lease = std::make_unique<Staging::CheckpointGuard>(staging);
+ 							staging.Publish(db);

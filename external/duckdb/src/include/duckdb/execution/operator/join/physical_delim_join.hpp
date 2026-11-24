@@ -41,6 +41,9 @@ public:
 
 public:
 	vector<const_reference<PhysicalOperator>> GetChildren() const override;
+	vector<const_reference<PhysicalOperator>> GetMaterializedInputChildren(ClientContext &) const override {
+		return {children[0].get()};
+	}
 
 	bool IsSink() const override {
 		return true;

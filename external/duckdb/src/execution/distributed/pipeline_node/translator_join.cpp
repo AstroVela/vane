@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 
 #include <algorithm>
@@ -206,7 +207,8 @@ idx_t EstimateDataSizeBytes(idx_t cardinality, const duckdb::vector<LogicalType>
 
 idx_t GetAutoBroadcastThresholdBytes() {
 	constexpr idx_t DEFAULT_THRESHOLD_BYTES = 10ULL * 1024 * 1024;
-	const char *env = std::getenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return DEFAULT_THRESHOLD_BYTES;
 	}
@@ -228,7 +230,8 @@ idx_t GetAutoBroadcastThresholdBytes() {
 enum class DistributedJoinStrategyOverride { kDefault, kHash, kBroadcast, kBroadcastLeft, kBroadcastRight };
 
 DistributedJoinStrategyOverride GetJoinStrategyOverride() {
-	const char *env = std::getenv("VANE_DISTRIBUTED_JOIN_STRATEGY");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_JOIN_STRATEGY");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return DistributedJoinStrategyOverride::kDefault;
 	}
@@ -251,7 +254,8 @@ DistributedJoinStrategyOverride GetJoinStrategyOverride() {
 }
 
 Optional<bool> BroadcastReceiverRepartitionOverride() {
-	const char *env = std::getenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION");
+	const duckdb::EnvironmentVariable env_env("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION");
+	const char *env = env_env.GetValue();
 	if (!env || !*env) {
 		return Optional<bool> {};
 	}
@@ -529,18 +533,15 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	DistributedPipelineNodeRef join_left = left_node;
 	DistributedPipelineNodeRef join_right = right_node;
 	optional_idx mark_build_summary_source_node_id;
-	bool needs_join_repartition = (plan_config_.num_partitions > 1);
-	if (!needs_join_repartition && left_node && right_node) {
-		size_t left_parts = left_node->config().clustering_spec()->num_partitions();
-		size_t right_parts = right_node->config().clustering_spec()->num_partitions();
-		if (left_parts > 1 || right_parts > 1) {
-			needs_join_repartition = true;
-		}
-	}
-	if (needs_join_repartition && left_node && right_node) {
+	// A logical single partition can still produce several dynamically assigned
+	// scan tasks. Keep an exchange boundary on both sides so FTE co-locates all
+	// matching keys instead of scheduling the two scan sources independently.
+	if (left_node && right_node) {
 		if (left_partition_by.empty() || right_partition_by.empty()) {
-			join_left = gen_gather_node(left_node);
-			join_right = gen_gather_node(right_node);
+			join_left =
+			    gen_shuffle_node(RepartitionSpec::create_into_partitions(1), left_node->config().schema(), left_node);
+			join_right =
+			    gen_shuffle_node(RepartitionSpec::create_into_partitions(1), right_node->config().schema(), right_node);
 		} else {
 			size_t target_partitions =
 			    std::max(static_cast<size_t>(plan_config_.num_partitions), static_cast<size_t>(1));

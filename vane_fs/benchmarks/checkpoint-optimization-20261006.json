@@ -1,0 +1,569 @@
+{
+  "scope": "VaneFS before/after comparison, both durability=fsync. Three alternating-order rounds on a shared host. No owned builds or tests overlap measurement. Not a production ranking.",
+  "started_utc": "2026-10-06T04:02:43.963643+00:00",
+  "finished_utc": "2026-10-06T04:05:15.587594+00:00",
+  "host": {
+    "platform": "Linux-6.11.0-24-generic-x86_64-with-glibc2.39",
+    "cpus": 36,
+    "isolated": false
+  },
+  "build": {
+    "before_commit": "f40c57742e8b755a2ab00c410ef50209a35e0c77",
+    "after": "working tree patch captured as source.diff",
+    "patch_sha256": "1ab0d42cd09f938eaec8d72f5081f153a1983d1d3c0246a29bef2cf166101cc4",
+    "source_sha256": {
+      "vane_fs/src/workspace.cpp": "f26ece0bee1e003a80d3483092187f55f187f3ea16b84f1fd84fc6114191f9b8",
+      "vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+      "vane_fs/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+      "vane_fs/include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a",
+      "vane_fs/CMakeLists.txt": "a60e246b0900101a0b67e4dec5bbb70ae5548bb9b7e5cbcbd65cb28aa1f983bf"
+    },
+    "build": "Release, C++17, same pinned static SQLite and libfuse3 as baseline; cmake --build vane_fs/build/core -j 2",
+    "binaries": {
+      "vane-before": "790c13c1e5085c8dd25767eafd805e78790765156f268c5c5c707e251301f6fb",
+      "vane-after": "deab6a7113e3703402e789b2177a1f44a0c09e93bd6d23c13bc9b1070936b5fe",
+      "vane-cli": "70f88dbfb7c3e4f6a4d82334ecdb79f15552be29a9a85928a5a3119609f2811c"
+    },
+    "checkpoint_policy": {
+      "before": "sqlite3_wal_autocheckpoint 4096 pages",
+      "after": "16 MiB worker notification; 64 MiB pre-write restart budget; retained allocation 16 MiB; timeout 5000 ms; local worker I/O waits are outside SQLite busy timeout"
+    },
+    "durability": "Both Vane variants fsync mode with unchanged FULL barrier and O_SYNC/O_DSYNC behavior."
+  },
+  "method": {
+    "write": "Create/open, one-MiB os.write calls, fsync and close inside timer; full readback size/SHA256 outside timer. Every write must return the full requested length.",
+    "read": "4096 warm four-KiB reads of a 64-MiB fixture. No global cache eviction.",
+    "wal": "File allocation sampled after each application write; this is not the exact instantaneous peak or a count of pending frames.",
+    "budget": "16 MiB background start, 64 MiB pre-write restart admission, retained allocation 16 MiB. One transaction and concurrent writers can overshoot. Local worker I/O is outside the SQLite lock-contention timeout."
+  },
+  "results": {
+    "before": {
+      "sequential_write": {
+        "samples": [
+          66.3816843558324,
+          58.395773766462206,
+          57.083896919434736
+        ],
+        "median": 58.395773766462206,
+        "min": 57.083896919434736,
+        "max": 66.3816843558324,
+        "unit": "MiB/s"
+      },
+      "sequential_write_256": {
+        "samples": [
+          59.77240281863612,
+          29.4549404474005,
+          15.79511358540238
+        ],
+        "median": 29.4549404474005,
+        "min": 15.79511358540238,
+        "max": 59.77240281863612,
+        "unit": "MiB/s"
+      },
+      "random_read_4k": {
+        "samples": [
+          67.8013643250895,
+          70.8547705193159,
+          59.90190464627106
+        ],
+        "median": 67.8013643250895,
+        "min": 59.90190464627106,
+        "max": 70.8547705193159,
+        "unit": "MiB/s"
+      }
+    },
+    "after": {
+      "sequential_write": {
+        "samples": [
+          86.4488440913597,
+          10.622250847158899,
+          86.62808770707355
+        ],
+        "median": 86.4488440913597,
+        "min": 10.622250847158899,
+        "max": 86.62808770707355,
+        "unit": "MiB/s"
+      },
+      "sequential_write_256": {
+        "samples": [
+          85.98954026817209,
+          82.5365487319583,
+          87.70093120476348
+        ],
+        "median": 85.98954026817209,
+        "min": 82.5365487319583,
+        "max": 87.70093120476348,
+        "unit": "MiB/s"
+      },
+      "random_read_4k": {
+        "samples": [
+          51.16131664227313,
+          71.81293445250648,
+          79.60688250794779
+        ],
+        "median": 71.81293445250648,
+        "min": 51.16131664227313,
+        "max": 79.60688250794779,
+        "unit": "MiB/s"
+      }
+    }
+  },
+  "samples": [
+    {
+      "variant": "before",
+      "metric": "sequential_write",
+      "repetition": 0,
+      "value": 66.3816843558324,
+      "seconds": 0.9641213630093262,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259366.2056897,
+      "load": [
+        8.2998046875,
+        10.70556640625,
+        8.20947265625
+      ],
+      "write_syscalls_seconds": 0.9187416366185062,
+      "fsync_seconds": 0.03815306298201904,
+      "max_write_seconds": 0.10994202696019784,
+      "peak_sampled_wal_bytes": 17983832
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write",
+      "repetition": 0,
+      "value": 86.4488440913597,
+      "seconds": 0.740322217985522,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259368.0090785,
+      "load": [
+        8.2998046875,
+        10.70556640625,
+        8.20947265625
+      ],
+      "write_syscalls_seconds": 0.6988151860423386,
+      "fsync_seconds": 0.03411079995566979,
+      "max_write_seconds": 0.22698843199759722,
+      "peak_sampled_wal_bytes": 66311432
+    },
+    {
+      "variant": "before",
+      "metric": "sequential_write_256",
+      "repetition": 0,
+      "value": 59.77240281863612,
+      "seconds": 4.282912982045673,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259377.2445807,
+      "load": [
+        8.1728515625,
+        10.599609375,
+        8.201171875
+      ],
+      "write_syscalls_seconds": 4.224654750723857,
+      "fsync_seconds": 0.030417574977036566,
+      "max_write_seconds": 0.15087193698855117,
+      "peak_sampled_wal_bytes": 21172712
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write_256",
+      "repetition": 0,
+      "value": 85.98954026817209,
+      "seconds": 2.9771062759682536,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259383.7638712,
+      "load": [
+        8.15869140625,
+        10.55615234375,
+        8.19970703125
+      ],
+      "write_syscalls_seconds": 2.9139065757626668,
+      "fsync_seconds": 0.03665306401671842,
+      "max_write_seconds": 0.32074146397644654,
+      "peak_sampled_wal_bytes": 67081872
+    },
+    {
+      "variant": "before",
+      "metric": "random_read_4k",
+      "repetition": 0,
+      "value": 67.8013643250895,
+      "seconds": 0.23598345194477588,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259393.5598853,
+      "load": [
+        8.36181640625,
+        10.52099609375,
+        8.2138671875
+      ]
+    },
+    {
+      "variant": "after",
+      "metric": "random_read_4k",
+      "repetition": 0,
+      "value": 51.16131664227313,
+      "seconds": 0.3127362829982303,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259396.1141276,
+      "load": [
+        8.4130859375,
+        10.49560546875,
+        8.21826171875
+      ]
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write",
+      "repetition": 1,
+      "value": 10.622250847158899,
+      "seconds": 6.025088366004638,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259410.068511,
+      "load": [
+        8.4169921875,
+        10.42919921875,
+        8.22119140625
+      ],
+      "write_syscalls_seconds": 5.993529916799162,
+      "fsync_seconds": 0.024442253983579576,
+      "max_write_seconds": 5.473968738981057,
+      "peak_sampled_wal_bytes": 65837632
+    },
+    {
+      "variant": "before",
+      "metric": "sequential_write",
+      "repetition": 1,
+      "value": 58.395773766462206,
+      "seconds": 1.0959697230136953,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259414.3003886,
+      "load": [
+        8.4638671875,
+        10.4052734375,
+        8.2255859375
+      ],
+      "write_syscalls_seconds": 1.077592045883648,
+      "fsync_seconds": 0.011899488978087902,
+      "max_write_seconds": 0.14833017601631582,
+      "peak_sampled_wal_bytes": 30434472
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write_256",
+      "repetition": 1,
+      "value": 82.5365487319583,
+      "seconds": 3.101656223007012,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259420.1462424,
+      "load": [
+        8.42626953125,
+        10.365234375,
+        8.22412109375
+      ],
+      "write_syscalls_seconds": 3.042436874296982,
+      "fsync_seconds": 0.030850076000206172,
+      "max_write_seconds": 0.2792908109840937,
+      "peak_sampled_wal_bytes": 66793472
+    },
+    {
+      "variant": "before",
+      "metric": "sequential_write_256",
+      "repetition": 1,
+      "value": 29.4549404474005,
+      "seconds": 8.691241472959518,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259439.13423,
+      "load": [
+        8.49609375,
+        10.24609375,
+        8.2294921875
+      ],
+      "write_syscalls_seconds": 8.652787897444796,
+      "fsync_seconds": 0.011421848030295223,
+      "max_write_seconds": 1.9955592770129442,
+      "peak_sampled_wal_bytes": 30434472
+    },
+    {
+      "variant": "after",
+      "metric": "random_read_4k",
+      "repetition": 1,
+      "value": 71.81293445250648,
+      "seconds": 0.2228010889957659,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259441.8847294,
+      "load": [
+        8.2158203125,
+        10.15869140625,
+        8.2119140625
+      ]
+    },
+    {
+      "variant": "before",
+      "metric": "random_read_4k",
+      "repetition": 1,
+      "value": 70.8547705193159,
+      "seconds": 0.22581401199568063,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259459.710421,
+      "load": [
+        8.6474609375,
+        10.15234375,
+        8.24072265625
+      ]
+    },
+    {
+      "variant": "before",
+      "metric": "sequential_write",
+      "repetition": 2,
+      "value": 57.083896919434736,
+      "seconds": 1.1211568139842711,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259463.8598516,
+      "load": [
+        8.51513671875,
+        10.099609375,
+        8.23388671875
+      ],
+      "write_syscalls_seconds": 1.1040335860452615,
+      "fsync_seconds": 0.010707375011406839,
+      "max_write_seconds": 0.145911936997436,
+      "peak_sampled_wal_bytes": 30434472
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write",
+      "repetition": 2,
+      "value": 86.62808770707355,
+      "seconds": 0.7387904049828649,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "cde944dc95ee2403e6875d8e69cc11034de20844ad7121c4c254b64f422c932d"
+      },
+      "epoch": 1791259465.510432,
+      "load": [
+        8.51513671875,
+        10.099609375,
+        8.23388671875
+      ],
+      "write_syscalls_seconds": 0.7127681503770873,
+      "fsync_seconds": 0.019613234035205096,
+      "max_write_seconds": 0.26873643102589995,
+      "peak_sampled_wal_bytes": 67110712
+    },
+    {
+      "variant": "before",
+      "metric": "sequential_write_256",
+      "repetition": 2,
+      "value": 15.79511358540238,
+      "seconds": 16.20754410000518,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259491.1706917,
+      "load": [
+        9.3828125,
+        10.12841796875,
+        8.30224609375
+      ],
+      "write_syscalls_seconds": 16.171299920824822,
+      "fsync_seconds": 0.011433751962613314,
+      "max_write_seconds": 2.35290774400346,
+      "peak_sampled_wal_bytes": 30434472
+    },
+    {
+      "variant": "after",
+      "metric": "sequential_write_256",
+      "repetition": 2,
+      "value": 87.70093120476348,
+      "seconds": 2.919011195015628,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 268435456,
+        "sha256": "59b4aaf834ead9a9533431ab84f3038d4f6032097fb0cb578317bbf9d22b7c09"
+      },
+      "epoch": 1791259497.7740366,
+      "load": [
+        9.19189453125,
+        10.076171875,
+        8.294921875
+      ],
+      "write_syscalls_seconds": 2.8526219219202176,
+      "fsync_seconds": 0.03728048095945269,
+      "max_write_seconds": 0.24014837900176644,
+      "peak_sampled_wal_bytes": 66739912
+    },
+    {
+      "variant": "before",
+      "metric": "random_read_4k",
+      "repetition": 2,
+      "value": 59.90190464627106,
+      "seconds": 0.26710335997631773,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259513.4904547,
+      "load": [
+        9.728515625,
+        10.154296875,
+        8.349609375
+      ]
+    },
+    {
+      "variant": "after",
+      "metric": "random_read_4k",
+      "repetition": 2,
+      "value": 79.60688250794779,
+      "seconds": 0.20098764699650928,
+      "unit": "MiB/s",
+      "validation": {
+        "verified_bytes": 67108864,
+        "sha256": "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
+      },
+      "epoch": 1791259515.3106544,
+      "load": [
+        9.728515625,
+        10.154296875,
+        8.349609375
+      ]
+    }
+  ],
+  "limitations": [
+    "Both versions have slow I/O samples. Before 256-MiB write samples are 59.77, 29.45 and 15.80 MiB/s; their median exaggerates the gain relative to the fastest baseline sample.",
+    "After 64-MiB write samples are 86.45, 10.62 and 86.63 MiB/s. The slow run includes a 5.47-second write; it completes without a short write. Moving checkpoints does not remove storage stalls.",
+    "The first implementation incorrectly timed out while waiting for its own checkpoint I/O. Its failed benchmark and instrumented reproduction remain in ignored build artifacts, and are excluded from this final implementation comparison. A deterministic test fails on that implementation and passes after the fix."
+  ],
+  "validation": {
+    "large_files": 18,
+    "database_quick_check": {
+      "before": [
+        [
+          "ok"
+        ]
+      ],
+      "after": [
+        [
+          "ok"
+        ]
+      ]
+    },
+    "native_release": "5 passed",
+    "native_asan_ubsan": "5 passed",
+    "component_python": "126 passed (1 existing fork warning)",
+    "asan_fuse": "13 passed, 21 deselected",
+    "checks": [
+      "format",
+      "pre-commit for affected files",
+      "copyleft inventory"
+    ]
+  },
+  "cleanup": {
+    "owned_mounts_processes_and_containers_removed": true,
+    "generated_data_removed": true,
+    "removed_roots": [
+      "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag",
+      "/tmp/vane-d9-jy4wj1zl"
+    ],
+    "unmounts": [
+      {
+        "variant": "before",
+        "unmount_seconds": 0.06705000100191683,
+        "returncode": 0
+      },
+      {
+        "variant": "after",
+        "unmount_seconds": 0.06642147002276033,
+        "returncode": 0
+      }
+    ],
+    "database_artifacts": [
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/before.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/before.sqlite",
+        "bytes": 1444073472,
+        "sha256": "e44818439b76104a0d77057f6467050fb258ba0425b3b50f5b38ad90a1cc234a"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/after.sqlite-wal",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/after.sqlite",
+        "bytes": 1444073472,
+        "sha256": "1ad8937c3d4e47b0e6e77810d794e9e527e1b6fc031a0da9f114ad967430c054"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/before.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      },
+      {
+        "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/owned-local-is5xpmag/after.sqlite-shm",
+        "bytes": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+      }
+    ],
+    "free_bytes_after_cleanup": 27982213120
+  },
+  "raw_artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/drive9-comparison/checkpoint-optimization-20261006-final/results.json",
+  "raw_sha256": "a5288b5c91bbbf83619cfe92033fc33d1457a1b766c5126d0989588876ac1478"
+}

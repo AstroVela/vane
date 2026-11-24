@@ -11,7 +11,7 @@ Long recordings must be windowed explicitly before embedding.
 import argparse
 
 import vane
-from vane.ai import embed, embed_audio
+from vane.ai import AudioInput, embed
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
             "SELECT struct_pack(sample_rate := 48000, data := resample(audio_file(?), 48000)) AS audio",
             params=[args.audio],
         )
-        vector = embed_audio(clips, vane.col("audio"), **options).select("embedding").fetchone()[0]
+        vector = embed(clips, AudioInput(vane.col("audio")), **options).select("embedding").fetchone()[0]
         queries = conn.sql("SELECT unnest(['A dog barking', 'A ringing alarm', 'Music playing', 'Heavy rain']) AS text")
         embedded = embed(queries, vane.col("text"), **options)
         for text, values in embedded.select("text", "embedding").fetchall():

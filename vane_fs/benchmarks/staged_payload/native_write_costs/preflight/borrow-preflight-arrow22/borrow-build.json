@@ -1,0 +1,180 @@
+{
+  "status": "FAIL",
+  "started_epoch": 1792224860.8166313,
+  "commands": [
+    {
+      "label": "borrow-venv",
+      "argv": [
+        "uv",
+        "venv",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792224546.048154,
+      "ended_epoch": 1792224546.0802875,
+      "returncode": 0
+    },
+    {
+      "label": "borrow-install",
+      "argv": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/bin/python",
+        ".",
+        "--no-build-isolation",
+        "-Ccmake.define.unofficial-sqlite3_DIR=/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release/share/unofficial-sqlite3",
+        "-Ccmake.define.VANE_FS_BUILD_TOOLS=ON",
+        "-Ccmake.define.VANE_FS_BUILD_FUSE=ON",
+        "-Ccmake.define.VANE_FS_BUILD_TESTS=ON",
+        "-Ccmake.define.VANE_FS_TEST_SQLITE_SYNC=fsync"
+      ],
+      "cwd": "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed",
+      "started_epoch": 1792224546.0808847,
+      "ended_epoch": 1792224575.57027,
+      "returncode": 0
+    },
+    {
+      "label": "borrow-cpp",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/build/python-release",
+        "--output-on-failure"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792224575.570908,
+      "ended_epoch": 1792224600.2985656,
+      "returncode": 0
+    },
+    {
+      "label": "borrow-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed",
+        "--basetemp",
+        "/dev/shm/owned-borrow-python-fun9a_6b",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests"
+      ],
+      "cwd": "/tmp",
+      "started_epoch": 1792224600.2997952,
+      "ended_epoch": 1792224600.332553,
+      "returncode": 1
+    },
+    {
+      "label": "borrow-test-deps",
+      "argv": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/bin/python",
+        "-r",
+        "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/test-requirements.txt"
+      ],
+      "cwd": "None",
+      "started_epoch": 1792224860.8213015,
+      "ended_epoch": 1792224862.589554,
+      "returncode": 0
+    },
+    {
+      "label": "borrow-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed",
+        "--basetemp",
+        "/dev/shm/owned-borrow-python-ewda2ohk",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests"
+      ],
+      "cwd": "/tmp",
+      "started_epoch": 1792224862.590982,
+      "ended_epoch": 1792224865.013524,
+      "returncode": 2
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/dev/shm/owned-borrow-python-fun9a_6b",
+      "files": {},
+      "removed": true,
+      "processes_stopped": true
+    },
+    {
+      "path": "/dev/shm/owned-borrow-python-ewda2ohk",
+      "files": {},
+      "removed": true,
+      "processes_stopped": true
+    }
+  ],
+  "tests": [],
+  "allocation_controls": [],
+  "reverse_patch_exact": true,
+  "sources": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/payload_file.hpp": "297d92e5612e7bdb400f328f53038d004f8f9d68ce59b8db9434f8c872741742",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/checkpoint.hpp": "76ee2fd7617f854974d4f82c6866c26bc50468adbfa5a171d5096ef1124b860a",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/workspace.cpp": "0694dc91dd1b31ce7dc95679ed46e9f03b1356e3cb31847332d40025cea43b08",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/include/vane_fs/workspace.hpp": "d49978d1de8e18b44a1dc1e363a1f970a78ac6c9d61a91297c1a25c7167df5ca",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_lookup_validation.cpp": "65152a42fdea07d5c3b05d4d43ce33dd27e91cc5cc0f11c8d491d22fd2d3efe3",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_inode_refs.cpp": "bc0bca4e90d3b5d2ce47c96c0c119c7c39e46b3607ac274b5aa0c9017147cf5e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_core.cpp": "2781dadfa9c4245608f275810774554886ac936d7a41dcb5b9225153638c25a0",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_workspace.py": "e4364572b834f83a017974d732556d1d31f4e8a6fdf4d5bf293c45d18956639c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_staging.cpp": "ddb48a5ac6f5cddf210a8eaa48c58b7d220965df54e192c89d172423353c35cb",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_sync_syscalls.cpp": "77b9d4953eff46f0a6f8744c9987dd668619cd4bcb2840c6326c94cd3c6805bf",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/borrowed/python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821"
+  },
+  "inputs": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/borrow.py": "eea59d83d4c298f422dbc49fe6ce94cf3cea65997c1d8c57fa5a231792a3e99e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/borrow.patch": "b5194f6aaba3d131ab5ff39141abe1fbb9fed67f4c018ee32014b91d154e50f2",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/test_borrow.cpp": "604c73782e127a1b0b14116772282cbb94b06facbdf2c9da195e13a6f7c6c66f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/probe.cpp": "e05a35e6f4f67383a99d1331a8bab90412be97abef34895409cc9e54112a985d",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/costs.cpp": "a1b7989caeb3e3b606423f4590872e280a3cc3402d18033644ee7cb073fa0d6f",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/costs.hpp": "a745ec1549830229776687195893e606081a26dbfe5a6086cabd4dbb21e083ee",
+    "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/native_write_costs/test-requirements.txt": "e1dc4ed11f60874cc3ae475f14200f190bfa0f697eb8f7816afbe4a001b6e99e",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/native-write-costs-20261017/build.json": "6c0b0a36df358de757dbfb2e20e090256fab0d748324065194d4694f0b92c45b"
+  },
+  "binaries": {},
+  "ended_epoch": 1792224865.0152981,
+  "error": "AssertionError('borrow-python')"
+}

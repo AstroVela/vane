@@ -1,0 +1,18 @@
+{
+  "status": "RETAINED_ANALYSIS_PREFLIGHT_FAILURES",
+  "runtime_or_measurement_changes": false,
+  "attempts": [
+    {
+      "stage": "source-unwrapping preflight",
+      "error": "KeyError: 'python/vane_fs/fsspec.py'",
+      "cause": "The copied Python/test sources are in original identity but outside instrumented native source_inputs.",
+      "correction": "Verify untouched files directly against original hashes; reverse diagnostic additions for src files."
+    },
+    {
+      "stage": "causal restart outcome analysis",
+      "error": "assert mount[\"variant\"] == \"updated\"",
+      "cause": "Inherited decoder assumed only the candidate used optional RESTART; both causal variants do.",
+      "correction": "Accept both verified causal variant labels without changing checkpoint or sync decoding."
+    }
+  ]
+}

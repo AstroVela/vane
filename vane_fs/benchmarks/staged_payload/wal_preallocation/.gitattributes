@@ -1,0 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+# A unified diff uses a leading space before its tab-indented context lines.
+reserve.patch whitespace=-space-before-tab

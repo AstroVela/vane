@@ -1,0 +1,49 @@
+--- a/src/checkpoint.hpp
++++ b/src/checkpoint.hpp
+@@ -144,16 +144,28 @@
+ 			}
+ 			requested = false;
+ 			lock.unlock();
+-			int frames = -1, copied = -1, code;
++			int frames = -1, copied = -1, code = SQLITE_OK;
++			bool deferred = false;
+ 			{
+ 				std::lock_guard<std::mutex> checkpoint_lock(checkpoint_mutex);
+-				code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
++				if (!retry) {
++					// A retained WAL can already be mostly backfilled. Batch fresh
++					// work by its uncopied bytes instead of syncing each tiny commit
++					// after the total WAL has first crossed the wake threshold.
++					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied);
++					deferred =
++					    code == SQLITE_OK && frames >= copied && copied >= 0 && Bytes(frames - copied) < START_BYTES;
++				}
++				// Once a real checkpoint has started, preserve the existing retry
++				// behavior for blocked readers and storage errors.
++				if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY))
++					code = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_PASSIVE, &frames, &copied);
+ 			}
+ 			if (code != SQLITE_OK && code != SQLITE_BUSY) {
+ 				int expected = SQLITE_OK;
+ 				error.compare_exchange_strong(expected, code);
+ 			}
+-			retry = code != SQLITE_OK || frames > copied;
++			retry = !deferred && (code != SQLITE_OK || frames > copied);
+ 			lock.lock();
+ 		}
+ 	}
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,3 +91,12 @@
+     set_tests_properties(vane_fs_crash PROPERTIES TIMEOUT 60)
+   endif()
+ endif()
++
++if(VANE_FS_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  add_executable(vane_fs_checkpoint_coalescing_test tests/test_checkpoint_coalescing.cpp)
++  target_include_directories(vane_fs_checkpoint_coalescing_test PRIVATE src)
++  target_link_libraries(vane_fs_checkpoint_coalescing_test PRIVATE vane_fs unofficial::sqlite3::sqlite3)
++  target_link_options(vane_fs_checkpoint_coalescing_test PRIVATE "LINKER:--wrap=sqlite3_wal_checkpoint_v2")
++  add_test(NAME vane_fs_checkpoint_coalescing COMMAND vane_fs_checkpoint_coalescing_test "${CMAKE_CURRENT_BINARY_DIR}/owned-coalescing-test")
++  set_tests_properties(vane_fs_checkpoint_coalescing PROPERTIES TIMEOUT 30)
++endif()

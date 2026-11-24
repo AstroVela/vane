@@ -1,0 +1,23 @@
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -304,6 +304,20 @@
+ 			if (fence.fd >= 0 || std::filesystem::exists(path + ".stage-fence"))
+ 				Fail("Existing publication fence");
+ 			fence.Open(path + ".stage-fence", true);
++			// Materialize the second slot before the existing initial barrier.
++			// It stays invalid until Save writes a checksummed record. This avoids
++			// allocating/extending the fence during the first OPEN publication.
++			Record empty {};
++			size_t written = 0;
++			while (written < empty.size()) {
++				auto n = pwrite(fence.fd, empty.data() + written, empty.size() - written,
++				                4096 + int64_t(written));
++				if (n < 0 && errno == EINTR)
++					continue;
++				if (n <= 0)
++					IO("Materializing publication fence");
++				written += size_t(n);
++			}
+ 			Save(false);
+ 			int directory = open(std::filesystem::path(path).parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+ 			if (directory < 0)

@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "duckdb/common/environment.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -71,11 +72,12 @@ inline string NormalizeRunnerType(string runner_type) {
 		throw InvalidInputException("Invalid runner type '%s'. Please use 'local-fast', 'local', or 'ray'.",
 		                            runner_type);
 	}
-	return runner_type;
+	return runner_type == "local-fast" ? "local" : runner_type;
 }
 
 inline string ResolveRunnerTypeFromEnvironment() {
-	const char *env = std::getenv("VANE_RUNNER");
+	const duckdb::EnvironmentVariable env_env("VANE_RUNNER");
+	const char *env = env_env.GetValue();
 	if (env) {
 		auto runner_type = NormalizeRunnerType(string(env));
 		if (runner_type.empty()) {
@@ -125,6 +127,8 @@ struct UDFFunctionData : public FunctionData {
 	Value payload;
 	LogicalType return_type;
 	shared_ptr<void> actor_handles;
+	//! Execution-time capacity, supplied with the query's prepared actor resources.
+	idx_t transport_input_target_bytes = 0;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

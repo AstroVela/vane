@@ -1,0 +1,96 @@
+{
+  "status": "PASS",
+  "recorded_epoch": 1792483223.5898788,
+  "comparison_base": "b7c00df040418a1e252044960503349ebeb4f62c",
+  "source_commit": "5f13479740e5d94c36370aa0ebf12a47d8f65e9a",
+  "scope": "Lint-only benchmark helper fixes, no native build or benchmark runs",
+  "commands": [
+    {
+      "label": "format-after",
+      "argv": [
+        "scripts/format",
+        "workspace",
+        "--from-ref",
+        "b7c00df040418a1e252044960503349ebeb4f62c",
+        "--check"
+      ],
+      "exit_code": 0,
+      "started_epoch": 1792483205.2341397,
+      "ended_epoch": 1792483216.1745253,
+      "log": "format-after.log"
+    },
+    {
+      "label": "hooks-after",
+      "argv": [
+        "pre-commit",
+        "run",
+        "--show-diff-on-failure",
+        "--color=never",
+        "--from-ref",
+        "b7c00df040418a1e252044960503349ebeb4f62c",
+        "--to-ref",
+        "HEAD"
+      ],
+      "exit_code": 0,
+      "started_epoch": 1792483216.1745672,
+      "ended_epoch": 1792483218.3404021,
+      "log": "hooks-after.log"
+    },
+    {
+      "label": "review-files",
+      "argv": [
+        "pre-commit",
+        "run",
+        "--show-diff-on-failure",
+        "--color=never",
+        "--files",
+        "vane_fs/benchmarks/pre_merge_review/fix-format.log",
+        "vane_fs/benchmarks/pre_merge_review/format-after.log",
+        "vane_fs/benchmarks/pre_merge_review/hooks-after.log",
+        "vane_fs/benchmarks/pre_merge_review/README.md",
+        "vane_fs/benchmarks/pre_merge_review/github-before.json",
+        "vane_fs/benchmarks/pre_merge_review/verification.json",
+        "vane_fs/benchmarks/pre_merge_review/format-before.log",
+        "vane_fs/benchmarks/pre_merge_review/hooks-before.log",
+        "vane_fs/benchmarks/pre_merge_review/snapshots.json",
+        "vane_fs/benchmarks/pre_merge_review/ruff-before.json",
+        "vane_fs/benchmarks/pre_merge_review/evidence/verify.py.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/performance_closeout/shipping.py/000.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py/000.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py/000.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/staged_payload/paced_request_waits/run.py/000.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py/000.gz.part",
+        "vane_fs/benchmarks/pre_merge_review/evidence/vane_fs/benchmarks/lookup_reads/run.py/000.gz.part"
+      ],
+      "exit_code": 0,
+      "started_epoch": 1792483218.3424156,
+      "ended_epoch": 1792483218.876576,
+      "log": "review-files.log"
+    },
+    {
+      "label": "copyleft",
+      "argv": [
+        "python3",
+        "-I",
+        "scripts/check_copyleft.py"
+      ],
+      "exit_code": 0,
+      "started_epoch": 1792483218.8766043,
+      "ended_epoch": 1792483223.5622642,
+      "log": "copyleft.log"
+    },
+    {
+      "label": "whitespace",
+      "argv": [
+        "git",
+        "diff",
+        "--check",
+        "HEAD"
+      ],
+      "exit_code": 0,
+      "started_epoch": 1792483223.5623055,
+      "ended_epoch": 1792483223.5898433,
+      "log": "whitespace.log"
+    }
+  ]
+}

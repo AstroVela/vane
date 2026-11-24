@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/sorting/hashed_sort.hpp"
 #include "duckdb/common/sorting/sorted_run.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
@@ -296,6 +302,14 @@ public:
 	// OVER(PARTITION BY...) (hash grouping)
 	GroupingPartition local_grouping;
 	GroupingAppend grouping_append;
+
+	void ResetBatchInput() override {
+		hash_exec.ResetInput();
+		sort_exec.ResetInput();
+		group_chunk.Reset();
+		sort_chunk.Reset();
+		payload_chunk.Reset();
+	}
 };
 
 HashedSortLocalSinkState::HashedSortLocalSinkState(ExecutionContext &context, const HashedSort &hashed_sort)

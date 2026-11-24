@@ -9,17 +9,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/execution/udf_executor.hpp"
+#include "duckdb/execution/execution_runtime.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
-static udf_executor_factory_t udf_executor_factory = nullptr;
-
-void SetUDFExecutorFactory(udf_executor_factory_t factory) {
-	udf_executor_factory = factory;
+void SetUDFExecutorFactory(DatabaseInstance &db, udf_executor_factory_t factory) {
+	auto &runtime = db.GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	runtime.udf_executor_factory = factory;
 }
 
-udf_executor_factory_t GetUDFExecutorFactory() {
-	return udf_executor_factory;
+udf_executor_factory_t GetUDFExecutorFactory(ClientContext &context) {
+	auto &runtime = DatabaseInstance::GetDatabase(context).GetExecutionRuntime();
+	lock_guard<mutex> guard(runtime.lock);
+	return runtime.udf_executor_factory;
 }
 
 } // namespace duckdb

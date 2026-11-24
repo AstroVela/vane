@@ -1,0 +1,110 @@
+FUSE library version: 3.14.0
+unique: 2, opcode: INIT (26), nodeid: 0, insize: 104, pid: 0
+INIT: 7.40
+flags=0x73fffffb
+max_readahead=0x00020000
+   INIT: 7.31
+   flags=0x40409029
+   max_readahead=0x00020000
+   max_write=0x00100000
+   max_background=0
+   congestion_threshold=0
+   time_gran=1
+   unique: 2, success, outsize: 80
+unique: 4, opcode: GETATTR (3), nodeid: 1, insize: 56, pid: 1698359
+   unique: 4, success, outsize: 120
+unique: 6, opcode: LOOKUP (1), nodeid: 1, insize: 47, pid: 1698359
+   unique: 6, error: -2 (No such file or directory), outsize: 16
+unique: 8, opcode: MKDIR (9), nodeid: 1, insize: 55, pid: 1698359
+   unique: 8, success, outsize: 144
+unique: 10, opcode: GETATTR (3), nodeid: 1, insize: 56, pid: 1698359
+   unique: 10, success, outsize: 120
+unique: 12, opcode: LOOKUP (1), nodeid: 2, insize: 45, pid: 1698359
+   unique: 12, error: -2 (No such file or directory), outsize: 16
+unique: 14, opcode: CREATE (35), nodeid: 2, insize: 61, pid: 1698359
+   unique: 14, success, outsize: 160
+unique: 16, opcode: IOCTL (39), nodeid: 3, insize: 72, pid: 1698359
+   unique: 16, error: -38 (Function not implemented), outsize: 16
+unique: 18, opcode: WRITE (16), nodeid: 3, insize: 8273, pid: 1698359
+NOTIFY: code=2 length=40
+   unique: 18, success, outsize: 24
+unique: 20, opcode: FLUSH (25), nodeid: 3, insize: 64, pid: 1698359
+   unique: 20, success, outsize: 16
+unique: 22, opcode: RELEASE (18), nodeid: 3, insize: 64, pid: 0
+   unique: 22, success, outsize: 16
+unique: 24, opcode: GETATTR (3), nodeid: 2, insize: 56, pid: 1698359
+   unique: 24, success, outsize: 120
+unique: 26, opcode: GETATTR (3), nodeid: 3, insize: 56, pid: 1698359
+   unique: 26, success, outsize: 120
+unique: 28, opcode: LOOKUP (1), nodeid: 2, insize: 45, pid: 1698359
+   unique: 28, error: -2 (No such file or directory), outsize: 16
+unique: 30, opcode: LOOKUP (1), nodeid: 2, insize: 45, pid: 1698359
+   unique: 30, error: -2 (No such file or directory), outsize: 16
+unique: 32, opcode: OPEN (14), nodeid: 3, insize: 48, pid: 1698359
+   unique: 32, success, outsize: 32
+unique: 34, opcode: IOCTL (39), nodeid: 3, insize: 72, pid: 1698359
+   unique: 34, error: -38 (Function not implemented), outsize: 16
+unique: 36, opcode: LOOKUP (1), nodeid: 2, insize: 45, pid: 1698359
+   unique: 36, error: -2 (No such file or directory), outsize: 16
+unique: 38, opcode: CREATE (35), nodeid: 2, insize: 61, pid: 1698359
+   unique: 38, success, outsize: 160
+unique: 40, opcode: IOCTL (39), nodeid: 4, insize: 72, pid: 1698359
+   unique: 40, error: -38 (Function not implemented), outsize: 16
+unique: 42, opcode: READ (15), nodeid: 3, insize: 80, pid: 1698359
+   unique: 42, success, outsize: 8209
+unique: 44, opcode: WRITE (16), nodeid: 4, insize: 8273, pid: 1698359
+NOTIFY: code=2 length=40
+   unique: 44, success, outsize: 24
+unique: 46, opcode: FLUSH (25), nodeid: 4, insize: 64, pid: 1698359
+   unique: 46, success, outsize: 16
+unique: 48, opcode: RELEASE (18), nodeid: 4, insize: 64, pid: 0
+   unique: 48, success, outsize: 16
+unique: 50, opcode: FLUSH (25), nodeid: 3, insize: 64, pid: 1698359
+   unique: 50, success, outsize: 16
+unique: 52, opcode: RELEASE (18), nodeid: 3, insize: 64, pid: 0
+   unique: 52, success, outsize: 16
+unique: 54, opcode: GETATTR (3), nodeid: 2, insize: 56, pid: 1698359
+   unique: 54, success, outsize: 120
+unique: 56, opcode: GETATTR (3), nodeid: 4, insize: 56, pid: 1698359
+   unique: 56, success, outsize: 120
+unique: 58, opcode: OPEN (14), nodeid: 4, insize: 48, pid: 1698359
+   unique: 58, success, outsize: 32
+unique: 60, opcode: IOCTL (39), nodeid: 4, insize: 72, pid: 1698359
+   unique: 60, error: -38 (Function not implemented), outsize: 16
+unique: 62, opcode: READ (15), nodeid: 4, insize: 80, pid: 1698359
+   unique: 62, success, outsize: 8209
+unique: 64, opcode: READ (15), nodeid: 4, insize: 80, pid: 1698359
+   unique: 64, success, outsize: 16
+unique: 66, opcode: FLUSH (25), nodeid: 4, insize: 64, pid: 1698359
+   unique: 66, success, outsize: 16
+unique: 68, opcode: RELEASE (18), nodeid: 4, insize: 64, pid: 0
+   unique: 68, success, outsize: 16
+unique: 70, opcode: SETATTR (4), nodeid: 3, insize: 128, pid: 1698359
+   unique: 70, success, outsize: 120
+unique: 72, opcode: SETATTR (4), nodeid: 3, insize: 128, pid: 1698359
+   unique: 72, success, outsize: 120
+unique: 74, opcode: LOOKUP (1), nodeid: 2, insize: 45, pid: 1698359
+   unique: 74, success, outsize: 144
+unique: 76, opcode: LOOKUP (1), nodeid: 2, insize: 46, pid: 1698359
+   unique: 76, error: -2 (No such file or directory), outsize: 16
+unique: 78, opcode: OPENDIR (27), nodeid: 2, insize: 48, pid: 1698359
+   unique: 78, success, outsize: 32
+unique: 80, opcode: LOOKUP (1), nodeid: 1, insize: 48, pid: 1698359
+   unique: 80, error: -2 (No such file or directory), outsize: 16
+unique: 82, opcode: RENAME (12), nodeid: 1, insize: 63, pid: 1698359
+   unique: 82, success, outsize: 16
+unique: 84, opcode: LOOKUP (1), nodeid: 2, insize: 49, pid: 1698359
+   unique: 84, error: -2 (No such file or directory), outsize: 16
+unique: 86, opcode: CREATE (35), nodeid: 2, insize: 65, pid: 1698359
+   unique: 86, success, outsize: 160
+unique: 88, opcode: WRITE (16), nodeid: 5, insize: 93, pid: 1698359
+NOTIFY: code=2 length=40
+   unique: 88, success, outsize: 24
+unique: 90, opcode: FLUSH (25), nodeid: 5, insize: 64, pid: 1698359
+   unique: 90, success, outsize: 16
+unique: 92, opcode: RELEASE (18), nodeid: 5, insize: 64, pid: 0
+   unique: 92, success, outsize: 16
+unique: 94, opcode: FSYNCDIR (30), nodeid: 2, insize: 56, pid: 1698359
+   unique: 94, success, outsize: 16
+unique: 96, opcode: RELEASEDIR (29), nodeid: 2, insize: 64, pid: 0
+   unique: 96, success, outsize: 16

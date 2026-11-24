@@ -1,0 +1,10 @@
+PASS threshold, writer progress, independent lease, OPEN and authoritative FULL
+PASS repeated budget, explicit-FULL reset and reopen
+PASS FULL during preflush, monotonic completion and late-commit wake
+PASS asynchronous error/retry and failed barrier
+PASS asynchronous error/retry and failed close
+PASS no rollback notification, conservative bytes and GC
+PASS GC exclusion, pinned snapshots and monotonic budget after tail reuse
+PASS fork abandonment preserves the parent's lease
+PASS strict mode has no prewriteback worker
+PASS nine advisory prewriteback cases

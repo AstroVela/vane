@@ -1,0 +1,53 @@
+{
+  "status": "PASS",
+  "returncode": 1,
+  "started_epoch": 1792304253.2900534,
+  "ended_epoch": 1792304263.8037868,
+  "log": "/home/kaka/astrovela_vane-fs/vane_fs/build/payload-progress-20261018/regression-before.log",
+  "text": "Timed out waiting for payload progress\n",
+  "helper_sha256": "182db0325031a1d9b44bc1b8473806ae7d491a74285524734547a5a6dd0b2148",
+  "cleanup": {
+    "path": "/dev/shm/owned-payload-before-2eeymw2f",
+    "removed": true,
+    "process_stopped": true,
+    "mount_absent": true,
+    "files": {
+      "reset.sqlite.stage-checkpoint": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-fence": {
+        "bytes": 8192,
+        "sha256": "dd9b4841a35cfb599ecc53daaa67a0ae5b930f8be1eb060a1264a6550589abf9"
+      },
+      "reset.sqlite-shm": {
+        "bytes": 32768,
+        "sha256": "12e43863246f237d2c89ae90e37e09e97bb0f9013c1f83b231eec98b59e0b8ca"
+      },
+      "reset.sqlite-wal": {
+        "bytes": 337872,
+        "sha256": "51e8c550e3a804b4fe47efb2dae4c2f0fedacafd4cd7fe3443ea210f90ea4727"
+      },
+      "reset.sqlite.payload": {
+        "bytes": 67112960,
+        "sha256": "0361aa18800050e4b80f35ab8689082570bbb36645a7d5512bd5ca72c4ec6bf6"
+      },
+      "reset.sqlite": {
+        "bytes": 4096,
+        "sha256": "da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"
+      },
+      "reset.sqlite.stage-publish": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-live": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "reset.sqlite.stage-init": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  }
+}

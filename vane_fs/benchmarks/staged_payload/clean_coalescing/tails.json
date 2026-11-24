@@ -1,0 +1,112 @@
+[
+  {
+    "window": "lookup-ablation",
+    "state": "fuse",
+    "variant": "updated",
+    "rep": 4,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 3.2290700770681724
+  },
+  {
+    "window": "lookup-ablation",
+    "state": "aged_fuse",
+    "variant": "baseline",
+    "rep": 1,
+    "workload": "stream_256",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 4.133175670052879
+  },
+  {
+    "window": "clean-ablation",
+    "state": "fuse",
+    "variant": "baseline",
+    "rep": 1,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 5.679959619068541
+  },
+  {
+    "window": "clean-ablation",
+    "state": "fuse",
+    "variant": "baseline",
+    "rep": 5,
+    "workload": "write_64",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 4.680657388991676
+  },
+  {
+    "window": "clean-ablation",
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 2,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 5.02565604809206
+  },
+  {
+    "window": "original-control",
+    "state": "fuse",
+    "variant": "updated",
+    "rep": 3,
+    "workload": "write_64",
+    "field": "write_latencies",
+    "index": 23,
+    "seconds": 3.1704156760824844
+  },
+  {
+    "window": "production-fuse",
+    "state": "fuse",
+    "variant": "baseline",
+    "rep": 2,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 6,
+    "seconds": 2.1253804709995165
+  },
+  {
+    "window": "production-fuse",
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 0,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 24,
+    "seconds": 6.987797113950364
+  },
+  {
+    "window": "production-fuse",
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 2,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 5,
+    "seconds": 6.900382474064827
+  },
+  {
+    "window": "production-fuse",
+    "state": "aged_fuse",
+    "variant": "updated",
+    "rep": 4,
+    "workload": "write_64",
+    "field": "write_latencies",
+    "index": 26,
+    "seconds": 6.649498402955942
+  },
+  {
+    "window": "production-fuse",
+    "state": "aged_fuse",
+    "variant": "baseline",
+    "rep": 5,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.1656069920863956
+  }
+]

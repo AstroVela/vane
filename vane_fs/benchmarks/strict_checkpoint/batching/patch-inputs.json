@@ -1,0 +1,22 @@
+{
+  "src/checkpoint.hpp": {
+    "baseline": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "candidate": "295232ca6980c46d4d3d0d3e86a0d8e815cadaf00a6d1684b89afa76d1dc74e1"
+  },
+  "src/workspace.cpp": {
+    "baseline": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "candidate": "6b81e6fb739c530f8a5a46f01357fea2d12ecf9ed2d4f59b2e3b399b6cbaa410"
+  },
+  "tests/test_checkpoint.cpp": {
+    "baseline": "cd298919190e5e784c17e554dc7ed540dcc226ffe5d006a171f91156e908148e",
+    "candidate": "135b7525925169dffe6ad53296d9b0f1ac7ae0f452368fa531a8cf3d7d05d814"
+  },
+  "CMakeLists.txt": {
+    "baseline": "e23d3a656f811125dd032dd65adec38c65348fb28549c9010d496af006fa5748",
+    "candidate": "79f91bb6c8f4df0a37a0635bab5adf3111d98dc328c34407f3f2a29b289d776d"
+  },
+  "tests/test_checkpoint_batching.cpp": {
+    "baseline": null,
+    "candidate": "5c2c882f0b58be1f9ec2b1caa6e0043291c18ca101e75c161d9e448d51d8c36e"
+  }
+}

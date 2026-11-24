@@ -1,0 +1,1 @@
+{"status":"PASS","runs":[{"label":"sanitize-tests","argv":["ctest","--test-dir","/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-batching-20261012T052240Z/updated/sanitize","--output-on-failure"],"returncode":0,"started_epoch":1791783110.793654,"ended_epoch":1791783143.807598}]}

@@ -1,0 +1,68 @@
+{
+  "status": "PASS",
+  "runs": [
+    {
+      "label": "baseline-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/baseline/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791708422.8878086,
+      "ended_epoch": 1791708442.2584937
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791708442.259147,
+      "ended_epoch": 1791708478.8781605
+    },
+    {
+      "label": "updated-module-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791708478.879376,
+      "ended_epoch": 1791708478.9444273
+    },
+    {
+      "label": "updated-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/owned-python",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/updated/tests"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791708478.945178,
+      "ended_epoch": 1791708570.1106956
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/external-partial-20261011T083153Z/owned-python",
+      "removed": true
+    }
+  ],
+  "ended_epoch": 1791708570.3042207
+}

@@ -173,10 +173,11 @@ def parse_manifest(contents: bytes) -> dict[str, Any]:
         raise ValueError("unsupported native runtime distribution")
     release = version(value["version"])
     if not re.fullmatch(
-        r"manylinux_(?:0|[1-9][0-9]*)_(?:0|[1-9][0-9]*)_x86_64",
+        r"(?:manylinux_(?:0|[1-9][0-9]*)_(?:0|[1-9][0-9]*)_x86_64"
+        r"|macosx_(?:0|[1-9][0-9]*)_(?:0|[1-9][0-9]*)_(?:arm64|x86_64)|win_amd64)",
         _text(value["platform"], 80),
     ):
-        raise ValueError("native runtime currently supports manylinux x86-64 only")
+        raise ValueError("native runtime requires a supported 64-bit Linux, macOS or Windows platform tag")
     if re.fullmatch(r"vane_media_[a-z0-9_]{1,64}", filename(value["namespace"])) is None:
         raise ValueError("invalid native runtime namespace")
     if value["namespace"] != runtime_namespace(value):
@@ -253,12 +254,32 @@ def reference(contents: bytes) -> dict[str, str]:
     }
 
 
+def filesystem_path(path: Path) -> Path:
+    """Allow private Windows cache children to exceed MAX_PATH without registry changes."""
+    if os.name != "nt":
+        return path
+    value = os.path.abspath(path)
+    if value.startswith(("\\\\?\\", "\\\\.\\")):
+        return Path(value)
+    return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+
+
 def read_file(directory: Path, name: str, maximum: int = MAX_FILE_BYTES) -> bytes:
     name = filename(name)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    with os.fdopen(os.open(directory / name, flags), "rb") as stream:
+    path = filesystem_path(directory / name)
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or getattr(before, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+    ):
+        raise ValueError("native runtime files must be regular files without reparse points")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= maximum:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not 0 < info.st_size <= maximum
+            or (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino)
+        ):
             raise ValueError("native runtime files must be bounded nonempty regular files")
         value = stream.read(maximum + 1)
         if len(value) != info.st_size or len(value) > maximum:
@@ -267,7 +288,11 @@ def read_file(directory: Path, name: str, maximum: int = MAX_FILE_BYTES) -> byte
 
 
 def verify_files(directory: Path, manifest: dict[str, Any]) -> None:
-    if directory.is_symlink() or not directory.is_dir():
+    directory = filesystem_path(directory)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+    ):
         raise ValueError("native runtime libraries must be a regular directory")
     if set(item.name for item in directory.iterdir()) != set(manifest["files"]):
         raise ValueError("native runtime library directory differs from its manifest")

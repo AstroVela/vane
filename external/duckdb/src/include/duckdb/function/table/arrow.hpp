@@ -40,11 +40,14 @@ struct ArrowProjectedColumns {
 struct ArrowStreamParameters {
 	ArrowProjectedColumns projected_columns;
 	TableFilterSet *filters;
+	//! Context executing this scan, which can differ from the factory's creator.
+	optional_ptr<ClientContext> context;
 };
 
 typedef unique_ptr<ArrowArrayStreamWrapper> (*stream_factory_produce_t)(uintptr_t stream_factory_ptr,
                                                                         ArrowStreamParameters &parameters);
-typedef void (*stream_factory_get_schema_t)(ArrowArrayStream *stream_factory_ptr, ArrowSchema &schema);
+typedef void (*stream_factory_get_schema_t)(ArrowArrayStream *stream_factory_ptr, ArrowSchema &schema,
+                                            ClientContext &context);
 
 struct ArrowScanFunctionData : public TableFunctionData {
 public:

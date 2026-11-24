@@ -1,0 +1,263 @@
+--- a/src/prewriteback.hpp
++++ b/src/prewriteback.hpp
+@@ -9,11 +9,12 @@
+ #include <mutex>
+ 
+ namespace vane_fs {
+-// Advisory data writeback only. This worker owns no SQLite connection and
+-// never advances publication, WAL checkpoint state, or a durability promise.
++// Optional finite data submission. Neither completion nor a FULL pause makes
++// this worker a durability authority; publication retains its own barriers.
+ class Prewriteback {
+ public:
+ 	static constexpr uint64_t START_BYTES = 64 * 1024 * 1024;
++	static constexpr int64_t BATCH_BYTES = 4 * 1024 * 1024;
+ 	Prewriteback(const std::string &database, int timeout)
+ 	    : file(std::make_unique<PayloadFile>(database, false, timeout)) {
+ 		Start();
+@@ -36,17 +37,39 @@
+ 			worker.join();
+ 	}
+ 	void AbandonInherited() {
+-		// Close the child's duplicate, without unlocking the parent's lease or
+-		// touching a mutex/thread object inherited from a vanished thread.
+ 		file.reset();
+ 	}
+ 	void CheckError() {
+ 		if (error.exchange(false))
+ 			throw Error(ErrorCode::Storage, "Background payload prewriteback failed");
+ 	}
+-	// The caller holds its Database mutex. Notify only after successful SQL
+-	// commit; an authoritative FULL barrier may also retire earlier requests.
+-	// Neither path may report failure after the commit has already succeeded.
++	// Stop new claims, without waiting for an active or already claimed call.
++	// A nested pause remains effective until its last owner releases it.
++	class Pause {
++	public:
++		explicit Pause(Prewriteback *worker, bool enabled = true) : worker(enabled ? worker : nullptr) {
++			if (this->worker) {
++				std::lock_guard<std::mutex> lock(worker->mutex);
++				++worker->pauses;
++				worker->wake.notify_all();
++			}
++		}
++		~Pause() {
++			if (worker) {
++				std::lock_guard<std::mutex> lock(worker->mutex);
++				--worker->pauses;
++				worker->wake.notify_all();
++			}
++		}
++		Pause(const Pause &) = delete;
++		Pause &operator=(const Pause &) = delete;
++
++	private:
++		Prewriteback *worker;
++	};
++	void Retire() noexcept {
++		OnCommit(0, true, {});
++	}
+ 	void OnCommit(uint64_t appended, bool full, std::pair<int64_t, int64_t> range) noexcept {
+ 		try {
+ 			bool notify;
+@@ -54,12 +77,13 @@
+ 				std::lock_guard<std::mutex> lock(mutex);
+ 				requested = std::max(requested, appended);
+ 				if (full) {
+-					completed = std::max(completed, appended);
++					completed = requested;
+ 					pending = {};
++					draining = false;
+ 				} else {
+ 					Merge(range);
+ 				}
+-				notify = full || requested - completed >= START_BYTES;
++				notify = full || draining || requested - completed >= START_BYTES;
+ 			}
+ 			if (notify)
+ 				wake.notify_one();
+@@ -77,32 +101,43 @@
+ 	}
+ 	void Run() {
+ 		std::unique_lock<std::mutex> lock(mutex);
+-		while (true) {
+-			wake.wait(lock, [this] { return stopped || requested - completed >= START_BYTES; });
++		for (;;) {
++			wake.wait(lock,
++			          [this] { return stopped || (!pauses && (draining || requested - completed >= START_BYTES)); });
+ 			if (stopped)
+ 				return;
++			if (std::chrono::steady_clock::now() < next) {
++				wake.wait_until(lock, next, [this] {
++					return stopped || pauses || (!draining && requested - completed < START_BYTES);
++				});
++				continue;
++			}
++			draining = true;
+ 			auto target = requested;
+ 			lock.unlock();
+-			bool success = false;
++			bool success = false, last = false, skipped = false;
+ 			std::pair<int64_t, int64_t> range {};
+ 			try {
+-				// This separate open-file description must not share flock state
+-				// with writer transactions. SH permits appends and excludes GC.
++				// Independent SH lease allows appends and excludes GC. Recheck
++				// pause/retirement after waiting, before claiming any queued bytes.
+ 				PayloadFile::Guard lease(*file, false);
+ 				{
+ 					std::lock_guard<std::mutex> state(mutex);
+-					// GC or another FULL barrier may have retired this request
+-					// while the worker waited for the payload lease.
+ 					if (stopped)
+ 						return;
+-					if (completed >= target) {
+-						success = true;
++					if (pauses || completed >= target) {
++						skipped = true;
+ 					} else {
+ 						target = requested;
+-						range = std::exchange(pending, {});
++						auto end = std::min(pending.second, file->WritebackSize());
++						auto begin = std::min(pending.first, end);
++						range = {begin, begin + std::min(end - begin, BATCH_BYTES)};
++						pending =
++						    range.second < end ? std::make_pair(range.second, end) : std::pair<int64_t, int64_t> {};
++						last = !pending.second;
+ 					}
+ 				}
+-				if (!success) {
++				if (!skipped) {
+ 					file->WritebackRange(range);
+ 					success = true;
+ 				}
+@@ -113,26 +148,31 @@
+ 				error.store(true);
+ 			}
+ 			lock.lock();
+-			if (success)
+-				completed = std::max(completed, target);
+-			else {
+-				// Retry the claimed range together with later commits, unless a
+-				// successful FULL barrier already retired the captured target.
++			if (skipped)
++				continue;
++			// Keep the completion-to-next-start deadline across Stop/Start.
++			next = std::chrono::steady_clock::now() + std::chrono::milliseconds(16);
++			if (success) {
++				if (last)
++					completed = std::max(completed, target);
++				if (!pending.second)
++					draining = false;
++			} else {
+ 				if (completed < target)
+ 					Merge(range);
+-				wake.wait_for(lock, std::chrono::milliseconds(20), [this] { return stopped; });
++				wake.wait_for(lock, std::chrono::milliseconds(20), [this] { return stopped || pauses; });
+ 			}
+ 		}
+ 	}
+-
+ 	std::unique_ptr<PayloadFile> file;
+ 	std::mutex mutex;
+ 	std::condition_variable wake;
+ 	std::thread worker;
+ 	std::atomic<bool> error {false};
+-	// completed means submitted (or retired by FULL), never durable.
+ 	uint64_t requested = 0, completed = 0;
+ 	std::pair<int64_t, int64_t> pending {};
+-	bool stopped = false;
++	std::chrono::steady_clock::time_point next {};
++	unsigned pauses = 0;
++	bool stopped = false, draining = false;
+ };
+ } // namespace vane_fs
+--- a/src/payload_file.hpp
++++ b/src/payload_file.hpp
+@@ -154,6 +154,8 @@
+ 	std::pair<int64_t, int64_t> TakeWritebackRange() {
+ 		return std::exchange(pending_range, {});
+ 	}
++	// Called under the worker's independent shared GC lease.
++	int64_t WritebackSize() { return Size(); }
+ 	void WritebackRange(std::pair<int64_t, int64_t> range) {
+ 		// The caller holds its independent shared payload lease. GC may
+ 		// have reclaimed earlier pending bytes before that lease began.
+--- a/src/staging.hpp
++++ b/src/staging.hpp
+@@ -7,6 +7,7 @@
+ // participate. An OPEN fence excludes metadata whose external bytes have not
+ // passed a data barrier; a CLEAN fence permits ordinary SQLite WAL recovery.
+ #include "payload_file.hpp"
++#include "prewriteback.hpp"
+ #include <array>
+ #include <mutex>
+ 
+@@ -385,15 +386,18 @@
+ 		if (Pending())
+ 			Save(false);
+ 	}
++	void AttachPrewriteback(Prewriteback *worker) { prewriteback = worker; }
+ 	void Publish(sqlite3 *db) {
+ 		if (!Pending())
+ 			return;
++		Prewriteback::Pause pause(prewriteback);
+ 		Exec(db, "PRAGMA synchronous=FULL; BEGIN IMMEDIATE");
+ 		try {
+ 			Exec(db, "UPDATE sync_barrier SET value=1-value WHERE id=1");
+ 			BeforeFullCommit();
+ 			Exec(db, "COMMIT");
+ 			AfterFullCommit();
++			if (prewriteback) prewriteback->Retire();
+ 			Exec(db, "PRAGMA synchronous=NORMAL");
+ 		} catch (...) {
+ 			sqlite3_exec(db, "ROLLBACK; PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
+@@ -402,6 +406,7 @@
+ 	}
+ 
+ private:
++	Prewriteback *prewriteback = nullptr;
+ 	const int timeout;
+ 	std::string path, uuid;
+ 	File initialization, liveness, publication, fence, payload_barrier;
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -912,12 +912,14 @@
+ 				Statement pages(db, "PRAGMA page_size");
+ 				pages.Step();
+ 				prewriteback = std::make_unique<Prewriteback>(sqlite3_db_filename(db, "main"), timeout_ms);
++				staging->AttachPrewriteback(prewriteback.get());
+ 				checkpointer = std::make_unique<Checkpointer>(db, int(pages.Integer(0)), timeout_ms, *staging);
+ 				sqlite3_wal_hook(db, Checkpointer::OnCommit, checkpointer.get());
+ 			}
+ 			staging->Ready();
+ 		} catch (...) {
+ 			checkpointer.reset();
++			staging->AttachPrewriteback(nullptr);
+ 			prewriteback.reset();
+ 			if (db) {
+ 				statements.Clear();
+@@ -940,6 +942,7 @@
+ 			if (db)
+ 				sqlite3_wal_hook(db, nullptr, nullptr);
+ 			checkpointer.reset();
++			staging->AttachPrewriteback(nullptr);
+ 			prewriteback.reset();
+ 			if (db) {
+ 				statements.Clear();
+@@ -1030,6 +1033,7 @@
+ 		}
+ 	}
+ 	void Commit() {
++		Prewriteback::Pause pause(database.prewriteback.get(), full);
+ 		// OPEN keeps a durable recovery prefix while NORMAL commits remain visible.
+ 		if (full)
+ 			database.staging->BeforeFullCommit();
+@@ -2093,6 +2097,7 @@
+ 		statements.Clear();
+ 		sqlite3_wal_hook(db, nullptr, nullptr);
+ 		checkpointer.reset();
++		staging->AttachPrewriteback(nullptr);
+ 		prewriteback.reset();
+ 		Check(db, sqlite3_close(db));
+ 		db = nullptr;

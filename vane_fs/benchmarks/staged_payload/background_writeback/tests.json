@@ -1,0 +1,117 @@
+{
+  "status": "PASS",
+  "runs": [
+    {
+      "label": "baseline-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/baseline/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725355.5433931,
+      "ended_epoch": 1791725384.0386162
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725384.0392995,
+      "ended_epoch": 1791725411.8326733
+    },
+    {
+      "label": "updated-module-identity",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/venv/bin/python",
+        "-I",
+        "-c",
+        "import vane_fs._native as n;print(n.__file__);assert '/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/venv' in n.__file__"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725411.8339305,
+      "ended_epoch": 1791725411.8669636
+    },
+    {
+      "label": "updated-python",
+      "argv": [
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "--rootdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated",
+        "--confcutdir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated",
+        "--basetemp",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/owned-python",
+        "-q",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/tests"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725411.867951,
+      "ended_epoch": 1791725521.9368272
+    },
+    {
+      "label": "sanitize-configure",
+      "argv": [
+        "cmake",
+        "-S",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated",
+        "-B",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/sanitize",
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release",
+        "-DVANE_FS_BUILD_PYTHON=OFF",
+        "-DVANE_FS_BUILD_TOOLS=OFF",
+        "-DVANE_FS_BUILD_FUSE=OFF",
+        "-DVANE_FS_BUILD_TESTS=ON",
+        "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined",
+        "-DVANE_FS_TEST_SQLITE_SYNC=fsync"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725522.131942,
+      "ended_epoch": 1791725523.0486479
+    },
+    {
+      "label": "sanitize-build",
+      "argv": [
+        "cmake",
+        "--build",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/sanitize",
+        "-j",
+        "2"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725523.0493596,
+      "ended_epoch": 1791725571.1563504
+    },
+    {
+      "label": "sanitize-tests",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/updated/sanitize",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791725571.1573882,
+      "ended_epoch": 1791725611.6920533
+    }
+  ],
+  "cleanup": [
+    {
+      "path": "/home/kaka/astrovela_vane-fs/vane_fs/build/background-writeback-20261011T131926Z/owned-python",
+      "removed": true
+    }
+  ],
+  "ended_epoch": 1791725611.693354
+}

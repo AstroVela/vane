@@ -1,0 +1,5 @@
+/usr/bin/ld: /tmp/ccHUuFDb.o: in function `__wrap_pwrite':
+trace.cpp:(.text+0x15c2): undefined reference to `__real_pwrite'
+/usr/bin/ld: /tmp/ccHUuFDb.o: in function `__wrap_pread64':
+trace.cpp:(.text+0x1652): undefined reference to `__real_pread64'
+collect2: error: ld returned 1 exit status

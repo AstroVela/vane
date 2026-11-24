@@ -1,0 +1,7 @@
+Using Python 3.12.13 environment at: venv
+Resolved 1 package in 3ms
+   Building vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/clean-tail-budget-20261013/updated
+      Built vane-fs @ file:///home/kaka/astrovela_vane-fs/vane_fs/build/clean-tail-budget-20261013/updated
+Prepared 1 package in 30.85s
+Installed 1 package in 552ms
+ + vane-fs==0.1.0 (from file:///home/kaka/astrovela_vane-fs/vane_fs/build/clean-tail-budget-20261013/updated)

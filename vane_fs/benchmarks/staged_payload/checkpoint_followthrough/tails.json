@@ -1,0 +1,47 @@
+[
+  {
+    "window": "lookup-diagnostic",
+    "variant": "baseline",
+    "rep": 2,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.349539014045149
+  },
+  {
+    "window": "lookup-diagnostic",
+    "variant": "updated",
+    "rep": 1,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.2723152550170198
+  },
+  {
+    "window": "clean-diagnostic",
+    "variant": "baseline",
+    "rep": 1,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.2771206530742347
+  },
+  {
+    "window": "budget-ablation",
+    "variant": "updated",
+    "rep": 2,
+    "workload": "stream_256",
+    "field": "write_latencies",
+    "index": 12,
+    "seconds": 5.306708925985731
+  },
+  {
+    "window": "budget-ablation",
+    "variant": "baseline",
+    "rep": 0,
+    "workload": "random_write_4k",
+    "field": "fsync_seconds",
+    "index": 0,
+    "seconds": 1.4466550230281428
+  }
+]

@@ -1,0 +1,21 @@
+{
+  "kernel": "6.11.0-24-generic",
+  "machine": "x86_64",
+  "read_only": true,
+  "settings": {
+    "/sys/block/sda/queue/wbt_lat_usec": "2000",
+    "/sys/block/sda/queue/scheduler": "none [mq-deadline]",
+    "/sys/block/sda/queue/rotational": "0",
+    "/sys/block/sda/queue/nr_requests": "64",
+    "/sys/block/sda/queue/write_cache": "write back",
+    "/sys/block/sda/device/model": "Fanxiang S103Pro",
+    "/sys/block/sda/device/vendor": "ATA",
+    "/proc/self/cgroup": "0::/user.slice/user-1002.slice/session-4.scope",
+    "/sys/fs/cgroup/io.max": "FileNotFoundError",
+    "/sys/fs/cgroup/io.weight": "FileNotFoundError",
+    "/proc/sys/vm/dirty_background_bytes": "1610612736",
+    "/proc/sys/vm/dirty_bytes": "4294967296",
+    "/proc/sys/vm/dirty_background_ratio": "0",
+    "/proc/sys/vm/dirty_ratio": "0"
+  }
+}

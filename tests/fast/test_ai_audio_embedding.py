@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import AudioInputSpec, embed, embed_audio
+from vane.ai import AudioInput, AudioInputSpec, embed
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai.functions import _EmbedAudioBatch
 from vane.ai.protocols import AudioEmbedderDescriptor
@@ -165,14 +165,14 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
         rel = conn.table("clips")
         options = dict(provider=provider, model=model, batch_size=2, max_retries=0)
         if entry == "expression":
-            result = rel.select(vane.col("id"), embed_audio(vane.col("audio"), **options).alias("embedding"))
+            result = rel.select(vane.col("id"), embed(AudioInput(vane.col("audio")), **options).alias("embedding"))
         elif entry == "relation":
-            result = embed_audio(rel, vane.col("audio"), **options).select("id", "embedding")
+            result = embed(rel, AudioInput(vane.col("audio")), **options).select("id", "embedding")
         elif entry == "method":
-            result = rel.embed_audio(vane.col("audio"), **options).select("id", "embedding")
+            result = rel.embed(AudioInput(vane.col("audio")), **options).select("id", "embedding")
         else:
             result = conn.sql(
-                "SELECT id, ai_embed_audio(audio, provider => 'audio_fixture', "
+                "SELECT id, ai_embed(audio, input_spec => {kind: 'audio'}, provider => 'audio_fixture', "
                 f"model => '{model}', options => {{batch_size: 2, max_retries: 0}}) AS embedding FROM clips"
             )
         assert result.types[-1] == vane.array_type(vane.sqltypes.FLOAT, 3)
@@ -195,17 +195,19 @@ def test_public_audio_embedding(request, monkeypatch, provider, runner, entry, n
 )
 def test_undecoded_or_untyped_inputs_fail_binding(provider, value):
     with vane.connect() as conn:
-        with pytest.raises(Exception, match="ai_embed_audio requires"):
-            conn.sql(f"SELECT ai_embed_audio({value}, provider => 'audio_fixture')").fetchall()
+        with pytest.raises(Exception, match="ai_embed audio input requires"):
+            conn.sql(
+                f"SELECT ai_embed({value}, input_spec => {{kind: 'audio'}}, provider => 'audio_fixture')"
+            ).fetchall()
 
 
 def test_null_and_explain_do_not_load_models(provider):
     with vane.connect() as conn:
         assert conn.sql(
-            "SELECT ai_embed_audio(NULL, provider => 'audio_fixture', model => 'must_not_load')"
+            "SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'audio_fixture', model => 'must_not_load')"
         ).fetchall() == [(None,)]
         conn.sql(
-            "EXPLAIN SELECT ai_embed_audio(NULL, provider => 'audio_fixture', model => 'must_not_load')"
+            "EXPLAIN SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'audio_fixture', model => 'must_not_load')"
         ).fetchall()
 
 
@@ -226,7 +228,7 @@ def test_paired_clap_metadata_does_not_import_model_libraries(monkeypatch):
 
 def test_no_fallback_or_chunk_averaging(provider):
     with pytest.raises(ValueError, match="audio embedding provider"):
-        embed_audio(vane.col("audio"), provider="openai")
+        embed(AudioInput(vane.col("audio")), provider="openai")
     with pytest.raises(ValueError, match="requires model"):
         TransformersProvider().get_audio_embedder("unknown")
     with pytest.raises(ValueError, match="512"):
@@ -256,3 +258,39 @@ def test_clap_rejects_unsupported_configuration(options):
     for factory in (TransformersProvider().get_audio_embedder, TransformersProvider().get_text_embedder):
         with pytest.raises((ValueError, TypeError)):
             factory(CLAP_MODEL, options=options)
+
+
+def test_mlx_audio_null_and_explain_do_not_load_models(monkeypatch):
+    from vane.ai.providers.mlx import MLXAudioEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("NULL/planning instantiated the MLX audio model")
+
+    monkeypatch.setattr(MLXAudioEmbedderDescriptor, "instantiate", forbidden)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+        query = "SELECT ai_embed(NULL, input_spec => {kind: 'audio'}, provider => 'mlx')"
+        assert conn.sql(query).fetchall() == [(None,)]
+        conn.sql("EXPLAIN " + query).fetchall()
+
+
+@pytest.mark.parametrize("policy", ["raise", "ignore"])
+def test_mlx_audio_rate_and_channel_errors_precede_instantiation(monkeypatch, policy):
+    from vane.ai.provider import load_provider
+    from vane.ai.providers.mlx import MLXAudioEmbedderDescriptor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid PCM instantiated the MLX audio model")
+
+    monkeypatch.setattr(MLXAudioEmbedderDescriptor, "instantiate", forbidden)
+    descriptor = load_provider("mlx").get_audio_embedder()
+    for value in (audio(rate=48000, shape=(321, 1)), audio(rate=16000, shape=(321, 2))):
+        wrapper = _EmbedAudioBatch(descriptor, "audio", "embedding", 768, on_error=policy)
+        loop = asyncio.new_event_loop()
+        wrapper.bind_async_runtime(loop.run_until_complete)
+        try:
+            with pytest.raises(EmbeddingConfigurationError):
+                wrapper(pa.table({"audio": array([value])}))
+        finally:
+            wrapper.close()
+            loop.close()

@@ -1,0 +1,155 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -17,6 +17,7 @@
+ #include <mutex>
+ #include <random>
+ #include <set>
++#include <string_view>
+ #include <tuple>
+ #include <unordered_map>
+ #include <utility>
+@@ -157,7 +158,7 @@
+ 	void Bind(int index, const Coordinate &value) {
+ 		Check(db, sqlite3_bind_blob(statement, index, value.bytes.data(), 32, SQLITE_TRANSIENT));
+ 	}
+-	void BindBytes(int index, const std::string &value) {
++	void BindBytes(int index, std::string_view value) {
+ 		Check(db, sqlite3_bind_blob64(statement, index, value.data(), value.size(), SQLITE_TRANSIENT));
+ 	}
+ 	void BindNull(int index) {
+@@ -576,8 +577,8 @@
+ 	Put(db, BLOCKS, key, {sqlite3_last_insert_rowid(db)}, view);
+ }
+ 
+-void InsertNewBlocks(sqlite3 *db, int64_t inode, std::vector<std::pair<int64_t, std::string>> &blocks,
+-                     int64_t &last_payload, const View &view) {
++void InsertNewBlocks(sqlite3 *db, int64_t inode, std::vector<std::pair<int64_t, std::string_view>> &blocks,
++                     int64_t &last_payload, const View &view, const std::string &input, int64_t input_offset) {
+ 	if (blocks.empty()) {
+ 		return;
+ 	}
+@@ -593,12 +594,25 @@
+ 	}
+ 	int64_t external = 0;
+ 	if (blocks.size() == EXTERNAL_BYTES / BLOCK_SIZE) {
++		// Borrow only a complete contiguous interval of this call's input.
++		// Partial boundaries and skipped zero blocks retain the gather path.
++		auto first_byte = blocks.front().first * BLOCK_SIZE;
++		bool contiguous = first_byte >= input_offset && input.size() >= EXTERNAL_BYTES &&
++		                  uint64_t(first_byte - input_offset) <= input.size() - EXTERNAL_BYTES;
++		for (size_t i = 1; contiguous && i < blocks.size(); ++i)
++			contiguous = blocks[i].first == blocks.front().first + int64_t(i);
+ 		std::string bytes;
+-		bytes.reserve(blocks.size() * BLOCK_SIZE);
+-		for (const auto &block : blocks)
+-			bytes += block.second;
++		std::string_view data;
++		if (contiguous) {
++			data = std::string_view(input).substr(size_t(first_byte - input_offset), EXTERNAL_BYTES);
++		} else {
++			bytes.reserve(blocks.size() * BLOCK_SIZE);
++			for (const auto &block : blocks)
++				bytes.append(block.second.data(), block.second.size());
++			data = bytes;
++		}
+ 		Staging::Get(db).BeginBatch(db);
+-		external = PayloadFile::Get(db).Append(bytes);
++		external = PayloadFile::Get(db).Append(data);
+ 	}
+ 	Statement payloads(db, payload_sql), versions(db, version_sql);
+ 	versions.Bind(1, inode);
+@@ -608,8 +622,10 @@
+ 	for (size_t i = 0; i < blocks.size(); ++i) {
+ 		auto payload = ++last_payload;
+ 		payloads.Bind(int(1 + 2 * i), payload);
+-		payloads.BindBytes(int(2 + 2 * i),
+-		                   external ? PayloadFile::Token(external + int64_t(i) * BLOCK_SIZE) : blocks[i].second);
++		if (external)
++			payloads.BindBytes(int(2 + 2 * i), PayloadFile::Token(external + int64_t(i) * BLOCK_SIZE));
++		else
++			payloads.BindBytes(int(2 + 2 * i), blocks[i].second);
+ 		versions.Bind(int(5 + 2 * i), blocks[i].first);
+ 		versions.Bind(int(6 + 2 * i), payload);
+ 	}
+@@ -693,7 +709,10 @@
+ 	}
+ 	int64_t last_payload = 0;
+ 	constexpr size_t BATCH_BLOCKS = 64;
+-	std::vector<std::pair<int64_t, std::string>> new_blocks;
++	std::vector<std::pair<int64_t, std::string_view>> new_blocks;
++	// At most the first and last block need padding. Their storage outlives
++	// every pending view; complete blocks borrow the immutable input string.
++	std::array<std::string, 2> edges;
+ 	if (vacant) {
+ 		new_blocks.reserve(BATCH_BLOCKS);
+ 	}
+@@ -713,28 +732,40 @@
+ 			insert_new = vacant;
+ 		}
+ 		size_t amount = std::min<size_t>(BLOCK_SIZE - position % BLOCK_SIZE, data.size() - consumed);
+-		std::string bytes;
+-		if (amount == BLOCK_SIZE) {
+-			bytes.assign(data.data() + consumed, amount);
++		std::string owned;
++		std::string_view bytes;
++		if (amount == BLOCK_SIZE && insert_new) {
++			bytes = std::string_view(data).substr(consumed, amount);
+ 		} else {
+-			bytes = insert_new ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, block, view);
+-			bytes.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
++			if (amount == BLOCK_SIZE) {
++				owned.assign(data.data() + consumed, amount);
++			} else {
++				owned = insert_new ? std::string(BLOCK_SIZE, 0) : Block(db, node.key.inode, block, view);
++				owned.replace(position % BLOCK_SIZE, amount, data.data() + consumed, amount);
++			}
++			if (insert_new) {
++				auto &edge = edges[consumed == 0 ? 0 : 1];
++				edge = std::move(owned);
++				bytes = edge;
++			} else {
++				bytes = owned;
++			}
+ 		}
+ 		if (insert_new) {
+ 			if (!std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == 0; })) {
+-				new_blocks.emplace_back(block, std::move(bytes));
++				new_blocks.emplace_back(block, bytes);
+ 				if (new_blocks.size() == BATCH_BLOCKS) {
+-					InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
++					InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view, data, offset);
+ 				}
+ 			}
+ 		} else {
+ 			// Publish explicit IDs before a trailing edge allocates an automatic one.
+-			InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
+-			StoreBlock(db, node.key.inode, block, bytes, view);
++			InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view, data, offset);
++			StoreBlock(db, node.key.inode, block, owned, view);
+ 		}
+ 		consumed += amount;
+ 	}
+-	InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view);
++	InsertNewBlocks(db, node.key.inode, new_blocks, last_payload, view, data, offset);
+ 	node.fields[1] = std::max<int64_t>(node.fields[1], offset + data.size());
+ 	node.fields[3] = Now();
+ 	Put(db, INODES, node.key, node.fields, view);
+--- a/src/payload_file.hpp
++++ b/src/payload_file.hpp
+@@ -13,6 +13,7 @@
+ #include <filesystem>
+ #include <limits>
+ #include <memory>
++#include <string_view>
+ #include <thread>
+ #include <cerrno>
+ #include <fcntl.h>
+@@ -101,7 +102,7 @@
+ 		int fd;
+ 		pid_t process;
+ 	};
+-	int64_t Append(const std::string &data) {
++	int64_t Append(std::string_view data) {
+ 		// The caller holds SQLite's IMMEDIATE writer transaction, serializing
+ 		// append allocation across connections and processes.
+ 		auto end = Size();

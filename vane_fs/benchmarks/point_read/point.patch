@@ -1,0 +1,32 @@
+--- a/src/workspace.cpp
++++ b/src/workspace.cpp
+@@ -489,11 +489,21 @@
+ 	// as corruption, rather than silently turning a dangling reference into a hole.
+-	Statement blocks(db, "SELECT b.block,p.data FROM block_versions b "
+-	                     "LEFT JOIN block_payloads p ON p.id=b.payload "
+-	                     "WHERE b.inode=? AND b.block>=? AND b.block<=? "
+-	                     "AND b.low<=? AND b.high>? AND b.deleted=0 ORDER BY b.block");
++	auto first = offset / BLOCK_SIZE;
++	auto last = (offset + length - 1) / BLOCK_SIZE;
++	// An equality on block lets SQLite also constrain low in the primary key.
++	// Keep the joined validation and duplicate-version checks for either query.
++	bool point = first == last;
++	Statement blocks(db, point ? "SELECT b.block,p.data FROM block_versions b "
++	                            "LEFT JOIN block_payloads p ON p.id=b.payload "
++	                            "WHERE b.inode=? AND b.block=? AND b.low<=? AND b.high>? "
++	                            "AND b.deleted=0 ORDER BY b.block"
++	                          : "SELECT b.block,p.data FROM block_versions b "
++	                            "LEFT JOIN block_payloads p ON p.id=b.payload "
++	                            "WHERE b.inode=? AND b.block>=? AND b.block<=? "
++	                            "AND b.low<=? AND b.high>? AND b.deleted=0 ORDER BY b.block");
+ 	blocks.Bind(1, inode);
+-	blocks.Bind(2, offset / BLOCK_SIZE);
+-	blocks.Bind(3, (offset + length - 1) / BLOCK_SIZE);
+-	blocks.Bind(4, view.point);
+-	blocks.Bind(5, view.point);
++	blocks.Bind(2, first);
++	if (!point)
++		blocks.Bind(3, last);
++	blocks.Bind(point ? 3 : 4, view.point);
++	blocks.Bind(point ? 4 : 5, view.point);
+ 	int64_t previous = -1;

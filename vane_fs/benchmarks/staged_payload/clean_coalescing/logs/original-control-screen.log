@@ -1,0 +1,43 @@
+fuse baseline 0 {'stream_256': 156.342, 'write_64': 54.364, 'read_64': 742.97, 'random_read_4k': 65.069, 'random_write_4k': 12.135, 'small_file_fsync': 257.662, 'mkdir': 1350.36, 'rename': 1811.878, 'rmdir': 2222.291}
+fuse updated 0 {'stream_256': 154.36, 'write_64': 96.149, 'read_64': 790.225, 'random_read_4k': 73.788, 'random_write_4k': 11.596, 'small_file_fsync': 273.518, 'mkdir': 1935.326, 'rename': 1896.555, 'rmdir': 1442.096}
+fuse updated 1 {'stream_256': 153.094, 'write_64': 96.503, 'read_64': 782.328, 'random_read_4k': 74.064, 'random_write_4k': 8.897, 'small_file_fsync': 259.363, 'mkdir': 1983.281, 'rename': 1915.678, 'rmdir': 2331.795}
+fuse baseline 1 {'stream_256': 154.297, 'write_64': 56.472, 'read_64': 774.065, 'random_read_4k': 71.38, 'random_write_4k': 15.228, 'small_file_fsync': 243.397, 'mkdir': 1898.491, 'rename': 2337.383, 'rmdir': 2414.878}
+fuse baseline 2 {'stream_256': 158.014, 'write_64': 57.148, 'read_64': 665.247, 'random_read_4k': 71.883, 'random_write_4k': 11.251, 'small_file_fsync': 260.711, 'mkdir': 1960.299, 'rename': 2420.222, 'rmdir': 2389.361}
+fuse updated 2 {'stream_256': 154.949, 'write_64': 100.044, 'read_64': 757.22, 'random_read_4k': 72.629, 'random_write_4k': 10.482, 'small_file_fsync': 267.833, 'mkdir': 1975.386, 'rename': 1838.211, 'rmdir': 1775.48}
+fuse updated 3 {'stream_256': 154.202, 'write_64': 11.938, 'read_64': 774.697, 'random_read_4k': 70.125, 'random_write_4k': 11.384, 'small_file_fsync': 249.957, 'mkdir': 1875.243, 'rename': 1694.01, 'rmdir': 2222.285}
+fuse baseline 3 {'stream_256': 153.147, 'write_64': 56.655, 'read_64': 807.798, 'random_read_4k': 76.333, 'random_write_4k': 15.966, 'small_file_fsync': 251.632, 'mkdir': 1906.722, 'rename': 2343.857, 'rmdir': 2231.26}
+fuse baseline 4 {'stream_256': 150.939, 'write_64': 53.912, 'read_64': 1163.241, 'random_read_4k': 81.297, 'random_write_4k': 15.761, 'small_file_fsync': 261.589, 'mkdir': 1776.937, 'rename': 2373.135, 'rmdir': 2623.791}
+fuse updated 4 {'stream_256': 153.803, 'write_64': 94.147, 'read_64': 746.972, 'random_read_4k': 64.906, 'random_write_4k': 14.391, 'small_file_fsync': 255.948, 'mkdir': 1953.852, 'rename': 1925.356, 'rmdir': 2298.457}
+fuse updated 5 {'stream_256': 153.964, 'write_64': 94.422, 'read_64': 702.774, 'random_read_4k': 72.344, 'random_write_4k': 12.397, 'small_file_fsync': 241.801, 'mkdir': 2028.637, 'rename': 1883.816, 'rmdir': 2157.431}
+fuse baseline 5 {'stream_256': 156.534, 'write_64': 55.159, 'read_64': 769.024, 'random_read_4k': 71.627, 'random_write_4k': 11.374, 'small_file_fsync': 250.79, 'mkdir': 2001.716, 'rename': 2360.142, 'rmdir': 2427.24}
+aged baseline 0 {'stream_256': 133.458, 'write_64': 51.534, 'read_64': 764.752, 'random_read_4k': 72.413, 'random_write_4k': 10.497, 'small_file_fsync': 249.471, 'mkdir': 1987.822, 'rename': 2474.567, 'rmdir': 2292.589}
+aged updated 0 {'stream_256': 152.441, 'write_64': 92.223, 'read_64': 725.41, 'random_read_4k': 69.356, 'random_write_4k': 10.973, 'small_file_fsync': 239.005, 'mkdir': 2037.125, 'rename': 1863.194, 'rmdir': 2166.989}
+aged updated 1 {'stream_256': 152.751, 'write_64': 89.892, 'read_64': 742.399, 'random_read_4k': 69.876, 'random_write_4k': 10.917, 'small_file_fsync': 262.543, 'mkdir': 1964.238, 'rename': 1801.588, 'rmdir': 2346.343}
+aged baseline 1 {'stream_256': 160.482, 'write_64': 50.65, 'read_64': 752.317, 'random_read_4k': 70.916, 'random_write_4k': 15.316, 'small_file_fsync': 241.028, 'mkdir': 1998.518, 'rename': 2518.716, 'rmdir': 2254.624}
+aged baseline 2 {'stream_256': 156.629, 'write_64': 52.399, 'read_64': 758.474, 'random_read_4k': 69.255, 'random_write_4k': 15.203, 'small_file_fsync': 249.279, 'mkdir': 1931.759, 'rename': 2331.928, 'rmdir': 2367.804}
+aged updated 2 {'stream_256': 153.06, 'write_64': 95.361, 'read_64': 728.023, 'random_read_4k': 71.341, 'random_write_4k': 10.628, 'small_file_fsync': 245.28, 'mkdir': 2357.743, 'rename': 2066.989, 'rmdir': 2488.125}
+aged updated 3 {'stream_256': 153.757, 'write_64': 97.674, 'read_64': 783.714, 'random_read_4k': 69.972, 'random_write_4k': 11.309, 'small_file_fsync': 262.472, 'mkdir': 1533.214, 'rename': 1579.386, 'rmdir': 1913.454}
+aged baseline 3 {'stream_256': 154.438, 'write_64': 53.92, 'read_64': 699.373, 'random_read_4k': 67.766, 'random_write_4k': 12.54, 'small_file_fsync': 250.712, 'mkdir': 2049.455, 'rename': 2355.32, 'rmdir': 1553.554}
+aged baseline 4 {'stream_256': 155.27, 'write_64': 50.983, 'read_64': 763.825, 'random_read_4k': 63.482, 'random_write_4k': 10.585, 'small_file_fsync': 242.516, 'mkdir': 1894.557, 'rename': 2316.524, 'rmdir': 2424.53}
+aged updated 4 {'stream_256': 152.143, 'write_64': 87.793, 'read_64': 708.498, 'random_read_4k': 68.655, 'random_write_4k': 12.551, 'small_file_fsync': 241.409, 'mkdir': 1926.71, 'rename': 1647.029, 'rmdir': 2187.391}
+aged updated 5 {'stream_256': 150.736, 'write_64': 94.424, 'read_64': 717.652, 'random_read_4k': 69.82, 'random_write_4k': 10.309, 'small_file_fsync': 246.357, 'mkdir': 2113.281, 'rename': 1932.081, 'rmdir': 2425.214}
+aged baseline 5 {'stream_256': 161.41, 'write_64': 50.423, 'read_64': 708.807, 'random_read_4k': 69.291, 'random_write_4k': 12.9, 'small_file_fsync': 267.474, 'mkdir': 1670.903, 'rename': 2066.965, 'rmdir': 2304.379}
+REJECT ['ext4/fuse/write_64', 'ext4/fuse/random_write_4k', 'ext4/fuse/rename', 'ext4/fuse/rmdir', 'ext4/fuse/combined_large_writes', 'ext4/aged_fuse/write_64', 'ext4/aged_fuse/random_write_4k', 'ext4/aged_fuse/rename']
+{
+  "ext4/fuse": {
+    "aggregate_mib_per_second": {
+      "baseline": 114.10066967021262,
+      "updated": 102.90754392882103
+    },
+    "aggregate_ratio": 0.9019013142188972,
+    "paired_wins": 5
+  },
+  "ext4/aged_fuse": {
+    "aggregate_mib_per_second": {
+      "baseline": 109.84867027219445,
+      "updated": 135.08908580404147
+    },
+    "aggregate_ratio": 1.2297744293973127,
+    "paired_wins": 6
+  }
+}

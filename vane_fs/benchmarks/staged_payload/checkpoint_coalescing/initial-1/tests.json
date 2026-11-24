@@ -1,0 +1,32 @@
+{
+  "status": "FAIL",
+  "runs": [
+    {
+      "label": "baseline-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T040740Z/baseline/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 0,
+      "started_epoch": 1791778074.0914755,
+      "ended_epoch": 1791778096.822131
+    },
+    {
+      "label": "updated-native",
+      "argv": [
+        "ctest",
+        "--test-dir",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T040740Z/updated/build/python-release",
+        "--output-on-failure"
+      ],
+      "returncode": 8,
+      "started_epoch": 1791778096.8228815,
+      "ended_epoch": 1791778140.4095845
+    }
+  ],
+  "cleanup": [],
+  "error": "CalledProcessError(8, ['ctest', '--test-dir', '/home/kaka/astrovela_vane-fs/vane_fs/build/checkpoint-coalescing-20261012T040740Z/updated/build/python-release', '--output-on-failure'], None, None)",
+  "ended_epoch": 1791778140.4102602
+}

@@ -82,7 +82,7 @@ public:
 					while (split < box.bins.size() && count < (box.count + 1) / 2) {
 						count += histogram[box.bins[split++]].count;
 					}
-					split = MaxValue<idx_t>(1, MinValue(split, box.bins.size() - 1));
+					split = MaxValue<idx_t>(1, MinValue<idx_t>(split, box.bins.size() - 1));
 					vector<idx_t> right(box.bins.begin() + split, box.bins.end());
 					box.bins.resize(split);
 					boxes[selected] = MakeBox(std::move(box.bins), histogram);

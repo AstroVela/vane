@@ -11,10 +11,11 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.execution._common import ensure_table, estimate_table_bytes
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.udf_stream_backpressure import STREAM_BUFFER_BLOCKS
 
 RAY_UDF_STREAM_PROTOCOL_VERSION = 1
 RAY_UDF_STREAM_OBJECTS_PER_BLOCK = 2
-RAY_UDF_STREAM_BUFFER_BLOCKS = 2
+RAY_UDF_STREAM_BUFFER_BLOCKS = STREAM_BUFFER_BLOCKS
 RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS = RAY_UDF_STREAM_OBJECTS_PER_BLOCK * RAY_UDF_STREAM_BUFFER_BLOCKS
 
 

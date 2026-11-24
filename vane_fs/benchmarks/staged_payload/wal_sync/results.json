@@ -1,0 +1,2487 @@
+{
+  "status": "PASS",
+  "percentile_method": "nearest rank",
+  "device_settings_after_runs": {
+    "/sys/block/sda/queue/scheduler": "none [mq-deadline]",
+    "/sys/block/sda/queue/write_cache": "write back",
+    "/sys/block/sda/queue/wbt_lat_usec": "2000",
+    "/sys/block/sda/queue/rotational": "0",
+    "/sys/block/sda/device/model": "Fanxiang S103Pro",
+    "/sys/block/sda/device/rev": "VBND",
+    "/proc/sys/kernel/perf_event_paranoid": "4"
+  },
+  "identity": {
+    "parent_commit": "41d81aae712d4a0c8e82bcf123ad66aa25e7df84",
+    "root": "/home/kaka/astrovela_vane-fs",
+    "previous_artifact": "/home/kaka/astrovela_vane-fs/vane_fs/build/aged-write-20261009T165802Z",
+    "free_bytes": 104526319616,
+    "created_epoch": 1791594128.941071,
+    "kernel": "6.11.0-24-generic",
+    "filesystem": "/dev/sda2 ext4   rw,relatime"
+  },
+  "raw": {
+    "config": {
+      "operations": 128,
+      "write_bytes": 32768,
+      "initial_bytes": 8388608,
+      "orders": [
+        [
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ]
+        ],
+        [
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ]
+        ],
+        [
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ]
+        ],
+        [
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ]
+        ],
+        [
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ]
+        ],
+        [
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ]
+        ],
+        [
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ],
+          [
+            "grow",
+            "fsync"
+          ]
+        ],
+        [
+          [
+            "grow",
+            "fsync"
+          ],
+          [
+            "reuse",
+            "fdatasync"
+          ],
+          [
+            "reuse",
+            "fsync"
+          ],
+          [
+            "grow",
+            "fdatasync"
+          ]
+        ]
+      ],
+      "preparation_sync": "fsync",
+      "validation": "SHA256 entire file and expected bytes",
+      "drop_caches": false,
+      "owned_concurrent_builds_or_tests": false
+    },
+    "status": "PASS",
+    "groups": {
+      "reuse_fsync": {
+        "total_sync_ms": {
+          "count": 8,
+          "min": 237.987727,
+          "median": 272.681492,
+          "p95": 278.632718,
+          "p99": 278.632718,
+          "max": 278.632718,
+          "sum": 2115.03799
+        },
+        "individual_sync_ms": {
+          "count": 1024,
+          "min": 1.67938,
+          "median": 1.9140735,
+          "p95": 2.020683,
+          "p99": 2.703533,
+          "max": 31.711024,
+          "sum": 2115.03799
+        },
+        "runs": [
+          {
+            "rep": 0,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594320.2509816,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594320.500025,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 237.987727,
+            "sync_p50_ms": 1.851942,
+            "sync_max_ms": 3.47004
+          },
+          {
+            "rep": 1,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594323.0576,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594323.3210046,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 250.387718,
+            "sync_p50_ms": 1.9503205,
+            "sync_max_ms": 2.703533
+          },
+          {
+            "rep": 2,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594324.3924196,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594324.681039,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 275.530071,
+            "sync_p50_ms": 1.9260335,
+            "sync_max_ms": 31.321738
+          },
+          {
+            "rep": 3,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594325.561361,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594325.8531501,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 278.399038,
+            "sync_p50_ms": 1.9526985,
+            "sync_max_ms": 30.507688
+          },
+          {
+            "rep": 4,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594327.8545437,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594328.1459248,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 278.632718,
+            "sync_p50_ms": 1.9442305,
+            "sync_max_ms": 31.711024
+          },
+          {
+            "rep": 5,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594328.3013668,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594328.5626988,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 248.737734,
+            "sync_p50_ms": 1.9297105,
+            "sync_max_ms": 3.385906
+          },
+          {
+            "rep": 6,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594330.1770604,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594330.4623702,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 272.02277,
+            "sync_p50_ms": 1.9004055,
+            "sync_max_ms": 31.332792
+          },
+          {
+            "rep": 7,
+            "mode": "reuse",
+            "method": "fsync",
+            "started_epoch": 1791594332.3074343,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594332.5918822,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 273.340214,
+            "sync_p50_ms": 1.7874725,
+            "sync_max_ms": 31.170548
+          }
+        ]
+      },
+      "reuse_fdatasync": {
+        "total_sync_ms": {
+          "count": 8,
+          "min": 112.311309,
+          "median": 118.049515,
+          "p95": 125.314397,
+          "p99": 125.314397,
+          "max": 125.314397,
+          "sum": 945.178078
+        },
+        "individual_sync_ms": {
+          "count": 1024,
+          "min": 0.806342,
+          "median": 0.8883445,
+          "p95": 1.007803,
+          "p99": 1.258796,
+          "max": 14.812487,
+          "sum": 945.178078
+        },
+        "runs": [
+          {
+            "rep": 0,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594320.681714,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594320.8003154,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 112.311309,
+            "sync_p50_ms": 0.8745005,
+            "sync_max_ms": 0.982065
+          },
+          {
+            "rep": 1,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594321.8523622,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594321.9756083,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 115.22426,
+            "sync_p50_ms": 0.8961215,
+            "sync_max_ms": 1.058268
+          },
+          {
+            "rep": 2,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594324.8341384,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594324.9669232,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 122.539908,
+            "sync_p50_ms": 0.949371,
+            "sync_max_ms": 1.310502
+          },
+          {
+            "rep": 3,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594325.9987805,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594326.1237776,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 117.274058,
+            "sync_p50_ms": 0.873366,
+            "sync_max_ms": 1.669881
+          },
+          {
+            "rep": 4,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594327.6050024,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594327.7337222,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 118.824972,
+            "sync_p50_ms": 0.9208265,
+            "sync_max_ms": 1.623139
+          },
+          {
+            "rep": 5,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594329.678475,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594329.8072174,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 120.037177,
+            "sync_p50_ms": 0.8860275,
+            "sync_max_ms": 4.041561
+          },
+          {
+            "rep": 6,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594329.9298122,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594330.0506823,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 113.651997,
+            "sync_p50_ms": 0.876209,
+            "sync_max_ms": 1.32639
+          },
+          {
+            "rep": 7,
+            "mode": "reuse",
+            "method": "fdatasync",
+            "started_epoch": 1791594332.0401146,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594332.1726959,
+            "validation": {
+              "bytes": 8388608,
+              "sha256": "d9752de00c668db1a955e9c952d53a4b1ebd6556c6da9f2e7ab42f47446a462d"
+            },
+            "sync_total_ms": 125.314397,
+            "sync_p50_ms": 0.8701455,
+            "sync_max_ms": 14.812487
+          }
+        ]
+      },
+      "grow_fsync": {
+        "total_sync_ms": {
+          "count": 8,
+          "min": 258.884941,
+          "median": 285.868017,
+          "p95": 297.018509,
+          "p99": 297.018509,
+          "max": 297.018509,
+          "sum": 2266.372551
+        },
+        "individual_sync_ms": {
+          "count": 1024,
+          "min": 1.652516,
+          "median": 2.012064,
+          "p95": 2.155384,
+          "p99": 3.689987,
+          "max": 31.506956,
+          "sum": 2266.372551
+        },
+        "runs": [
+          {
+            "rep": 0,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594320.9269402,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594321.213528,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 258.884941,
+            "sync_p50_ms": 1.974473,
+            "sync_max_ms": 3.491773
+          },
+          {
+            "rep": 1,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594322.0984101,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594322.4128337,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 287.475846,
+            "sync_p50_ms": 2.0264995,
+            "sync_max_ms": 30.591274
+          },
+          {
+            "rep": 2,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594323.4636781,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594323.7792318,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 290.981676,
+            "sync_p50_ms": 2.013614,
+            "sync_max_ms": 31.350549
+          },
+          {
+            "rep": 3,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594326.2504644,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594326.5501385,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 283.081397,
+            "sync_p50_ms": 2.00138,
+            "sync_max_ms": 31.361982
+          },
+          {
+            "rep": 4,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594327.1337094,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594327.4397802,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 289.803427,
+            "sync_p50_ms": 2.038871,
+            "sync_max_ms": 31.498057
+          },
+          {
+            "rep": 5,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594329.1974463,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594329.5114164,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 297.018509,
+            "sync_p50_ms": 2.0674695,
+            "sync_max_ms": 31.506956
+          },
+          {
+            "rep": 6,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594331.105333,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594331.3996642,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 274.866567,
+            "sync_p50_ms": 2.0314915,
+            "sync_max_ms": 15.912639
+          },
+          {
+            "rep": 7,
+            "mode": "grow",
+            "method": "fsync",
+            "started_epoch": 1791594331.5740194,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594331.877274,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 284.260188,
+            "sync_p50_ms": 1.886082,
+            "sync_max_ms": 31.335004
+          }
+        ]
+      },
+      "grow_fdatasync": {
+        "total_sync_ms": {
+          "count": 8,
+          "min": 254.344849,
+          "median": 277.1702345,
+          "p95": 293.724483,
+          "p99": 293.724483,
+          "max": 293.724483,
+          "sum": 2215.635429
+        },
+        "individual_sync_ms": {
+          "count": 1024,
+          "min": 1.708531,
+          "median": 2.02886,
+          "p95": 2.158826,
+          "p99": 2.579506,
+          "max": 31.468083,
+          "sum": 2215.635429
+        },
+        "runs": [
+          {
+            "rep": 0,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594321.3795109,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594321.6889186,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 279.424706,
+            "sync_p50_ms": 1.955337,
+            "sync_max_ms": 30.545365
+          },
+          {
+            "rep": 1,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594322.5791166,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594322.8944423,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 293.724483,
+            "sync_p50_ms": 2.062675,
+            "sync_max_ms": 31.468083
+          },
+          {
+            "rep": 2,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594323.9417744,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594324.228339,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 265.345463,
+            "sync_p50_ms": 2.065396,
+            "sync_max_ms": 3.22741
+          },
+          {
+            "rep": 3,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594325.0849142,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594325.3948069,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 293.340284,
+            "sync_p50_ms": 2.046885,
+            "sync_max_ms": 31.440001
+          },
+          {
+            "rep": 4,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594326.6941714,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594326.9651432,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 254.344849,
+            "sync_p50_ms": 2.0003065,
+            "sync_max_ms": 2.579506
+          },
+          {
+            "rep": 5,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594328.711655,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594329.0265174,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 293.19082,
+            "sync_p50_ms": 2.0555535,
+            "sync_max_ms": 31.452872
+          },
+          {
+            "rep": 6,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594330.614113,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594330.9075437,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 274.915763,
+            "sync_p50_ms": 2.0451325,
+            "sync_max_ms": 15.650812
+          },
+          {
+            "rep": 7,
+            "mode": "grow",
+            "method": "fdatasync",
+            "started_epoch": 1791594332.7434068,
+            "size_before": 8388608,
+            "allocated_before": 8388608,
+            "ended_epoch": 1791594333.0242078,
+            "validation": {
+              "bytes": 12582912,
+              "sha256": "10a6c56e02bf63a4bca38d074a30ad290ecbc418df326bc3f8d7941e024d2e1b"
+            },
+            "sync_total_ms": 261.349061,
+            "sync_p50_ms": 1.9327925,
+            "sync_max_ms": 15.832907
+          }
+        ]
+      }
+    },
+    "host": {
+      "cpu_busy_percent": {
+        "count": 12,
+        "min": 2.846776444320402,
+        "median": 3.292852233537822,
+        "p95": 9.465135816297956,
+        "p99": 9.465135816297956,
+        "max": 9.465135816297956,
+        "sum": 51.19747122751274
+      },
+      "iowait_percent": {
+        "count": 12,
+        "min": 1.3974287311347122,
+        "median": 1.5517874350361565,
+        "p95": 1.6745743790120011,
+        "p99": 1.6745743790120011,
+        "max": 1.6745743790120011,
+        "sum": 18.555918280213774
+      },
+      "minimum_available_bytes": 59278848000,
+      "samples": 13
+    }
+  },
+  "sqlite_build": {
+    "status": "PASS",
+    "source": "/home/kaka/astrovela_vane-fs/vane_fs/build/staged-payload-20261008T151551Z/sqlite3.c",
+    "source_sha256": "0a409f1633283fa31a9126b11fbfd64a1991c5d30defad07e5745d4667f5e23d",
+    "commands": [
+      {
+        "argv": [
+          "gcc",
+          "-O3",
+          "-DNDEBUG",
+          "-fPIC",
+          "-include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/include/sqlite3-vcpkg-config.h",
+          "-DHAVE_FDATASYNC=0",
+          "-c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/sqlite3.c",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/sqlite3.o"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594371.715452,
+        "ended_epoch": 1791594415.0417957
+      },
+      {
+        "argv": [
+          "ar",
+          "rcs",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/lib/libsqlite3.a",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/sqlite3.o"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594415.042227,
+        "ended_epoch": 1791594415.0683668
+      },
+      {
+        "argv": [
+          "gcc",
+          "-O3",
+          "-DNDEBUG",
+          "-fPIC",
+          "-include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/include/sqlite3-vcpkg-config.h",
+          "-DHAVE_FDATASYNC=1",
+          "-c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/sqlite3.c",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/sqlite3.o"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594415.0705736,
+        "ended_epoch": 1791594457.9958487
+      },
+      {
+        "argv": [
+          "ar",
+          "rcs",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/lib/libsqlite3.a",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/sqlite3.o"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594457.9964113,
+        "ended_epoch": 1791594458.0252259
+      },
+      {
+        "argv": [
+          "gcc",
+          "-O3",
+          "-I/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/identity.c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+          "-ldl",
+          "-pthread",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/sdk-identity"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594458.0258017,
+        "ended_epoch": 1791594458.1048384
+      },
+      {
+        "argv": [
+          "gcc",
+          "-O3",
+          "-I/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/identity.c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync/lib/libsqlite3.a",
+          "-ldl",
+          "-pthread",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fsync-identity"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594458.145205,
+        "ended_epoch": 1791594458.2268174
+      },
+      {
+        "argv": [
+          "gcc",
+          "-O3",
+          "-I/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/identity.c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync/lib/libsqlite3.a",
+          "-ldl",
+          "-pthread",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/fdatasync-identity"
+        ],
+        "returncode": 0,
+        "started_epoch": 1791594458.2678976,
+        "ended_epoch": 1791594458.3497229
+      }
+    ],
+    "identities": {
+      "sdk": {
+        "version": "3.53.2",
+        "source_id": "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24",
+        "compile_options": [
+          "ATOMIC_INTRINSICS=1",
+          "COMPILER=gcc-13.3.0",
+          "DEFAULT_AUTOVACUUM",
+          "DEFAULT_CACHE_SIZE=-2000",
+          "DEFAULT_FILE_FORMAT=4",
+          "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+          "DEFAULT_MMAP_SIZE=0",
+          "DEFAULT_PAGE_SIZE=4096",
+          "DEFAULT_PCACHE_INITSZ=20",
+          "DEFAULT_RECURSIVE_TRIGGERS",
+          "DEFAULT_SECTOR_SIZE=4096",
+          "DEFAULT_SYNCHRONOUS=2",
+          "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+          "DEFAULT_WAL_SYNCHRONOUS=2",
+          "DEFAULT_WORKER_THREADS=0",
+          "DIRECT_OVERFLOW_READ",
+          "ENABLE_COLUMN_METADATA",
+          "ENABLE_UNLOCK_NOTIFY",
+          "MALLOC_SOFT_LIMIT=1024",
+          "MAX_ATTACHED=10",
+          "MAX_COLUMN=2000",
+          "MAX_COMPOUND_SELECT=500",
+          "MAX_DEFAULT_PAGE_SIZE=8192",
+          "MAX_EXPR_DEPTH=1000",
+          "MAX_FUNCTION_ARG=1000",
+          "MAX_LENGTH=1000000000",
+          "MAX_LIKE_PATTERN_LENGTH=50000",
+          "MAX_MMAP_SIZE=0x7fff0000",
+          "MAX_PAGE_COUNT=0xfffffffe",
+          "MAX_PAGE_SIZE=65536",
+          "MAX_SQL_LENGTH=1000000000",
+          "MAX_TRIGGER_DEPTH=1000",
+          "MAX_VARIABLE_NUMBER=32766",
+          "MAX_VDBE_OP=250000000",
+          "MAX_WORKER_THREADS=8",
+          "MUTEX_PTHREADS",
+          "OMIT_JSON",
+          "SYSTEM_MALLOC",
+          "TEMP_STORE=1",
+          "THREADSAFE=1"
+        ],
+        "sync_symbols": [
+          "U fsync"
+        ],
+        "library_sha256": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f"
+      },
+      "fsync": {
+        "version": "3.53.2",
+        "source_id": "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24",
+        "compile_options": [
+          "ATOMIC_INTRINSICS=1",
+          "COMPILER=gcc-13.3.0",
+          "DEFAULT_AUTOVACUUM",
+          "DEFAULT_CACHE_SIZE=-2000",
+          "DEFAULT_FILE_FORMAT=4",
+          "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+          "DEFAULT_MMAP_SIZE=0",
+          "DEFAULT_PAGE_SIZE=4096",
+          "DEFAULT_PCACHE_INITSZ=20",
+          "DEFAULT_RECURSIVE_TRIGGERS",
+          "DEFAULT_SECTOR_SIZE=4096",
+          "DEFAULT_SYNCHRONOUS=2",
+          "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+          "DEFAULT_WAL_SYNCHRONOUS=2",
+          "DEFAULT_WORKER_THREADS=0",
+          "DIRECT_OVERFLOW_READ",
+          "ENABLE_COLUMN_METADATA",
+          "ENABLE_UNLOCK_NOTIFY",
+          "MALLOC_SOFT_LIMIT=1024",
+          "MAX_ATTACHED=10",
+          "MAX_COLUMN=2000",
+          "MAX_COMPOUND_SELECT=500",
+          "MAX_DEFAULT_PAGE_SIZE=8192",
+          "MAX_EXPR_DEPTH=1000",
+          "MAX_FUNCTION_ARG=1000",
+          "MAX_LENGTH=1000000000",
+          "MAX_LIKE_PATTERN_LENGTH=50000",
+          "MAX_MMAP_SIZE=0x7fff0000",
+          "MAX_PAGE_COUNT=0xfffffffe",
+          "MAX_PAGE_SIZE=65536",
+          "MAX_SQL_LENGTH=1000000000",
+          "MAX_TRIGGER_DEPTH=1000",
+          "MAX_VARIABLE_NUMBER=32766",
+          "MAX_VDBE_OP=250000000",
+          "MAX_WORKER_THREADS=8",
+          "MUTEX_PTHREADS",
+          "OMIT_JSON",
+          "SYSTEM_MALLOC",
+          "TEMP_STORE=1",
+          "THREADSAFE=1"
+        ],
+        "sync_symbols": [
+          "U fsync"
+        ],
+        "library_sha256": "eb616b28f8404378a6a745ba44afca75e15659a8cc8b8d6c5e7eb619be08fd69"
+      },
+      "fdatasync": {
+        "version": "3.53.2",
+        "source_id": "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24",
+        "compile_options": [
+          "ATOMIC_INTRINSICS=1",
+          "COMPILER=gcc-13.3.0",
+          "DEFAULT_AUTOVACUUM",
+          "DEFAULT_CACHE_SIZE=-2000",
+          "DEFAULT_FILE_FORMAT=4",
+          "DEFAULT_JOURNAL_SIZE_LIMIT=-1",
+          "DEFAULT_MMAP_SIZE=0",
+          "DEFAULT_PAGE_SIZE=4096",
+          "DEFAULT_PCACHE_INITSZ=20",
+          "DEFAULT_RECURSIVE_TRIGGERS",
+          "DEFAULT_SECTOR_SIZE=4096",
+          "DEFAULT_SYNCHRONOUS=2",
+          "DEFAULT_WAL_AUTOCHECKPOINT=1000",
+          "DEFAULT_WAL_SYNCHRONOUS=2",
+          "DEFAULT_WORKER_THREADS=0",
+          "DIRECT_OVERFLOW_READ",
+          "ENABLE_COLUMN_METADATA",
+          "ENABLE_UNLOCK_NOTIFY",
+          "MALLOC_SOFT_LIMIT=1024",
+          "MAX_ATTACHED=10",
+          "MAX_COLUMN=2000",
+          "MAX_COMPOUND_SELECT=500",
+          "MAX_DEFAULT_PAGE_SIZE=8192",
+          "MAX_EXPR_DEPTH=1000",
+          "MAX_FUNCTION_ARG=1000",
+          "MAX_LENGTH=1000000000",
+          "MAX_LIKE_PATTERN_LENGTH=50000",
+          "MAX_MMAP_SIZE=0x7fff0000",
+          "MAX_PAGE_COUNT=0xfffffffe",
+          "MAX_PAGE_SIZE=65536",
+          "MAX_SQL_LENGTH=1000000000",
+          "MAX_TRIGGER_DEPTH=1000",
+          "MAX_VARIABLE_NUMBER=32766",
+          "MAX_VDBE_OP=250000000",
+          "MAX_WORKER_THREADS=8",
+          "MUTEX_PTHREADS",
+          "OMIT_JSON",
+          "SYSTEM_MALLOC",
+          "TEMP_STORE=1",
+          "THREADSAFE=1"
+        ],
+        "sync_symbols": [
+          "U fdatasync"
+        ],
+        "library_sha256": "791a3b79edb66829ed9b93703fb81ffd744d900735f7979940f5ce15e04a0840"
+      }
+    },
+    "compiler": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+  },
+  "validation": {
+    "status": "PASS",
+    "native_tests_per_variant": 12,
+    "python_passed_per_variant": 144,
+    "python_skipped_per_variant": 1,
+    "original_run": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/tests.json",
+    "repairs": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/tests-repaired.json",
+    "corrected_syscall": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fsync-syscall-corrected.json",
+    "notes": [
+      "Initial syscall test omitted required mount lease; corrected scaffold then passed both variants.",
+      "Initial fdatasync loss model retained deleted SQLite rollback journal; VFS already records SQLite images. Restricted direct fdatasync capture to payload/fence sidecars; both variants pass corrected test.",
+      "11 existing native cases plus one actual WAL syscall error/retry regression per variant. Counterexample using wrong expected syscall fails as intended."
+    ]
+  },
+  "fuse": {
+    "raw_file": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/fuse/results.json",
+    "report": {
+      "status": "PASS",
+      "config": {
+        "orders": [
+          [
+            "sdk",
+            "fsync",
+            "fdatasync"
+          ],
+          [
+            "fsync",
+            "fdatasync",
+            "sdk"
+          ],
+          [
+            "fdatasync",
+            "sdk",
+            "fsync"
+          ],
+          [
+            "fdatasync",
+            "fsync",
+            "sdk"
+          ],
+          [
+            "sdk",
+            "fdatasync",
+            "fsync"
+          ],
+          [
+            "fsync",
+            "sdk",
+            "fdatasync"
+          ]
+        ],
+        "durability": "fsync",
+        "application_write_bytes": 1048576,
+        "read_fixture_application_write_bytes": 1048576,
+        "logical_block_bytes": 4096,
+        "page_bytes": 4096,
+        "cache_configuration": "production defaults",
+        "strict_wal_trigger_frames": 4096,
+        "external_threshold_bytes": 262144,
+        "wake_mib": 16,
+        "admission_mib": 64,
+        "retained_wal_mib": 16,
+        "global_drop_caches": false,
+        "owned_concurrent_tests_or_builds": false,
+        "fresh_fuse_rounds": 6,
+        "aged_fuse_rounds": 6,
+        "native_rounds": 0,
+        "aged_guard_bytes": 33554432,
+        "aged_guard_write_bytes": 1048576,
+        "aged_guard_zero_stride": 8192,
+        "aged_fuse_read_fixture_bytes": 67108864,
+        "aged_native_read_fixture_bytes": 16777216,
+        "scope": "Same exact-interval UPDATE component. Existing SDK vs identical recompiled SQLite controls varying HAVE_FDATASYNC only. Plain binaries; no per-thread probes. Each workspace remains independent."
+      },
+      "started_epoch": 1791594864.562906,
+      "ended_epoch": 1791595277.2002175,
+      "monitor_stopped": true,
+      "free_bytes_after": 104398745600
+    },
+    "metrics": {
+      "fuse": {
+        "sdk": {
+          "write_64.fsync_seconds": {
+            "count": 6,
+            "min": 0.17543858289718628,
+            "median": 3.5634925405029207,
+            "p95": 4.434364274027757,
+            "p99": 4.434364274027757,
+            "max": 4.434364274027757,
+            "sum": 16.29169771494344
+          },
+          "write_64.seconds": {
+            "count": 6,
+            "min": 0.37959007208701223,
+            "median": 3.882478659041226,
+            "p95": 4.82980821991805,
+            "p99": 4.82980821991805,
+            "max": 4.82980821991805,
+            "sum": 18.1038310341537
+          },
+          "write_64.mib_per_second": {
+            "count": 6,
+            "min": 13.251043744566307,
+            "median": 16.983346756803556,
+            "p95": 168.60293433946683,
+            "p99": 168.60293433946683,
+            "max": 168.60293433946683,
+            "sum": 371.263321475746
+          },
+          "write_256.fsync_seconds": {
+            "count": 6,
+            "min": 0.1794471809407696,
+            "median": 0.19474231451749802,
+            "p95": 0.21270815201569349,
+            "p99": 0.21270815201569349,
+            "max": 0.21270815201569349,
+            "sum": 1.1771872339304537
+          },
+          "write_256.seconds": {
+            "count": 6,
+            "min": 1.715681554051116,
+            "median": 1.8054431144846603,
+            "p95": 2.2979100389638916,
+            "p99": 2.2979100389638916,
+            "max": 2.2979100389638916,
+            "sum": 11.411144860903732
+          },
+          "write_256.mib_per_second": {
+            "count": 6,
+            "min": 111.40557970469038,
+            "median": 141.7966862133391,
+            "p95": 149.21183910587925,
+            "p99": 149.21183910587925,
+            "max": 149.21183910587925,
+            "sum": 816.2805332214075
+          },
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.08194700197782367,
+            "median": 0.08464884548448026,
+            "p95": 0.08888059097807854,
+            "p99": 0.08888059097807854,
+            "max": 0.08888059097807854,
+            "sum": 0.5096763338660821
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 720.067219352591,
+            "median": 756.0890132253967,
+            "p95": 780.9925739238092,
+            "p99": 780.9925739238092,
+            "max": 780.9925739238092,
+            "sum": 4523.763170156627
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.22380926902405918,
+            "median": 0.235759784525726,
+            "p95": 0.26766017405316234,
+            "p99": 0.26766017405316234,
+            "max": 0.26766017405316234,
+            "sum": 1.444379079155624
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 59.77729057600515,
+            "median": 67.8717472094167,
+            "p95": 71.48944308593414,
+            "p99": 71.48944308593414,
+            "max": 71.48944308593414,
+            "sum": 400.0844754297555
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.12966803403105587,
+            "median": 0.14086864155251533,
+            "p95": 0.18207275099121034,
+            "p99": 0.18207275099121034,
+            "max": 0.18207275099121034,
+            "sum": 0.8960568440379575
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 10.984620098899649,
+            "median": 14.20901194276113,
+            "p95": 15.424001874825944,
+            "p99": 15.424001874825944,
+            "max": 15.424001874825944,
+            "sum": 81.55732272497582
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.034003038075752556,
+            "median": 0.03596764552639797,
+            "p95": 0.06205897394102067,
+            "p99": 0.06205897394102067,
+            "max": 0.06205897394102067,
+            "sum": 0.24189370905514807
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.09358613402582705,
+            "median": 0.10524909500963986,
+            "p95": 0.13122481398750097,
+            "p99": 0.13122481398750097,
+            "max": 0.13122481398750097,
+            "sum": 0.65415394899901
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 15.241019889656677,
+            "median": 19.026777884956942,
+            "p95": 21.37068723715052,
+            "p99": 21.37068723715052,
+            "max": 21.37068723715052,
+            "sum": 111.56651042112973
+          }
+        },
+        "fsync": {
+          "write_64.fsync_seconds": {
+            "count": 6,
+            "min": 0.17668877099640667,
+            "median": 0.18737607047660276,
+            "p95": 3.3370272730244324,
+            "p99": 3.3370272730244324,
+            "max": 3.3370272730244324,
+            "sum": 4.273844520910643
+          },
+          "write_64.seconds": {
+            "count": 6,
+            "min": 0.38872409297619015,
+            "median": 0.41522727051051334,
+            "p95": 3.6644193689571694,
+            "p99": 3.6644193689571694,
+            "max": 3.6644193689571694,
+            "sum": 5.703558965004049
+          },
+          "write_64.mib_per_second": {
+            "count": 6,
+            "min": 17.465249895296044,
+            "median": 154.13600692733155,
+            "p95": 164.64119707630286,
+            "p99": 164.64119707630286,
+            "max": 164.64119707630286,
+            "sum": 802.9500194830255
+          },
+          "write_256.fsync_seconds": {
+            "count": 6,
+            "min": 0.17996892100200057,
+            "median": 0.1839113614987582,
+            "p95": 0.1855558049865067,
+            "p99": 0.1855558049865067,
+            "max": 0.1855558049865067,
+            "sum": 1.1010102909058332
+          },
+          "write_256.seconds": {
+            "count": 6,
+            "min": 1.7387596380431205,
+            "median": 1.8047610424691811,
+            "p95": 1.848784880945459,
+            "p99": 1.848784880945459,
+            "max": 1.848784880945459,
+            "sum": 10.800650795921683
+          },
+          "write_256.mib_per_second": {
+            "count": 6,
+            "min": 138.4693279561454,
+            "median": 141.84848908321823,
+            "p95": 147.23139092883136,
+            "p99": 147.23139092883136,
+            "max": 147.23139092883136,
+            "sum": 853.5983345109706
+          },
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.054242782993242145,
+            "median": 0.08133233850821853,
+            "p95": 0.0981156179914251,
+            "p99": 0.0981156179914251,
+            "max": 0.0981156179914251,
+            "sum": 0.45955066999886185
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 652.2916668128548,
+            "median": 787.1356921824848,
+            "p95": 1179.8804646135775,
+            "p99": 1179.8804646135775,
+            "max": 1179.8804646135775,
+            "sum": 5218.704403387824
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.21252582094166428,
+            "median": 0.22771743102930486,
+            "p95": 0.23657333804294467,
+            "p99": 0.23657333804294467,
+            "max": 0.23657333804294467,
+            "sum": 1.3594499450409785
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 67.63230435162373,
+            "median": 70.26252351654159,
+            "p95": 75.28496974676693,
+            "p99": 75.28496974676693,
+            "max": 75.28496974676693,
+            "sum": 424.14824108533765
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.12116552202496678,
+            "median": 0.14390612550778314,
+            "p95": 0.16068054805509746,
+            "p99": 0.16068054805509746,
+            "max": 0.16068054805509746,
+            "sum": 0.8556822901591659
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 12.447057370716701,
+            "median": 13.963291994950389,
+            "p95": 16.506345753933942,
+            "p99": 16.506345753933942,
+            "max": 16.506345753933942,
+            "sum": 85.18640134853221
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.03533818305004388,
+            "median": 0.03733205399475992,
+            "p95": 0.06318599206861109,
+            "p99": 0.06318599206861109,
+            "max": 0.06318599206861109,
+            "sum": 0.24703410209622234
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.08451225596945733,
+            "median": 0.0967707255622372,
+            "p95": 0.12327084399294108,
+            "p99": 0.12327084399294108,
+            "max": 0.12327084399294108,
+            "sum": 0.6086401770589873
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 16.224436656850724,
+            "median": 20.66855956969704,
+            "p95": 23.665206626631747,
+            "p99": 23.665206626631747,
+            "max": 23.665206626631747,
+            "sum": 120.32464138161347
+          }
+        },
+        "fdatasync": {
+          "write_64.fsync_seconds": {
+            "count": 6,
+            "min": 0.1709122940665111,
+            "median": 0.17664198350394145,
+            "p95": 0.20490965899080038,
+            "p99": 0.20490965899080038,
+            "max": 0.20490965899080038,
+            "sum": 1.1016992019722238
+          },
+          "write_64.seconds": {
+            "count": 6,
+            "min": 0.378937304019928,
+            "median": 0.4033013170119375,
+            "p95": 0.42287107603624463,
+            "p99": 0.42287107603624463,
+            "max": 0.42287107603624463,
+            "sum": 2.4158282569842413
+          },
+          "write_64.mib_per_second": {
+            "count": 6,
+            "min": 151.34636447566942,
+            "median": 158.76605942498887,
+            "p95": 168.8933745003746,
+            "p99": 168.8933745003746,
+            "max": 168.8933745003746,
+            "sum": 955.3973176772054
+          },
+          "write_256.fsync_seconds": {
+            "count": 6,
+            "min": 0.1793209119932726,
+            "median": 0.18810377642512321,
+            "p95": 0.21435107302386314,
+            "p99": 0.21435107302386314,
+            "max": 0.21435107302386314,
+            "sum": 1.1631580027751625
+          },
+          "write_256.seconds": {
+            "count": 6,
+            "min": 1.747070432989858,
+            "median": 1.772942568990402,
+            "p95": 1.8222153940005228,
+            "p99": 1.8222153940005228,
+            "max": 1.8222153940005228,
+            "sum": 10.65917641192209
+          },
+          "write_256.mib_per_second": {
+            "count": 6,
+            "min": 140.48833131519828,
+            "median": 144.39318728765238,
+            "p95": 146.53101281205537,
+            "p99": 146.53101281205537,
+            "max": 146.53101281205537,
+            "sum": 864.7565605005663
+          },
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.05649098404683173,
+            "median": 0.07937756198225543,
+            "p95": 0.08404156297910959,
+            "p99": 0.08404156297910959,
+            "max": 0.08404156297910959,
+            "sum": 0.4380703930510208
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 761.5279598727672,
+            "median": 806.2731958193447,
+            "p95": 1132.9241485144462,
+            "p99": 1132.9241485144462,
+            "max": 1132.9241485144462,
+            "sum": 5405.712797852184
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.2036273250123486,
+            "median": 0.2233523849863559,
+            "p95": 0.24275850201956928,
+            "p99": 0.24275850201956928,
+            "max": 0.24275850201956928,
+            "sum": 1.3466558689251542
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 65.90912312809628,
+            "median": 71.83637400518849,
+            "p95": 78.57491620552257,
+            "p99": 78.57491620552257,
+            "max": 78.57491620552257,
+            "sum": 429.9394813124972
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.13080289703793824,
+            "median": 0.1348374934750609,
+            "p95": 0.15734756691381335,
+            "p99": 0.15734756691381335,
+            "max": 0.15734756691381335,
+            "sum": 0.8364701558602974
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 12.710714498022673,
+            "median": 14.834726932678683,
+            "p95": 15.290181221444335,
+            "p99": 15.290181221444335,
+            "max": 15.290181221444335,
+            "sum": 86.47076432615057
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.004731416003778577,
+            "median": 0.03537709597731009,
+            "p95": 0.03935154795181006,
+            "p99": 0.03935154795181006,
+            "max": 0.03935154795181006,
+            "sum": 0.1861363819334656
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.09656506904866546,
+            "median": 0.10480179550359026,
+            "p95": 0.12607047997880727,
+            "p99": 0.12607047997880727,
+            "max": 0.12607047997880727,
+            "sum": 0.6503262149635702
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 15.864142028619264,
+            "median": 19.167856747098284,
+            "p95": 20.7114230819021,
+            "p99": 20.7114230819021,
+            "max": 20.7114230819021,
+            "sum": 112.0413493548843
+          }
+        }
+      },
+      "aged_fuse": {
+        "sdk": {
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.08134536095894873,
+            "median": 0.08544350450392812,
+            "p95": 0.0879453819943592,
+            "p99": 0.0879453819943592,
+            "max": 0.0879453819943592,
+            "sum": 0.5100358739728108
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 727.7243960814787,
+            "median": 749.142248840172,
+            "p95": 786.7688980112567,
+            "p99": 786.7688980112567,
+            "max": 786.7688980112567,
+            "sum": 4520.750404926418
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.22328755806665868,
+            "median": 0.23250300897052512,
+            "p95": 0.24682134797330946,
+            "p99": 0.24682134797330946,
+            "max": 0.24682134797330946,
+            "sum": 1.4043932169442996
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 64.82421448297978,
+            "median": 68.8189622826789,
+            "p95": 71.65647803458657,
+            "p99": 71.65647803458657,
+            "max": 71.65647803458657,
+            "sum": 410.6649121718481
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.09610970504581928,
+            "median": 0.121796086023096,
+            "p95": 0.15773127507418394,
+            "p99": 0.15773127507418394,
+            "max": 0.15773127507418394,
+            "sum": 0.7645568961743265
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 12.679793522618535,
+            "median": 16.42763345115184,
+            "p95": 20.809552989955815,
+            "p99": 20.809552989955815,
+            "max": 20.809552989955815,
+            "sum": 96.91960909987793
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.003377635031938553,
+            "median": 0.003648911020718515,
+            "p95": 0.005264410050585866,
+            "p99": 0.005264410050585866,
+            "max": 0.005264410050585866,
+            "sum": 0.023630452109500766
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.0908444500528276,
+            "median": 0.11797137546818703,
+            "p95": 0.15407860302366316,
+            "p99": 0.15407860302366316,
+            "max": 0.15407860302366316,
+            "sum": 0.7409203399438411
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 12.980387677144522,
+            "median": 16.958246400554792,
+            "p95": 22.015654218138433,
+            "p99": 22.015654218138433,
+            "max": 22.015654218138433,
+            "sum": 100.36311338938289
+          },
+          "small_file_fsync.seconds": {
+            "count": 6,
+            "min": 0.4766913920175284,
+            "median": 0.4992502319510095,
+            "p95": 5.887578794034198,
+            "p99": 5.887578794034198,
+            "max": 5.887578794034198,
+            "sum": 8.351514140958898
+          },
+          "small_file_fsync.ops_per_second": {
+            "count": 6,
+            "min": 21.740685683850316,
+            "median": 256.3846715054282,
+            "p95": 268.51754016001473,
+            "p99": 268.51754016001473,
+            "max": 268.51754016001473,
+            "sum": 1321.5186347793335
+          },
+          "mkdir.seconds": {
+            "count": 6,
+            "min": 0.05725782096851617,
+            "median": 0.06182554451515898,
+            "p95": 0.06891125999391079,
+            "p99": 0.06891125999391079,
+            "max": 0.06891125999391079,
+            "sum": 0.37210808193776757
+          },
+          "mkdir.ops_per_second": {
+            "count": 6,
+            "min": 1857.4613207088432,
+            "median": 2072.1940037018453,
+            "p95": 2235.502466473221,
+            "p99": 2235.502466473221,
+            "max": 2235.502466473221,
+            "sum": 12435.957481621192
+          },
+          "mkdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.003360928036272526,
+            "median": 0.0037200244842097163,
+            "p95": 0.004829882993362844,
+            "p99": 0.004829882993362844,
+            "max": 0.004829882993362844,
+            "sum": 0.023590138996951282
+          },
+          "rename.seconds": {
+            "count": 6,
+            "min": 0.04902962304186076,
+            "median": 0.05218746745958924,
+            "p95": 0.055716700037010014,
+            "p99": 0.055716700037010014,
+            "max": 0.055716700037010014,
+            "sum": 0.3134796068770811
+          },
+          "rename.ops_per_second": {
+            "count": 6,
+            "min": 2297.336344668215,
+            "median": 2453.278564286211,
+            "p95": 2610.6666145631084,
+            "p99": 2610.6666145631084,
+            "max": 2610.6666145631084,
+            "sum": 14726.701825621607
+          },
+          "rename.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.002597693935967982,
+            "median": 0.003776751458644867,
+            "p95": 0.006187309045344591,
+            "p99": 0.006187309045344591,
+            "max": 0.006187309045344591,
+            "sum": 0.02417653682641685
+          },
+          "rmdir.seconds": {
+            "count": 6,
+            "min": 0.04830692906398326,
+            "median": 0.05283973348559812,
+            "p95": 0.06533121701795608,
+            "p99": 0.06533121701795608,
+            "max": 0.06533121701795608,
+            "sum": 0.32704056706279516
+          },
+          "rmdir.ops_per_second": {
+            "count": 6,
+            "min": 1959.2471385435788,
+            "median": 2431.3172647804363,
+            "p95": 2649.723393314074,
+            "p99": 2649.723393314074,
+            "max": 2649.723393314074,
+            "sum": 14256.740311723555
+          },
+          "rmdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.0034784090239554644,
+            "median": 0.004388137953355908,
+            "p95": 0.013591933064162731,
+            "p99": 0.013591933064162731,
+            "max": 0.013591933064162731,
+            "sum": 0.035395052982494235
+          }
+        },
+        "fsync": {
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.07810514699667692,
+            "median": 0.08744573901640251,
+            "p95": 0.09168114105705172,
+            "p99": 0.09168114105705172,
+            "max": 0.09168114105705172,
+            "sum": 0.5149999830173329
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 698.0715909739149,
+            "median": 731.9001149673915,
+            "p95": 819.4082267423805,
+            "p99": 819.4082267423805,
+            "max": 819.4082267423805,
+            "sum": 4485.95331461815
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.21807131101377308,
+            "median": 0.2302086615236476,
+            "p95": 0.23541435902006924,
+            "p99": 0.23541435902006924,
+            "max": 0.23541435902006924,
+            "sum": 1.3741969880647957
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 67.96526799215331,
+            "median": 69.50281425770333,
+            "p95": 73.37049484234753,
+            "p99": 73.37049484234753,
+            "max": 73.37049484234753,
+            "sum": 419.42373406832996
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.13853222702164203,
+            "median": 0.15389091050019488,
+            "p95": 1.0997404570225626,
+            "p99": 1.0997404570225626,
+            "max": 1.0997404570225626,
+            "sum": 2.7167086912086233
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 1.8186109160836004,
+            "median": 12.996224753736282,
+            "p95": 14.437073906907974,
+            "p99": 14.437073906907974,
+            "max": 14.437073906907974,
+            "sum": 57.22250474963591
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.0038907849229872227,
+            "median": 0.0043200739892199636,
+            "p95": 0.8373220160137862,
+            "p99": 0.8373220160137862,
+            "max": 0.8373220160137862,
+            "sum": 1.6405618898570538
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.134640914038755,
+            "median": 0.1497932614875026,
+            "p95": 0.262416569981724,
+            "p99": 0.262416569981724,
+            "max": 0.262416569981724,
+            "sum": 1.0761404549703002
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 7.6214699404816155,
+            "median": 13.351737108136383,
+            "p95": 14.85432577666786,
+            "p99": 14.85432577666786,
+            "max": 14.85432577666786,
+            "sum": 71.25818455453707
+          },
+          "small_file_fsync.seconds": {
+            "count": 6,
+            "min": 0.4621862970525399,
+            "median": 0.7831384285236709,
+            "p95": 6.46629775792826,
+            "p99": 6.46629775792826,
+            "max": 6.46629775792826,
+            "sum": 13.718839844106697
+          },
+          "small_file_fsync.ops_per_second": {
+            "count": 6,
+            "min": 19.79494368985105,
+            "median": 186.68927694607058,
+            "p95": 276.944601811614,
+            "p99": 276.944601811614,
+            "max": 276.944601811614,
+            "sum": 965.882910782651
+          },
+          "mkdir.seconds": {
+            "count": 6,
+            "min": 0.05202322907280177,
+            "median": 0.06648715498158708,
+            "p95": 0.06974420405458659,
+            "p99": 0.06974420405458659,
+            "max": 0.06974420405458659,
+            "sum": 0.38186514598783106
+          },
+          "mkdir.ops_per_second": {
+            "count": 6,
+            "min": 1835.2779522699611,
+            "median": 1925.6650418806353,
+            "p95": 2460.439351445787,
+            "p99": 2460.439351445787,
+            "max": 2460.439351445787,
+            "sum": 12200.303486759969
+          },
+          "mkdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.0036170040257275105,
+            "median": 0.00374009448569268,
+            "p95": 0.006004315102472901,
+            "p99": 0.006004315102472901,
+            "max": 0.006004315102472901,
+            "sum": 0.02525723516009748
+          },
+          "rename.seconds": {
+            "count": 6,
+            "min": 0.043135024956427515,
+            "median": 0.05165414104703814,
+            "p95": 0.054843920981511474,
+            "p99": 0.054843920981511474,
+            "max": 0.054843920981511474,
+            "sum": 0.30291393294464797
+          },
+          "rename.ops_per_second": {
+            "count": 6,
+            "min": 2333.8958577223225,
+            "median": 2478.4851050625493,
+            "p95": 2967.426125968355,
+            "p99": 2967.426125968355,
+            "max": 2967.426125968355,
+            "sum": 15306.313917269163
+          },
+          "rename.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.00201434304472059,
+            "median": 0.002735411049798131,
+            "p95": 0.004104877007193863,
+            "p99": 0.004104877007193863,
+            "max": 0.004104877007193863,
+            "sum": 0.018023801152594388
+          },
+          "rmdir.seconds": {
+            "count": 6,
+            "min": 0.048307707998901606,
+            "median": 0.04872210102621466,
+            "p95": 0.05038688704371452,
+            "p99": 0.05038688704371452,
+            "max": 0.05038688704371452,
+            "sum": 0.29401098913513124
+          },
+          "rmdir.ops_per_second": {
+            "count": 6,
+            "min": 2540.3434804168414,
+            "median": 2627.1539854770517,
+            "p95": 2649.680667998374,
+            "p99": 2649.680667998374,
+            "max": 2649.680667998374,
+            "sum": 15676.126553578579
+          },
+          "rmdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.003179240971803665,
+            "median": 0.004894278943538666,
+            "p95": 0.00909614295233041,
+            "p99": 0.00909614295233041,
+            "max": 0.00909614295233041,
+            "sum": 0.03379900078289211
+          }
+        },
+        "fdatasync": {
+          "read_64.seconds": {
+            "count": 6,
+            "min": 0.07335039810277522,
+            "median": 0.08244447747711092,
+            "p95": 0.09090400696732104,
+            "p99": 0.09090400696732104,
+            "max": 0.09090400696732104,
+            "sum": 0.4980341079644859
+          },
+          "read_64.mib_per_second": {
+            "count": 6,
+            "min": 704.0393722468942,
+            "median": 776.3968988571888,
+            "p95": 872.524235114936,
+            "p99": 872.524235114936,
+            "max": 872.524235114936,
+            "sum": 4648.43284732656
+          },
+          "random_read_4k.seconds": {
+            "count": 6,
+            "min": 0.2090740039711818,
+            "median": 0.23164944647578523,
+            "p95": 0.2432894048979506,
+            "p99": 0.2432894048979506,
+            "max": 0.2432894048979506,
+            "sum": 1.3749970188364387
+          },
+          "random_read_4k.mib_per_second": {
+            "count": 6,
+            "min": 65.76529712303464,
+            "median": 69.09978692706969,
+            "p95": 76.5279264571094,
+            "p99": 76.5279264571094,
+            "max": 76.5279264571094,
+            "sum": 419.96671682801707
+          },
+          "random_write_4k.seconds": {
+            "count": 6,
+            "min": 0.09438891196623445,
+            "median": 0.15469258947996423,
+            "p95": 0.8785905480617657,
+            "p99": 0.8785905480617657,
+            "max": 0.8785905480617657,
+            "sum": 1.5550162750296295
+          },
+          "random_write_4k.mib_per_second": {
+            "count": 6,
+            "min": 2.2763732257445115,
+            "median": 12.928993261188651,
+            "p95": 21.188929486923804,
+            "p99": 21.188929486923804,
+            "max": 21.188929486923804,
+            "sum": 79.25027392487016
+          },
+          "random_write_4k.fsync_seconds": {
+            "count": 6,
+            "min": 0.0018619700567796826,
+            "median": 0.002508271543774754,
+            "p95": 0.7588968040654436,
+            "p99": 0.7588968040654436,
+            "max": 0.7588968040654436,
+            "sum": 0.7731891702860594
+          },
+          "random_write_4k.requests_seconds": {
+            "count": 6,
+            "min": 0.0916056860005483,
+            "median": 0.1343219725531526,
+            "p95": 0.1533118369989097,
+            "p99": 0.1533118369989097,
+            "max": 0.1533118369989097,
+            "sum": 0.7818205381045118
+          },
+          "random_write_4k.requests_mib_per_second": {
+            "count": 6,
+            "min": 13.045307127943573,
+            "median": 15.068341405866972,
+            "p95": 21.832705886706957,
+            "p99": 21.832705886706957,
+            "max": 21.832705886706957,
+            "sum": 95.45432904571686
+          },
+          "small_file_fsync.seconds": {
+            "count": 6,
+            "min": 0.3057549720397219,
+            "median": 0.3262513530207798,
+            "p95": 4.315251660998911,
+            "p99": 4.315251660998911,
+            "max": 4.315251660998911,
+            "sum": 5.910148930037394
+          },
+          "small_file_fsync.ops_per_second": {
+            "count": 6,
+            "min": 29.6622329485113,
+            "median": 392.34189339277566,
+            "p95": 418.6358741645287,
+            "p99": 418.6358741645287,
+            "max": 418.6358741645287,
+            "sum": 2038.419136774978
+          },
+          "mkdir.seconds": {
+            "count": 6,
+            "min": 0.056389690027572215,
+            "median": 0.06189859053120017,
+            "p95": 0.06465761607978493,
+            "p99": 0.06465761607978493,
+            "max": 0.06465761607978493,
+            "sum": 0.36615283717401326
+          },
+          "mkdir.ops_per_second": {
+            "count": 6,
+            "min": 1979.6585114126863,
+            "median": 2067.9023559169577,
+            "p95": 2269.918489309186,
+            "p99": 2269.918489309186,
+            "max": 2269.918489309186,
+            "sum": 12608.552017157366
+          },
+          "mkdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.0035000970819965005,
+            "median": 0.003737282007932663,
+            "p95": 0.004771584994159639,
+            "p99": 0.004771584994159639,
+            "max": 0.004771584994159639,
+            "sum": 0.023184784105978906
+          },
+          "rename.seconds": {
+            "count": 6,
+            "min": 0.04716633108910173,
+            "median": 0.050152929965406656,
+            "p95": 0.0523972949013114,
+            "p99": 0.0523972949013114,
+            "max": 0.0523972949013114,
+            "sum": 0.300837293965742
+          },
+          "rename.ops_per_second": {
+            "count": 6,
+            "min": 2442.8742025916386,
+            "median": 2552.1939256690525,
+            "p95": 2713.800226653112,
+            "p99": 2713.800226653112,
+            "max": 2713.800226653112,
+            "sum": 15337.767315295618
+          },
+          "rename.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.002038648002780974,
+            "median": 0.00377778202528134,
+            "p95": 0.004011756042018533,
+            "p99": 0.004011756042018533,
+            "max": 0.004011756042018533,
+            "sum": 0.02105553005822003
+          },
+          "rmdir.seconds": {
+            "count": 6,
+            "min": 0.044657272985205054,
+            "median": 0.047823598491959274,
+            "p95": 0.06889304297510535,
+            "p99": 0.06889304297510535,
+            "max": 0.06889304297510535,
+            "sum": 0.3042677919147536
+          },
+          "rmdir.ops_per_second": {
+            "count": 6,
+            "min": 1857.9524792692505,
+            "median": 2676.5229633947106,
+            "p95": 2866.2744373667056,
+            "p99": 2866.2744373667056,
+            "max": 2866.2744373667056,
+            "sum": 15463.585549797164
+          },
+          "rmdir.final_directory_fsync_seconds": {
+            "count": 6,
+            "min": 0.0036898390389978886,
+            "median": 0.004324914945755154,
+            "p95": 0.015379586024209857,
+            "p99": 0.015379586024209857,
+            "max": 0.015379586024209857,
+            "sum": 0.03664626192767173
+          }
+        }
+      }
+    },
+    "host": {
+      "cpu_busy_percent": {
+        "count": 409,
+        "min": 1.8699413898967345,
+        "median": 4.938616071428571,
+        "p95": 12.20263084242933,
+        "p99": 13.518052057094879,
+        "max": 14.87279843444227,
+        "sum": 2410.323748008181
+      },
+      "iowait_percent": {
+        "count": 409,
+        "min": 0.0,
+        "median": 0.5595970900951315,
+        "p95": 5.445736434108527,
+        "p99": 10.050251256281408,
+        "max": 11.095623083356566,
+        "sum": 576.7467548018363
+      },
+      "minimum_available_bytes": 58775437312,
+      "samples": 410
+    },
+    "sample_files": {
+      "fresh": "fresh-results.json",
+      "aged": "aged-results.json"
+    }
+  },
+  "timeline": {
+    "status": "PASS",
+    "raw_file": "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/timeline/results.json",
+    "config": {
+      "orders": [
+        [
+          "fsync",
+          "fdatasync"
+        ],
+        [
+          "fdatasync",
+          "fsync"
+        ],
+        [
+          "fsync",
+          "fdatasync"
+        ],
+        [
+          "fdatasync",
+          "fsync"
+        ]
+      ],
+      "durability": "fsync",
+      "application_write_bytes": 1048576,
+      "read_fixture_application_write_bytes": 1048576,
+      "logical_block_bytes": 4096,
+      "page_bytes": 4096,
+      "cache_configuration": "production defaults",
+      "strict_wal_trigger_frames": 4096,
+      "external_threshold_bytes": 262144,
+      "wake_mib": 16,
+      "admission_mib": 64,
+      "retained_wal_mib": 16,
+      "global_drop_caches": false,
+      "owned_concurrent_tests_or_builds": false,
+      "fresh_fuse_rounds": 0,
+      "aged_fuse_rounds": 4,
+      "native_rounds": 0,
+      "aged_guard_bytes": 33554432,
+      "aged_guard_write_bytes": 1048576,
+      "aged_guard_zero_stride": 8192,
+      "aged_fuse_read_fixture_bytes": 67108864,
+      "aged_native_read_fixture_bytes": 16777216,
+      "scope": "Separate instrumented FUSE diagnosis. Same aged workload and preparation as the plain comparison; slow syscalls, checkpoint/sync timeline, sync file sizes and ftruncate events plus 10 ms owned-thread samples. Not adoption throughput."
+    },
+    "host": {
+      "cpu_busy_percent": {
+        "count": 96,
+        "min": 2.007808142777468,
+        "median": 4.779876548032973,
+        "p95": 11.75645342312009,
+        "p99": 13.335197092535644,
+        "max": 13.335197092535644,
+        "sum": 528.7330632777607
+      },
+      "iowait_percent": {
+        "count": 96,
+        "min": 0.0,
+        "median": 0.6157308155155141,
+        "p95": 4.2155220547180345,
+        "p99": 12.164429530201343,
+        "max": 12.164429530201343,
+        "sum": 120.79004426551573
+      },
+      "minimum_available_bytes": 59000393728,
+      "samples": 97
+    },
+    "phase_details": "timeline.json"
+  },
+  "reproduction": {
+    "status": "PASS",
+    "runs": [
+      {
+        "label": "reproduce-prepare",
+        "argv": [
+          "/home/kaka/astrovela_vane-fs/.venv/bin/python",
+          "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/wal_sync/prepare.py",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction",
+          "--amalgamation",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/sqlite3.c",
+          "--sqlite-prefix",
+          "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release"
+        ],
+        "started_epoch": 1791595499.582753,
+        "ended_epoch": 1791595500.1876938,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-sqlite-configure",
+        "argv": [
+          "cmake",
+          "-S",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite",
+          "-B",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/build",
+          "-G",
+          "Ninja",
+          "-DCMAKE_BUILD_TYPE=Release"
+        ],
+        "started_epoch": 1791595500.1881254,
+        "ended_epoch": 1791595500.7413874,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-sqlite-build",
+        "argv": [
+          "cmake",
+          "--build",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/build",
+          "--parallel",
+          "2"
+        ],
+        "started_epoch": 1791595500.7418795,
+        "ended_epoch": 1791595545.2072592,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fsync-configure",
+        "argv": [
+          "cmake",
+          "-S",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fsync",
+          "-B",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fsync/build",
+          "-G",
+          "Ninja",
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fsync",
+          "-DVANE_FS_BUILD_PYTHON=OFF",
+          "-DVANE_FS_BUILD_TESTS=ON"
+        ],
+        "started_epoch": 1791595545.2229302,
+        "ended_epoch": 1791595545.9182146,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fsync-build",
+        "argv": [
+          "cmake",
+          "--build",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fsync/build",
+          "--parallel",
+          "2"
+        ],
+        "started_epoch": 1791595545.918844,
+        "ended_epoch": 1791595561.7228498,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fsync-test",
+        "argv": [
+          "ctest",
+          "--test-dir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fsync/build",
+          "--output-on-failure"
+        ],
+        "started_epoch": 1791595561.7234015,
+        "ended_epoch": 1791595580.4844394,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fsync-identity-build",
+        "argv": [
+          "gcc",
+          "-O3",
+          "-I/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fsync/include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/identity.c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fsync/lib/libsqlite3.a",
+          "-ldl",
+          "-pthread",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fsync/build/sqlite-identity"
+        ],
+        "started_epoch": 1791595580.4849582,
+        "ended_epoch": 1791595580.571164,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fdatasync-configure",
+        "argv": [
+          "cmake",
+          "-S",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fdatasync",
+          "-B",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fdatasync/build",
+          "-G",
+          "Ninja",
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fdatasync",
+          "-DVANE_FS_BUILD_PYTHON=OFF",
+          "-DVANE_FS_BUILD_TESTS=ON"
+        ],
+        "started_epoch": 1791595580.5884545,
+        "ended_epoch": 1791595581.3078318,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fdatasync-build",
+        "argv": [
+          "cmake",
+          "--build",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fdatasync/build",
+          "--parallel",
+          "2"
+        ],
+        "started_epoch": 1791595581.3083148,
+        "ended_epoch": 1791595597.1059978,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fdatasync-test",
+        "argv": [
+          "ctest",
+          "--test-dir",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fdatasync/build",
+          "--output-on-failure"
+        ],
+        "started_epoch": 1791595597.1064687,
+        "ended_epoch": 1791595628.7879243,
+        "returncode": 0
+      },
+      {
+        "label": "reproduce-fdatasync-identity-build",
+        "argv": [
+          "gcc",
+          "-O3",
+          "-I/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fdatasync/include",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/sqlite/identity.c",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/sqlite/fdatasync/lib/libsqlite3.a",
+          "-ldl",
+          "-pthread",
+          "-o",
+          "/home/kaka/astrovela_vane-fs/vane_fs/build/wal-sync-20261010T010012Z/reproduction/fdatasync/build/sqlite-identity"
+        ],
+        "started_epoch": 1791595628.788712,
+        "ended_epoch": 1791595628.8706524,
+        "returncode": 0
+      }
+    ],
+    "matched_sources": {
+      "fsync": {
+        "src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+        "src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+        "src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+        "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+        "src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+        "src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+        "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+        "src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+        "src/checkpoint.hpp": "290cafaf0a8919fb499ab33b1597c8c3c13839369063b90c766edb28f623aa5a",
+        "src/workspace.cpp": "e83c59650b74ed8f0559d71b61ae81eea60d67a874fc7685b6fb3fd11741bd93",
+        "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+        "include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+        "include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a",
+        "python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+        "python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+        "python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+        "tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+        "tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+        "tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+        "tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+        "tests/test_inode_refs.cpp": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f",
+        "tests/test_core.cpp": "68d3470bf7fee352f0a221ec5760b0495327d39e662a28f39c9d3385410e763b",
+        "tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+        "tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+        "tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+        "tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+        "tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+        "tests/test_workspace.py": "57acebd0b5e292b0f15b862bfa61a9636de6c70d6cc5df0fb86ccca142950099",
+        "tests/test_staging.cpp": "3e094047a7cc8489fb51443929075b9c266d6971d68d60b8d467c69b015f17ba",
+        "tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+        "tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+        "tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+        "tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+        "tests/test_version_update.cpp": "7bf3a4089ba60e1d724c3dc9c54344aabfb10302fbc2e44b101c3a6cd3e1f30e",
+        "tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+      },
+      "fdatasync": {
+        "src/staging.hpp": "d2c5fe2cf5bedcd7affe2acc641d29ebaf426eda4a6583c1de97ff34bb362b58",
+        "src/payload_file.hpp": "2697d1069a82cd2a6179d05f4afbd49b3626b74ba0d209bc7d1d836a022a6fa6",
+        "src/python.cpp": "d6d321d6ad2701e410471594a1385b37b2f3e1203ca42dc0e8fa66b763ab99bb",
+        "src/owner_lock.hpp": "a94bc085e62b48b15260a5a1367e5f68b7df2b3a407fe70c580aaf61f34bb6e1",
+        "src/native_reader.hpp": "c685b6b369c453e6de384c6ac8b7f660a205903ea87944918b6f8d70e118a6b7",
+        "src/fuse.cpp": "e59a800661db6efaa16d85ccb557eb7c6a71080541d9fd5d4349a577a6555460",
+        "src/cli.cpp": "86ba9dbcb72973486a2f81dab6c81979ee4927922ef2d7d7e9cbf34dce4ff1e1",
+        "src/native_reader.cpp": "4b52535722942c3e8b6b977c5b257108b6e4a2cd2cc2d9a7a3d00595c2202440",
+        "src/checkpoint.hpp": "290cafaf0a8919fb499ab33b1597c8c3c13839369063b90c766edb28f623aa5a",
+        "src/workspace.cpp": "e83c59650b74ed8f0559d71b61ae81eea60d67a874fc7685b6fb3fd11741bd93",
+        "src/benchmark.cpp": "f262223fe74ef2ae7a0d14e5e3d93634f0d7615aaee212746ebe3fd185115a62",
+        "include/vane_fs/reader_abi.h": "ad75b6825a3f3819b7af21600f6afba1ef121e18a905f4f0d48de747f36dbbf5",
+        "include/vane_fs/workspace.hpp": "5d9ca9947ef6bcbc2073423bfeb9fa7650087c44c1bcba74d9e00dfe6b00663a",
+        "python/vane_fs/fsspec.py": "e584ba563bf94e6abce35a0a3151e634c08ee2312645b6a8ad006ce5f2180145",
+        "python/vane_fs/vane.py": "173db3b5f002a7d10282fc5b1773a239f86f3c7d50cc76e654015d6b0da501d8",
+        "python/vane_fs/__init__.py": "f7e8b62740b6dc85a3465ed2b5ae47940baa1fa1483df042786b81a9f15d3821",
+        "tests/test_inline_publication.cpp": "7a4aba2e6fd50e20e4e2ab6c7fb4a6f86da3b52bfd606788eadb92367a08a787",
+        "tests/test_fuse.py": "f58a073e379f79db18c6e48447e547cdb52d1d65de2cc3ff52ffb69c10731c25",
+        "tests/test_checkpoint_coalescing.cpp": "777d8750d6fcf075094440ef3d5b1411f620a4f5a9af4c8d3fa06cec298219a9",
+        "tests/test_vane.py": "159871870e9370a0f1e0b840f556f514c6b9536920af9379a478f211c8a05fda",
+        "tests/test_inode_refs.cpp": "0a437fc5e93f1cf5c08bad51b0ea4db39e2665f7ae7d94ec7c6d7a84c224113f",
+        "tests/test_core.cpp": "68d3470bf7fee352f0a221ec5760b0495327d39e662a28f39c9d3385410e763b",
+        "tests/conftest.py": "dee50c02355a3113f7c5400bb09de307432d84cf7d0b1b4360e9bc303d6947d2",
+        "tests/test_external.py": "293be70a86e60f22f46047ba57eb3e1adba594ee6a1173efc1382a66c2fba77c",
+        "tests/test_crash.cpp": "d8337f71673a86a31d1d11aac3d3e26e2a00843218c9b731031f2966f1479d1c",
+        "tests/test_checkpoint.cpp": "ce8c7725d1d48eb5c260dacae4fd2614f681303e41fb6f09b0d336ddca34a4ff",
+        "tests/test_staging.py": "91f7eea6c507158f861c41c122ebfdfe9ced98a7e89db0fa624f092d22f1baa4",
+        "tests/test_workspace.py": "57acebd0b5e292b0f15b862bfa61a9636de6c70d6cc5df0fb86ccca142950099",
+        "tests/test_staging.cpp": "3e094047a7cc8489fb51443929075b9c266d6971d68d60b8d467c69b015f17ba",
+        "tests/test_recovery.py": "daafed1664ca64cca11baf9f4ee29ba648e707db3addcc54b03508d7ee1c65a1",
+        "tests/test_external_faults.cpp": "3f8ca0736abf896a153b9920f0b814f6a930beca84114b717960292cf7b8ad40",
+        "tests/test_transaction_cache.cpp": "3942aca360b039633a76d7b6e563a287919843d4833e04351bae5cbfaceab61c",
+        "tests/test_durability.cpp": "c1eaa094f2aad5ef86f93757f57095ee6b7a252b486f78dd1c8972320b9503fd",
+        "tests/test_version_update.cpp": "7bf3a4089ba60e1d724c3dc9c54344aabfb10302fbc2e44b101c3a6cd3e1f30e",
+        "tests/test_fsspec.py": "a89e5276f5d3e61ff27b4026391f023b7dce9c4bb22366284c076faa81ec47c2"
+      }
+    },
+    "sqlite_identity_matches": {
+      "fsync": true,
+      "fdatasync": true
+    }
+  },
+  "production_identity_after": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": "cae97ec42ce136c902d6fda9b9d1c1cd9dc60844c1c6c993be11367d464fc02b",
+    "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": "c662d344ec1c19c6daeed58d4e365241f2e6d237f6d7d3b6fca1554800e61159",
+    "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": "6d02862badc3057451407c4e219bd11109e8e3933bb8924eef6ba55006a70479"
+  },
+  "performance_windows": [
+    {
+      "started_epoch": 1791594320.1604712,
+      "ended_epoch": 1791594333.2359464
+    },
+    {
+      "started_epoch": 1791594864.562906,
+      "ended_epoch": 1791595277.2002175
+    },
+    {
+      "started_epoch": 1791595277.3576472,
+      "ended_epoch": 1791595374.908334
+    }
+  ],
+  "owned_build_test_intervals_checked": 46,
+  "cleanup_verification": {
+    "owned_benchmark_workspaces_removed": 44,
+    "raw_files_removed": 32,
+    "owned_mounts_absent": true,
+    "owned_work_directories_absent": true,
+    "owned_daemons_stopped": true,
+    "free_bytes": 104322113536
+  }
+}

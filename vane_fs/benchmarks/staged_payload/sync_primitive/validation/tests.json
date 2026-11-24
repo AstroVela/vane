@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "build": "/home/kaka/astrovela_vane-fs/vane_fs/build/sync-primitive-20261013/build.json",
+  "python_tests_per_variant": 154,
+  "native_tests_per_variant": 12,
+  "asan_ubsan_tests_per_variant": 12,
+  "probe_cases_per_mode": 6,
+  "expected_negative_checks": 2
+}

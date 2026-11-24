@@ -1,0 +1,31 @@
+{
+  "status": "RETAINED_BEFORE_FIX",
+  "failure": "Unlinked files in the current mutable interval had already been removed; the GC fixture reclaimed no versions/payloads.",
+  "measured_comparisons": 0,
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/build.json": {
+      "sha256": "344b801a2030ec788d858ab0949002d98af0d4239d6dc81f6f427c524045e5a4",
+      "bytes": 12379
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/release-gc-active.log": {
+      "sha256": "ecb4f4cc94fd010845dd8e5bbc8c556897dad373d8516431dd4c5394b11483b9",
+      "bytes": 29
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/release-gc-active-trace.json": {
+      "sha256": "f5a5d94ad3e399a7cc967beaa69ec8ab8de2f16ac2069d86a47d24bfaf467ae8",
+      "bytes": 3017
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/probe-release": {
+      "sha256": "de9ededa642588b19678d1c7497e7702d51efc300ab697ad6e4fea2aa6797cfb",
+      "bytes": 1825728
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/probe.cpp.txt": {
+      "sha256": "2c021228216b85338eb4c05857359926e3bc65e53e0eb76123f69225e6fc600b",
+      "bytes": 6632
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/second/build.py.txt": {
+      "sha256": "2e8d24748dd38960d84653801758c931a4db145ef072419cd6b7c23dc385ff1c",
+      "bytes": 9072
+    }
+  }
+}

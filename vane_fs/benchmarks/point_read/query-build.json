@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "c++",
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG",
+    "-Ivane_fs/vcpkg_installed/x64-linux-release/include",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T074424Z/query_probe.cpp",
+    "vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a",
+    "-ldl",
+    "-pthread",
+    "-o",
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/point-read-20261011T074424Z/query-probe"
+  ],
+  "returncode": 0,
+  "started": 1791704701.7379417,
+  "ended": 1791704702.680826
+}

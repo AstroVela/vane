@@ -23,6 +23,7 @@ __all__ = [
     "FunctionNullHandling",
     "PythonUDFType",
     "vectorized",
+    "no_retries",
 ]
 
 
@@ -46,3 +47,18 @@ def vectorized(func: typing.Callable[..., typing.Any]) -> typing.Callable[..., t
 
     new_func.__annotations__ = new_annotations
     return new_func
+
+
+_Function = typing.TypeVar("_Function", bound=typing.Callable[..., typing.Any])
+
+
+def no_retries(function: _Function) -> _Function:
+    """Disable Ray UDF and enclosing native-fragment retries for this callable.
+
+    Apply to a map_batches function or callable class before binding it. Actor
+    reuse remains enabled; an execution failure is surfaced instead of replayed.
+    """
+    if not callable(function):
+        raise TypeError("no_retries requires a function or callable class")
+    setattr(function, "_vane_datasink_no_task_retries", True)
+    return function

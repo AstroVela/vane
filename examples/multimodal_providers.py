@@ -43,7 +43,7 @@ to the selected checkpoint. Remote checkpoints are first resolved to a local Hub
 snapshot at engine_args.revision, using engine_args.download_dir when set. The
 view lasts until engine shutdown; the checkpoint and shared cache are unchanged.
 
-Decoded clip embedding uses vane.ai.embed_video on an ordered LIST of
+Decoded clip embedding uses vane.ai.embed(VideoInput(...)) on an ordered LIST of
 {frame_index, frame_time, data IMAGE}. Sampling belongs to the caller; both
 native adapters use microsecond timestamp precision and disable resampling.
 Processors declaring second_per_grid_ts consume a scalar time interval: they

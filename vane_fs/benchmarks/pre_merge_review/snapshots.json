@@ -1,0 +1,49 @@
+{
+  "source_commit": "5f13479740e5d94c36370aa0ebf12a47d8f65e9a",
+  "ci_base": "b7c00df040418a1e252044960503349ebeb4f62c",
+  "purpose": "Six lint-only fixes; original benchmark source identities remain reproducible from immutable snapshots. No native or performance-policy changes.",
+  "snapshots": {
+    "vane_fs/benchmarks/lookup_reads/run.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/lookup_reads/run.py",
+      "before_sha256": "d027c9f85290181c4dc39961e43266e60bd21ff506675f89f6f4f630c2844a22",
+      "bytes": 6226,
+      "retained_as": "evidence/vane_fs/benchmarks/lookup_reads/run.py/000.gz.part",
+      "packed_sha256": "2b303ca2143b3fb09729b0ef7f0d40d1882e20b0823a7fdfdcae63f363de9763"
+    },
+    "vane_fs/benchmarks/performance_closeout/shipping.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/performance_closeout/shipping.py",
+      "before_sha256": "24a27f79ebf8eee7b9022f98f074141d49a5f44ecc81977a024e796b814d8501",
+      "bytes": 13172,
+      "retained_as": "evidence/vane_fs/benchmarks/performance_closeout/shipping.py/000.gz.part",
+      "packed_sha256": "611f36d5b65cc5092e29355b8eae2d8e15e38ededffe87aa4f58d1bca7e3f046"
+    },
+    "vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py",
+      "before_sha256": "69f782b3da039853203c71ccb646ecad49941a1d10b47f892262bf4b71047d02",
+      "bytes": 4988,
+      "retained_as": "evidence/vane_fs/benchmarks/staged_payload/begin_gate_matched/analyze.py/000.gz.part",
+      "packed_sha256": "75e481d0946489544d1b7bb6e3df78d398d97717000f11295cff3c96f776dfad"
+    },
+    "vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py",
+      "before_sha256": "d04b5f2e77a1f8540e1d6bc5555a322f3a149a410b93faa29fa99bb3e6e4a0a6",
+      "bytes": 3150,
+      "retained_as": "evidence/vane_fs/benchmarks/staged_payload/gate_sync_waits/sample.py/000.gz.part",
+      "packed_sha256": "99e8018aa574b9d16a873ab39831bc210b2d187e100170cc944d0bab8e5278c3"
+    },
+    "vane_fs/benchmarks/staged_payload/paced_request_waits/run.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/paced_request_waits/run.py",
+      "before_sha256": "ddef73b3ca3320b8911f292b936e68cc3af8212f6d53e26c2e9fed7a599b0553",
+      "bytes": 1362,
+      "retained_as": "evidence/vane_fs/benchmarks/staged_payload/paced_request_waits/run.py/000.gz.part",
+      "packed_sha256": "6909cfd6db78c289309b32dd032703bf02c4d75fedb7ae41e97a53a2f4da4d2e"
+    },
+    "vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py": {
+      "original_absolute_path": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py",
+      "before_sha256": "740e9d1808269ccf0c360f80bbc74a55321ab91ffe252371def367061ad96692",
+      "bytes": 13454,
+      "retained_as": "evidence/vane_fs/benchmarks/staged_payload/sqlite_step_waits/attribute.py/000.gz.part",
+      "packed_sha256": "519af00e944fa3c3dcf3ca6aecc88274b8873b49c5d124d18c72a932413bf0c0"
+    }
+  }
+}

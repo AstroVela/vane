@@ -37,7 +37,7 @@ from vane.ai.options import (
     normalize_prompt_options,
 )
 from vane.ai.protocols import NativeInferencePlan, PrompterDescriptor
-from vane.ai.providers._native_inference import NativeEmbeddingProviderMixin
+from vane.ai.providers._native_inference import InferenceEmbeddingProviderMixin
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_ENGINE_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -275,13 +275,14 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any], *, engine: s
     }
 
 
-class VLLMProvider(NativeEmbeddingProviderMixin):
-    """Provider backed by a native Python vLLM engine."""
+class VLLMProvider(InferenceEmbeddingProviderMixin):
+    """Native prompting and explicit native or HTTP embedding."""
 
     _native_family = "vllm"
 
-    def __init__(self, name: str | None = None):
+    def __init__(self, name: str | None = None, *, api_key: str | None = None):
         self._name = name or "vllm"
+        self._capture_http_client(api_key)
 
     @property
     def name(self) -> str:

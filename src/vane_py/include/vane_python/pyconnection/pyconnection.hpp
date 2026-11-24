@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 
 namespace duckdb {
 struct BoundParameterData;
@@ -72,6 +73,8 @@ public:
 
 public:
 	shared_ptr<DuckDBPyConnection> Get();
+	//! Inspect the existing catalog without opening a Python connection from a conversion callback.
+	shared_ptr<DuckDBPyConnection> GetIfOpen();
 	void Set(shared_ptr<DuckDBPyConnection> conn);
 
 private:
@@ -172,6 +175,8 @@ struct VaneSessionContext {
 	mutex lock;
 	idx_t connection_count = 1;
 	bool ray_session_opened = false;
+	py::object local_query_runtime = py::none();
+	bool local_runtime_closing = false;
 };
 
 struct DuckDBPyConnection : public enable_shared_from_this<DuckDBPyConnection> {
@@ -184,6 +189,7 @@ private:
 	public:
 		void AddCursor(shared_ptr<DuckDBPyConnection> conn);
 		void ClearCursors();
+		void CheckLocalQueryCloseReentrancy();
 
 	private:
 		mutex lock;
@@ -194,12 +200,18 @@ public:
 	ConnectionGuard con;
 	Cursors cursors;
 	//! Runner initialization may reenter this connection on its owning thread.
-	std::recursive_mutex py_connection_lock;
+	shared_ptr<std::recursive_mutex> py_connection_lock = make_shared_ptr<std::recursive_mutex>();
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
 	shared_ptr<VaneSessionContext> vane_session;
 	bool vane_session_attached = false;
+	bool vane_session_owner = false;
+	//! GIL-protected; published before request admission so interrupt can cancel a waiter.
+	py::object local_query_request = py::none();
+	py::object local_query_stream = py::none(); // Weak reference; no connection/result cycle.
+	bool local_query_closing = false;
+	std::thread::id local_query_thread;
 	//! MemoryFileSystem used to temporarily store file-like objects for reading
 	shared_ptr<ModifiedMemoryFileSystem> internal_object_filesystem;
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> registered_functions;
@@ -297,6 +309,8 @@ public:
 	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
+	py::object ExecuteResult(const py::object &query, const py::object &params, const py::object &delivery_timeout,
+	                         bool stream, idx_t rows_per_batch);
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);
 
 	shared_ptr<DuckDBPyConnection> Append(const string &name, const PandasDataFrame &value, bool by_name);
@@ -403,6 +417,15 @@ public:
 	bool CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries, const string &entry);
 	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();
+	py::object ConfigureLocalRuntime(const py::kwargs &options);
+	py::object GetLocalQueryRuntime() const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
+	//! Reject all connection entry from input callbacks before acquiring locks.
+	//! This includes idle cursors and callbacks before a file handle exists.
+	static void CheckCallbackEntry();
+	//! Used by detached result streams too; callback callers must never wait.
+	static unique_lock<std::recursive_mutex> LockConnection(const shared_ptr<std::recursive_mutex> &mutex);
+	void CheckLocalQueryCloseReentrancy();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);
@@ -434,6 +457,7 @@ private:
 	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
+	unique_ptr<DuckDBPyRelation> CreateConnectionResult(shared_ptr<DuckDBPyResult> result);
 	unique_ptr<DuckDBPyRelation> RunQueryInternal(const py::object &query, string alias, py::object params,
 	                                              bool for_connection);
 	unique_ptr<DuckDBPyRelation> RunStatement(unique_ptr<SQLStatement> statement, string alias, py::object params,
@@ -458,3 +482,6 @@ static bool ModuleIsLoaded() {
 }
 
 } // namespace duckdb
+
+// Keep the connection holder caster identical in every translation unit.
+#include "vane_python/pybind11/conversions/pyconnection_default.hpp"

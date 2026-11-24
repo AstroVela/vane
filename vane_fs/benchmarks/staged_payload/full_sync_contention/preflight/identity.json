@@ -1,0 +1,27 @@
+{
+  "status": "RETAINED_BEFORE_FIX",
+  "failure": "Native CreateNode requires an open parent inode; Snapshot requires acquiring the mount lease after snapshot preparation.",
+  "measured_comparisons": 0,
+  "files": {
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/build.json": {
+      "sha256": "8b24fa16922eacc34339624ebaa4239e944f2ec47a6c72d1c08d7fa1c9ecf7c2",
+      "bytes": 8743
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/release-cold-active.log": {
+      "sha256": "7ccdff7b01aa39c3203fbe555dc1ab36032cbc4fb20dfc9a12cf4cb2735fb63b",
+      "bytes": 23
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/probe-release": {
+      "sha256": "b67b553959f27d50770249312ebf4479ee8a1f80e9272bcbbf3b020985fd0bf7",
+      "bytes": 1825728
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/probe.cpp.txt": {
+      "sha256": "ad1a990957e151318137c80a4d40ac757e90112a299d2401e97b8953c2b3a5a8",
+      "bytes": 6594
+    },
+    "/home/kaka/astrovela_vane-fs/vane_fs/build/full-sync-contention-20261013/preflight/build.py.txt": {
+      "sha256": "86e578737e2490e0c1efb7e3b2b3107120c084e43b64ce33b6adfd50a8126a08",
+      "bytes": 8568
+    }
+  }
+}

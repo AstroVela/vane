@@ -1,0 +1,487 @@
+{
+  "status": "PASS",
+  "head_before_integration": "e794bc7166d16277eff52061b7c80774352ac215",
+  "artifact_root": "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z",
+  "scope": "Instrumented strict production v2 BLOB diagnosis, not plain performance rates",
+  "config": {
+    "orders": [
+      [
+        "fsync",
+        "fdatasync"
+      ],
+      [
+        "fdatasync",
+        "fsync"
+      ],
+      [
+        "fsync",
+        "fdatasync"
+      ],
+      [
+        "fdatasync",
+        "fsync"
+      ],
+      [
+        "fsync",
+        "fdatasync"
+      ],
+      [
+        "fdatasync",
+        "fsync"
+      ]
+    ],
+    "durability": "strict",
+    "application_write_bytes": 1048576,
+    "read_fixture_application_write_bytes": 1048576,
+    "logical_block_bytes": 4096,
+    "page_bytes": 4096,
+    "cache_configuration": "production defaults",
+    "strict_wal_trigger_frames": 4096,
+    "external_threshold_bytes": null,
+    "wake_mib": 16,
+    "admission_mib": 64,
+    "retained_wal_mib": 16,
+    "global_drop_caches": false,
+    "owned_concurrent_tests_or_builds": false,
+    "fresh_fuse_rounds": 6,
+    "aged_fuse_rounds": 0,
+    "native_rounds": 0,
+    "aged_guard_bytes": 33554432,
+    "aged_guard_write_bytes": 1048576,
+    "aged_guard_zero_stride": 8192,
+    "aged_fuse_read_fixture_bytes": 67108864,
+    "aged_native_read_fixture_bytes": 16777216,
+    "format_version": 2,
+    "scope": "Instrumented production v2 BLOB strict mounts; 64 MiB sequential writes followed by the preceding read/overwrite/small-file/metadata workload. Original sync sequence; no split writeback. Application small-file calls, WAL/db sync intervals, whole-device counters and own-thread waits retained."
+  },
+  "measurement_window": [
+    1791602283.110588,
+    1791602464.6256125
+  ],
+  "hardware": {
+    "collected_epoch": 1791602919.8021414,
+    "kernel": "6.11.0-24-generic",
+    "block_device": "sda                      Fanxiang S103Pro 2TB\n\u251c\u2500sda1 vfat   /boot/efi  \n\u2514\u2500sda2 ext4   /          \n",
+    "cpu": "Architecture:                         x86_64\nCPU op-mode(s):                       32-bit, 64-bit\nAddress sizes:                        46 bits physical, 48 bits virtual\nByte Order:                           Little Endian\nCPU(s):                               36\nOn-line CPU(s) list:                  0-35\nVendor ID:                            GenuineIntel\nModel name:                           Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz\nCPU family:                           6\nModel:                                79\nThread(s) per core:                   2\nCore(s) per socket:                   18\nSocket(s):                            1\nStepping:                             1\nCPU(s) scaling MHz:                   44%\nCPU max MHz:                          3000.0000\nCPU min MHz:                          1200.0000\nBogoMIPS:                             4596.96\nFlags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 pti intel_ppin ssbd ibrs ibpb stibp fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm rdt_a rdseed adx smap intel_pt xsaveopt cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts md_clear flush_l1d\nL1d cache:                            576 KiB (18 instances)\nL1i cache:                            576 KiB (18 instances)\nL2 cache:                             4.5 MiB (18 instances)\nL3 cache:                             45 MiB (1 instance)\nNUMA node(s):                         1\nNUMA node0 CPU(s):                    0-35\nVulnerability Gather data sampling:   Not affected\nVulnerability Itlb multihit:          KVM: Mitigation: VMX unsupported\nVulnerability L1tf:                   Mitigation; PTE Inversion\nVulnerability Mds:                    Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Meltdown:               Mitigation; PTI\nVulnerability Mmio stale data:        Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Reg file data sampling: Not affected\nVulnerability Retbleed:               Not affected\nVulnerability Spec rstack overflow:   Not affected\nVulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:             Mitigation; Retpolines; IBPB conditional; IBRS_FW; STIBP conditional; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                  Not affected\nVulnerability Tsx async abort:        Mitigation; Clear CPU buffers; SMT vulnerable\n",
+    "device_settings": {
+      "scheduler": "none [mq-deadline]",
+      "wbt_lat_usec": "2000",
+      "write_cache": "write back"
+    }
+  },
+  "sdk_libraries": {
+    "fsync": {
+      "prefix": "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release",
+      "sha256": "737ac97ced4d6307e4ac4614395768d32d981f88bc8c98caf0c752fd8659cc2f",
+      "sync_symbols": [
+        "U fsync"
+      ],
+      "config_sha256": "058b15e09bc22c009800609a90aaf302ee06d013cf160cb5af08d9c692676dee"
+    },
+    "fdatasync": {
+      "prefix": "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fdatasync/x64-linux-fdatasync-release",
+      "sha256": "b951954b26fb6e11ba2e3cc3856f8723d785528217ade313fbe4ad37acdc3353",
+      "sync_symbols": [
+        "U fdatasync"
+      ],
+      "config_sha256": "058b15e09bc22c009800609a90aaf302ee06d013cf160cb5af08d9c692676dee"
+    }
+  },
+  "build_checks": {
+    "status": "PASS",
+    "started_epoch": 1791602223.832587,
+    "checks": [
+      {
+        "variant": "fsync",
+        "sdist_sources_match": true
+      },
+      {
+        "variant": "fdatasync",
+        "sdist_sources_match": true
+      }
+    ],
+    "native_libraries_identical": true,
+    "invalid_configuration": {
+      "command": [
+        "cmake",
+        "-S",
+        "/home/kaka/astrovela_vane-fs/vane_fs",
+        "-B",
+        "/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/configure-invalid",
+        "-G",
+        "Ninja",
+        "-DVANE_FS_BUILD_PYTHON=OFF",
+        "-DVANE_FS_BUILD_TESTS=ON",
+        "-DVANE_FS_TEST_SQLITE_SYNC=unknown",
+        "-DCMAKE_PREFIX_PATH=/home/kaka/astrovela_vane-fs/vane_fs/build/fdatasync-option-20261010T030643Z/sdk/fsync/x64-linux-release"
+      ],
+      "returncode": 1,
+      "rejected": true
+    },
+    "ended_epoch": 1791602224.56222
+  },
+  "rates": {
+    "fsync": {
+      "write_64": {
+        "seconds": [
+          1.1602295129559934,
+          1.2806604329962283,
+          1.2489026450784877,
+          1.180313790915534,
+          1.2341558190528303,
+          1.2497254209592938
+        ],
+        "mib_per_second": [
+          55.16149975959754,
+          49.974215140125665,
+          51.24498715108246,
+          54.22286894602589,
+          51.85730927324693,
+          51.21124922854923
+        ]
+      },
+      "read_64": {
+        "seconds": [
+          0.12966906593646854,
+          0.08573669905308634,
+          0.12212992098648101,
+          0.12647781695704907,
+          0.1168705050367862,
+          0.1265773269115016
+        ],
+        "mib_per_second": [
+          493.5641321836686,
+          746.4714726230894,
+          524.0321084550966,
+          506.0175890111538,
+          547.6146439159764,
+          505.61977853068856
+        ]
+      },
+      "random_read_4k": {
+        "seconds": [
+          0.3111690180376172,
+          0.24213509098626673,
+          0.2530960850417614,
+          0.2762396039906889,
+          0.2548174289986491,
+          0.28018037194851786
+        ],
+        "mib_per_second": [
+          51.41900084045565,
+          66.07881548613487,
+          63.21709795455732,
+          57.920731744675194,
+          62.790053501736026,
+          57.10607023871017
+        ]
+      },
+      "random_write_4k": {
+        "seconds": [
+          1.4774326189653948,
+          7.79333300399594,
+          1.4669138230383396,
+          1.471662794938311,
+          1.4070648839697242,
+          1.495365206967108
+        ],
+        "mib_per_second": [
+          1.3536996370098724,
+          0.25662960879183827,
+          1.363406608206546,
+          1.3590069728465453,
+          1.4213985600702648,
+          1.3374659184804691
+        ]
+      },
+      "small_file_fsync": {
+        "seconds": [
+          0.7652131080394611,
+          0.781116632046178,
+          0.7684452689718455,
+          0.8070066400105134,
+          0.7841684060404077,
+          0.7771520901005715
+        ],
+        "ops_per_second": [
+          167.27366357843312,
+          163.86797406258904,
+          166.57009310664347,
+          158.61083868942202,
+          163.23024367472954,
+          164.70392556421675
+        ]
+      },
+      "mkdir": {
+        "seconds": [
+          0.38457954302430153,
+          0.3802575260633603,
+          0.3923876730259508,
+          0.40212326194159687,
+          0.38940048206131905,
+          0.3958338040392846
+        ],
+        "ops_per_second": [
+          332.8310159022465,
+          336.61398191149027,
+          326.2080049888179,
+          318.31035932109376,
+          328.7104302553066,
+          323.36803651892404
+        ]
+      },
+      "rename": {
+        "seconds": [
+          0.39749835699331015,
+          0.3779517930233851,
+          0.4050517480354756,
+          0.4069455749122426,
+          0.3959501449717209,
+          0.39814662898425013
+        ],
+        "ops_per_second": [
+          322.013909612598,
+          338.6675294647437,
+          316.00900532044955,
+          314.5383753775995,
+          323.27302218601756,
+          321.4895987605195
+        ]
+      },
+      "rmdir": {
+        "seconds": [
+          0.6683270060457289,
+          0.6618813580134884,
+          0.6604587469482794,
+          0.6790087759727612,
+          0.6496454880107194,
+          0.6679599740309641
+        ],
+        "ops_per_second": [
+          191.52301020623707,
+          193.38813285838384,
+          193.8046858966404,
+          188.51008194500093,
+          197.03053798149054,
+          191.62824866219665
+        ]
+      }
+    },
+    "fdatasync": {
+      "write_64": {
+        "seconds": [
+          1.1400208909763023,
+          1.0545838719699532,
+          7.400418784003705,
+          1.0818838850827888,
+          1.1062915460206568,
+          1.1274675040040165
+        ],
+        "mib_per_second": [
+          56.13932210065997,
+          60.687444309620034,
+          8.648159228277528,
+          59.1560710742101,
+          57.850934710844285,
+          56.76438546806401
+        ]
+      },
+      "read_64": {
+        "seconds": [
+          0.11998647102154791,
+          0.11159759701695293,
+          0.1306976709747687,
+          0.08730609796475619,
+          0.13166617299430072,
+          0.11719885806087404
+        ],
+        "mib_per_second": [
+          533.3934689062277,
+          573.4890509360849,
+          489.67972820537295,
+          733.053034002683,
+          486.0777718721292,
+          546.0804060629829
+        ]
+      },
+      "random_read_4k": {
+        "seconds": [
+          0.2410286710364744,
+          0.24222964700311422,
+          0.2617962450021878,
+          0.2310858720447868,
+          0.2752411389956251,
+          0.24463996104896069
+        ],
+        "mib_per_second": [
+          66.38214421212467,
+          66.05302116381442,
+          61.116231823211564,
+          69.23833057565301,
+          58.13084504149766,
+          65.40223408880392
+        ]
+      },
+      "random_write_4k": {
+        "seconds": [
+          6.545184568036348,
+          0.8665894939331338,
+          0.8649822400184348,
+          0.7699857030529529,
+          0.9005512669682503,
+          7.176671348977834
+        ],
+        "mib_per_second": [
+          0.30556815918791264,
+          2.3078978155190057,
+          2.312186201600365,
+          2.5974508254765056,
+          2.220861902435713,
+          0.27868072853647646
+        ]
+      },
+      "small_file_fsync": {
+        "seconds": [
+          0.46358529094140977,
+          0.46819346700794995,
+          0.48870077601168305,
+          6.393887876998633,
+          0.5110971019603312,
+          0.5201043050037697
+        ],
+        "ops_per_second": [
+          276.10884663762397,
+          273.391256007907,
+          261.91896203770295,
+          20.019118643050824,
+          250.4416470159025,
+          246.1044809061372
+        ]
+      },
+      "mkdir": {
+        "seconds": [
+          0.2545355570036918,
+          0.2978066080249846,
+          0.2792386779328808,
+          0.23946212604641914,
+          0.86622966802679,
+          0.2544663338921964
+        ],
+        "ops_per_second": [
+          502.87669631219137,
+          429.8091330104448,
+          458.38922081835204,
+          534.5312935841366,
+          147.7668160357229,
+          503.0134951141578
+        ]
+      },
+      "rename": {
+        "seconds": [
+          0.24329091201070696,
+          0.2605998090002686,
+          0.234797790995799,
+          0.26116438605822623,
+          0.23160413303412497,
+          0.2396226949058473
+        ],
+        "ops_per_second": [
+          526.1191178171376,
+          491.17457334693626,
+          545.149932872623,
+          490.11276741026467,
+          552.6671667000876,
+          534.1731093137645
+        ]
+      },
+      "rmdir": {
+        "seconds": [
+          0.3955274970503524,
+          0.4059774569468573,
+          0.38406151509843767,
+          0.3571044489508495,
+          0.35299048898741603,
+          0.366483545047231
+        ],
+        "ops_per_second": [
+          323.6184613068887,
+          315.28844227613183,
+          333.2799433632206,
+          358.43854753435863,
+          362.616002394793,
+          349.2653400946115
+        ]
+      }
+    }
+  },
+  "selected_slow_phases": [
+    {
+      "variant": "fdatasync",
+      "rep": 0,
+      "workload": "random_write_4k",
+      "phase_ms": 6545.184568036348,
+      "wal_ms": 5265.14106,
+      "database_sync_ms": 984.005011,
+      "slow_wal_count": 61,
+      "slow_wal_ms": 4805.924551,
+      "slow_wal_device_flush_ms": 4797,
+      "slow_wal_device_flush_count": 79
+    },
+    {
+      "variant": "fsync",
+      "rep": 1,
+      "workload": "random_write_4k",
+      "phase_ms": 7793.33300399594,
+      "wal_ms": 6335.068109,
+      "database_sync_ms": 1106.914349,
+      "slow_wal_count": 65,
+      "slow_wal_ms": 5442.390225,
+      "slow_wal_device_flush_ms": 5284,
+      "slow_wal_device_flush_count": 142
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 3,
+      "workload": "small_file_fsync",
+      "phase_ms": 6393.887876998633,
+      "wal_ms": 5837.532879,
+      "database_sync_ms": 334.410756,
+      "slow_wal_count": 69,
+      "slow_wal_ms": 5644.550256,
+      "slow_wal_device_flush_ms": 5625,
+      "slow_wal_device_flush_count": 69
+    },
+    {
+      "variant": "fdatasync",
+      "rep": 5,
+      "workload": "random_write_4k",
+      "phase_ms": 7176.671348977834,
+      "wal_ms": 5741.684939,
+      "database_sync_ms": 1138.144112,
+      "slow_wal_count": 69,
+      "slow_wal_ms": 5301.938162,
+      "slow_wal_device_flush_ms": 5271,
+      "slow_wal_device_flush_count": 100
+    }
+  ],
+  "validation": {
+    "status": "PASS",
+    "checked_epoch": 1791602919.8011124,
+    "unchanged": {
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/workspace.cpp": true,
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/fuse.cpp": true,
+      "/home/kaka/astrovela_vane-fs/vane_fs/src/checkpoint.hpp": true,
+      "/home/kaka/astrovela_vane-fs/vane_fs/vcpkg_installed/x64-linux-release/lib/libsqlite3.a": true,
+      "/home/kaka/astrovela_vane-fs/.venv/lib/python3.12/site-packages/vane_fs/_native.cpython-312-x86_64-linux-gnu.so": true
+    },
+    "cleanup_entries_absent": 16,
+    "measured_mounts": 12,
+    "owned_processes_absent": true,
+    "owned_mounts_absent": true,
+    "owned_builds_tests_before_measurements": true,
+    "native_tests_per_variant": 6,
+    "python_tests_per_variant": 132,
+    "small_file_wal_stage_counts_verified_mounts": 12,
+    "free_bytes": 103966257152
+  }
+}

@@ -16,6 +16,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_dependency.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -97,6 +98,7 @@ OperatorPartitionData PandasScanFunction::PandasScanGetPartitionData(ClientConte
 unique_ptr<FunctionData> PandasScanFunction::PandasScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types, vector<string> &names) {
 	PythonGILWrapper acquire;
+	PythonInputCallbackScope callback(context.shared_from_this());
 	py::handle df(reinterpret_cast<PyObject *>(input.inputs[0].GetPointer()));
 
 	vector<PandasColumnBindData> pandas_bind_data;
@@ -202,6 +204,10 @@ void PandasScanFunction::PandasBackendScanSwitch(PandasColumnBindData &bind_data
 //! The main pandas scan function: note that this can be called in parallel without the GIL
 //! hence this needs to be GIL-safe, i.e. no methods that create Python objects are allowed
 void PandasScanFunction::PandasScanFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	// Both pandas and NumPy object columns can invoke Python (for example,
+	// __str__) on native worker threads. Attribute the whole conversion to
+	// this execution, including when the input view was bound by another cursor.
+	PythonInputCallbackScope callback(context.shared_from_this());
 	auto &data = data_p.bind_data->CastNoConst<PandasScanFunctionData>();
 	auto &state = data_p.local_state->Cast<PandasScanLocalState>();
 

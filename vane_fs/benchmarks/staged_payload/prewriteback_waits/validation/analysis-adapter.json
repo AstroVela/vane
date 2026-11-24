@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "prepared_epoch": 1792324349.6837196,
+  "measurement_ended_epoch": 1792323926.0384278,
+  "original": "/home/kaka/astrovela_vane-fs/vane_fs/benchmarks/staged_payload/prewriteback_waits/analyze.py",
+  "original_sha256": "c9b10a0297b737613d41d7b518f95b740845b802fb7805ee5485f96b2fdfc4e8",
+  "adapter_sha256": "f4d23806989566605366e4d3fa5520d7a669f55b34582cfc5ab64462e10b003b",
+  "changes": [
+    [
+      "        position = 0\n        for _, root in sorted(selected, key=lambda item: item[1][5]):\n            assert root[5] == position\n            position += root[6]\n        assert position == sample[\"bytes\"] == 64 * 1024**2",
+      "        position = 0\n        for _, root in sorted(selected, key=lambda item: item[1][5]):\n            assert root[5] == position\n            returned = min(root[6], max(0, sample[\"bytes\"] - root[5]))\n            position += returned\n        assert position == sample[\"bytes\"] == 64 * 1024**2"
+    ],
+    [
+      "native_request_bytes=position,",
+      "native_request_bytes=sum(r[6] for _, r in selected),\n                native_returned_bytes=position,\n                eof_requests=sum(r[5] == sample[\"bytes\"] for _, r in selected),"
+    ]
+  ],
+  "exact_reverse": true,
+  "measured_workload_and_sources_unchanged": true
+}

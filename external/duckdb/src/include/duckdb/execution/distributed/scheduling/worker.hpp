@@ -163,11 +163,14 @@ public:
 	/// selected outputs are retained, so collecting first is not a safe fallback.
 	/// A successful implementation must return an empty vector: every selected
 	/// output is transferred exactly once through the callback.
-	virtual DuckDBResult<std::vector<MaterializedOutput>>
-	wait_fte_query_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+	virtual DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query_streaming(const std::string &query_id,
+	                                                                               double timeout_s,
+	                                                                               MaterializedOutputCallback on_output,
+	                                                                               bool preserve_task_order = true) {
 		(void)query_id;
 		(void)timeout_s;
 		(void)on_output;
+		(void)preserve_task_order;
 		return DuckDBResult<std::vector<MaterializedOutput>>::err(
 		    DuckDBError::invalid_state_error("worker manager does not support streaming FTE result drain"));
 	}

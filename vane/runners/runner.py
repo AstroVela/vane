@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class Runner:
-    name: ClassVar[Literal["ray", "local"]]
+    name: ClassVar[Literal["ray"]]
 
     @abstractmethod
     def run_iter(self, logical_plan: Any) -> Iterator[MaterializedResult]:

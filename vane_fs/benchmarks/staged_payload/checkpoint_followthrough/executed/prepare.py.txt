@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Extend the verified request recorder with worker decisions and all WAL calls."""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def replace(text, old, new):
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--diagnostic-parent", type=Path, required=True)
+    parser.add_argument("--candidates", type=Path, required=True)
+    args = parser.parse_args()
+    here = Path(__file__).resolve().parent
+    repo = here.parents[3]
+    out = args.output.resolve()
+    preceding, candidates = args.diagnostic_parent.resolve(), args.candidates.resolve()
+    previous = json.loads((preceding / "build.json").read_text())
+    measured = json.loads((candidates / "candidates.json").read_text())
+    assert previous["status"] == measured["status"] == "PASS"
+    old = preceding.with_name(preceding.name + "-generator")
+    for path in (old / "prepare.py", old / "trace.hpp", old / "trace.cpp"):
+        assert digest(path) == previous["inputs"][str(path)]
+    originals = {"progress": Path(previous["original_sources"]["updated"]["path"])}
+    originals.update({name: candidates / name for name in ("lookup", "coalesced")})
+    expected = {"progress": previous["original_sources"]["updated"]["sha256"]}
+    expected.update({name: measured["variants"][name]["sources"] for name in ("lookup", "coalesced")})
+    assert all(digest(originals[n] / p) == h for n, entries in expected.items() for p, h in entries.items())
+    generator = out.with_name(out.name + "-generator")
+    generator.mkdir()
+    source = (old / "prepare.py").read_text()
+    source = replace(source, 'for name in ("baseline", "updated"):', 'for name in ("progress", "lookup", "coalesced"):')
+    source = replace(
+        source,
+        'component = parent / "updated" if name == "updated" else Path(identity["parent"]) / "updated"',
+        "component = Path(" + repr({n: str(p) for n, p in originals.items()}) + "[name])",
+    )
+    source = replace(source, 'expected = identity["source_inputs"][name]', "expected = " + repr(expected) + "[name]")
+    source = replace(source, '            if name == "updated":\n', "            if True:\n")
+    marker = '            (target / "src/checkpoint.hpp").write_text(checkpoint)'
+    extra = """            decision = "request_trace::Decision(staging.Pending(), frames, copied, retry, deferred, "
+            if name == "coalesced":
+                decision += "clean_pending ? std::chrono::duration_cast<std::chrono::nanoseconds>(clean_deadline - std::chrono::steady_clock::now()).count() : 0);"
+            else:
+                decision += "0);"
+            needle = "if (!deferred && (code == SQLITE_OK || code == SQLITE_BUSY)) {"
+            checkpoint = replace_once(checkpoint, needle, decision + "\\n\\t\\t\\t\\t\\t\\t" + needle)
+"""
+    source = replace(source, marker, extra + marker)
+    # Retain component and test identities from the prior build; new validation is separate.
+    source = replace(
+        source,
+        'shutil.copy2(parent / "tests.json", out / "tests.json")',
+        'shutil.copy2(parent / "tests.json", out / "reused-tests.json")',
+    )
+    (generator / "prepare.py").write_text(source)
+
+    header = (old / "trace.hpp").read_text()
+    header = replace(
+        header,
+        "void CommitFrames(int frames);",
+        """void CommitFrames(int frames);
+void Decision(bool pending, int frames, int copied, bool retry, bool deferred, long long remaining);
+void Checkpoint(int mode, int frames, int copied, int code, long long begin);""",
+    )
+    (generator / "trace.hpp").write_text(header)
+    recorder = (old / "trace.cpp").read_text()
+    recorder = replace(
+        recorder,
+        "int committed_frames = -1;",
+        "int committed_frames = -1;\n\tstd::array<long long, 7> decision {-1, -1, -1, -1, -1, -1, -1};",
+    )
+    recorder = replace(
+        recorder,
+        "std::vector<Sync> syncs;",
+        "std::vector<Sync> syncs;\n\tstd::vector<std::array<long long, 7>> checkpoints;",
+    )
+    recorder = replace(
+        recorder,
+        "threads[index].syncs.reserve(65536);",
+        "threads[index].syncs.reserve(65536);\n\t\tthreads[index].checkpoints.reserve(131072);",
+    )
+    recorder = replace(recorder, '\\"committed_frames\\"],', '\\"committed_frames\\",\\"decision\\"],')
+    recorder = replace(
+        recorder,
+        "<< row.committed_frames << ']';",
+        """<< row.committed_frames << ",[";
+            for (size_t j = 0; j < row.decision.size(); ++j) {
+                if (j) file << ',';
+                file << row.decision[j];
+            }
+            file << "]]";""",
+    )
+    recorder = replace(
+        recorder,
+        'file << "]}";',
+        """file << "],\\"checkpoints\\":[";
+        first = true;
+        for (const auto &call : threads[i].checkpoints) {
+            if (!first) file << ',';
+            first = false;
+            file << '[';
+            for (size_t j = 0; j < call.size(); ++j) {
+                if (j) file << ',';
+                file << call[j];
+            }
+            file << ']';
+        }
+        file << "]}";""",
+    )
+    recorder = replace(
+        recorder,
+        "void CommitFrames(int frames) {",
+        """void Decision(bool pending, int frames, int copied, bool retry, bool deferred, long long remaining) {
+    if (active) active->decision = {Now(), pending, frames, copied, retry, deferred, remaining};
+}
+void Checkpoint(int mode, int frames, int copied, int code, long long begin) {
+    auto &thread = CurrentThread();
+    if (thread.checkpoints.size() == thread.checkpoints.capacity()) std::abort();
+    thread.checkpoints.push_back({active ? int64_t(active - thread.rows.data()) : -1, mode, frames, copied, code, begin, Now()});
+}
+void CommitFrames(int frames) {""",
+    )
+    recorder = replace(
+        recorder,
+        "auto rc = __real_sqlite3_wal_checkpoint_v2(db, name, mode, frames, copied);",
+        "auto begin = request_trace::Now();\n\tauto rc = __real_sqlite3_wal_checkpoint_v2(db, name, mode, frames, copied);\n\trequest_trace::Checkpoint(mode, frames ? *frames : -1, copied ? *copied : -1, rc, begin);",
+    )
+    (generator / "trace.cpp").write_text(recorder)
+    test = (
+        (old / "test_trace.cpp")
+        .read_text()
+        .replace('#include "trace.hpp"', '#include "trace.hpp"\n#include <sqlite3.h>')
+    )
+    test = replace(
+        test,
+        "request_trace::Install(argv[1]);",
+        """request_trace::Install(argv[1]);
+    {
+        request_trace::Scope scope("recorder_probe");
+        request_trace::Decision(false, 5000, 4999, false, true, 1234567);
+        sqlite3 *db = nullptr;
+        Require(sqlite3_open(":memory:", &db) == SQLITE_OK);
+        int frames = -1, copied = -1;
+        Require(sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied) == SQLITE_OK);
+        Require(sqlite3_close(db) == SQLITE_OK);
+    }""",
+    )
+    (generator / "test_trace.cpp").write_text(test)
+    validate = (old / "validate.py").read_text()
+    validate = replace(
+        validate,
+        "    assert kinds == {",
+        """    probes = [(t, i, dict(zip(trace["columns"], r, strict=True))) for t in trace["threads"] for i, r in enumerate(t["rows"]) if r[0] == "recorder_probe"]
+    assert len(probes) == 1
+    thread, index, probe = probes[0]
+    assert probe["decision"][1:] == [0, 5000, 4999, 0, 1, 1234567]
+    calls_wal = [c for c in thread["checkpoints"] if c[0] == index]
+    assert len(calls_wal) == 1 and calls_wal[0][1:5] == [-1, -1, -1, 0]
+    assert probe["begin_ns"] <= calls_wal[0][5] <= calls_wal[0][6] <= probe["end_ns"]
+    assert kinds == {""",
+    )
+    (generator / "validate.py").write_text(validate)
+    identity = dict(
+        status="PASS",
+        inputs={
+            str(p): digest(p)
+            for p in (
+                Path(__file__),
+                preceding / "build.json",
+                candidates / "candidates.json",
+                old / "prepare.py",
+                old / "trace.hpp",
+                old / "trace.cpp",
+                old / "test_trace.cpp",
+                old / "validate.py",
+            )
+        },
+    )
+    (generator / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+    sdk = repo / "vane_fs/vcpkg_installed/x64-linux-release"
+    subprocess.run(
+        [
+            sys.executable,
+            str(generator / "prepare.py"),
+            str(out),
+            "--parent",
+            previous["parent"],
+            "--sqlite-prefix",
+            str(sdk),
+            "--fuse-prefix",
+            str(repo / ".cache/fuse-sdk/root/usr"),
+        ],
+        check=True,
+    )
+    subprocess.run([sys.executable, str(generator / "validate.py"), str(out), "--sqlite-prefix", str(sdk)], check=True)
+
+
+if __name__ == "__main__":
+    main()

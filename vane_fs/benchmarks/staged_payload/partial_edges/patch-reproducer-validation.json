@@ -1,0 +1,8 @@
+{
+  "status": "PASS",
+  "candidate_source_byte_identical": true,
+  "patch_sha256": "3e2a38c69882f026beecfe91360e96c078b1190e6669d61501e719b736f97fa3",
+  "change": "Zero context for the stored Python-test diff avoids whitespace-only diff context; C++ and Python candidate bytes unchanged",
+  "completed_epoch": 1791710364.5272079,
+  "stdout": "patching file src/workspace.cpp\npatching file tests/test_core.cpp\npatching file tests/test_workspace.py\npatching file tests/test_staging.cpp\n"
+}
