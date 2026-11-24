@@ -77,7 +77,7 @@ def _tiff_codec_content_error(error: RuntimeError) -> bool:
     }
     if name in statuses:
         return message.rpartition(" returned ")[2].strip("'") in statuses[name]
-    if name in ("Jpeg8Error", "Jpeg12Error"):
+    if name in ("JpegError", "Jpeg8Error", "Jpeg12Error"):
         # libjpeg reports formatted text, including its own allocation failures.
         return not any(
             token in message.lower()
