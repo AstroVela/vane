@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.embedding import AudioInput, ImageInput, MultimodalInput, TextInput, VideoInput
-    from vane.ai.functions import embed, prompt
+    from vane.ai.functions import embed, image_url, prompt
     from vane.ai.options import (
         EmbedOptions,
         JevOptions,
@@ -67,6 +67,7 @@ __all__ = [
     "VideoClip",
     "VideoInputSpec",
     "embed",
+    "image_url",
     "jev",
     "load_provider",
     "prompt",
@@ -103,6 +104,7 @@ _LAZY_EXPORTS = {
     "VideoInputSpec": ("vane.ai._video_embedding", "VideoInputSpec"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
     "embed": ("vane.ai.functions", "embed"),
+    "image_url": ("vane.ai.functions", "image_url"),
     "load_provider": ("vane.ai.provider", "load_provider"),
     "jev": ("vane.ai._jev", "jev"),
     "prompt": ("vane.ai.functions", "prompt"),

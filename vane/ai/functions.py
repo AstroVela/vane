@@ -36,6 +36,7 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard, cast, overload
 
 import numpy as np
@@ -49,7 +50,12 @@ from vane._typing import Expression, Relation
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedEmbedder
 from vane.ai._errors import _raise_if_resource_error
-from vane.ai._media import PromptMedia, normalize_media_content_type
+from vane.ai._media import (
+    PromptImageURL,
+    PromptMedia,
+    configured_prompt_image_origin,
+    normalize_media_content_type,
+)
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -1329,6 +1335,9 @@ class _EmbedMultimodalBatch(_EmbeddingBatch):
 class _PromptBatch:
     """Actor-local row-preserving wrapper for ordered text/media Prompt parts."""
 
+    # Serialized Prompt batches created before image URL support lack this field.
+    _image_url_indices: frozenset[int] = frozenset()
+
     def __init__(
         self,
         descriptor: Any,
@@ -1342,6 +1351,7 @@ class _PromptBatch:
         on_error: _OnError = "raise",
         supports_media_inputs: bool | None = None,
         packed_input_column: str | None = None,
+        image_url_indices: frozenset[int] = frozenset(),
     ) -> None:
         if not message_columns:
             raise ValueError("Prompt message_columns cannot be empty")
@@ -1351,6 +1361,7 @@ class _PromptBatch:
         self._descriptor = descriptor
         self._message_columns = list(message_columns)
         self._packed_input_column = packed_input_column
+        self._image_url_indices = image_url_indices
         self._output_column = output_column
         self._max_concurrency_per_actor = max_concurrency_per_actor
         self._single_message = single_message
@@ -1516,7 +1527,9 @@ class _PromptBatch:
             f"got {type(value).__name__}"
         )
 
-    def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
+    def _build_row_messages(
+        self, columns: list[list[Any]], index: int, allowed_image_origin: tuple[str, str] | None
+    ) -> tuple[Any, ...] | None:
         if self._packed_input_column is not None:
             packed = columns[0][index]
             if packed is None:
@@ -1529,8 +1542,12 @@ class _PromptBatch:
         if self._single_message and values[0] is None:
             return None
         parts: list[Any] = []
-        for value in values:
-            self._append_message_value(parts, value)
+        for part_index, value in enumerate(values):
+            if part_index in self._image_url_indices and value is not None:
+                assert allowed_image_origin is not None
+                parts.append(PromptImageURL(value, allowed_image_origin))
+            else:
+                self._append_message_value(parts, value)
         return tuple(parts) if parts else None
 
     def _validate_result(self, result: Any) -> str | None:
@@ -1547,6 +1564,7 @@ class _PromptBatch:
         )
 
     def __call__(self, table: pa.Table) -> pa.Table:
+        allowed_image_origin = configured_prompt_image_origin() if self._image_url_indices else None
         input_columns = [self._packed_input_column] if self._packed_input_column is not None else self._message_columns
         columns = [table.column(name).to_pylist() for name in input_columns]
         row_count = table.num_rows
@@ -1554,7 +1572,7 @@ class _PromptBatch:
         row_messages: dict[int, tuple[Any, ...]] = {}
         for index in range(row_count):
             try:
-                messages = self._build_row_messages(columns, index)
+                messages = self._build_row_messages(columns, index, allowed_image_origin)
             except Exception as exc:
                 if self._on_error == "raise":
                     raise
@@ -2109,17 +2127,54 @@ def _prepare_prompt_call(
     return descriptor, udf_options, execution_backend, structured_output
 
 
-def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool]:
-    if is_expression(messages):
-        return [messages], True
-    if not isinstance(messages, list):
-        raise TypeError("Prompt messages must be an Expression or a non-empty list of Expressions")
-    if not messages:
+@dataclass(frozen=True)
+class _ImageURLExpression:
+    expression: Expression
+
+
+_PromptMessage = Expression | _ImageURLExpression
+_PromptMessages = _PromptMessage | list[Expression] | list[_PromptMessage]
+
+
+def image_url(expression: Expression) -> _ImageURLExpression:
+    """Mark a VARCHAR expression as an image URL for an OpenAI-compatible endpoint.
+
+    Configure VANE_AI_IMAGE_URL_ORIGIN on the worker to an operator-controlled
+    image origin (scheme, host and optional port). The worker checks the supplied
+    URL against that origin and permits any path on it. Missing or invalid worker
+    configuration fails the query. The model endpoint fetches the image and
+    controls MIME validation, download size limits and redirect handling.
+    """
+    if not is_expression(expression):
+        raise TypeError("image_url expects a VARCHAR Expression")
+    return _ImageURLExpression(expression)
+
+
+def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool, frozenset[int]]:
+    single_message = not isinstance(messages, list)
+    values = [messages] if single_message else messages
+    if not values:
         raise ValueError("Prompt messages list cannot be empty")
-    for index, expression in enumerate(messages):
-        if not is_expression(expression):
+    expressions = []
+    image_url_indices = set()
+    for index, value in enumerate(values):
+        if isinstance(value, _ImageURLExpression):
+            image_url_indices.add(index)
+            expressions.append(value.expression)
+        elif is_expression(value):
+            expressions.append(value)
+        else:
             raise TypeError(f"Prompt messages[{index}] must be an Expression")
-    return list(messages), False
+    return expressions, single_message, frozenset(image_url_indices)
+
+
+def _require_image_url_support(descriptor: Any, image_url_indices: frozenset[int]) -> None:
+    if not image_url_indices:
+        return
+    from vane.ai.providers.openai import OpenAIPrompterDescriptor
+
+    if not isinstance(descriptor, OpenAIPrompterDescriptor) or not descriptor.supports_image_inputs():
+        raise ValueError("Prompt image URLs require an OpenAI-compatible provider with image support")
 
 
 def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[str]:
@@ -2228,8 +2283,10 @@ def _prompt_relation(
 ) -> Relation:
     if not _is_relation_like(rel):
         raise TypeError("vane.ai.prompt relation API requires a Relation")
-    message_expressions, single_message = _normalize_prompt_messages(messages)
+    message_expressions, single_message, image_url_indices = _normalize_prompt_messages(messages)
     message_types = _prompt_relation_types(rel, message_expressions)
+    if any(message_types[index] != "VARCHAR" for index in image_url_indices):
+        raise TypeError("Prompt image URL expressions must have type VARCHAR")
     if not isinstance(output_column, str) or not output_column.strip():
         raise ValueError("output_column must be a non-empty string")
 
@@ -2243,6 +2300,7 @@ def _prompt_relation(
         options,
         relation=True,
     )
+    _require_image_url_support(descriptor, image_url_indices)
 
     if isinstance(descriptor, NativeInferencePlan):
         if any(value != "VARCHAR" for value in message_types):
@@ -2286,7 +2344,12 @@ def _prompt_relation(
     if has_file_inputs:
         udf_inputs = {
             _PROMPT_PACKED_INPUT_COLUMN: _packed_prompt_messages(
-                message_expressions,
+                [
+                    _validated_prompt_message(message, media_policy="text")
+                    if index in image_url_indices
+                    else message
+                    for index, message in enumerate(message_expressions)
+                ],
                 supports_media_inputs=supports_media_inputs,
                 supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
                 single_message=single_message,
@@ -2295,7 +2358,10 @@ def _prompt_relation(
     else:
         media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
         validated_messages = [
-            _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
+            _validated_prompt_message(
+                message, media_policy="text" if index in image_url_indices else media_policy
+            )
+            for index, message in enumerate(message_expressions)
         ]
         udf_inputs = dict(zip(input_names, validated_messages, strict=True))
     wrapper = _PromptBatch(
@@ -2310,6 +2376,7 @@ def _prompt_relation(
         on_error=udf_options.on_error,
         supports_media_inputs=supports_media_inputs,
         packed_input_column=packed_input_column,
+        image_url_indices=image_url_indices,
     )
     expression = _build_ai_batch_expression(
         wrapper,
@@ -2339,7 +2406,7 @@ def _prompt_expression(
     on_error: _OnError = "raise",
     options: Mapping[str, Any],
 ) -> Expression:
-    message_expressions, single_message = _normalize_prompt_messages(messages)
+    message_expressions, single_message, image_url_indices = _normalize_prompt_messages(messages)
     descriptor, udf_options, _, structured_output = _prepare_prompt_call(
         provider,
         model,
@@ -2350,6 +2417,7 @@ def _prompt_expression(
         options,
         relation=False,
     )
+    _require_image_url_support(descriptor, image_url_indices)
 
     if isinstance(descriptor, NativeInferencePlan):
         validated_messages = [
@@ -2383,7 +2451,10 @@ def _prompt_expression(
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
     supports_media_inputs = bool(descriptor.supports_image_inputs())
     packed_messages = _packed_prompt_messages(
-        message_expressions,
+        [
+            _validated_prompt_message(message, media_policy="text") if index in image_url_indices else message
+            for index, message in enumerate(message_expressions)
+        ],
         supports_media_inputs=supports_media_inputs,
         supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
         single_message=single_message,
@@ -2400,6 +2471,7 @@ def _prompt_expression(
         on_error=udf_options.on_error,
         supports_media_inputs=supports_media_inputs,
         packed_input_column=_PROMPT_PACKED_INPUT_COLUMN,
+        image_url_indices=image_url_indices,
     )
     expression = _build_ai_batch_expression(
         wrapper,
@@ -2430,7 +2502,7 @@ _PROMPT_OUTPUT_COLUMN_DEFAULT = _DefaultPromptOutputColumn("response")
 
 @overload
 def prompt(
-    messages: Expression | list[Expression],
+    messages: _PromptMessages,
     /,
     *,
     return_format: type[BaseModel] | JSONSchema | None = None,
@@ -2446,7 +2518,7 @@ def prompt(
 @overload
 def prompt(
     *,
-    messages: Expression | list[Expression],
+    messages: _PromptMessages,
     return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
@@ -2461,7 +2533,7 @@ def prompt(
 def prompt(
     rel: Relation,
     /,
-    messages: Expression | list[Expression],
+    messages: _PromptMessages,
     *,
     return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
@@ -2478,7 +2550,7 @@ def prompt(
 def prompt(
     *,
     rel: Relation,
-    messages: Expression | list[Expression],
+    messages: _PromptMessages,
     return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
     provider: str | Provider = "openai",
@@ -2491,9 +2563,9 @@ def prompt(
 
 
 def prompt(
-    first: Expression | list[Expression] | Relation = _PROMPT_ARGUMENT_UNSET,
+    first: _PromptMessages | Relation = _PROMPT_ARGUMENT_UNSET,
     /,
-    messages: Expression | list[Expression] = _PROMPT_ARGUMENT_UNSET,
+    messages: _PromptMessages = _PROMPT_ARGUMENT_UNSET,
     *,
     rel: Relation = _PROMPT_ARGUMENT_UNSET,
     return_format: type[BaseModel] | JSONSchema | None = None,
@@ -2505,7 +2577,9 @@ def prompt(
     output_column: str = _PROMPT_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[PromptOptions],
 ) -> Expression | Relation:
-    """Prompt over ordered VARCHAR, BLOB, BLOB[], FILE, or FILE[] Expressions.
+    """Prompt over ordered text, BLOB, FILE, and explicitly marked image URL expressions.
+
+    Wrap VARCHAR expressions with ``image_url()`` to let the provider fetch them.
 
     ``return_format`` accepts a Pydantic model class or the portable JSON
     Schema subset and exposes a native STRUCT. ``return_raw_response=True``
