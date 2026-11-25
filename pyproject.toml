@@ -117,7 +117,7 @@ onnx_cuda = [ # Install this alternative instead of the CPU onnx extra
     "Pillow==12.3.0",
 ]
 litert = [ # Explicit local .litertlm EmbeddingGemma 2 text/image/audio inference
-    "litert-lm-api==0.18.0",
+    "litert-lm-api==0.18.1",
     "pillow>=10.4",
 ]
 clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
