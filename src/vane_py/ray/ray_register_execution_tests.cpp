@@ -447,7 +447,7 @@ void RegisterRayExecutionTestsBindings(py::module_ &m) {
 
 	m.def(
 	    "flight_exchange_selected_attempt_handles_for_test",
-	    []() {
+	    [](bool partition_by_task) {
 		    using namespace duckdb::distributed;
 		    FlightExchangeConfig config;
 		    config.node_id = "coordinator";
@@ -457,6 +457,7 @@ void RegisterRayExecutionTestsBindings(py::module_ &m) {
 		    ExchangeContext ctx;
 		    ctx.query_id = "q";
 		    ctx.exchange_id = "flight_exchange_selected_attempt_test";
+		    ctx.partition_by_task = partition_by_task;
 		    auto exchange = mgr.CreateExchange(ctx, 2);
 		    auto sink0 = exchange->AddSink(0);
 		    auto sink1 = exchange->AddSink(1);
@@ -490,6 +491,7 @@ void RegisterRayExecutionTestsBindings(py::module_ &m) {
 		    }
 		    return out;
 	    },
+	    py::arg("partition_by_task") = false,
 	    "Exercise FlightExchange selected-attempt source handle generation for fast tests.");
 
 	m.def(

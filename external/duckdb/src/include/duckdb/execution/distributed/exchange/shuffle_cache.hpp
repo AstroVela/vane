@@ -30,6 +30,9 @@ class TemporaryMemoryState;
 
 namespace distributed {
 
+//! Convert a local shuffle filename to the form supported by Arrow file I/O.
+std::string LocalShufflePathForArrow(const std::string &path);
+
 struct ShufflePartitionFile {
 	std::string path;
 	idx_t rows = 0;

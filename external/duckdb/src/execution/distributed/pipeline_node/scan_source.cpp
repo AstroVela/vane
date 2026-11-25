@@ -52,8 +52,8 @@ SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionCon
 	}
 
 	auto injected_input_ptr = std::make_shared<Optional<TaskInput>>(std::move(injected_input));
-	auto &task_id_counter = plan_context.task_id_counter();
-	plan_context.spawn([self, tx_ptr, &task_id_counter, injected_input_ptr]() mutable -> DuckDBResult<void> {
+	plan_context.spawn([self, tx_ptr, task_id_counter = plan_context.task_id_counter(),
+	                    injected_input_ptr]() mutable -> DuckDBResult<void> {
 		auto t_spawn_start = std::chrono::steady_clock::now();
 		auto t_wall_start = std::chrono::system_clock::now();
 		double t_wall_epoch = std::chrono::duration<double>(t_wall_start.time_since_epoch()).count();

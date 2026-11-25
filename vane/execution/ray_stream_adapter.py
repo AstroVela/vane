@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+_WINDOWS_TASK_CANCEL_GRACE_S = 2.0 if sys.platform == "win32" else 0.0
 _REQUIRED_GENERATOR_METHODS = ("__anext__", "completed")
 _REQUIRED_RAY_METHODS = ("wait",)
 _REQUIRED_CORE_WORKER_METHODS = (
@@ -130,6 +133,9 @@ class TaskLeaseObjectRefGenerator:
         self._execution_backend = "ray_actor" if lease.get("actor_index") is not None else "ray_task"
         self._generator: Any | None = None
         self._completion_ref: Any | None = None
+        self._cancel_grace_deadline: float | None = None
+        self._cancel_completion_ref: Any | None = None
+        self._cancel_submitting = False
         self._lease: dict[str, Any] | None = lease
         self._lease_identity = dict(lease)
         self._released = False
@@ -219,12 +225,21 @@ class TaskLeaseObjectRefGenerator:
             ),
         )
 
-    def _begin_cancellation(self, *, cancel_generator: bool) -> None:
+    def _begin_cancellation(self, *, cancel_generator: bool, grace_deadline: float | None = None) -> None:
         with self._lock:
             if not self._cancelled:
                 self._cancelled = True
                 if cancel_generator:
                     self._cancel_generator = self._generator
+                    self._cancel_completion_ref = self._completion_ref
+                    if (
+                        self._execution_backend == "ray_task"
+                        and _WINDOWS_TASK_CANCEL_GRACE_S
+                        and grace_deadline is not None
+                    ):
+                        now = time.monotonic()
+                        if now < grace_deadline:
+                            self._cancel_grace_deadline = min(now + _WINDOWS_TASK_CANCEL_GRACE_S, grace_deadline)
                     if self._cancel_generator is None:
                         self._generator_cancel_submitted = True
                 self._generator = None
@@ -233,17 +248,39 @@ class TaskLeaseObjectRefGenerator:
         with self._lock:
             if self._cancel_generator is None:
                 return self._generator_cancel_submitted or not self._cancelled
+            if self._cancel_submitting:
+                return False
+            self._cancel_submitting = True
             generator = self._cancel_generator
-            ray_module = self._ray
-            force = self._execution_backend == "ray_task"
         try:
-            ray_module.cancel(generator, force=force, recursive=True)
-        except BaseException:
-            raise
-        with self._lock:
-            self._generator_cancel_submitted = True
-            if self._cancel_generator is generator:
+            if not self._cancel_remote_generator(generator):
+                return False
+            with self._lock:
+                self._cancel_completion_ref = None
+                self._generator_cancel_submitted = True
                 self._cancel_generator = None
+            return True
+        finally:
+            with self._lock:
+                self._cancel_submitting = False
+
+    def _cancel_remote_generator(self, generator: Any) -> bool:
+        force = self._execution_backend == "ray_task"
+        if self._cancel_grace_deadline is not None and self._cancel_completion_ref is not None:
+            # A sibling may already be publishing its failure. Killing that worker can
+            # strand its terminal ref on Windows. Observe without fetching the result.
+            try:
+                ready, _ = self._ray.wait([self._cancel_completion_ref], num_returns=1, timeout=0, fetch_local=False)
+            except Exception:
+                pass  # A failed readiness probe must not prevent cancellation.
+            else:
+                if ready:
+                    force = False
+                elif time.monotonic() < self._cancel_grace_deadline:
+                    return False
+        # A soft RPC on a still-running task can mask a later hard cancel while
+        # native user code holds the GIL. Submit a single cancellation decision.
+        self._ray.cancel(generator, force=force, recursive=True)
         return True
 
     def _handoff_task_completion(self) -> bool | RayStreamCleanupWait:
@@ -311,8 +348,8 @@ class TaskLeaseObjectRefGenerator:
             generator_complete = self._generator_cancellation_complete_locked()
             return task_complete and generator_complete
 
-    def cancel_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
-        self._begin_cancellation(cancel_generator=True)
+    def cancel_operations(self, *, grace_deadline: float | None = None) -> tuple[RayStreamCleanupOperation, ...]:
+        self._begin_cancellation(cancel_generator=True, grace_deadline=grace_deadline)
         return (
             RayStreamCleanupOperation(
                 self._submit_generator_cancel,
@@ -559,8 +596,8 @@ class RayStreamAdapter:
         """Build deterministic cleanup for a fully drained generator stream."""
         return self._prepare_terminal_operations("retire")
 
-    def cancel_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
-        return self._prepare_terminal_operations("cancel")
+    def cancel_operations(self, *, grace_deadline: float | None = None) -> tuple[RayStreamCleanupOperation, ...]:
+        return self._prepare_terminal_operations("cancel", grace_deadline=grace_deadline)
 
     def retire_failed_operations(self) -> tuple[RayStreamCleanupOperation, ...]:
         return self._prepare_terminal_operations("failed")
@@ -568,6 +605,8 @@ class RayStreamAdapter:
     def _prepare_terminal_operations(
         self,
         requested_kind: str,
+        *,
+        grace_deadline: float | None = None,
     ) -> tuple[RayStreamCleanupOperation, ...]:
         if requested_kind not in {"retire", "failed", "cancel"}:
             raise ValueError(f"invalid Ray stream terminal kind: {requested_kind}")
@@ -595,7 +634,7 @@ class RayStreamAdapter:
         leased_operations: list[RayStreamCleanupOperation] = []
         if leased is not None:
             if terminal_kind == "cancel":
-                source_operations = leased.cancel_operations()
+                source_operations = leased.cancel_operations(grace_deadline=grace_deadline)
             elif terminal_kind == "failed":
                 source_operations = leased.retire_failed_operations()
             elif leased.cancellation_started:

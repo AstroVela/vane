@@ -61,6 +61,8 @@ print(os.pathsep.join(paths))
 ' "$project_root")"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-fast-tests.XXXXXX")"
 cleanup_test_workdir() {
+  # Release Windows' current-directory handle before deleting the directory.
+  cd "$project_root"
   rm -rf -- "$test_workdir"
 }
 trap cleanup_test_workdir EXIT

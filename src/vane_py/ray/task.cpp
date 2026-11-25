@@ -1401,5 +1401,8 @@ py::object RayWorkerTask::ExchangeSinkConfig() const {
 	result["query_id"] = sink->SinkQueryId();
 	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();
 	result["preserve_order"] = sink->PreservesOrder();
+	if (sink->PartitionsByTask()) {
+		result["partition_by_task"] = true;
+	}
 	return result;
 }

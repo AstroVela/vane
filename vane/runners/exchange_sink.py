@@ -11,6 +11,7 @@ _CONFIG_KEYS = {
     "output_location_prefix",
     "output_partition_count",
     "preserve_order",
+    "partition_by_task",
 }
 
 
@@ -55,6 +56,11 @@ def normalize_exchange_sink_config(exchange_sink_config: Any) -> dict[str, Any]:
     }
     if preserve_order:
         result["preserve_order"] = True
+    partition_by_task = exchange_sink_config.get("partition_by_task", False)
+    if not isinstance(partition_by_task, bool):
+        raise TypeError("exchange_sink_config partition_by_task must be a boolean")
+    if partition_by_task:
+        result["partition_by_task"] = True
     return result
 
 

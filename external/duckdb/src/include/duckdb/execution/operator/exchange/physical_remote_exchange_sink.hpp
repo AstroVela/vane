@@ -101,6 +101,12 @@ public:
 	bool PreservesOrder() const {
 		return preserve_order_;
 	}
+	bool PartitionsByTask() const {
+		return partition_by_task_;
+	}
+	void EnableTaskPartitioning() {
+		partition_by_task_ = true;
+	}
 	void EnableMarkJoinBuildSummary(vector<unique_ptr<Expression>> expressions) {
 		collect_mark_join_build_summary_ = true;
 		mark_join_build_expressions_ = std::move(expressions);
@@ -129,6 +135,7 @@ private:
 	vector<string> range_boundaries_;
 	vector<string> range_order_modifiers_;
 	bool preserve_order_ = false;
+	bool partition_by_task_ = false;
 	bool collect_mark_join_build_summary_ = false;
 	vector<unique_ptr<Expression>> mark_join_build_expressions_;
 };

@@ -1308,6 +1308,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto mark_join_build_expressions =
 		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(114, "mark_join_build_expressions");
 		auto preserve_order = deserializer.ReadPropertyWithDefault<bool>(115, "preserve_order");
+		auto partition_by_task = deserializer.ReadPropertyWithDefault<bool>(116, "partition_by_task");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1317,6 +1318,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_query_id), std::move(sink_output_location_prefix),
 		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers), preserve_order);
+		if (partition_by_task) {
+			result->EnableTaskPartitioning();
+		}
 		if (collect_mark_join_build_summary) {
 			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 		}

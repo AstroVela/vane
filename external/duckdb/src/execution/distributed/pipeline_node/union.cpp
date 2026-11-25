@@ -42,7 +42,7 @@ class UnionTaskFanInStream {
 public:
 	UnionTaskFanInStream(std::vector<DistributedPipelineNodeRef> children, PlanExecutionContext &plan_context,
 	                     PipelineNodeContext union_context, bool allow_out_of_order)
-	    : children_(std::move(children)), plan_context_(&plan_context), union_context_(std::move(union_context)),
+	    : children_(std::move(children)), plan_context_(plan_context), union_context_(std::move(union_context)),
 	      allow_out_of_order_(allow_out_of_order) {
 		if (children_.empty()) {
 			finished_ = true;
@@ -71,10 +71,10 @@ public:
 
 private:
 	std::unique_ptr<SubmittableTaskStream<WorkerTask>> CreateChildStream(idx_t child_idx) {
-		if (!plan_context_ || child_idx >= children_.size() || !children_[child_idx]) {
+		if (child_idx >= children_.size() || !children_[child_idx]) {
 			throw InvalidInputException("UnionNode cannot create an invalid branch task stream");
 		}
-		auto stream = children_[child_idx]->produce_tasks(*plan_context_);
+		auto stream = children_[child_idx]->produce_tasks(plan_context_);
 		return std::unique_ptr<SubmittableTaskStream<WorkerTask>>(
 		    new SubmittableTaskStream<WorkerTask>(std::move(stream)));
 	}
@@ -183,7 +183,7 @@ private:
 
 private:
 	std::vector<DistributedPipelineNodeRef> children_;
-	PlanExecutionContext *plan_context_;
+	PlanExecutionContext plan_context_;
 	PipelineNodeContext union_context_;
 	bool allow_out_of_order_;
 	std::vector<std::unique_ptr<SubmittableTaskStream<WorkerTask>>> streams_;

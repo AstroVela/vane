@@ -22,6 +22,7 @@
  *   - Source streams selected ShuffleCache partition files batch by batch
  */
 
+#include "duckdb/common/extra_type_info.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
@@ -234,12 +235,47 @@ DuckDBError FlightExchangeArrowToError(const arrow::Status &status, const std::s
 	return DuckDBError::external_error(context + ": " + status.ToString());
 }
 
+// Copy only the containers on a path to an ENUM. Unchanged siblings keep their exact extension metadata.
+void UseArrowEnumLabels(LogicalType &type) {
+	if (type.id() == LogicalTypeId::ENUM) {
+		type = LogicalType::VARCHAR;
+		return;
+	}
+	if (!TypeVisitor::Contains(type, LogicalTypeId::ENUM)) {
+		return;
+	}
+	type = type.Copy();
+	auto info = type.AuxInfo();
+	switch (info->type) {
+	case ExtraTypeInfoType::STRUCT_TYPE_INFO:
+		for (auto &child : info->Cast<StructTypeInfo>().child_types) {
+			UseArrowEnumLabels(child.second);
+		}
+		break;
+	case ExtraTypeInfoType::LIST_TYPE_INFO:
+		UseArrowEnumLabels(info->Cast<ListTypeInfo>().child_type);
+		break;
+	case ExtraTypeInfoType::ARRAY_TYPE_INFO:
+		UseArrowEnumLabels(info->Cast<ArrayTypeInfo>().child_type);
+		break;
+	default:
+		break;
+	}
+}
+
 bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const LogicalType &expected_type) {
 	if (arrow_type == expected_type) {
 		return true;
 	}
 	if (expected_type.id() == LogicalTypeId::AGGREGATE_STATE && arrow_type.id() == LogicalTypeId::BLOB) {
 		return true;
+	}
+	// Arrow decodes an ENUM dictionary to its labels, including inside lists and structs.
+	// Check the complete wire type before casting labels back through the producer's ENUM.
+	if (TypeVisitor::Contains(expected_type, LogicalTypeId::ENUM)) {
+		auto labels = expected_type;
+		UseArrowEnumLabels(labels);
+		return GovernedLogicalType::IsCanonicalStorageType(arrow_type, labels);
 	}
 	return TypeVisitor::Contains(expected_type, GovernedLogicalType::IsGoverned) &&
 	       GovernedLogicalType::IsCanonicalStorageType(arrow_type, expected_type);
@@ -1224,24 +1260,33 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 		return file;
 	};
 
-	for (idx_t partition_id = 0; partition_id < output_partition_count_; partition_id++) {
+	auto append_handle = [&](idx_t partition_id, const std::pair<idx_t, SinkAttemptMetadata> &entry) {
+		const auto source_task_partition_id = entry.first;
+		const auto attempt_id = entry.second.attempt_id;
+		const auto &attempt_metadata = entry.second;
+		ExchangeSourceHandle handle;
+		handle.partition_id = partition_id;
+		handle.source_task_partition_id = source_task_partition_id;
+		handle.attempt_id = attempt_id;
+		handle.node_id = attempt_metadata.node_id;
+		handle.mark_join_build_summary = mark_join_build_summary;
+		if (FlightExchangeUsesNetworkTransport(config_)) {
+			handle.flight_host = attempt_metadata.flight_host;
+			handle.flight_port = attempt_metadata.flight_port;
+			handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+		}
+		handle.files.push_back(build_source_file(attempt_metadata, partition_id));
+		handles.push_back(std::move(handle));
+	};
+	if (ctx_.partition_by_task) {
 		for (const auto &entry : selected_attempts) {
-			const auto source_task_partition_id = entry.first;
-			const auto attempt_id = entry.second.attempt_id;
-			const auto &attempt_metadata = entry.second;
-			ExchangeSourceHandle handle;
-			handle.partition_id = partition_id;
-			handle.source_task_partition_id = source_task_partition_id;
-			handle.attempt_id = attempt_id;
-			handle.node_id = attempt_metadata.node_id;
-			handle.mark_join_build_summary = mark_join_build_summary;
-			if (FlightExchangeUsesNetworkTransport(config_)) {
-				handle.flight_host = attempt_metadata.flight_host;
-				handle.flight_port = attempt_metadata.flight_port;
-				handle.flight_server_epoch = attempt_metadata.flight_server_epoch;
+			append_handle(entry.first % output_partition_count_, entry);
+		}
+	} else {
+		for (idx_t partition_id = 0; partition_id < output_partition_count_; partition_id++) {
+			for (const auto &entry : selected_attempts) {
+				append_handle(partition_id, entry);
 			}
-			handle.files.push_back(build_source_file(attempt_metadata, partition_id));
-			handles.push_back(std::move(handle));
 		}
 	}
 	return handles;

@@ -4,6 +4,7 @@
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 
 #include <sstream>
+#include <unordered_set>
 
 namespace duckdb {
 namespace distributed {
@@ -43,7 +44,11 @@ std::vector<std::string> NodeDisplayLines(const DistributedPipelineNodeRef &node
 }
 
 void AppendTree(const DistributedPipelineNodeRef &node, DisplayLevel level, const std::string &prefix, bool is_last,
-                bool is_root, std::vector<std::string> &out) {
+                bool is_root, std::unordered_set<NodeID> &visited, std::vector<std::string> &out) {
+	if (!visited.insert(node->node_id()).second) {
+		out.push_back(prefix + "+- " + node->name() + " [reference to node " + std::to_string(node->node_id()) + "]");
+		return;
+	}
 	auto lines = NodeDisplayLines(node, level);
 	if (is_root) {
 		out.push_back(lines[0]);
@@ -62,7 +67,7 @@ void AppendTree(const DistributedPipelineNodeRef &node, DisplayLevel level, cons
 	std::string child_prefix = is_root ? "" : prefix + (is_last ? "   " : "|  ");
 	for (size_t idx = 0; idx < children.size(); ++idx) {
 		bool child_last = (idx + 1) == children.size();
-		AppendTree(children[idx], level, child_prefix, child_last, false, out);
+		AppendTree(children[idx], level, child_prefix, child_last, false, visited, out);
 	}
 }
 
@@ -83,7 +88,8 @@ std::string viz_distributed_pipeline_ascii(const DistributedPipelineNodeRef &roo
 	std::vector<std::string> lines;
 	if (root) {
 		auto level = simple ? DisplayLevel::Compact : DisplayLevel::Default;
-		AppendTree(root, level, "", true, true, lines);
+		std::unordered_set<NodeID> visited;
+		AppendTree(root, level, "", true, true, visited, lines);
 	}
 	std::ostringstream ss;
 	for (size_t i = 0; i < lines.size(); ++i) {

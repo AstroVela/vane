@@ -37,6 +37,19 @@ def _lifecycle(actor: object) -> FteWorkerLifecycleMixin:
     return lifecycle
 
 
+def test_cte_fragment_registration_requires_worker_capability():
+    legacy = _lifecycle(SimpleNamespace(register_fragments=object()))
+    current = _lifecycle(SimpleNamespace(register_fragments=object(), register_materialized_cte_fragments=object()))
+    plain = SimpleNamespace(_requires_cte_exchange=False)
+    writer = SimpleNamespace(_requires_cte_exchange=True)
+    assert legacy._fragment_registration_method([plain]) is legacy.actor_handle.register_fragments
+    with pytest.raises(RuntimeError, match="worker lacks materialized CTE exchange support"):
+        legacy._fragment_registration_method([plain, writer])
+    with pytest.raises(RuntimeError, match="worker lacks materialized CTE exchange support"):
+        legacy._fragment_registration_method([object()], requires_cte_exchange=True)
+    assert current._fragment_registration_method([writer]) is current.actor_handle.register_materialized_cte_fragments
+
+
 def test_worker_finish_shutdown_waits_for_graceful_rpc_before_kill(monkeypatch):
     from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
 

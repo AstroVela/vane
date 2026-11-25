@@ -1025,15 +1025,17 @@ def test_exchange_source_task_descriptor_preserves_replicated_distribution():
     assert vane.ray_cxx.exchange_source_task_source_handles_for_test(split[0][1]) == handles
 
 
-def test_flight_exchange_selected_attempt_runtime_path():
-    handles = vane.ray_cxx.flight_exchange_selected_attempt_handles_for_test()
+@pytest.mark.parametrize("partition_by_task", [False, True])
+def test_flight_exchange_selected_attempt_runtime_path(partition_by_task):
+    handles = vane.ray_cxx.flight_exchange_selected_attempt_handles_for_test(partition_by_task)
 
-    assert len(handles) == 4
     sink0_handles = [h for h in handles if "__sink_0__" in h["path"]]
     sink1_handles = [h for h in handles if "__sink_1__" in h["path"]]
-    assert len(sink0_handles) == 2
-    assert len(sink1_handles) == 2
-    assert {h["partition_id"] for h in sink0_handles} == {0, 1}
+    expected_count = 1 if partition_by_task else 2
+    assert len(handles) == 2 * expected_count
+    assert len(sink0_handles) == len(sink1_handles) == expected_count
+    assert {h["partition_id"] for h in sink0_handles} == ({0} if partition_by_task else {0, 1})
+    assert {h["partition_id"] for h in sink1_handles} == ({1} if partition_by_task else {0, 1})
     assert all(h["attempt_id"] == 1 for h in sink0_handles)
     assert all(h["node_id"] == "worker-retry" for h in sink0_handles)
     assert all(h["flight_host"] == "flight-retry.internal" for h in sink0_handles)
@@ -1334,15 +1336,27 @@ def test_ray_task_result_poller_shutdown_is_terminal_and_idempotent():
     )
 
 
-def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path):
-    result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path))
+@pytest.mark.parametrize("remote_reader", [False, True])
+def test_flight_exchange_source_reads_only_selected_retry_attempt_data(tmp_path, remote_reader, monkeypatch):
+    if remote_reader:
+        # With the attempt and partition subdirectories, the Windows path exceeds MAX_PATH.
+        tmp_path = tmp_path / ("flight-" * 22)
+        # Prepare the fixture without requiring the host's LongPathsEnabled
+        # policy. The native helper still receives the ordinary long path.
+        if sys.platform == "win32":
+            Path("\\\\?\\" + str(tmp_path.resolve())).mkdir()
+        else:
+            tmp_path.mkdir()
+        monkeypatch.setenv("VANE_SHUFFLE_CACHE_FLUSH_THRESHOLD_BYTES", "1")
+    result = vane.ray_cxx.flight_exchange_selected_attempt_dataplane_for_test(str(tmp_path), remote_reader)
 
     assert result["handle_attempts"] == [1]
     assert result["handle_paths"] == [result["selected_output_location"]]
     assert result["handle_node_ids"] == [result["selected_node_id"]]
     assert result["lost_output_location"] != result["selected_output_location"]
-    assert result["selected_values_before_late_loser"] == [201, 202]
-    assert result["selected_values_after_late_loser"] == [201, 202]
+    expected = list(range(201, 214)) if remote_reader else [201, 202]
+    assert result["selected_values_before_late_loser"] == expected
+    assert result["selected_values_after_late_loser"] == expected
     assert result["lost_manifest_exists_after_late_loser"] is False
     assert result["selected_manifest_exists_after_late_loser"] is True
 

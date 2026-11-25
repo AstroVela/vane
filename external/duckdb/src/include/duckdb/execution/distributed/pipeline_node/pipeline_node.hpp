@@ -502,7 +502,8 @@ public:
 			// Some pipeline nodes may have null children (placeholders). Skip null children.
 			if (!child_impl)
 				continue;
-			children_.push_back(std::make_shared<DistributedPipelineNode>(child_impl));
+			auto shared_child = std::dynamic_pointer_cast<DistributedPipelineNode>(child_impl);
+			children_.push_back(shared_child ? shared_child : std::make_shared<DistributedPipelineNode>(child_impl));
 		}
 	}
 

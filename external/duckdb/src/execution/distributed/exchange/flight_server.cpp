@@ -86,14 +86,15 @@ public:
 				return arrow::Status::OK();
 			}
 
-			ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(files_[current_file_idx_]));
+			ARROW_ASSIGN_OR_RAISE(auto input,
+			                      arrow::io::ReadableFile::Open(LocalShufflePathForArrow(files_[current_file_idx_])));
 			ARROW_ASSIGN_OR_RAISE(current_reader_, arrow::ipc::RecordBatchStreamReader::Open(std::move(input)));
 		}
 	}
 
 private:
 	arrow::Status Initialize() {
-		ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(files_[0]));
+		ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(LocalShufflePathForArrow(files_[0])));
 		ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchStreamReader::Open(std::move(input)));
 		schema_ = reader->schema();
 		current_reader_ = std::move(reader);
@@ -175,7 +176,8 @@ public:
 				return arrow::flight::FlightPayload {};
 			}
 
-			ARROW_ASSIGN_OR_RAISE(current_input_, arrow::io::ReadableFile::Open(files_[current_file_idx_]));
+			ARROW_ASSIGN_OR_RAISE(current_input_,
+			                      arrow::io::ReadableFile::Open(LocalShufflePathForArrow(files_[current_file_idx_])));
 		}
 	}
 
@@ -192,11 +194,11 @@ private:
 
 	arrow::Status Initialize() {
 		// Open first file to read schema via RecordBatchStreamReader
-		ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(files_[0]));
+		ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(LocalShufflePathForArrow(files_[0])));
 		ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchStreamReader::Open(input));
 		schema_ = reader->schema();
 		// Re-open the first file for raw message reading (reader consumed the schema)
-		ARROW_ASSIGN_OR_RAISE(current_input_, arrow::io::ReadableFile::Open(files_[0]));
+		ARROW_ASSIGN_OR_RAISE(current_input_, arrow::io::ReadableFile::Open(LocalShufflePathForArrow(files_[0])));
 		current_file_idx_ = 0;
 		return arrow::Status::OK();
 	}
@@ -209,7 +211,7 @@ private:
 };
 
 arrow::Result<std::shared_ptr<arrow::Schema>> ReadSchemaFromFile(const std::string &path) {
-	ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(path));
+	ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(LocalShufflePathForArrow(path)));
 	ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchStreamReader::Open(std::move(input)));
 	return reader->schema();
 }
@@ -257,7 +259,7 @@ public:
 		for (const auto &file : files_res.value().files) {
 			files.push_back(file.path);
 		}
-		std::sort(files.begin(), files.end());
+		// The catalog and committed manifest record spill order. Filename order puts batch_10 before batch_2.
 
 		if (files.empty()) {
 			// Return empty stream with schema only

@@ -1196,6 +1196,15 @@ class RayWorkerActor:
         return True
 
     @ray.method(concurrency_group="control")
+    async def register_materialized_cte_fragments(self, fragments: list[dict[str, Any]]) -> dict[str, int]:
+        # Method presence gates the wire format before an older worker deserializes a CTE writer.
+        from vane._native.ray_cxx import DistributedPhysicalPlan
+
+        if not hasattr(DistributedPhysicalPlan, "_requires_cte_exchange"):
+            raise RuntimeError("Ray worker native library lacks materialized CTE exchange support")
+        return await self.register_fragments(fragments)
+
+    @ray.method(concurrency_group="control")
     async def register_fragments(self, fragments: list[dict[str, Any]]) -> dict[str, int]:
         """Register plan fragments in this actor.
 
