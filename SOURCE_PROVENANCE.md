@@ -102,6 +102,26 @@ DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`.
 
 The imported DuckDB tree contains upstream benchmark generators with additional terms, including TPC-H, TPC-DS, and TPC-E material. They are not part of Vane release artifacts. The sdist allowlist and artifact checker enforce this boundary.
 
+The optional Iceberg qualification build fetches
+[`AstroVela/duckdb-iceberg@f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c`](https://github.com/AstroVela/duckdb-iceberg/tree/f83b867b9b4c5b4a1c7eefd61a16e46a8cf55b1c)
+and its independently built dependency
+[`duckdb/duckdb-avro@f9d590297485f0318f480372c70bdd852826e258`](https://github.com/duckdb/duckdb-avro/tree/f9d590297485f0318f480372c70bdd852826e258).
+These immutable revisions are pinned in the engine's extension configuration.
+The Iceberg source is the AstroVela-maintained fork of `duckdb/duckdb-iceberg`.
+Its native engine compatibility changes are reviewed in that repository;
+Vane consumes the fixed source directly with `ICEBERG_VANE_NATIVE=ON` and
+keeps distributed execution disabled for this local qualification. No downstream
+Iceberg patch is stored or applied by Vane. The MIT license
+files are copied unchanged to `LICENSES/Iceberg-MIT.txt` and
+`LICENSES/Avro-extension-MIT.txt`; implementation source remains externally
+fetched.
+The separate SDK manifest pins
+`duckdb/vcpkg-duckdb-ports@f13de79b66345fe31d3f9c119517613023d194a8`, whose
+Avro C port builds `duckdb/duckdb-avro-c@8af400279c445a81b8552a7670d8c1ebd92ba34a`.
+`LICENSES/iceberg-native-dependencies.txt` records the resulting native
+dependency notices. Qualification artifacts use the existing test signing and
+provider descriptor workflow; production publication remains separate.
+
 When importing code:
 
 1. Record the upstream repository, immutable revision, and source path in the pull request.

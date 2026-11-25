@@ -1,0 +1,4 @@
+# Test fixture writer only; these packages are not Vane runtime dependencies.
+pyiceberg[pyarrow]==0.12.0
+pyiceberg-core==0.10.1
+pyarrow==25.0.0
