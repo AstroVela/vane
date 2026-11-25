@@ -290,6 +290,80 @@ def service_client(root, *, query=False, **options):
     )
 
 
+def test_service_batch_uses_one_mlx_forward_for_joint_rows(media_sdk, tmp_path, monkeypatch):
+    pytest.importorskip("zmq")
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(from_pretrained=lambda *a, **k: Tokenizer())
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = service_case(root)
+    instance = (
+        load_provider("mlx")
+        .get_multimodal_embedder(
+            options={
+                "runtime": "service",
+                "service_path": str(root / "mlx.json"),
+                "service_id": "mlx-fixture",
+                "service_batch_rows": 3,
+            }
+        )
+        .instantiate()
+    )
+    image = np.zeros((3, 5, 3), np.uint8)
+    rows = [content(("text", "first")), content(("image", image)), content(("text", "third"), ("image", image))]
+
+    async def run():
+        await service.start()
+        try:
+            values = await instance.embed_multimodal(rows)
+            np.testing.assert_equal(values, np.eye(3, 768, dtype=np.float32))
+            assert len(media_sdk.model_calls) == service.metrics["completed"] == 1
+            assert len(media_sdk.model_calls[0]["input_ids"]) == 3
+            assert service.credits.bytes == service.credits.inflight == 0
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("resource", [False, True])
+def test_mlx_batch_fallback_only_after_ordinary_collective_failure(fake_core, tmp_path, monkeypatch, resource):
+    pytest.importorskip("zmq")
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    service = service_case(root)
+    instance = service_client(root, service_batch_rows=2)
+
+    async def run():
+        await service.start()
+        batches = []
+
+        def fail(contents, encoding):
+            batches.append([row.parts[0].value for row in contents])
+            if resource:
+                raise MemoryError("allocation")
+            raise RuntimeError("batch processor failure")
+
+        monkeypatch.setattr(fake_core.cores[0], "encode_batch", fail, raising=False)
+        try:
+            if resource:
+                with pytest.raises(MemoryError, match="restart"):
+                    await instance.embed_text(["1", "0"])
+                assert service.metrics["accepted"] == 1
+            else:
+                values = await instance.embed_text(["1", "0"])
+                assert np.argmax(values, axis=1).tolist() == [1, 0]
+                assert service.metrics["completed"] == 3
+            assert batches == [["1", "0"]]
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_real_ipc_cancel_and_cancelled_shutdown_wait_for_actual_owner_work(fake_core, tmp_path, monkeypatch):
     pytest.importorskip("zmq")
     from vane.ai import _embedding_shared_memory as shm

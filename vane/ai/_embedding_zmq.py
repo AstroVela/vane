@@ -170,12 +170,19 @@ class Client:
             # or configuration error into an ignorable transport failure.
             self.owner._check_response(response, request_id)
 
-    async def request(self, plan: Any, request_context: ipc.RequestContext) -> np.ndarray:
-        parts, arrays, size = plan
+    async def request(self, plan: ipc.RowPlan | list[ipc.RowPlan], request_context: ipc.RequestContext) -> Any:
+        request_id = uuid.uuid4().hex
+        if isinstance(plan, list):
+            size = sum(row[2] for row in plan)
+            arrays = [array for _, buffers, _ in plan for array in buffers]
+            rows = [{"parts": parts, "nbytes": length} for parts, _, length in plan]
+            reservation = self.owner._reservation(rows, size, request_id, request_context, batch=True)
+        else:
+            parts, arrays, size = plan
+            reservation = self.owner._reservation(parts, size, request_id, request_context)
         endpoint, key = _read_endpoint(self.owner.options["service_path"])
         zmq = _zmq()
         sock = _socket(self.context, zmq.STREAM)
-        request_id = uuid.uuid4().hex
         self.sockets.add(sock)
         started = time.monotonic()
         try:
@@ -184,9 +191,7 @@ class Client:
             await connection.authenticate()
             assert connection.key is not None
             key = connection.key
-            await connection.send(
-                _pack(self.owner._reservation(parts, size, request_id, request_context), key, b"request")
-            )
+            await connection.send(_pack(reservation, key, b"request"))
             response = _unpack(await connection.receive(), key, b"response")
             if isinstance(response, dict) and "error" in response:
                 await self._acknowledge(connection, response, request_id)
@@ -218,18 +223,25 @@ class Client:
             self.owner._check_response(response, request_id)
             if response.get("state") != "released":
                 raise EmbeddingConfigurationError("Embedding service omitted consumption acknowledgement")
-            values = response.get("vector")
-            if not isinstance(values, list) or any(type(value) not in (int, float) for value in values):
-                raise ValueError("Embedding service returned an invalid vector")
-            with np.errstate(over="ignore", invalid="ignore"):
-                vector: np.ndarray[Any, Any] = np.asarray(values, dtype=np.float32)
-            if vector.shape != (self.owner.descriptor.dimensions,) or not np.isfinite(vector).all():
-                raise ValueError("Embedding service returned an invalid vector")
-            return vector
+            if isinstance(plan, list):
+                vectors = response.get("vectors")
+                if not isinstance(vectors, list) or len(vectors) != len(plan):
+                    raise EmbeddingConfigurationError("Embedding service returned an invalid batch row count")
+                return [self._vector(value) if value is not None else None for value in vectors]
+            return self._vector(response.get("vector"))
         finally:
             self.owner.metrics["request_seconds"] += time.monotonic() - started
             self.sockets.discard(sock)
             sock.close(linger=0)
+
+    def _vector(self, values: Any) -> np.ndarray:
+        if not isinstance(values, list) or any(type(value) not in (int, float) for value in values):
+            raise ValueError("Embedding service returned an invalid vector")
+        with np.errstate(over="ignore", invalid="ignore"):
+            vector: np.ndarray[Any, Any] = np.asarray(values, dtype=np.float32)
+        if vector.shape != (self.owner.descriptor.dimensions,) or not np.isfinite(vector).all():
+            raise ValueError("Embedding service returned an invalid vector")
+        return vector
 
 
 class Server:
@@ -452,7 +464,11 @@ class Server:
                 self.owner._resource_context(
                     {
                         "request_id": peer.request_id,
-                        "error": "resource" if _is_resource_error(error) else "configuration",
+                        "error": "batch_rejected"
+                        if isinstance(error, ipc.BatchRejected)
+                        else "resource"
+                        if _is_resource_error(error)
+                        else "configuration",
                     }
                 ),
             )
@@ -533,8 +549,11 @@ class Server:
             if published != {"request_id": message["request_id"], "state": "published"}:
                 raise EmbeddingConfigurationError("Invalid embedding publication")
             snapshot = bytearray(memory.buf[:size]) if memory is not None else None
-            content = ipc.restore(message["parts"], snapshot)
-            ipc.describe(content, owner.spec)
+            if "rows" in message:
+                content = ipc.restore_batch(message["rows"], snapshot, owner.spec)
+            else:
+                content = ipc.restore(message["parts"], snapshot)
+                ipc.describe(content, owner.spec)
             owner.metrics["accepted"] += 1
             started = time.monotonic()
             inference = asyncio.create_task(owner._infer(content, request_context))

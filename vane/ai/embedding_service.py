@@ -24,6 +24,7 @@ from vane.ai._embedding_content import EmbeddingContent
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._errors import _is_resource_error
 from vane.ai.provider import _ProviderResultError
+from vane.ai.providers._embedding_service_backend import BatchServiceBackend
 
 
 class _Credits:
@@ -181,12 +182,11 @@ class EmbeddingService:
             "model",
             "dimensions",
             "request_id",
-            "parts",
             "nbytes",
             "encoding",
             "model_contract",
         }
-        if not isinstance(message, dict) or set(message) != fields:
+        if not isinstance(message, dict) or set(message) not in (fields | {"parts"}, fields | {"rows"}):
             raise EmbeddingConfigurationError("Invalid embedding reservation")
         expected = {
             "version": ipc.VERSION,
@@ -200,17 +200,56 @@ class EmbeddingService:
         identity = message["request_id"]
         if not isinstance(identity, str) or len(identity) != 32 or any(c not in "0123456789abcdef" for c in identity):
             raise EmbeddingConfigurationError("Invalid embedding request identity")
-        ipc.validate_layout(message["parts"], message["nbytes"], self.spec)
         context = ipc.RequestContext.from_wire(message)
-        self.backend.validate_request(context, message["parts"])
+        if "rows" in message:
+            rows = message["rows"]
+            if not isinstance(rows, list) or not 2 <= len(rows) <= ipc.max_response_rows(
+                self.descriptor.get_dimensions()
+            ):
+                raise EmbeddingConfigurationError("Invalid embedding batch row count")
+            total = 0
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != {"parts", "nbytes"}:
+                    raise EmbeddingConfigurationError("Invalid embedding batch row descriptor")
+                ipc.validate_layout(row["parts"], row["nbytes"], self.spec)
+                self.backend.validate_request(context, row["parts"])
+                if 2 * row["nbytes"] > self.credits.max_bytes:
+                    raise EmbeddingConfigurationError("Embedding row exceeds service shared-memory budget")
+                total += row["nbytes"]
+            if type(message["nbytes"]) is not int or total != message["nbytes"]:
+                raise EmbeddingConfigurationError("Invalid aggregate embedding batch size")
+            if 2 * total > self.credits.max_bytes or not isinstance(self.backend, BatchServiceBackend):
+                raise ipc.BatchRejected("Batch cannot be admitted")
+        else:
+            ipc.validate_layout(message["parts"], message["nbytes"], self.spec)
+            self.backend.validate_request(context, message["parts"])
         return context
 
-    async def _infer(self, content: EmbeddingContent, context: ipc.RequestContext) -> dict[str, Any]:
+    def _vector(self, value: Any) -> list[float]:
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (self.descriptor.get_dimensions(),) or not np.isfinite(vector).all():
+            raise ValueError("Invalid embedding result")
+        return vector.tolist()
+
+    async def _infer(
+        self, content: EmbeddingContent | list[EmbeddingContent], context: ipc.RequestContext
+    ) -> dict[str, Any]:
         try:
-            vector = np.asarray(await self.backend.embed(content, context), dtype=np.float32)
-            if vector.shape != (self.descriptor.get_dimensions(),) or not np.isfinite(vector).all():
-                raise ValueError("Invalid embedding result")
-            return {"vector": vector.tolist()}
+            if isinstance(content, list):
+                assert isinstance(self.backend, BatchServiceBackend)
+                values = await self.backend.embed_batch(content, context)
+                if not isinstance(values, list) or len(values) != len(content):
+                    raise _ProviderResultError("Invalid embedding batch result count")
+                vectors = []
+                for value in values:
+                    try:
+                        vectors.append(None if value is None else self._vector(value))
+                    except (ValueError, TypeError, OverflowError):
+                        vectors.append(None)
+                return {"vectors": vectors}
+            return {"vector": self._vector(await self.backend.embed(content, context))}
+        except ipc.BatchRejected:
+            return {"error": "batch_rejected"}
         except EmbeddingConfigurationError:
             return {"error": "configuration"}
         except _ProviderResultError:

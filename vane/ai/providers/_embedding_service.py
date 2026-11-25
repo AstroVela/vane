@@ -83,6 +83,9 @@ class _ServiceDescriptor(EmbeddingDescriptor[Any]):
             raise EmbeddingConfigurationError("service_id requires 1 to 128 ASCII letters, digits, '-', '_' or '.'")
         timeout = self.options.setdefault("timeout", 60.0)
         concurrency = self.options.setdefault("max_concurrency_per_actor", 8)
+        batch_rows = self.options.get("service_batch_rows", 1)
+        if type(batch_rows) is not int or not 1 <= batch_rows <= ipc.MAX_BATCH_ROWS:
+            raise EmbeddingConfigurationError(f"service_batch_rows must be between 1 and {ipc.MAX_BATCH_ROWS}")
         if type(timeout) not in (float, int) or not math.isfinite(timeout) or timeout <= 0:
             raise EmbeddingConfigurationError("Embedding service timeout must be finite and positive")
         if type(concurrency) is not int or not 1 <= concurrency <= 1024:
@@ -266,24 +269,59 @@ class ServiceEmbedder(ManagedEmbedder):
         # Entire batch validation precedes any connection/model work, even when
         # on_error='ignore'. No replay/retry after uncertain service completion.
         plans = [ipc.describe(content, self.spec) for content in contents]
-        for parts, _, size in plans:
-            ipc.encode(self._reservation(parts, size, "0" * 32, context))
+        chunks: list[list[ipc.RowPlan]] = []
+        limit = min(self.options.get("service_batch_rows", 1), ipc.max_response_rows(self.descriptor.get_dimensions()))
+        control_bytes = 0
+        for plan in plans:
+            parts, _, size = plan
+            # The sum of single reservation sizes bounds the batch envelope,
+            # which includes the service/model/context fields only once.
+            row_bytes = len(ipc.encode(self._reservation(parts, size, "0" * 32, context)))
+            if not chunks or len(chunks[-1]) == limit or control_bytes + row_bytes > ipc.MAX_CONTROL_BYTES:
+                chunks.append([])
+                control_bytes = 0
+            chunks[-1].append(plan)
+            control_bytes += row_bytes
 
-        async def invoke(plan: Any, check_stopped: Callable[[], None]) -> Any:
+        def handle_failure(error: Exception) -> None:
+            if isinstance(error, (EmbeddingConfigurationError, MemoryError, ProviderImportError, _ProviderResultError)):
+                raise error
+            _raise_if_resource_error(error)
+            if getattr(self, "_request_on_error", "raise") == "raise":
+                raise error
+            _log_substituted_failure(error, on_error="ignore")
+
+        validate = getattr(self, "_validate_vector", lambda value: value)
+
+        async def invoke(chunk: list[ipc.RowPlan], check_stopped: Callable[[], None]) -> list[Any]:
             check_stopped()
+            single = len(chunk) == 1
             try:
-                result = await asyncio.wait_for(self._request((plan, context)), self.options["timeout"])
-                return getattr(self, "_validate_vector", lambda value: value)(result)
-            except (EmbeddingConfigurationError, MemoryError, ProviderImportError, _ProviderResultError):
-                raise
-            except Exception as error:
-                _raise_if_resource_error(error)
-                if getattr(self, "_request_on_error", "raise") == "raise":
+                request = self._request((chunk[0] if single else chunk, context))
+                result = await asyncio.wait_for(request, self.options["timeout"])
+            except ipc.BatchRejected:
+                if single:
                     raise
-                _log_substituted_failure(error, on_error="ignore")
-                return None
+                # An authenticated rejection authorizes this fallback. Dispatch
+                # serially inside the worker to retain the concurrency bound.
+                return [(await invoke([row], check_stopped))[0] for row in chunk]
+            except Exception as error:
+                handle_failure(error)
+                return [None] * len(chunk)
 
-        return await map_async_ordered(plans, invoke, max_concurrency=self.options["max_concurrency_per_actor"])
+            values = []
+            for value in [result] if single else result:
+                try:
+                    if value is None:
+                        raise RuntimeError("Embedding service row failed")
+                    values.append(validate(value))
+                except Exception as error:
+                    handle_failure(error)
+                    values.append(None)
+            return values
+
+        batches = await map_async_ordered(chunks, invoke, max_concurrency=self.options["max_concurrency_per_actor"])
+        return [value for batch in batches for value in batch]
 
     async def _request(self, plan: Any) -> Any:
         if self.closed:
@@ -301,6 +339,8 @@ class ServiceEmbedder(ManagedEmbedder):
             raise EmbeddingConfigurationError("Embedding service response identity mismatch")
         if response.get("error") == "configuration":
             raise EmbeddingConfigurationError("Embedding service rejected input or model/service configuration")
+        if response.get("error") == "batch_rejected":
+            raise ipc.BatchRejected("Embedding service requires single-row requests")
         if response.get("error") == "resource":
             if response.get("restart_required") is True:
                 raise MemoryError("Embedding service exhausted model or host resources; restart the embedding service")
@@ -311,7 +351,7 @@ class ServiceEmbedder(ManagedEmbedder):
             raise RuntimeError("Embedding service request failed")
 
     def _reservation(
-        self, parts: Any, size: int, request_id: str, context: ipc.RequestContext | None = None
+        self, parts: Any, size: int, request_id: str, context: ipc.RequestContext | None = None, *, batch: bool = False
     ) -> dict[str, Any]:
         context = context or self._context()
         return {
@@ -321,7 +361,7 @@ class ServiceEmbedder(ManagedEmbedder):
             "model": self.descriptor.model,
             "dimensions": self.descriptor.dimensions,
             "request_id": request_id,
-            "parts": parts,
+            ("rows" if batch else "parts"): parts,
             "nbytes": size,
             "encoding": context.onnx.to_wire()
             if context.onnx is not None

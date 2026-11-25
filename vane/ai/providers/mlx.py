@@ -853,14 +853,18 @@ class _MLXModelCore(MLXMultimodalEmbedder, MLXVideoEmbedder, MLXAudioEmbedder, M
         _MLXEmbedder._load_processor(self, snapshot, config, weights)
 
     def encode(self, content: EmbeddingContent, encoding: str) -> np.ndarray:
+        return self.encode_batch([content], encoding)[0]
+
+    def encode_batch(self, contents: list[EmbeddingContent], encoding: str) -> list[np.ndarray]:
         if encoding == "multimodal":
-            return self.embed_multimodal([content])[0]
+            return self.embed_multimodal(contents)
         kind = "text" if encoding in {"text_document", "text_query"} else encoding
-        if kind not in {"text", "image", "video", "audio"} or len(content.parts) != 1:
+        if kind not in {"text", "image", "video", "audio"} or any(len(row.parts) != 1 for row in contents):
             raise EmbeddingConfigurationError("MLX unary encoding requires exactly one matching part")
-        part = content.parts[0]
-        if part.spec.kind != kind or part.spec.mime_type is not None:
+        parts = [row.parts[0] for row in contents]
+        if any(part.spec.kind != kind or part.spec.mime_type is not None for part in parts):
             raise EmbeddingConfigurationError("MLX request encoding does not match its input part")
+        values = [part.value for part in parts]
         if kind == "text":
-            return self.embed_text([part.value], input_type="query" if encoding == "text_query" else "document")[0]
-        return getattr(self, "embed_" + kind)([part.value])[0]
+            return self.embed_text(values, input_type="query" if encoding == "text_query" else "document")
+        return getattr(self, "embed_" + kind)(values)

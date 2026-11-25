@@ -129,6 +129,9 @@ def test_service_planning_needs_no_sdk_and_claims_no_gpu(tmp_path, monkeypatch, 
         {"engine_args": {}},
         {"base_url": "http://localhost"},
         {"service_id": ""},
+        {"service_batch_rows": True},
+        {"service_batch_rows": 0},
+        {"service_batch_rows": ipc.MAX_BATCH_ROWS + 1},
         {"service_path": "relative"},
         {"timeout": float("nan")},
         {"input_modalities": ["audio"]},
@@ -139,6 +142,157 @@ def test_service_planning_needs_no_sdk_and_claims_no_gpu(tmp_path, monkeypatch, 
 def test_invalid_service_configuration_fails_without_connecting(tmp_path, options):
     with pytest.raises((EmbeddingConfigurationError, TypeError, ValueError)):
         client(tmp_path, **options)
+
+
+@pytest.mark.parametrize("family", ["sglang", "vllm"])
+def test_service_batch_reuses_native_dispatch_and_preserves_rows(tmp_path, monkeypatch, family):
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    sdk = install_sdk(monkeypatch.setitem)
+    service = make_service(root, family)
+    instance = client(root, family, service_batch_rows=3, max_concurrency_per_actor=1)
+    image = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+    rows = [EmbeddingContent(content("text", str(i)).parts + content("image", image[:, ::-1]).parts) for i in range(7)]
+
+    async def run():
+        await service.start()
+        try:
+            native = service.backend.runtime
+            original = native._embed_content
+            calls = []
+            later_row_done = asyncio.Event()
+
+            async def embed(row):
+                index = int(row.parts[0].value)
+                np.testing.assert_equal(row.parts[1].value, image[:, ::-1])
+                calls.append(index)
+                vector = await original(row)
+                if index == 0:
+                    await asyncio.wait_for(later_row_done.wait(), 5)
+                elif index == 2:
+                    later_row_done.set()
+                if index == 1:
+                    raise RuntimeError("bad row")
+                return [index, vector[1]]
+
+            monkeypatch.setattr(native, "_embed_content", embed)
+            instance._request_on_error = "ignore"
+            assert await instance.embed_multimodal([]) == []
+            values = await instance.embed_multimodal(rows)
+            assert [None if value is None else value.tolist() for value in values] == [
+                None if i == 1 else [i, 4] for i in range(7)
+            ]
+            assert service.metrics["completed"] == 3 and sorted(calls) == list(range(7))
+            assert len(sdk.engines) == 1 and len(sdk.calls) == 7
+            assert service.credits.bytes == service.credits.inflight == 0
+            instance._request_on_error = "raise"
+            with pytest.raises(RuntimeError, match="row failed"):
+                await instance.embed_multimodal(rows[:3])
+            assert len(sdk.calls) == 10 and service.metrics["completed"] == 4
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_service_batch_budget_falls_back_before_inference(tmp_path, monkeypatch):
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    sdk = install_sdk(monkeypatch.setitem)
+    service = make_service(root, max_bytes=8)
+    instance = client(root, service_batch_rows=3)
+    reservations = []
+    hello = service._hello
+
+    def observe(message):
+        reservations.append(len(message.get("rows", [None])))
+        return hello(message)
+
+    monkeypatch.setattr(service, "_hello", observe)
+
+    async def run():
+        await service.start()
+        try:
+            np.testing.assert_equal(await instance.embed_text(["", "123", "45"]), [[3, 4]] * 3)
+            assert reservations == [3, 1, 1, 1]
+            assert service.metrics["completed"] == len(sdk.calls) == 3
+            assert not service._zmq_server.buffers and service.credits.bytes == 0
+            with pytest.raises(EmbeddingConfigurationError):
+                await instance.embed_text(["ok", "too large"])
+            assert len(sdk.calls) == 3
+        finally:
+            await instance.aclose()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fault", ["size", "offset", "extra", "empty"])
+def test_batch_reservation_validates_all_rows_before_admission(tmp_path, fault):
+    service = make_service(tmp_path)
+    instance = client(tmp_path)
+    parts, _, size = ipc.describe(content(), instance.spec)
+    message = instance._reservation(parts, size * 2, "0" * 32)
+    del message["parts"]
+    rows = [{"parts": parts, "nbytes": size}, {"parts": [dict(parts[0])], "nbytes": size}]
+    message["rows"] = rows
+    if fault == "size":
+        message["nbytes"] += 1
+    elif fault == "offset":
+        rows[-1]["parts"][0]["offset"] = size
+    elif fault == "extra":
+        rows[-1]["offset"] = size
+    else:
+        message["rows"] = []
+    with pytest.raises(EmbeddingConfigurationError):
+        service._hello(message)
+    assert service.metrics["accepted"] == service.credits.bytes == 0
+
+
+@pytest.mark.parametrize("fault", ["disconnect", "resource", "result_count"])
+def test_accepted_batch_failure_never_replays_rows(tmp_path, monkeypatch, fault):
+    from vane.ai.provider import _ProviderResultError
+
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    sdk = install_sdk(monkeypatch.setitem)
+    service = make_service(root)
+    instance = client(root, service_batch_rows=2)
+    instance._request_on_error = "ignore"
+
+    async def run():
+        await service.start()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def fail(contents, context):
+            started.set()
+            if fault == "resource":
+                raise MemoryError("out of memory")
+            if fault == "disconnect":
+                await release.wait()
+            return []
+
+        monkeypatch.setattr(service.backend, "embed_batch", fail)
+        try:
+            request = asyncio.create_task(instance.embed_text(["first", "second"]))
+            await asyncio.wait_for(started.wait(), 5)
+            if fault == "disconnect":
+                server = service._zmq_server
+                server._disconnect(next(iter(server.pending)))
+                assert await asyncio.wait_for(request, 5) == [None, None]
+                assert service.credits.inflight == 1
+            else:
+                with pytest.raises(MemoryError if fault == "resource" else _ProviderResultError):
+                    await asyncio.wait_for(request, 5)
+        finally:
+            release.set()
+            await instance.aclose()
+            await service.aclose()
+        assert service.metrics["accepted"] == 1 and not sdk.calls
+        assert service.credits.inflight == service.credits.bytes == 0
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("family", ["sglang", "vllm"])
@@ -1054,6 +1208,7 @@ def check_public_embed(process, family, backend):
             runtime="service",
             service_path=str(root / "engine.json"),
             service_id="fixture-v1",
+            service_batch_rows=3,
             execution_backend=backend,
             on_error="ignore",
             output_column="vector",
