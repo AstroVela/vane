@@ -780,14 +780,15 @@ def _adapt_batch_wrapper_for_backend(wrapper: Any, execution_backend: str | None
 def chunk_text(
     text: str,
     max_chars: int = 2000,
-    overlap_chars: int = 200,
+    overlap_chars: int = 0,
 ) -> list[str]:
     """Split text into overlapping chunks.
 
     Args:
         text: The input text to chunk.
         max_chars: Maximum characters per chunk.
-        overlap_chars: Number of overlapping characters between chunks.
+        overlap_chars: Number of overlapping characters between chunks. Defaults
+            to 0 (no overlap) and must be smaller than ``max_chars``.
 
     Returns:
         List of text chunks. Returns ``[text]`` if text fits in one chunk.

@@ -541,7 +541,7 @@ class TestChunking:
         """Short text returns single chunk."""
         from vane.ai.functions import chunk_text
 
-        result = chunk_text("hello world", max_chars=100, overlap_chars=0)
+        result = chunk_text("hello world", max_chars=100)
         assert result == ["hello world"]
 
     def test_chunk_text_exact_boundary(self):
@@ -549,8 +549,28 @@ class TestChunking:
         from vane.ai.functions import chunk_text
 
         text = "a" * 100
-        result = chunk_text(text, max_chars=100, overlap_chars=0)
+        result = chunk_text(text, max_chars=100)
         assert result == [text]
+
+    @pytest.mark.parametrize("max_chars", [1, 100, 200, 201])
+    def test_chunk_text_default_overlap_is_valid_for_small_limits(self, max_chars):
+        from vane.ai.functions import chunk_text
+
+        text = "a中🙂é" * (max_chars + 1)
+        chunks = chunk_text(text, max_chars=max_chars)
+        assert "".join(chunks) == text
+        assert all(0 < len(chunk) <= max_chars for chunk in chunks)
+
+    def test_chunk_text_empty_with_default_overlap(self):
+        from vane.ai.functions import chunk_text
+
+        assert chunk_text("", max_chars=1) == [""]
+
+    def test_chunk_text_defaults_do_not_duplicate_text(self):
+        from vane.ai.functions import chunk_text
+
+        text = "a" * 2100
+        assert chunk_text(text) == [text[:2000], text[2000:]]
 
     @pytest.mark.parametrize("max_chars", [0, -1, True, 1.5])
     def test_chunk_text_rejects_invalid_max_chars(self, max_chars):
@@ -559,12 +579,13 @@ class TestChunking:
         with pytest.raises(ValueError, match="max_chars must be a positive integer"):
             chunk_text("text", max_chars=max_chars, overlap_chars=0)
 
-    @pytest.mark.parametrize("overlap_chars", [-1, True, 1.5, 100])
-    def test_chunk_text_rejects_invalid_overlap_chars(self, overlap_chars):
+    @pytest.mark.parametrize("text", ["", "short", "a" * 101])
+    @pytest.mark.parametrize("overlap_chars", [-1, True, 1.5, None, 100, 101, 200])
+    def test_chunk_text_rejects_invalid_overlap_chars(self, overlap_chars, text):
         from vane.ai.functions import chunk_text
 
         with pytest.raises(ValueError, match="overlap_chars"):
-            chunk_text("text", max_chars=100, overlap_chars=overlap_chars)
+            chunk_text(text, max_chars=100, overlap_chars=overlap_chars)
 
     def test_chunk_text_splits(self):
         """Long text is split into overlapping chunks."""
