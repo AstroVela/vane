@@ -48,6 +48,10 @@ class _Cursor:
         connection.statements.append((sql, parameters))
         if "pg_attribute" in sql:
             self._rows = list(connection.target_types.items())
+        elif "current_setting('TimeZone')" in sql:
+            self._rows = [(connection.time_zone,)]
+        elif sql.startswith('INSERT INTO "vane_converted_'):
+            return
         elif sql.startswith("INSERT INTO"):
             failure = connection.merge_errors.pop(0) if connection.merge_errors else None
             if failure is not None:
@@ -73,6 +77,7 @@ class _Connection:
         self.merge_errors: list[BaseException | None] = []
         self.commit_errors: list[BaseException] = []
         self.rollback_error: BaseException | None = None
+        self.time_zone = "Asia/Shanghai"
         self.commits = 0
         self.rollbacks = 0
         self.close_calls = 0
@@ -98,7 +103,11 @@ class _Connection:
 
     @property
     def merge_sql(self) -> str:
-        return next(sql for sql, _ in self.statements if sql.startswith("INSERT INTO"))
+        return next(
+            sql
+            for sql, _ in self.statements
+            if sql.startswith("INSERT INTO") and not sql.startswith('INSERT INTO "vane_converted_')
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -283,6 +292,7 @@ def test_postgres_sink_prepares_a_parameterized_typed_upsert() -> None:
         '"embedding" = EXCLUDED."embedding"'
     )
     assert connection.statements[-1] == (f'TRUNCATE "{stage}"', None)
+    assert not any("TimeZone" in sql for sql, _ in connection.statements)
 
 
 def test_postgres_sink_inserts_only_new_keys_when_every_column_is_a_key() -> None:
@@ -407,6 +417,97 @@ def test_postgres_sink_rejects_values_adbc_would_change_before_sending(
     with pytest.raises(ValueError, match="cannot be sent without changing its values"):
         worker.write(pa.table({"id": [1], "value": pa.array(values, type=source_type)}))
     assert _Connection.instances[0].ingests == []
+
+
+@pytest.mark.parametrize(
+    ("source_type", "values"),
+    [
+        (pa.timestamp("us"), [2**63 - 1]),
+        (pa.timestamp("us"), [-(2**63 - 1)]),
+        (pa.timestamp("us", tz="UTC"), [2**63 - 1]),
+        (pa.date32(), [2**31 - 1]),
+        (pa.date32(), [-(2**31 - 1)]),
+        (pa.list_(pa.timestamp("us")), [[0, 2**63 - 1]]),
+    ],
+)
+def test_postgres_sink_rejects_infinite_dates_and_timestamps_before_sending(
+    source_type: pa.DataType, values: list[object]
+) -> None:
+    worker = _single_column_worker(source_type)
+    with pytest.raises(ValueError, match="infinite date or timestamp"):
+        worker.write(pa.table({"id": [1], "value": pa.array(values, type=source_type)}))
+    assert _Connection.instances[0].ingests == []
+
+
+@pytest.mark.parametrize(
+    ("source_type", "target_type", "converts"),
+    [
+        (pa.timestamp("us"), "timestamp with time zone", True),
+        (pa.date32(), "timestamp with time zone", True),
+        (pa.string(), "timestamp with time zone", True),
+        (pa.time64("us"), "time with time zone", True),
+        (pa.string(), "tstzrange", True),
+        (pa.list_(pa.timestamp("us")), "timestamp with time zone[]", True),
+        (pa.timestamp("us", tz="UTC"), "timestamp without time zone", True),
+        (pa.timestamp("us", tz="UTC"), "date", True),
+        (pa.timestamp("us", tz="UTC"), "text", True),
+        (pa.timestamp("us", tz="UTC"), "timestamp with time zone", False),
+        (pa.list_(pa.timestamp("us", tz="UTC")), "timestamp with time zone[]", False),
+        (pa.timestamp("us"), "timestamp without time zone", False),
+        (pa.timestamp("us"), "date", False),
+        (pa.string(), "text", False),
+        (pa.list_(pa.float32()), "vector", False),
+    ],
+)
+def test_postgres_sink_detects_casts_that_read_the_time_zone(
+    source_type: pa.DataType, target_type: str, converts: bool
+) -> None:
+    assert postgres._converts_with_time_zone(postgres._wire_type(source_type), target_type) is converts
+
+
+def test_postgres_sink_converts_time_zone_dependent_values_in_utc() -> None:
+    _Connection.target_types = {"id": "bigint", "seen_at": "timestamp with time zone", "embedding": "vector"}
+    schema = pa.schema([("id", pa.int64()), ("seen_at", pa.timestamp("us")), ("embedding", pa.list_(pa.float32()))])
+    sink = PostgresSink("items", dsn="postgresql://db.example/app", key_columns="id")
+    worker = sink.bind(schema).open_worker(WriteContext("zones"))
+    connection = _Connection.instances[0]
+    assert connection.commits == 2
+    connection.statements.clear()
+    worker.write(pa.table({"id": [1], "seen_at": [dt.datetime(2026, 1, 1)], "embedding": [[0.1]]}, schema=schema))
+
+    stage = connection.ingests[0][0]
+    converted = '"' + stage.replace("vane_stage_", "vane_converted_") + '"'
+    assert connection.statements == [
+        ("SELECT set_config('TimeZone', $1, true)", ("UTC",)),
+        (
+            f'INSERT INTO {converted} ("c0", "c1", "c2") SELECT CAST("c0" AS bigint), '
+            f'CAST("c1" AS timestamp with time zone), CAST("c2" AS vector) FROM "{stage}"',
+            None,
+        ),
+        ("SELECT set_config('TimeZone', $1, true)", ("Asia/Shanghai",)),
+        (
+            'INSERT INTO "items" AS "vane_target" ("id", "seen_at", "embedding") SELECT "c0", "c1", "c2" '
+            f'FROM {converted} ON CONFLICT ("id") DO UPDATE SET "seen_at" = EXCLUDED."seen_at", '
+            '"embedding" = EXCLUDED."embedding"',
+            None,
+        ),
+        (f'TRUNCATE "{stage}", {converted}', None),
+    ]
+    assert connection.commits == 3
+
+
+def test_postgres_sink_creates_the_conversion_table_with_the_target_base_types() -> None:
+    _Connection.target_types = {"id": "bigint", "seen_at": "timestamp without time zone", "codes": "text[]"}
+    schema = pa.schema(
+        [("id", pa.int64()), ("seen_at", pa.timestamp("us", tz="UTC")), ("codes", pa.list_(pa.string()))]
+    )
+    PostgresSink("items", dsn="postgresql://db.example/app", key_columns="id").bind(schema).open_worker(
+        WriteContext("zones")
+    )
+    connection = _Connection.instances[0]
+    create = next(sql for sql, _ in connection.statements if sql.startswith("CREATE TEMPORARY TABLE"))
+    assert create.startswith('CREATE TEMPORARY TABLE "vane_converted_')
+    assert create.endswith('("c0" bigint, "c1" timestamp without time zone, "c2" text[])')
 
 
 def test_postgres_sink_enforces_schema_and_batch_limits_before_sending() -> None:
@@ -830,4 +931,82 @@ def test_postgres_sink_live_rejects_duplicate_keys_before_writing(
         relation.write_datasink(_live_sink(schema, "items", key_columns="id"))
 
     assert exc_info.value.outcome is WriteOutcome.ABORTED
+    assert _live_rows(connection, f'SELECT count(*) FROM "{schema}"."items"') == [(0,)]
+
+
+@pytest.mark.external_service
+def test_postgres_sink_live_applies_the_length_of_array_domain_elements(
+    _live_schema: tuple[Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    connection, schema = _live_schema
+    with connection.cursor() as cursor:
+        cursor.execute(f'CREATE DOMAIN "{schema}"."code" AS varchar(3)')
+        cursor.execute(f'CREATE TABLE "{schema}"."items" (id bigint PRIMARY KEY, codes "{schema}"."code"[])')
+
+    vane.sql("SELECT 1::BIGINT AS id, ['abc'] AS codes").write_datasink(_live_sink(schema, "items", key_columns="id"))
+    with pytest.raises(DataSinkWriteError, match="value too long"):
+        vane.sql("SELECT 1::BIGINT AS id, ['abc', 'abcd'] AS codes").write_datasink(
+            _live_sink(schema, "items", key_columns="id")
+        )
+    # An explicit cast to the domain array would have stored 'abc' twice instead of failing.
+    assert _live_rows(connection, f'SELECT codes::text FROM "{schema}"."items"') == [("{abc}",)]
+
+
+@pytest.mark.external_service
+def test_postgres_sink_live_converts_time_zones_in_utc(
+    _live_schema: tuple[Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    # libpq sends PGTZ as the session time zone, so the worker connections do not run in UTC.
+    monkeypatch.setenv("PGTZ", "Asia/Shanghai")
+    connection, schema = _live_schema
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'CREATE TABLE "{schema}"."items" (id bigint PRIMARY KEY, naive_at timestamptz, zoned_at timestamp, '
+            "zoned_day date, text_at timestamptz, local_time timetz, "
+            "session_zone text DEFAULT current_setting('TimeZone'))"
+        )
+    vane.sql(
+        "SELECT 1::BIGINT AS id, TIMESTAMP '2026-01-01 00:30:00' AS naive_at, "
+        "TIMESTAMPTZ '2026-01-01 00:30:00+00' AS zoned_at, TIMESTAMPTZ '2026-01-01 20:00:00+00' AS zoned_day, "
+        "'2026-01-01 00:30:00' AS text_at, TIME '12:00:00' AS local_time"
+    ).write_datasink(_live_sink(schema, "items", key_columns="id"))
+
+    assert _live_rows(
+        connection,
+        "SELECT (naive_at AT TIME ZONE 'UTC')::text, zoned_at::text, zoned_day::text, "
+        "(text_at AT TIME ZONE 'UTC')::text, local_time::text, session_zone "
+        f'FROM "{schema}"."items"',
+    ) == [
+        (
+            "2026-01-01 00:30:00",
+            "2026-01-01 00:30:00",
+            "2026-01-01",
+            "2026-01-01 00:30:00",
+            "12:00:00+00",
+            "Asia/Shanghai",
+        )
+    ]
+
+
+@pytest.mark.external_service
+@pytest.mark.parametrize(
+    ("value_sql", "column_type"),
+    [
+        ("'infinity'::TIMESTAMP", "timestamp"),
+        ("'-infinity'::TIMESTAMPTZ", "timestamptz"),
+        ("'infinity'::DATE", "date"),
+    ],
+)
+def test_postgres_sink_live_rejects_infinite_dates_and_timestamps(
+    _live_schema: tuple[Any, str], monkeypatch: pytest.MonkeyPatch, value_sql: str, column_type: str
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    connection, schema = _live_schema
+    with connection.cursor() as cursor:
+        cursor.execute(f'CREATE TABLE "{schema}"."items" (id bigint PRIMARY KEY, value {column_type})')
+    relation = vane.sql(f"SELECT 1::BIGINT AS id, {value_sql} AS value")
+    with pytest.raises(DataSinkWriteError, match="infinite date or timestamp"):
+        relation.write_datasink(_live_sink(schema, "items", key_columns="id"))
     assert _live_rows(connection, f'SELECT count(*) FROM "{schema}"."items"') == [(0,)]

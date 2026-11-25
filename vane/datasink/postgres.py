@@ -48,17 +48,35 @@ _URI_SCHEMES = ("postgresql://", "postgres://")
 _CONNINFO_SPACE = " \t\n\v\f\r"
 _INVALID_DSN = "dsn is not a valid libpq connection string or URI"
 _TARGET_ALIAS = '"vane_target"'
-# Target column types without typmods, for the merge casts. Domains resolve to their innermost base type, since an
-# explicit cast to a domain applies the domain's typmod the same truncating way.
+
+
+def _innermost_base_type(type_oid: str) -> str:
+    """Return a scalar subquery for the innermost base type of ``type_oid``, following nested domains."""
+
+    return (
+        "(WITH RECURSIVE chain(oid, typtype, typbasetype, depth) AS ("
+        f"SELECT t.oid, t.typtype, t.typbasetype, 0 FROM pg_type AS t WHERE t.oid = {type_oid} "
+        "UNION ALL SELECT t.oid, t.typtype, t.typbasetype, chain.depth + 1 FROM chain "
+        "JOIN pg_type AS t ON t.oid = chain.typbasetype WHERE chain.typtype = 'd') "
+        "SELECT chain.oid FROM chain ORDER BY chain.depth DESC LIMIT 1)"
+    )
+
+
+# Target column types without typmods, for the merge casts. Domains resolve to their innermost base type, and arrays
+# of domains to arrays of that base type, since an explicit cast to a domain applies the domain's typmod the same
+# truncating way.
 _TARGET_TYPES_SQL = (
-    "SELECT a.attname, format_type(base.oid, -1) FROM pg_attribute AS a CROSS JOIN LATERAL ("
-    "WITH RECURSIVE chain(oid, typtype, typbasetype, depth) AS ("
-    "SELECT t.oid, t.typtype, t.typbasetype, 0 FROM pg_type AS t WHERE t.oid = a.atttypid "
-    "UNION ALL SELECT t.oid, t.typtype, t.typbasetype, chain.depth + 1 FROM chain "
-    "JOIN pg_type AS t ON t.oid = chain.typbasetype WHERE chain.typtype = 'd') "
-    "SELECT chain.oid FROM chain ORDER BY chain.depth DESC LIMIT 1) AS base "
+    "SELECT a.attname, CASE WHEN element.typtype = 'd' "
+    f"THEN format_type({_innermost_base_type('element.oid')}, -1) || '[]' "
+    "ELSE format_type(base.oid, -1) END "
+    f"FROM pg_attribute AS a CROSS JOIN LATERAL (SELECT {_innermost_base_type('a.atttypid')} AS oid) AS base "
+    "JOIN pg_type AS base_type ON base_type.oid = base.oid "
+    "LEFT JOIN pg_type AS element ON base_type.typcategory = 'A' AND element.oid = base_type.typelem "
     "WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped"
 )
+# Target types whose casts from other types read the session time zone, such as timestamp to timestamptz.
+_ZONED_TARGET_TYPES = frozenset({"timestamp with time zone", "time with time zone", "tstzrange", "tstzmultirange"})
+_CONVERSION_TIME_ZONE = "UTC"
 _PARTIAL_VISIBILITY_WARNING = (
     "PostgreSQL commits worker batches independently; a later operation failure can leave this batch applied"
 )
@@ -297,6 +315,37 @@ def _wire_type(data_type: pa.DataType) -> pa.DataType:
     return data_type
 
 
+def _converts_with_time_zone(wire_type: pa.DataType, target_type: str) -> bool:
+    """Whether casting a staged value to the target type depends on the session time zone."""
+
+    if _is_list_type(wire_type):
+        wire_type = wire_type.value_type
+    target = target_type.removesuffix("[]")
+    if pa.types.is_timestamp(wire_type) and wire_type.tz is not None:
+        # ADBC stages these as timestamptz, which only another timestamptz keeps without a zone.
+        return target != "timestamp with time zone"
+    return target in _ZONED_TARGET_TYPES
+
+
+def _has_infinite_values(column: pa.ChunkedArray) -> bool:
+    """Whether a date or timestamp column holds the extreme values that DuckDB uses for infinity.
+
+    ADBC would store a positive infinite timestamp as a finite one in the year 294247, and fail on the others with
+    a range error that does not name the column.
+    """
+
+    values = pc.list_flatten(column) if _is_list_type(column.type) else column
+    if pa.types.is_timestamp(values.type):
+        storage, limit = pa.int64(), _MAX_INT64
+    elif pa.types.is_date32(values.type):
+        storage, limit = pa.int32(), (1 << 31) - 1
+    else:
+        return False
+    extremes = pc.min_max(pc.cast(values, storage))
+    largest, smallest = extremes["max"].as_py(), extremes["min"].as_py()
+    return (largest is not None and largest >= limit) or (smallest is not None and smallest <= -limit)
+
+
 def _load_adbc_postgresql() -> ModuleType:
     try:
         import adbc_driver_postgresql.dbapi  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -372,8 +421,17 @@ class PostgresSink(DataSink):
     values are sent with microsecond precision, the precision PostgreSQL
     stores; values that would change fail the batch before it is sent. With
     adbc-driver-postgresql before 1.13, which writes NULL list elements as zero
-    values, a batch whose lists contain NULL elements fails the same way.
-    Nested lists, structs, maps, and intervals are rejected at bind time.
+    values, a batch whose lists contain NULL elements fails the same way, as
+    does a batch with infinite dates or timestamps, which ADBC cannot send as
+    infinity. Nested lists, structs, maps, and intervals are rejected at bind
+    time.
+
+    Casts that depend on a time zone, such as a timestamp without a time zone
+    into a ``timestamptz`` column, or a ``timestamptz`` into a ``timestamp`` or
+    ``date`` column, use UTC instead of the server's ``TimeZone`` setting. To
+    read timestamps without a time zone in another zone, convert them in the
+    query, for example with ``timezone('Asia/Shanghai', ts)``. Column defaults
+    and triggers still run in the connection's own time zone.
 
     ``dsn`` is a libpq connection string or URI without a password. It may be
     a string or an ``EnvironmentSecret`` resolved on each worker. Passwords
@@ -506,9 +564,15 @@ class _PostgresWorker(DataSinkWorker):
             if sink.schema is None
             else f"{_quote_identifier(sink.schema)}.{_quote_identifier(sink.table)}"
         )
-        self._stage_name = f"vane_stage_{uuid.uuid4().hex}"
+        nonce = uuid.uuid4().hex
+        self._stage_name = f"vane_stage_{nonce}"
         self._stage = _quote_identifier(self._stage_name)
+        self._converted = _quote_identifier(f"vane_converted_{nonce}")
         self._stage_created = False
+        self._merge_sql = ""
+        self._convert_sql: str | None = None
+        self._session_time_zone: str | None = None
+        self._truncate_sql = f"TRUNCATE {self._stage}"
         self._warning_pending = True
         self._base_metadata: dict[str, Any] = {
             "provider": "postgres",
@@ -523,7 +587,7 @@ class _PostgresWorker(DataSinkWorker):
         self._connection: Any | None = _open_connection(dsn, secrets)
         del dsn, secrets
         try:
-            self._merge_sql = self._prepare()
+            self._prepare()
         except BaseException as error:
             try:
                 self.close()
@@ -541,7 +605,7 @@ class _PostgresWorker(DataSinkWorker):
             raise RuntimeError("PostgresSink worker is closed")
         return self._connection
 
-    def _prepare(self) -> str:
+    def _prepare(self) -> None:
         connection = self._connection_or_raise()
         with connection.cursor() as cursor:
             cursor.execute("SELECT set_config('statement_timeout', $1, false)", (f"{self._sink.timeout}s",))
@@ -569,9 +633,27 @@ class _PostgresWorker(DataSinkWorker):
             if not field.is_key
         )
         action = f"DO UPDATE SET {updates}" if updates else "DO NOTHING"
+        source = self._stage
+        if any(_converts_with_time_zone(field.wire_type, target_types[field.target_name]) for field in self._fields):
+            # Casts that read the time zone run under UTC into a second temporary table, so their results do not
+            # depend on the server's TimeZone setting. The INSERT then runs in the session's own time zone, which
+            # column defaults and triggers keep using.
+            staged = ", ".join(_quote_identifier(f"c{index}") for index in range(len(self._fields)))
+            definitions = ", ".join(
+                f"{_quote_identifier(f'c{index}')} {target_types[field.target_name]}"
+                for index, field in enumerate(self._fields)
+            )
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_setting('TimeZone')")
+                self._session_time_zone = str(cursor.fetchall()[0][0])
+                cursor.execute(f"CREATE TEMPORARY TABLE {self._converted} ({definitions})")
+            connection.commit()
+            self._convert_sql = f"INSERT INTO {self._converted} ({staged}) SELECT {values} FROM {self._stage}"
+            self._truncate_sql = f"TRUNCATE {self._stage}, {self._converted}"
+            source, values = self._converted, staged
         # The alias keeps EXCLUDED unambiguous for a target table named "excluded".
-        return (
-            f"INSERT INTO {self._target} AS {_TARGET_ALIAS} ({columns}) SELECT {values} FROM {self._stage} "
+        self._merge_sql = (
+            f"INSERT INTO {self._target} AS {_TARGET_ALIAS} ({columns}) SELECT {values} FROM {source} "
             f"ON CONFLICT ({keys}) {action}"
         )
 
@@ -603,6 +685,11 @@ class _PostgresWorker(DataSinkWorker):
                         f"PostgreSQL source field {binding.source_name!r} cannot be sent without changing its "
                         f"values as Arrow type {binding.wire_type}: {error}"
                     ) from error
+            if _has_infinite_values(column):
+                raise ValueError(
+                    f"PostgreSQL source field {binding.source_name!r} contains an infinite date or timestamp, "
+                    "which ADBC cannot send as infinity; replace it with NULL or a finite value in the query"
+                )
             if (
                 self._null_list_elements_unsupported
                 and _is_list_type(column.type)
@@ -626,9 +713,13 @@ class _PostgresWorker(DataSinkWorker):
                 mode="append" if self._stage_created else "create",
                 temporary=True,
             )
+            if self._convert_sql is not None:
+                cursor.execute("SELECT set_config('TimeZone', $1, true)", (_CONVERSION_TIME_ZONE,))
+                cursor.execute(self._convert_sql)
+                cursor.execute("SELECT set_config('TimeZone', $1, true)", (self._session_time_zone,))
             cursor.execute(self._merge_sql)
             affected = cursor.rowcount
-            cursor.execute(f"TRUNCATE {self._stage}")
+            cursor.execute(self._truncate_sql)
         if isinstance(affected, bool) or not isinstance(affected, int) or affected < 0:
             raise RuntimeError("PostgreSQL upsert returned an invalid row count")
         return affected
