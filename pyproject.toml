@@ -7,7 +7,7 @@
 [project]
 name = "vane-ai"
 dynamic = ["version"]
-description = "A distributed, multimodal data engine built on DuckDB and Ray"
+description = "High-performance, multimodal-native data engine for AI workloads"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = [
@@ -24,7 +24,20 @@ license-files = [
     "external/duckdb/extension/icu/third_party/icu/LICENSE",
     "external/duckdb/third_party/jemalloc/LICENSE",
 ]
-keywords = ["Vane", "DuckDB", "Ray", "Distributed", "Database", "SQL", "OLAP"]
+keywords = [
+    "Vane",
+    "DuckDB",
+    "Multimodal",
+    "AI",
+    "SQL",
+    "Video",
+    "Audio",
+    "Embeddings",
+    "Ray",
+    "Distributed",
+    "Database",
+    "OLAP",
+]
 requires-python = ">=3.10,<3.15"
 dependencies = [
     "botocore>=1.38.0,<2",
@@ -44,6 +57,9 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
     "Intended Audience :: Developers",
     "Intended Audience :: Education",
     "Intended Audience :: Information Technology",
@@ -62,7 +78,9 @@ authors = [{name = "Vane contributors"}]
 maintainers = [{name = "Vane maintainers"}]
 
 [project.urls]
-Documentation = "https://github.com/AstroVela/vane#readme"
+Homepage = "https://vane.astrovela.ai/"
+Documentation = "https://vane.astrovela.ai/docs/data"
+Benchmarks = "https://vane.astrovela.ai/benchmarks"
 Source = "https://github.com/AstroVela/vane"
 Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
