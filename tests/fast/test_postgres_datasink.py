@@ -439,6 +439,54 @@ def test_postgres_sink_rejects_infinite_dates_and_timestamps_before_sending(
     assert _Connection.instances[0].ingests == []
 
 
+_MAX_HUGEINT = 2**127 - 1
+
+
+def _bind_relation(relation: vane.DuckDBPyRelation) -> BoundDataSink:
+    sink = PostgresSink("items", dsn="postgresql://db.example/app", key_columns="id")
+    return sink.bind(datasink._relation_arrow_schema(relation))
+
+
+def test_postgres_sink_sends_uhugeint_through_a_checked_hugeint_cast() -> None:
+    relation = vane.sql(
+        f'SELECT 1::BIGINT AS id, {_MAX_HUGEINT}::UHUGEINT AS "u""q", [7::UHUGEINT] AS ul, '
+        "[7::UHUGEINT, 8]::UHUGEINT[2] AS ua, -1::HUGEINT AS h"
+    )
+
+    prepared = _bind_relation(relation).prepare_input(relation)
+
+    assert prepared.columns == relation.columns
+    assert [str(data_type) for data_type in prepared.types] == [
+        "BIGINT",
+        "HUGEINT",
+        "HUGEINT[]",
+        "HUGEINT[2]",
+        "HUGEINT",
+    ]
+    assert datasink._relation_arrow_schema(prepared) == datasink._relation_arrow_schema(relation)
+    assert prepared.fetchall() == [(1, _MAX_HUGEINT, [7], (7, 8), -1)]
+
+    overflow = vane.sql(f"SELECT 1::BIGINT AS id, [{_MAX_HUGEINT + 1}::UHUGEINT] AS u")
+    with pytest.raises(vane.ConversionException, match="out of range"):
+        _bind_relation(overflow).prepare_input(overflow).fetchall()
+
+    plain = vane.sql("SELECT 1::BIGINT AS id, 1::HUGEINT AS h")
+    assert _bind_relation(plain).prepare_input(plain) is plain
+
+
+@pytest.mark.parametrize(
+    "value_sql",
+    ["TIMETZ '12:34:56+05:30'", "[TIMETZ '12:34:56+05:30']", "[TIMETZ '12:34:56+05:30']::TIMETZ[1]"],
+)
+def test_postgres_sink_rejects_time_with_time_zone_before_opening_a_connection(value_sql: str) -> None:
+    relation = vane.sql(f"SELECT 1::BIGINT AS id, {value_sql} AS value")
+    sink = PostgresSink("items", dsn="postgresql://db.example/app", key_columns="id")
+
+    with pytest.raises(ValueError, match="'value' has type TIME WITH TIME ZONE.*cast it to VARCHAR"):
+        relation.write_datasink(sink)
+    assert _Connection.instances == []
+
+
 @pytest.mark.parametrize(
     ("source_type", "target_type", "converts"),
     [
@@ -1010,3 +1058,43 @@ def test_postgres_sink_live_rejects_infinite_dates_and_timestamps(
     with pytest.raises(DataSinkWriteError, match="infinite date or timestamp"):
         relation.write_datasink(_live_sink(schema, "items", key_columns="id"))
     assert _live_rows(connection, f'SELECT count(*) FROM "{schema}"."items"') == [(0,)]
+
+
+@pytest.mark.external_service
+def test_postgres_sink_live_writes_uhugeint_through_a_checked_hugeint_cast(
+    _live_schema: tuple[Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    connection, schema = _live_schema
+    with connection.cursor() as cursor:
+        cursor.execute(f'CREATE TABLE "{schema}"."items" (id bigint PRIMARY KEY, value numeric, items numeric[])')
+    vane.sql(
+        f"SELECT 1::BIGINT AS id, {_MAX_HUGEINT}::UHUGEINT AS value, [0, {_MAX_HUGEINT}]::UHUGEINT[] AS items"
+    ).write_datasink(_live_sink(schema, "items", key_columns="id"))
+    assert _live_rows(connection, f'SELECT id, value::text, items::text FROM "{schema}"."items"') == [
+        (1, str(_MAX_HUGEINT), f"{{0,{_MAX_HUGEINT}}}")
+    ]
+
+    with pytest.raises(DataSinkWriteError, match="out of range for the destination type INT128"):
+        vane.sql(
+            f"SELECT 2::BIGINT AS id, {_MAX_HUGEINT + 1}::UHUGEINT AS value, []::UHUGEINT[] AS items"
+        ).write_datasink(_live_sink(schema, "items", key_columns="id"))
+    assert _live_rows(connection, f'SELECT count(*) FROM "{schema}"."items"') == [(1,)]
+
+
+@pytest.mark.external_service
+def test_postgres_sink_live_keeps_the_offset_of_a_time_with_time_zone_sent_as_text(
+    _live_schema: tuple[Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    connection, schema = _live_schema
+    with connection.cursor() as cursor:
+        cursor.execute(f'CREATE TABLE "{schema}"."items" (id bigint PRIMARY KEY, value timetz)')
+    with pytest.raises(ValueError, match="cast it to VARCHAR"):
+        vane.sql("SELECT 1::BIGINT AS id, TIMETZ '12:34:56+05:30' AS value").write_datasink(
+            _live_sink(schema, "items", key_columns="id")
+        )
+    vane.sql("SELECT 1::BIGINT AS id, CAST(TIMETZ '12:34:56+05:30' AS VARCHAR) AS value").write_datasink(
+        _live_sink(schema, "items", key_columns="id")
+    )
+    assert _live_rows(connection, f'SELECT id, value::text FROM "{schema}"."items"') == [(1, "12:34:56+05:30")]

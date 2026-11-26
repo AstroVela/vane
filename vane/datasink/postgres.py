@@ -18,7 +18,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, quote, urlsplit
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -38,6 +38,9 @@ from vane.execution._diagnostics import bounded_utf8_text, exception_message_fro
 
 if TYPE_CHECKING:
     from types import ModuleType
+
+    from vane import DuckDBPyRelation
+    from vane.sqltypes import DuckDBPyType
 
 _MAX_INT64 = (1 << 63) - 1
 _MAX_IDENTIFIER_BYTES = 63
@@ -289,6 +292,21 @@ def _validate_source_type(data_type: pa.DataType, path: str) -> None:
         )
 
 
+def _duckdb_value_type(data_type: DuckDBPyType) -> tuple[str, str]:
+    """Return the DuckDB type id of a column's values and the suffix that declares a list or array of them."""
+
+    if data_type.id not in ("list", "array"):
+        return data_type.id, ""
+    children = dict(data_type.children)
+    element = cast("DuckDBPyType", children["child"])
+    if data_type.id == "list":
+        return element.id, "[]"
+    size = children["size"]
+    if not isinstance(size, int):
+        raise TypeError(f"DuckDB array type {data_type} has no integer size")
+    return element.id, f"[{size}]"
+
+
 def _wire_type(data_type: pa.DataType) -> pa.DataType:
     """Return the Arrow type sent to ADBC for an input type.
 
@@ -424,7 +442,11 @@ class PostgresSink(DataSink):
     values, a batch whose lists contain NULL elements fails the same way, as
     does a batch with infinite dates or timestamps, which ADBC cannot send as
     infinity. Nested lists, structs, maps, and intervals are rejected at bind
-    time.
+    time. Arrow has no type for DuckDB ``UHUGEINT`` or ``TIME WITH TIME
+    ZONE`` values: ``UHUGEINT`` values are sent as ``HUGEINT``, so a value of
+    2**127 or more fails the write, and ``TIME WITH TIME ZONE`` inputs, whose
+    offset would be lost, are rejected before any worker opens. Cast them to
+    ``VARCHAR`` in the query to write them as text.
 
     Casts that depend on a time zone, such as a timestamp without a time zone
     into a ``timestamptz`` column, or a ``timestamptz`` into a ``timestamp`` or
@@ -548,6 +570,27 @@ class _BoundPostgresSink(BoundKeyedUpsertSink):
     @property
     def key_columns(self) -> Sequence[str]:
         return self._sink.key_columns
+
+    def prepare_input(self, relation: DuckDBPyRelation) -> DuckDBPyRelation:
+        # DuckDB exports UHUGEINT as decimal128(38, 0) without a range check, which turns values of 2**127 and more
+        # negative, and exports TIME WITH TIME ZONE as a time without its offset. A checked cast to HUGEINT keeps the
+        # Arrow type and fails on the values that do not fit.
+        projections: list[str] = []
+        changed = False
+        for name, data_type in zip(relation.columns, relation.types, strict=True):
+            quoted = _quote_identifier(name)
+            type_id, suffix = _duckdb_value_type(data_type)
+            if type_id == "time with time zone":
+                raise ValueError(
+                    f"PostgreSQL source field {name!r} has type {data_type}, which Vane cannot send with its offset; "
+                    "cast it to VARCHAR in the query"
+                )
+            if type_id == "uhugeint":
+                projections.append(f"CAST({quoted} AS HUGEINT{suffix}) AS {quoted}")
+                changed = True
+            else:
+                projections.append(quoted)
+        return relation.project(", ".join(projections)) if changed else relation
 
     def open_worker(self, _context: WriteContext) -> DataSinkWorker:
         return _PostgresWorker(self._sink, self._schema, self._fields)
