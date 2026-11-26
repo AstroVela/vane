@@ -88,6 +88,7 @@ release_tests=(
   "$project_root/tests/fast/test_doris_datasink.py"
   "$project_root/tests/fast/test_extension_catalog.py"
   "$project_root/tests/fast/test_milvus_datasink.py"
+  "$project_root/tests/fast/test_postgres_datasink.py"
   "$project_root/tests/fast/test_qdrant_datasink.py"
   "$project_root/tests/fast/test_package_metadata.py"
   "$project_root/tests/fast/test_python_filesystem_concurrency.py"
