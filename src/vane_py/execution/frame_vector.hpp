@@ -38,7 +38,7 @@ struct FrameColumn {
 // Measurement and copying traverse precisely the same selected values. Lists
 // are compacted: unused elements and borrowed operator buffers never enter a
 // frame. The limit bounds even the temporary selection used for nested values.
-bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &rows, FrameColumn &layout, idx_t &size,
+bool VisitFrameVector(Vector &column, idx_t source_count, const FrameSelection &rows, FrameColumn &layout, idx_t &size,
                       idx_t limit, data_ptr_t buffer = nullptr, bool contiguous = false) {
 	const auto &type = column.GetType();
 	auto width = FrameWidth(type);
@@ -89,16 +89,10 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &r
 	if (physical == PhysicalType::STRUCT) {
 		auto &children = StructVector::GetEntries(column);
 		layout.children.resize(children.size());
-		vector<idx_t> selected;
-		selected.reserve(count);
-		idx_t child_count = 0;
-		for (idx_t row = 0; row < count; row++) {
-			auto index = index_at(row);
-			selected.push_back(index);
-			child_count = MaxValue(child_count, index + 1);
-		}
+		// Slicing a STRUCT also slices each child. Its dictionary indexes
+		// address the parent validity mask, while children take logical rows.
 		for (idx_t i = 0; i < children.size(); i++) {
-			if (!VisitFrameVector(*children[i], child_count, selected, layout.children[i], size, limit, buffer)) {
+			if (!VisitFrameVector(*children[i], source_count, rows, layout.children[i], size, limit, buffer)) {
 				return false;
 			}
 		}
@@ -169,20 +163,26 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const vector<idx_t> &r
 	return true;
 }
 
-idx_t Measure(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count, idx_t limit,
+idx_t Measure(DataChunk &input, const FrameSelection &rows, idx_t offset, idx_t count, idx_t limit,
               vector<FrameColumn> *columns = nullptr, data_ptr_t buffer = nullptr) {
 	if (!count || offset > rows.size() || count > rows.size() - offset) {
 		throw InvalidInputException("invalid direct frame row selection");
 	}
-	vector<idx_t> selected;
-	selected.reserve(count);
+	// Borrow the caller's immutable selection only for this synchronous visit.
+	// Nested compaction still owns its independently derived child selections.
+	auto selected = rows.Slice(offset, count);
 	bool contiguous = true;
-	for (idx_t i = offset; i < offset + count; i++) {
-		if (rows[i] >= input.size()) {
+	if (selected.IsRange()) {
+		if (selected[count - 1] >= input.size()) {
 			throw InvalidInputException("direct frame row selection is out of bounds");
 		}
-		contiguous = contiguous && rows[i] == rows[offset] + i - offset;
-		selected.push_back(rows[i]);
+	} else {
+		for (idx_t i = 0; i < count; i++) {
+			if (selected[i] >= input.size()) {
+				throw InvalidInputException("direct frame row selection is out of bounds");
+			}
+			contiguous = contiguous && selected[i] == selected[0] + i;
+		}
 	}
 	idx_t size = 0;
 	for (auto &column : input.data) {

@@ -146,7 +146,7 @@ class InProcessTaskService:
                 for part in range(fragment.partition_count):
                     identity = self.task_id(fragment_id, part)
                     assignments = {
-                        source.source_id: [split.split_id for split in source.splits[part :: fragment.partition_count]]
+                        source.source_id: source.assigned_split_ids(part, fragment.partition_count)
                         for source in fragment.sources
                     }
                     self.native.prepare(

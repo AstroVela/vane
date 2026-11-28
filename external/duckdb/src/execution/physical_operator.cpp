@@ -1273,6 +1273,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
 		auto grouping_sets = deserializer.ReadProperty<vector<GroupingSet>>(105, "grouping_sets");
 		auto grouping_functions = deserializer.ReadProperty<vector<unsafe_vector<idx_t>>>(106, "grouping_functions");
+		auto emit_partial_states = deserializer.ReadProperty<bool>(107, "emit_partial_states");
 		auto &context = deserializer.Get<ClientContext &>();
 		for (auto &aggregate : aggregates) {
 			auto &bound_aggregate = aggregate->Cast<BoundAggregateExpression>();
@@ -1280,10 +1281,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 				FunctionBinder::BindSortedAggregate(context, bound_aggregate, groups, grouping_sets);
 			}
 		}
-		return make_uniq<PhysicalHashAggregate>(
+		auto result = make_uniq<PhysicalHashAggregate>(
 		    physical_plan, context, std::move(types), std::move(aggregates), std::move(groups),
 		    std::move(grouping_sets), std::move(grouping_functions), estimated_cardinality,
 		    TupleDataValidityType::CAN_HAVE_NULL_VALUES, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+		if (emit_partial_states) {
+			result->SetPartialStateOutput();
+		}
+		return std::move(result);
 	}
 	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
 		auto groups = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "groups");

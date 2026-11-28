@@ -70,11 +70,7 @@ def execute_graph(connection, graph):
         outputs[fragment_id] = []
         for partition in range(fragment.partition_count):
             assignments = {
-                source.source_id: [
-                    split.split_id
-                    for index, split in enumerate(source.splits)
-                    if index % fragment.partition_count == partition
-                ]
+                source.source_id: source.assigned_split_ids(partition, fragment.partition_count)
                 for source in fragment.sources
             }
             outputs[fragment_id].append(

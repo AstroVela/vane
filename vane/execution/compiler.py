@@ -53,6 +53,7 @@ def _native_source(source: dict[str, Any]) -> SourceSpec:
         codec=source["codec"],
         requires_snapshot=source["requires_snapshot"],
         splits=tuple(ScanSplitSpec(**split) for split in source["splits"]),
+        split_partitions=tuple(source.get("split_partitions", ())),
     )
 
 

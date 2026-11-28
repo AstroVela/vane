@@ -964,6 +964,22 @@ InsertionOrderPreservingMap<string> PhysicalHashAggregate::ParamsToString() cons
 	return result;
 }
 
+void PhysicalHashAggregate::SetPartialStateOutput() {
+	if (grouping_sets.size() != 1 || grouping_sets[0].size() != grouped_aggregate_data.GroupCount() ||
+	    grouped_aggregate_data.groups.empty() || grouped_aggregate_data.aggregates.empty() ||
+	    !grouped_aggregate_data.grouping_functions.empty()) {
+		throw InternalException("partial state output requires a single nonempty grouping set");
+	}
+	for (const auto &expression : grouped_aggregate_data.aggregates) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		if (aggregate.return_type.id() != LogicalTypeId::AGGREGATE_STATE || aggregate.IsDistinct() ||
+		    aggregate.order_bys || aggregate.function.HasStateDestructorCallback()) {
+			throw InternalException("partial state output requires unordered, non-distinct exported states");
+		}
+	}
+	grouped_aggregate_data.emit_partial_states = true;
+}
+
 void PhysicalHashAggregate::SerializeOperatorData(Serializer &serializer) const {
 	serializer.WriteProperty(103, "groups", grouped_aggregate_data.groups);
 	vector<unique_ptr<Expression>> aggregates;
@@ -984,6 +1000,7 @@ void PhysicalHashAggregate::SerializeOperatorData(Serializer &serializer) const 
 	serializer.WriteProperty(104, "aggregates", aggregates);
 	serializer.WriteProperty(105, "grouping_sets", grouping_sets);
 	serializer.WriteProperty(106, "grouping_functions", grouped_aggregate_data.grouping_functions);
+	serializer.WriteProperty(107, "emit_partial_states", grouped_aggregate_data.emit_partial_states);
 }
 
 } // namespace duckdb

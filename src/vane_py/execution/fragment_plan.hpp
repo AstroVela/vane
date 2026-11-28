@@ -21,6 +21,8 @@ struct SourceSpec {
 	string capability;
 	string codec;
 	vector<DistributedScanSplit> splits;
+	// Authoritative split owners for complete groups or co-located join inputs.
+	vector<idx_t> split_partitions;
 	bool requires_snapshot = false;
 	void Serialize(Serializer &serializer) const;
 	static SourceSpec Deserialize(Deserializer &deserializer);
@@ -35,6 +37,9 @@ struct PlanNode {
 	// A native subtree with shared CTE/delimiter state. Its children declare
 	// external input ports, all bound within this one serialization scope.
 	bool scoped = false;
+	// A complete bounded word/mask input gates an unchanged Parquet probe key.
+	idx_t parquet_mask_words = 0;
+	idx_t parquet_mask_key = 0;
 	void Serialize(Serializer &serializer) const;
 	static PlanNode Deserialize(Deserializer &deserializer);
 };
@@ -75,7 +80,8 @@ vector<LogicalType> DeserializeSchema(const string &payload);
 // transport runner configuration, credentials, Python state or attached DBs.
 string CaptureConnection(ClientContext &context);
 void ApplyConnection(ClientContext &context, const string &snapshot);
-string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool require_replay);
+string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool require_replay,
+                      optional_ptr<const unordered_map<string, string>> bound_versions = nullptr);
 void ValidateSources(ClientContext &context, const FragmentSpec &fragment, const string &snapshot, bool require_replay);
 vector<std::pair<string, string>> ScanCapabilities(ClientContext &context);
 
@@ -84,7 +90,8 @@ vector<std::pair<string, string>> ScanCapabilities(ClientContext &context);
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns, const string &snapshot_directory = "", idx_t source_budget = 0,
                       idx_t *source_bytes = nullptr, SourceSnapshotCache *source_cache = nullptr,
-                      idx_t worker_operator_bytes = 0);
+                      idx_t worker_operator_bytes = 0,
+                      optional_ptr<unordered_map<string, string>> bound_versions = nullptr);
 
 using InputFactory =
     std::function<unique_ptr<PhysicalOperator>(PhysicalPlan &, const string &, const vector<LogicalType> &)>;

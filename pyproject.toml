@@ -331,6 +331,7 @@ include = [
     "/tests/fast/test_hash_key_projection.py",
     "/tests/fast/test_join_build_filter.py",
     "/tests/fast/test_parquet_aggregate_partitioning.py",
+    "/tests/fast/test_parquet_join_partitioning.py",
     "/tests/fast/test_execution_performance.py",
     "/tests/fast/test_analytical_exchange.py",
     "/tests/fast/test_worker_resources.py",

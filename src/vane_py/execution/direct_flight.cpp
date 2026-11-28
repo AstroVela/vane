@@ -73,19 +73,19 @@ struct Registry {
 class Stream : public arrow::flight::FlightDataStream {
 public:
 	Stream(std::shared_ptr<Endpoint> endpoint_p, const arrow::flight::ServerCallContext &context_p)
-	    : endpoint(std::move(endpoint_p)), context(context_p), arrow_schema(ArrowSchemaFor(endpoint->channel->types)) {
+	    : endpoint(std::move(endpoint_p)), context(context_p), layout(endpoint->channel->types) {
 	}
 	~Stream() override {
 		(void)Close();
 	}
 	std::shared_ptr<arrow::Schema> schema() override {
-		return arrow_schema;
+		return layout.schema;
 	}
 	arrow::Result<arrow::flight::FlightPayload> GetSchemaPayload() override {
 		arrow::flight::FlightPayload payload;
-		arrow::ipc::DictionaryFieldMapper mapper(*arrow_schema);
-		ARROW_RETURN_NOT_OK(arrow::ipc::GetSchemaPayload(*arrow_schema, arrow::ipc::IpcWriteOptions::Defaults(), mapper,
-		                                                 &payload.ipc_message));
+		arrow::ipc::DictionaryFieldMapper mapper(*layout.schema);
+		ARROW_RETURN_NOT_OK(arrow::ipc::GetSchemaPayload(*layout.schema, arrow::ipc::IpcWriteOptions::Defaults(),
+		                                                 mapper, &payload.ipc_message));
 		return payload;
 	}
 	arrow::Result<arrow::flight::FlightPayload> Next() override {
@@ -119,7 +119,6 @@ public:
 				if (state == DirectRead::CLOSED) {
 					return arrow::Status::Cancelled("direct consumer closed");
 				}
-				DataChunk chunk;
 				string metadata;
 				{
 					std::lock_guard<std::mutex> guard(endpoint->lock);
@@ -128,17 +127,22 @@ public:
 					}
 					if (state == DirectRead::END) {
 						endpoint->finished = sent_finish = true;
-						chunk.Initialize(Allocator::DefaultAllocator(), endpoint->channel->types, 0);
 						metadata = "F:" + std::to_string(endpoint->sent);
 					} else {
 						// Every unacknowledged frame keeps its channel credit. The
 						// transport also has a fixed, separately reserved flight window.
 						endpoint->leases.push_back(batch);
-						batch->Reference(chunk);
 						metadata = "D:" + std::to_string(++endpoint->sent);
 					}
 				}
-				auto record = Encode(chunk, arrow_schema);
+				std::shared_ptr<arrow::RecordBatch> record;
+				if (batch) {
+					record = EncodeFlightFrame(batch, layout);
+				} else {
+					DataChunk empty;
+					empty.Initialize(Allocator::DefaultAllocator(), endpoint->channel->types, 0);
+					record = Encode(empty, layout.schema);
+				}
 				arrow::flight::FlightPayload payload;
 				Check(arrow::ipc::GetRecordBatchPayload(*record, arrow::ipc::IpcWriteOptions::Defaults(),
 				                                        &payload.ipc_message));
@@ -173,7 +177,7 @@ public:
 private:
 	std::shared_ptr<Endpoint> endpoint;
 	const arrow::flight::ServerCallContext &context;
-	std::shared_ptr<arrow::Schema> arrow_schema;
+	ExchangeArrowLayout layout;
 	bool sent_finish = false;
 };
 
@@ -316,8 +320,9 @@ struct Link {
 			options.timeout = arrow::flight::TimeoutDuration(timeout);
 			options.stop_token = stop.token();
 			auto input = Unwrap(data->DoGet(options, arrow::flight::Ticket {ticket}), "data open");
+			ExchangeArrowLayout layout(channel->types);
 			auto schema = Unwrap(input->GetSchema(), "data schema");
-			if (!schema->Equals(*ArrowSchemaFor(channel->types))) {
+			if (!schema->Equals(*layout.schema)) {
 				throw IOException("direct Flight schema mismatch");
 			}
 			ready = true;
@@ -354,12 +359,9 @@ struct Link {
 					throw IOException("invalid direct Flight sequence or frame size");
 				}
 				DataChunk chunk;
-				Decode(*message.data, channel->types, chunk);
-				vector<idx_t> rows;
-				for (idx_t row = 0; row < chunk.size(); row++) {
-					rows.push_back(row);
-				}
-				if (channel->FrameRows(chunk, rows, 0) != rows.size()) {
+				Decode(*message.data, channel->types, layout, chunk);
+				FrameSelection rows(chunk.size());
+				if (channel->FitFrame(chunk, rows, 0, rows.size()).rows != rows.size()) {
 					throw IOException("direct Flight frame exceeds reserved native frame");
 				}
 				while (!done) {

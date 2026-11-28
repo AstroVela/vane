@@ -121,6 +121,57 @@ def exchange_expected(table):
     return table
 
 
+@pytest.mark.parametrize("aggregate", ["count(*)", "sum(range)", "avg(range)"])
+@pytest.mark.parametrize("transport", ["flight", "materialized"])
+def test_opaque_aggregate_states_preserve_binary_values(tmp_path, aggregate, transport):
+    from tests.fast.test_direct_flight import service
+    from tests.fast.test_materialized_exchange import channel, read_object, write_object
+    from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
+
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        # Export once: opaque native states can contain uninitialized padding.
+        # Compare these exact bytes across the transport, not separate exports.
+        state = connection.execute(f"select {aggregate} export_state from range(17)").fetchone()[0]
+        graph = compile_fragment_graph(
+            connection,
+            f"select {aggregate} from range(17)",
+            query_id="opaque-states",
+            options=FragmentCompileOptions(2),
+        )
+        partial = next(fragment for fragment in graph.fragments if fragment.sources)
+        assert partial.fragment_id != graph.result.fragment_id
+        schema = partial.outputs[0].schema
+    assert native.arrow_schema(schema, ["state"]) == pa.schema([("state", pa.binary())])
+    expected = [(state,), (None,), (state,)]
+    if transport == "materialized":
+        path = tmp_path / "states.mat"
+        metadata = write_object(path, schema, expected)
+        assert read_object(path, schema, metadata) == expected
+        return
+    source, target = channel(schema), channel(schema)
+    sender, receiver = service(), service()
+    try:
+        sender.publish("states", source, "consumer")
+        receiver.subscribe(sender.location, "states", target, "producer", 10)
+        assert source._write_rows("producer", 1, expected) == "accepted"
+        source.finish("producer", 1)
+        actual = []
+        while True:
+            state, batch = eventually(lambda: target.poll("consumer"), lambda value: value[0] != "blocked")
+            if state == "end":
+                break
+            try:
+                actual.extend(batch.to_rows())
+            finally:
+                batch.close()
+        assert actual == expected
+        eventually(lambda: source.snapshot()["bytes"], lambda size: size == 0)
+        assert target.snapshot()["bytes"] == 0
+    finally:
+        receiver.close()
+        sender.close()
+
+
 def exchange_table(connection, sql, flight, materialized_path=None, *, rows=False):
     def consume(batch):
         if rows:

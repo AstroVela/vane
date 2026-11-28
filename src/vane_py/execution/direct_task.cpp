@@ -13,6 +13,7 @@
 
 #include <set>
 #include <chrono>
+#include <numeric>
 
 namespace duckdb {
 namespace vane_execution {
@@ -188,28 +189,53 @@ public:
 	using Clock = std::chrono::steady_clock;
 	Clock::time_point next_flush = Clock::now() + std::chrono::milliseconds(10);
 	struct Buffer {
-		unique_ptr<ColumnDataCollection> data;
+		unique_ptr<DataChunk> data;
 		idx_t bytes = 0;
 		idx_t Count() const {
-			return data ? data->Count() : 0;
+			return data ? data->size() : 0;
 		}
 		void Reset() {
 			data.reset();
 			bytes = 0;
 		}
 	};
+	struct PartitionRows {
+		vector<idx_t> offsets;
+		vector<idx_t> indexes;
+
+		void Assign(const vector<idx_t> &partitions, idx_t targets) {
+			offsets.assign(targets + 1, 0);
+			for (auto partition : partitions) {
+				offsets[partition]++;
+			}
+			std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+			indexes.resize(partitions.size());
+			// Fill each partition from its end, preserving input order. The
+			// resulting offsets delimit slices of a single batch-sized index.
+			for (idx_t i = partitions.size(); i > 0; i--) {
+				auto row = i - 1;
+				indexes[--offsets[partitions[row]]] = row;
+			}
+		}
+		FrameSelection Rows(idx_t target) const {
+			return FrameSelection(indexes).Slice(offsets[target], offsets[target + 1] - offsets[target]);
+		}
+	};
 	vector<vector<Buffer>> buffers;
+	// Keep at most one empty coalescing chunk per native sink task. Its next
+	// allocation is sized from frames this task has actually produced.
+	unique_ptr<DataChunk> spare;
+	idx_t buffered_rows = 0;
 	// Scratch belongs to this native sink task and never retains input leases.
 	unique_ptr<Vector> hashes;
 	bool initialized = false;
 	idx_t output = 0;
 	idx_t channel = 0;
 	idx_t offset = 0;
-	vector<vector<vector<idx_t>>> selections;
+	vector<PartitionRows> selections;
 	void ResetBatchInput() override {
 		initialized = false;
 		output = channel = offset = 0;
-		selections.clear();
 	}
 };
 
@@ -247,6 +273,7 @@ public:
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &) const override {
 		auto state = make_uniq<DirectSinkLocal>();
 		state->buffers.resize(outputs.size());
+		state->selections.resize(outputs.size());
 		for (idx_t i = 0; i < outputs.size(); i++) {
 			state->buffers[i].resize(outputs[i].channels.size());
 			if (!outputs[i].hash_columns.empty() && !state->hashes) {
@@ -256,7 +283,7 @@ public:
 		return std::move(state);
 	}
 	DirectWrite Write(DirectSinkGlobal &state, const DirectOutput &output, DirectChannel &channel, DataChunk &chunk,
-	                  const vector<idx_t> &rows, idx_t offset, idx_t count, const InterruptState &interrupt) const {
+	                  const FrameSelection &rows, idx_t offset, idx_t count, const InterruptState &interrupt) const {
 		// Sequence allocation and waiter registration are shared by tasks that
 		// publish to this channel. Other targets can copy and publish in parallel,
 		// and returning their credit does not reschedule this channel's tasks.
@@ -272,8 +299,8 @@ public:
 		}
 		return result;
 	}
-	bool Flush(DirectSinkGlobal &global, DirectSinkLocal::Buffer &buffer, const DirectOutput &output,
-	           DirectChannel &channel, const InterruptState &interrupt) const {
+	bool Flush(DirectSinkGlobal &global, DirectSinkLocal &local, DirectSinkLocal::Buffer &buffer,
+	           const DirectOutput &output, DirectChannel &channel, const InterruptState &interrupt) const {
 		if (!buffer.Count()) {
 			return true;
 		}
@@ -281,20 +308,19 @@ public:
 			buffer.Reset();
 			return true;
 		}
-		ColumnDataScanState scan;
-		DataChunk chunk;
-		buffer.data->InitializeScan(scan);
-		buffer.data->InitializeScanChunk(chunk);
-		buffer.data->Scan(scan, chunk);
-		D_ASSERT(chunk.size() == buffer.Count());
-		vector<idx_t> rows;
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			rows.push_back(row);
-		}
+		auto &chunk = *buffer.data;
+		FrameSelection rows(chunk.size());
 		auto result = Write(global, output, channel, chunk, rows, 0, rows.size(), interrupt);
 		if (result == DirectWrite::BLOCKED) {
 			progress->output_blocked.store(true);
 			return false;
+		}
+		if (result == DirectWrite::ACCEPTED) {
+			local.buffered_rows = MaxValue(local.buffered_rows, chunk.size());
+			chunk.Reset();
+			if (chunk.GetCapacity() >= local.buffered_rows) {
+				local.spare = std::move(buffer.data);
+			}
 		}
 		buffer.Reset();
 		return true;
@@ -312,7 +338,7 @@ public:
 			for (idx_t target = 0; target < outputs[out].channels.size(); target++) {
 				auto &channel = *outputs[out].channels[target];
 				live = channel.HasConsumers() || live;
-				if (!Flush(global, state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
+				if (!Flush(global, state, state.buffers[out][target], outputs[out], channel, input.interrupt_state)) {
 					return SinkResultType::BLOCKED;
 				}
 			}
@@ -331,6 +357,7 @@ public:
 			}
 		}
 		if (!live) {
+			state.spare.reset();
 			for (auto &out : state.buffers) {
 				for (auto &buffer : out) {
 					buffer.Reset();
@@ -340,23 +367,13 @@ public:
 			return SinkResultType::FINISHED;
 		}
 		if (!state.initialized) {
-			state.selections.resize(outputs.size());
 			for (idx_t out = 0; out < outputs.size(); out++) {
 				auto &output = outputs[out];
-				auto &selection = state.selections[out];
-				selection.resize(output.channels.size());
-				if (!output.hash_columns.empty()) {
-					auto ids = HashPartitions(output.hash_columns, chunk, output.channels.size(), *state.hashes);
-					for (idx_t row = 0; row < ids.size(); row++) {
-						selection[ids[row]].push_back(row);
-					}
-				} else {
-					for (auto &rows : selection) {
-						for (idx_t row = 0; row < chunk.size(); row++) {
-							rows.push_back(row);
-						}
-					}
+				if (output.hash_columns.empty()) {
+					continue;
 				}
+				auto ids = HashPartitions(output.hash_columns, chunk, output.channels.size(), *state.hashes);
+				state.selections[out].Assign(ids, output.channels.size());
 			}
 			state.initialized = true;
 		}
@@ -365,7 +382,8 @@ public:
 			for (; state.channel < output.channels.size(); state.channel++, state.offset = 0) {
 				auto &channel = *output.channels[state.channel];
 				auto &buffer = state.buffers[state.output][state.channel];
-				auto &rows = state.selections[state.output][state.channel];
+				auto rows = output.hash_columns.empty() ? FrameSelection(chunk.size())
+				                                        : state.selections[state.output].Rows(state.channel);
 				while (state.offset < rows.size()) {
 					// Closed targets discard their remaining rows before sizing a
 					// frame. HasConsumers still reports a sticky channel error.
@@ -374,14 +392,14 @@ public:
 						break;
 					}
 					if (buffer.Count() == channel.limits.frame_rows &&
-					    !Flush(global, buffer, output, channel, input.interrupt_state)) {
+					    !Flush(global, state, buffer, output, channel, input.interrupt_state)) {
 						return SinkResultType::BLOCKED;
 					}
-					auto count = channel.FrameRows(chunk, rows, state.offset);
-					count = MinValue<idx_t>(count, channel.limits.frame_rows - buffer.Count());
-					auto bytes = channel.FrameSize(chunk, rows, state.offset, count);
-					if (buffer.Count() && bytes > channel.limits.frame_bytes - buffer.bytes) {
-						if (!Flush(global, buffer, output, channel, input.interrupt_state)) {
+					auto extent =
+					    channel.FitFrame(chunk, rows, state.offset, channel.limits.frame_rows - buffer.Count());
+					auto count = extent.rows;
+					if (buffer.Count() && extent.bytes > channel.limits.frame_bytes - buffer.bytes) {
+						if (!Flush(global, state, buffer, output, channel, input.interrupt_state)) {
 							return SinkResultType::BLOCKED;
 						}
 						continue;
@@ -391,20 +409,24 @@ public:
 					// frame cannot be stranded behind an idle upstream producer.
 					if (buffer.Count() || (count < channel.limits.frame_rows && count == rows.size() - state.offset)) {
 						if (!buffer.data) {
-							// The bounded coalescer is an operator allocation charged
-							// to DuckDB's buffer pool, separately from channel credit.
-							buffer.data = make_uniq<ColumnDataCollection>(BufferAllocator::Get(context.client), types);
+							buffer.data = std::move(state.spare);
+							if (!buffer.data) {
+								auto capacity = MinValue(channel.limits.frame_rows,
+								                         NextPowerOfTwo(MaxValue(count, state.buffered_rows)));
+								buffer.data = make_uniq<DataChunk>();
+								buffer.data->Initialize(BufferAllocator::Get(context.client), types, capacity);
+							}
 						}
-						SelectionVector selection(count);
-						for (idx_t i = 0; i < count; i++) {
-							selection.set_index(i, rows[state.offset + i]);
+						if (rows.IsRange() && count == chunk.size()) {
+							buffer.data->Append(chunk, true);
+						} else {
+							SelectionVector selection(count);
+							for (idx_t i = 0; i < count; i++) {
+								selection.set_index(i, rows[state.offset + i]);
+							}
+							buffer.data->Append(chunk, true, &selection, count);
 						}
-						DataChunk selected;
-						selected.InitializeEmpty(types);
-						selected.Reference(chunk);
-						selected.Slice(selection, count);
-						buffer.data->Append(selected);
-						buffer.bytes += bytes;
+						buffer.bytes += extent.bytes;
 						state.offset += count;
 						continue;
 					}
@@ -420,7 +442,7 @@ public:
 					state.offset += count;
 				}
 				if ((buffer.Count() == channel.limits.frame_rows || buffer.bytes == channel.limits.frame_bytes) &&
-				    !Flush(global, buffer, output, channel, input.interrupt_state)) {
+				    !Flush(global, state, buffer, output, channel, input.interrupt_state)) {
 					return SinkResultType::BLOCKED;
 				}
 			}
@@ -436,7 +458,7 @@ public:
 		auto &global = input.global_state.Cast<DirectSinkGlobal>();
 		for (idx_t out = 0; out < outputs.size(); out++) {
 			for (idx_t channel = 0; channel < outputs[out].channels.size(); channel++) {
-				if (!Flush(global, state.buffers[out][channel], outputs[out], *outputs[out].channels[channel],
+				if (!Flush(global, state, state.buffers[out][channel], outputs[out], *outputs[out].channels[channel],
 				           input.interrupt_state)) {
 					return SinkCombineResultType::BLOCKED;
 				}

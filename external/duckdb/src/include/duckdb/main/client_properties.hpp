@@ -30,6 +30,8 @@ struct ClientProperties {
 	ArrowOffsetSize arrow_offset_size = ArrowOffsetSize::REGULAR;
 	bool arrow_use_list_view = false;
 	bool produce_arrow_string_view = false;
+	//! Binary views are independent of the Arrow version needed for compact decimals.
+	bool produce_arrow_binary_view = true;
 	bool arrow_lossless_conversion = false;
 	ArrowFormatVersion arrow_output_version = ArrowFormatVersion::V1_0;
 	optional_ptr<ClientContext> client_context;

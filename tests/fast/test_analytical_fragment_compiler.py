@@ -415,3 +415,120 @@ def test_partial_aggregation_reduces_rows_before_exchange():
         assert Counter(execute_graph(connection, graph)) == Counter(
             connection.execute("select range % 3 k, sum(range) from range(90) group by k").fetchall()
         )
+
+
+def hash_partitioned_group_query(aggregate="sum(b.v), count(*)", null_safe=False):
+    key = "case when range%16=0 then null else range end" if null_safe else "range"
+    build_key = "case when range%16=0 then null else range%2048 end" if null_safe else "range%2048"
+    comparison = "is not distinct from" if null_safe else "="
+    return (
+        f"select a.k,a.payload,{aggregate} from "
+        f"(select {key} k,'payload-'||range::varchar payload from range(2048)) a join "
+        f"(select {build_key} k,range%7 v from range(16384)) b on a.k {comparison} b.k "
+        "group by a.k,a.payload order by a.k nulls first,a.payload limit 20"
+    )
+
+
+@pytest.mark.parametrize("partitions,threads", [(2, 1), (3, 4)])
+@pytest.mark.parametrize(
+    "aggregate",
+    [
+        "sum(b.v), count(*)",
+        "count(distinct b.v), sum(distinct b.v)",
+        "sum(b.v::double order by b.v), avg(b.v::double order by b.v)",
+        "sum(b.v::decimal(38,2)), avg(b.v::hugeint)",
+    ],
+)
+@pytest.mark.parametrize("null_safe", [False, True])
+def test_hash_partitioned_groups_finalize_before_top_n(partitions, threads, aggregate, null_safe):
+    config = {
+        "threads": threads,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown",
+    }
+    sql = hash_partitioned_group_query(aggregate, null_safe)
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, partitions)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+        # Only the two original join inputs shuffle. Complete groups and local
+        # TopN stay in their join partition instead of sending wide group state.
+        assert sum(e.distribution is Distribution.HASH for e in graph.exchanges) == 2
+        assert all(b"aggregate_state_export" not in f.native_plan for f in graph.fragments)
+
+
+@pytest.mark.parametrize("group", ["a.k%2", "a.k::double", "a.k::varchar collate nocase"])
+def test_hash_partitioned_groups_require_unchanged_group_key(group):
+    config = {
+        "threads": 1,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown",
+    }
+    sql = (
+        f"select {group} k,sum(b.v) from range(2048) a(k) join "
+        "(select range%2048 k,range%7 v from range(16384)) b using(k) "
+        f"group by {group} order by 1"
+    )
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+        assert sum(e.distribution is Distribution.HASH for e in graph.exchanges) == 3
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_hash_partitioned_groups_require_every_join_key(complete):
+    config = {
+        "threads": 4,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown",
+    }
+    groups = "a.g,a.k" if complete else "a.k"
+    sql = (
+        f"select {groups},sum(b.v) from (select range%31 k,range%3 g from range(2048)) a join "
+        "(select range%31 k,range%3 g,range%7 v from range(16384)) b using(k,g) "
+        f"group by {groups} order by all"
+    )
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+        assert sum(e.distribution is Distribution.HASH for e in graph.exchanges) == (2 if complete else 3)
+
+
+def test_hash_partitioned_groups_preserve_permuted_downstream_routing():
+    config = {
+        "threads": 4,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown",
+    }
+    sql = (
+        "select x.g,x.k,x.s,c.range from (select a.g,a.k,sum(b.v) s from "
+        "(select range%31 k,range%3 g from range(2048)) a join "
+        "(select range%31 k,range%3 g,range%7 v from range(16384)) b using(k,g) "
+        "group by a.g,a.k) x join range(32768) c on x.k=c.range%31 and x.g=c.range%3 "
+        "order by x.k,x.g,c.range limit 20"
+    )
+    with vane.connect(backend="local", config=config) as connection:
+        graph = compile_sql(connection, sql, 3)
+        assert execute_graph(connection, graph) == connection.execute(sql).fetchall()
+        assert any(e.distribution is Distribution.PASSTHROUGH for e in graph.exchanges)
+
+
+@pytest.mark.parametrize("partitions,threads", [(2, 1), (3, 4)])
+def test_complete_hash_groups_bound_top_n_exchange_rows(partitions, threads):
+    from tests.fast.test_direct_exchange import collect, submission
+    from vane.execution.direct_exchange import DirectExchangeLimits, InProcessTaskService
+
+    config = {
+        "threads": threads,
+        "disabled_optimizers": "join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown",
+    }
+    sql = hash_partitioned_group_query()
+    with vane.connect(backend="local", config=config) as connection:
+        expected = connection.execute(sql).fetchall()
+        spec = submission(connection, sql, partitions=partitions)
+        gather = {e.exchange_id for e in spec.graph.exchanges if e.distribution is Distribution.GATHER}
+        limits = DirectExchangeLimits(4096, 1024, 32, 1)
+        with InProcessTaskService(connection, spec, limits) as service:
+            service.start()
+            assert collect(service) == expected
+            rows = sum(
+                c.snapshot()["accepted_rows"] for name, c in service.channels.items() if name.split("/")[0] in gather
+            )
+            assert gather and 0 < rows <= partitions * 20
+            assert all(c.snapshot()["peak_bytes"] <= limits.window_bytes for c in service.channels.values())
+        assert all(c.snapshot()["bytes"] == c.snapshot()["leased_bytes"] == 0 for c in service.channels.values())

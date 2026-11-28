@@ -370,7 +370,7 @@ void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, co
 	}
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::AGGREGATE_STATE:
-		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
+		if (options.produce_arrow_binary_view && options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			// Views are only introduced in arrow format v1.4
 			child.format = "vz";
 		} else if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {

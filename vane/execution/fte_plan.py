@@ -63,8 +63,7 @@ def bind_task(
             objects.extend(matching)
         inputs[edge.consumer_port] = inputs.get(edge.consumer_port, ()) + tuple(objects)
     assignments = {
-        source.source_id: [split.split_id for split in source.splits[partition :: fragment.partition_count]]
-        for source in fragment.sources
+        source.source_id: source.assigned_split_ids(partition, fragment.partition_count) for source in fragment.sources
     }
     outputs: list[PartitionSpec] = []
     for edge in spec.graph.exchanges:

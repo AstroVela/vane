@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "arrow_frame.hpp"
+#include "direct_exchange.hpp"
 #include "exchange_types.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/vector_buffer.hpp"
@@ -11,6 +12,10 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/client_properties.hpp"
 #include <arrow/c/bridge.h>
+#include <arrow/util/bitmap_ops.h>
+#include <arrow/util/endian.h>
+
+#include <cstring>
 
 namespace duckdb {
 namespace vane_execution {
@@ -129,7 +134,7 @@ std::shared_ptr<arrow::DataType> ArrowTypeFor(const LogicalType &type, ArrowLayo
 		return arrow::utf8();
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::AGGREGATE_STATE:
-		return layout == ArrowLayout::NATIVE_COMPACT ? arrow::binary_view() : arrow::binary();
+		return arrow::binary();
 	case LogicalTypeId::SQLNULL:
 		return arrow::null();
 	case LogicalTypeId::HUGEINT:
@@ -196,23 +201,6 @@ std::shared_ptr<arrow::ArrayData> NormalizeArray(const std::shared_ptr<arrow::Ar
 	if (data->type->Equals(type)) {
 		return data;
 	}
-	if (data->type->id() == arrow::Type::BINARY_VIEW) {
-		// The native v1.5 exporter also emits binary views. Keep the established
-		// BLOB/aggregate-state wire layout, including inside nested columns.
-		arrow::BinaryViewArray values(data);
-		arrow::BinaryBuilder builder;
-		CheckArrow(builder.Reserve(values.length()));
-		for (int64_t row = 0; row < values.length(); row++) {
-			if (values.IsNull(row)) {
-				builder.UnsafeAppendNull();
-			} else {
-				CheckArrow(builder.Append(values.GetView(row)));
-			}
-		}
-		std::shared_ptr<arrow::Array> result;
-		CheckArrow(builder.Finish(&result));
-		return result->data();
-	}
 	if (type->id() == arrow::Type::DECIMAL256) {
 		// The native exporter owns a signed 128-bit buffer. Its decimal128(38)
 		// schema cannot describe the entire HUGEINT/DECIMAL intermediate domain.
@@ -259,10 +247,64 @@ hugeint_t DecodeInt128(const arrow::Array &source, idx_t row, const char *domain
 	}
 	return native;
 }
+
+vector<idx_t> FixedWidthColumns(const vector<LogicalType> &types) {
+	if (!ARROW_LITTLE_ENDIAN) {
+		return {};
+	}
+	vector<idx_t> widths;
+	for (auto &type : types) {
+		switch (type.id()) {
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::UBIGINT:
+		case LogicalTypeId::FLOAT:
+		case LogicalTypeId::DOUBLE:
+		case LogicalTypeId::DATE:
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS:
+		case LogicalTypeId::TIMESTAMP_NS:
+		case LogicalTypeId::TIMESTAMP_TZ:
+			break;
+		case LogicalTypeId::DECIMAL:
+			if (type.InternalType() == PhysicalType::INT32 || type.InternalType() == PhysicalType::INT64) {
+				break;
+			}
+			// Arrow widens native INT16 and INT128 decimal coefficients.
+			return {};
+		default:
+			return {};
+		}
+		widths.push_back(GetTypeIdSize(type.InternalType()));
+	}
+	return widths;
+}
+
+// IPC payloads and the transport may outlive the RecordBatch that produced
+// them. Keep the native channel lease for as long as a buffer is referenced.
+class LeasedArrowBuffer final : public arrow::Buffer {
+public:
+	LeasedArrowBuffer(const_data_ptr_t data, idx_t size, const shared_ptr<DirectBatch> &lease_p)
+	    : arrow::Buffer(data, size), lease(lease_p) {
+	}
+
+private:
+	shared_ptr<DirectBatch> lease;
+};
 } // namespace
 
 std::shared_ptr<arrow::Schema> ArrowSchemaFor(const vector<LogicalType> &types, const vector<string> &names) {
 	return SchemaFor(types, names, ArrowLayout::EXCHANGE);
+}
+
+ExchangeArrowLayout::ExchangeArrowLayout(const vector<LogicalType> &types)
+    : schema(ArrowSchemaFor(types)), fixed_widths(FixedWidthColumns(types)) {
 }
 
 std::shared_ptr<arrow::Schema> ResultSchemaFor(const vector<LogicalType> &types, const vector<string> &names) {
@@ -289,6 +331,10 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 		}
 	}
 	ClientProperties properties;
+	// Export the binary wire layout directly, including nested BLOBs and
+	// aggregate states. Compact decimals still need Arrow v1.5, independently
+	// of binary views, which would otherwise copy every state a second time.
+	properties.produce_arrow_binary_view = false;
 	if (compact_decimals) {
 		properties.arrow_output_version = ArrowFormatVersion::V1_5;
 	}
@@ -313,6 +359,33 @@ std::shared_ptr<arrow::RecordBatch> Encode(DataChunk &chunk, const std::shared_p
 	return arrow::RecordBatch::Make(schema, chunk.size(), std::move(columns));
 }
 
+std::shared_ptr<arrow::RecordBatch> EncodeFlightFrame(const shared_ptr<DirectBatch> &batch,
+                                                      const ExchangeArrowLayout &layout) {
+	DataChunk chunk;
+	batch->Reference(chunk);
+	if (layout.fixed_widths.empty()) {
+		return Encode(chunk, layout.schema);
+	}
+	const auto count = chunk.size();
+	std::vector<std::shared_ptr<arrow::Array>> columns;
+	columns.reserve(chunk.ColumnCount());
+	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+		auto &column = chunk.data[i];
+		auto &validity = FlatVector::Validity(column);
+		auto nulls = count - validity.CountValid(count);
+		std::shared_ptr<arrow::Buffer> bitmap;
+		if (nulls) {
+			bitmap = std::make_shared<LeasedArrowBuffer>(reinterpret_cast<const_data_ptr_t>(validity.GetData()),
+			                                             arrow::bit_util::BytesForBits(count), batch);
+		}
+		auto data =
+		    std::make_shared<LeasedArrowBuffer>(FlatVector::GetData(column), count * layout.fixed_widths[i], batch);
+		columns.push_back(arrow::MakeArray(arrow::ArrayData::Make(layout.schema->field(i)->type(), count,
+		                                                          {std::move(bitmap), std::move(data)}, nulls)));
+	}
+	return arrow::RecordBatch::Make(layout.schema, count, std::move(columns));
+}
+
 template <class Array, class T>
 void DecodePrimitive(const arrow::Array &source, Vector &target, idx_t count) {
 	auto &values = static_cast<const Array &>(source);
@@ -322,7 +395,26 @@ void DecodePrimitive(const arrow::Array &source, Vector &target, idx_t count) {
 	}
 }
 
-// String and blob references borrow the Arrow batch until the channel copies
+void DecodeValidity(const arrow::Array &source, Vector &target) {
+	if (!source.null_count()) {
+		return;
+	}
+	const auto count = idx_t(source.length());
+	auto &validity = FlatVector::Validity(target);
+	if (ARROW_LITTLE_ENDIAN && source.null_bitmap_data()) {
+		validity.Initialize(count);
+		arrow::internal::CopyBitmap(source.null_bitmap_data(), source.offset(), count,
+		                            reinterpret_cast<data_ptr_t>(validity.GetData()), 0);
+		return;
+	}
+	for (idx_t row = 0; row < count; row++) {
+		if (source.IsNull(row)) {
+			validity.SetInvalid(row);
+		}
+	}
+}
+
+// Binary cells borrow the Arrow batch until the channel copies
 // them into its reserved frame. Nested vectors are decoded column by column;
 // the staging reservation covers the complete received batch.
 void DecodeVector(const arrow::Array &source, Vector &target) {
@@ -480,15 +572,12 @@ void DecodeVector(const arrow::Array &source, Vector &target) {
 	default:
 		throw NotImplementedException("unsupported exchange Arrow type: %s", type.ToString());
 	}
-	for (idx_t row = 0; row < count; row++) {
-		if (source.IsNull(row)) {
-			FlatVector::Validity(target).SetInvalid(row);
-		}
-	}
+	DecodeValidity(source, target);
 }
 
-void Decode(const arrow::RecordBatch &batch, const vector<LogicalType> &types, DataChunk &chunk) {
-	if (!batch.schema()->Equals(*ArrowSchemaFor(types))) {
+void Decode(const arrow::RecordBatch &batch, const vector<LogicalType> &types, const ExchangeArrowLayout &layout,
+            DataChunk &chunk) {
+	if (!batch.schema()->Equals(*layout.schema)) {
 		throw IOException("exchange Arrow schema mismatch");
 	}
 	auto validation = batch.ValidateFull();
@@ -496,6 +585,26 @@ void Decode(const arrow::RecordBatch &batch, const vector<LogicalType> &types, D
 		throw IOException("invalid exchange Arrow frame: %s", validation.ToString());
 	}
 	const auto count = idx_t(batch.num_rows());
+	if (count && !layout.fixed_widths.empty()) {
+		chunk.InitializeEmpty(types);
+		chunk.SetCardinality(count);
+		for (idx_t col = 0; col < types.size(); col++) {
+			auto &source = *batch.column(col);
+			auto &target = chunk.data[col];
+			auto width = layout.fixed_widths[col];
+			auto values = source.data()->buffers[1]->data() + source.offset() * width;
+			// IPC or a foreign Arrow producer may place values at an unaligned
+			// address. Native readers require aligned values even for a slice.
+			if (reinterpret_cast<uintptr_t>(values) % width) {
+				target.Initialize(false, count);
+				std::memcpy(FlatVector::GetData(target), values, count * width);
+			} else {
+				FlatVector::SetData(target, const_cast<data_ptr_t>(values));
+			}
+			DecodeValidity(source, target);
+		}
+		return;
+	}
 	chunk.Initialize(Allocator::DefaultAllocator(), types, MaxValue<idx_t>(count, 1));
 	chunk.SetCardinality(count);
 	for (idx_t col = 0; col < types.size(); col++) {

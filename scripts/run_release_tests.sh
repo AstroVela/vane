@@ -75,7 +75,6 @@ release_tests=(
   "$project_root/tests/fast/test_native_fragment_compiler.py"
   "$project_root/tests/fast/test_fragment_sql_coverage.py"
   "$project_root/tests/fast/test_analytical_fragment_compiler.py"
-  "$project_root/tests/fast/test_execution_performance.py"
   "$project_root/tests/fast/test_analytical_exchange.py"
   "$project_root/tests/fast/test_worker_resources.py"
   "$project_root/tests/fast/test_ray_analytical_execution.py"
@@ -111,6 +110,20 @@ release_tests=(
   "$project_root/tests/fast/test_vane_config.py"
   "$project_root/tests/fast/test_expression_udf_contracts.py"
   "$project_root/tests/fast/test_ray_remote_exceptions.py"
+)
+
+# Qualify aggregate-state transport and both partial-output strategies on every
+# native wheel, including real producer/final-merge spills. The full performance
+# matrices run in the non-Ray fast-test shards; repeating them in each Python
+# build exceeds this unsharded gate's deadline.
+release_tests+=(
+  "$project_root/tests/fast/test_execution_performance.py::test_partial_aggregates_exchange_native_states"
+  "$project_root/tests/fast/test_execution_performance.py::test_partial_aggregates_preserve_duplicate_states_until_final_merge[clustered-False-4]"
+  "$project_root/tests/fast/test_execution_performance.py::test_partial_aggregates_preserve_duplicate_states_until_final_merge[interleaved-False-4]"
+  "$project_root/tests/fast/test_execution_performance.py::test_partial_aggregates_spill_with_costed_output"
+  "$project_root/tests/fast/test_execution_performance.py::test_merge_aggregate_batches_preserve_repeated_targets_and_null_states[False-4-mixed-False]"
+  "$project_root/tests/fast/test_execution_performance.py::test_merge_aggregate_batches_preserve_repeated_targets_and_null_states[False-4-mixed-True]"
+  "$project_root/tests/fast/test_execution_performance.py::test_merge_aggregate_state_import_spills_and_releases_storage[8-4]"
 )
 
 # Keep the local backpressure acceptance cases in the non-Ray process. These

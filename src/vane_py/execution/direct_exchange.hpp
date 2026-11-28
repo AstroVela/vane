@@ -16,12 +16,46 @@ namespace vane_execution {
 
 using ExchangeWakeup = std::function<void()>;
 
+// A synchronous view of either a contiguous range or explicit source row indexes.
+struct FrameSelection {
+	explicit FrameSelection(idx_t count) : FrameSelection(nullptr, 0, count) {
+	}
+	FrameSelection(const vector<idx_t> &rows) : FrameSelection(rows.data(), 0, rows.size()) {
+	}
+	idx_t size() const {
+		return count;
+	}
+	idx_t operator[](idx_t row) const {
+		D_ASSERT(row < count);
+		return indexes ? indexes[start + row] : start + row;
+	}
+	bool IsRange() const {
+		return !indexes;
+	}
+	FrameSelection Slice(idx_t offset, idx_t length) const {
+		D_ASSERT(offset <= count && length <= count - offset);
+		return FrameSelection(indexes, start + offset, length);
+	}
+
+private:
+	FrameSelection(const idx_t *indexes, idx_t start, idx_t count) : indexes(indexes), start(start), count(count) {
+	}
+	const idx_t *indexes;
+	idx_t start;
+	idx_t count;
+};
+
 struct DirectLimits {
 	idx_t window_bytes;
 	idx_t frame_bytes;
 	idx_t frame_rows;
 	idx_t frame_slots;
 	void Validate() const;
+};
+
+struct DirectFrameExtent {
+	idx_t rows;
+	idx_t bytes;
 };
 
 struct DirectLedger {
@@ -92,10 +126,9 @@ public:
 	void Abort(const string &reason);
 	void CloseConsumer(const string &consumer);
 	DirectRead Poll(const string &consumer, shared_ptr<DirectBatch> &batch, ExchangeWakeup wakeup = {});
-	DirectWrite TryWrite(const string &producer, idx_t sequence, DataChunk &input, const vector<idx_t> &rows,
+	DirectWrite TryWrite(const string &producer, idx_t sequence, DataChunk &input, const FrameSelection &rows,
 	                     idx_t offset, idx_t count, ExchangeWakeup wakeup = {});
-	idx_t FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_t offset) const;
-	idx_t FrameSize(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count) const;
+	DirectFrameExtent FitFrame(DataChunk &input, const FrameSelection &rows, idx_t offset, idx_t max_rows) const;
 	idx_t LastSequence(const string &producer) const;
 	DirectProducerStatus ProducerStatus(const string &producer) const;
 	bool ProducerDrained(const string &producer) const;
@@ -119,6 +152,7 @@ private:
 	};
 	void Release(const string &consumer, const string &producer, idx_t bytes);
 	void CheckError() const;
+	bool MatchesSchema(const DataChunk &input) const;
 	bool AtEnd(const Consumer &consumer) const;
 	Producer &GetProducer(const string &producer);
 	Consumer &GetConsumer(const string &consumer);

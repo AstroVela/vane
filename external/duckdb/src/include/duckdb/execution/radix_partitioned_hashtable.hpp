@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -66,6 +72,7 @@ private:
 	void PopulateGroupChunk(DataChunk &group_chunk, DataChunk &input_chunk) const;
 
 	shared_ptr<TupleDataLayout> layout_ptr;
+	bool can_import_states;
 };
 
 } // namespace duckdb

@@ -95,6 +95,31 @@ void MergeAggregateInitialize(const AggregateFunction &function, data_ptr_t stat
 	info.child_function.initialize(info.child_function, state);
 }
 
+void MergeAggregateImport(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state,
+                          idx_t count) {
+	D_ASSERT(input_count == 1);
+	auto &bind_data = GetMergeBindData(aggr_input_data);
+	UnifiedVectorFormat input_data;
+	inputs[0].ToUnifiedFormat(count, input_data);
+	const auto input_states = UnifiedVectorFormat::GetData<string_t>(input_data);
+	const auto targets = FlatVector::GetData<data_ptr_t>(state);
+	for (idx_t row = 0; row < count; row++) {
+		const auto input_idx = input_data.sel->get_index(row);
+		if (!input_data.validity.RowIsValid(input_idx)) {
+			bind_data.child_function.initialize(bind_data.child_function, targets[row]);
+			continue;
+		}
+		const auto &entry = input_states[input_idx];
+		if (entry.GetSize() != bind_data.state_size) {
+			throw IOException("Aggregate state size mismatch, expect %llu, got %llu", bind_data.state_size,
+			                  entry.GetSize());
+		}
+		// Each target is a private, aligned tuple owned by the aggregate. Input
+		// strings can be unaligned or shared and must never be modified in place.
+		memcpy(targets[row], entry.GetData(), bind_data.state_size);
+	}
+}
+
 void MergeAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state,
                           idx_t count) {
 	if (count == 0) {
@@ -186,6 +211,9 @@ AggregateFunction MakeMergeAggregateFunction(const AggregateFunction &child_func
 	merge_function.order_dependent = child_function.order_dependent;
 	merge_function.distinct_dependent = child_function.distinct_dependent;
 	merge_function.function_info = make_shared_ptr<MergeAggregateFunctionInfo>(child_function, state_size);
+	if (!child_function.HasStateDestructorCallback()) {
+		merge_function.SetStateImportCallback(MergeAggregateImport);
+	}
 	merge_function.serialize = MergeAggregateSerialize;
 	merge_function.deserialize = MergeAggregateDeserialize;
 	return merge_function;

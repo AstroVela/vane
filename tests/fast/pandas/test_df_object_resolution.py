@@ -235,7 +235,7 @@ class TestResolveObjectColumns:
                 [{"key": ["a", "b", "c", "d"], "value": [1, 3, 3, 7]}],
             ]
         )
-        x.rename(columns={0: "a"}, inplace=True)
+        x = x.rename(columns={0: "a"})
         converted_col = duckdb_cursor.sql("select * from x as 'a'").df()
         duckdb_cursor.sql(
             """
@@ -293,7 +293,7 @@ class TestResolveObjectColumns:
                 [{"key": ["a", "b", "c", "d"], "value": [1, 3, 3, 7]}],
             ]
         )
-        x.rename(columns={0: "a"}, inplace=True)
+        x = x.rename(columns={0: "a"})
         converted_col = duckdb_cursor.sql("select * from x").df()
         duckdb_cursor.sql(
             """
@@ -451,7 +451,7 @@ class TestResolveObjectColumns:
                 [[50, "a", 67]],
             ]
         )
-        x.rename(columns={0: "a"}, inplace=True)
+        x = x.rename(columns={0: "a"})
         converted_col = duckdb_cursor.sql("select * from x").df()
         duckdb_cursor.sql(
             """

@@ -155,7 +155,7 @@ class _Query:
                     if task not in tasks:
                         continue
                     assignments = {
-                        source.source_id: [split.split_id for split in source.splits[part :: fragment.partition_count]]
+                        source.source_id: source.assigned_split_ids(part, fragment.partition_count)
                         for source in fragment.sources
                     }
                     outputs = [
