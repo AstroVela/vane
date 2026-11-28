@@ -1954,11 +1954,12 @@ private:
 		}
 		return plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 0);
 	}
-	optional_idx GroupKeyReference(const Expression &expression, vector<const BoundFunctionExpression *> &transforms) {
+	optional_idx ParquetKeyReference(const Expression &expression,
+	                                 optional_ptr<vector<const BoundFunctionExpression *>> transforms) {
 		if (expression.GetExpressionType() == ExpressionType::BOUND_REF) {
 			return expression.Cast<BoundReferenceExpression>().index;
 		}
-		if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		if (!transforms || expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 			return optional_idx();
 		}
 		auto &function = expression.Cast<BoundFunctionExpression>();
@@ -1980,8 +1981,8 @@ private:
 		if (!compress && !decompress) {
 			return optional_idx();
 		}
-		transforms.push_back(&function);
-		return GroupKeyReference(*function.children[0], transforms);
+		transforms->push_back(&function);
+		return ParquetKeyReference(*function.children[0], transforms);
 	}
 	bool InjectiveGroupKey(pair<Value, Value> bounds, const vector<const BoundFunctionExpression *> &transforms) {
 		// No nonempty split: there are no groups to merge. Otherwise validate
@@ -2036,70 +2037,112 @@ private:
 		}
 		return output_keys.size() == child.hash_keys.size() ? output_keys : vector<idx_t>();
 	}
+	optional_idx ParquetKeyColumn(const PhysicalOperator &input, const DistributedSubtree &child, const Expression &key,
+	                              optional_ptr<vector<const BoundFunctionExpression *>> transforms = nullptr) {
+		if (!child.local_scan || child.fragment.sources.size() != 1 ||
+		    key.GetExpressionType() != ExpressionType::BOUND_REF || !key.return_type.IsIntegral()) {
+			return optional_idx();
+		}
+		auto column = key.Cast<BoundReferenceExpression>().index;
+		auto op = &input;
+		while (op != child.local_scan.get()) {
+			if (op->type == PhysicalOperatorType::PROJECTION) {
+				auto &expressions = op->Cast<PhysicalProjection>().select_list;
+				if (column >= expressions.size()) {
+					return optional_idx();
+				}
+				auto reference = ParquetKeyReference(*expressions[column], transforms);
+				if (!reference.IsValid()) {
+					return optional_idx();
+				}
+				column = reference.GetIndex();
+			} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
+				auto &join = op->Cast<PhysicalHashJoin>();
+				if ((join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT &&
+				     join.join_type != JoinType::SEMI && join.join_type != JoinType::ANTI &&
+				     join.join_type != JoinType::MARK) ||
+				    column >= join.lhs_output_columns.col_idxs.size()) {
+					return optional_idx();
+				}
+				column = join.lhs_output_columns.col_idxs[column];
+			} else if (op->type != PhysicalOperatorType::FILTER) {
+				return optional_idx();
+			}
+			op = &op->children[0].get();
+		}
+		auto &scan = op->Cast<PhysicalTableScan>();
+		if (!IsParquetScan(scan.function.name) || column >= op->types.size() || !op->types[column].IsIntegral() ||
+		    (!transforms && (key.return_type != op->types[column] || scan.extra_info.sample_options))) {
+			return optional_idx();
+		}
+		if (!scan.projection_ids.empty() && column >= scan.projection_ids.size()) {
+			return optional_idx();
+		}
+		auto position = scan.projection_ids.empty() ? column : scan.projection_ids[column];
+		if (position >= scan.column_ids.size()) {
+			return optional_idx();
+		}
+		auto &index = scan.column_ids[position];
+		if (!index.HasPrimaryIndex() || index.HasChildren() || index.IsVirtualColumn()) {
+			return optional_idx();
+		}
+		auto raw = index.GetPrimaryIndex();
+		auto &bind = ParquetBind(scan.bind_data.get());
+		if (raw >= bind.types.size() || bind.types[raw] != op->types[column]) {
+			return optional_idx();
+		}
+		return raw;
+	}
+
+	ParquetPartitionColumn PartitionColumn(const DistributedSubtree &child, idx_t column) {
+		auto &scan = child.local_scan->Cast<PhysicalTableScan>();
+		ParquetPartitionColumn result {ParquetBind(scan.bind_data.get()), column, {}};
+		for (auto &split : child.fragment.sources[0].splits) {
+			result.splits.push_back(DecodeFile(split.payload));
+		}
+		return result;
+	}
+
 	bool CompleteParquetGroups(PhysicalOperator &input, DistributedSubtree &child,
 	                           const vector<unique_ptr<Expression>> &groups) {
-		if (!child.local_scan || child.fragment.sources.size() != 1) {
-			return false;
-		}
 		for (auto &group : groups) {
-			if (group->GetExpressionType() != ExpressionType::BOUND_REF || !group->return_type.IsIntegral()) {
-				continue;
-			}
-			auto column = group->Cast<BoundReferenceExpression>().index;
-			auto op = &input;
 			vector<const BoundFunctionExpression *> transforms;
-			while (!op->children.empty()) {
-				if (op->type == PhysicalOperatorType::PROJECTION) {
-					auto &expressions = op->Cast<PhysicalProjection>().select_list;
-					if (column >= expressions.size()) {
-						break;
-					}
-					auto reference = GroupKeyReference(*expressions[column], transforms);
-					if (!reference.IsValid()) {
-						break;
-					}
-					column = reference.GetIndex();
-				} else if (op->type == PhysicalOperatorType::HASH_JOIN) {
-					auto &join = op->Cast<PhysicalHashJoin>();
-					if ((join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT &&
-					     join.join_type != JoinType::SEMI && join.join_type != JoinType::ANTI &&
-					     join.join_type != JoinType::MARK) ||
-					    column >= join.lhs_output_columns.col_idxs.size()) {
-						break;
-					}
-					column = join.lhs_output_columns.col_idxs[column];
-				} else if (op->type != PhysicalOperatorType::FILTER) {
-					break;
-				}
-				op = &op->children[0].get();
-			}
-			if (op != child.local_scan.get() || column >= op->types.size() || !op->types[column].IsIntegral()) {
+			auto column = ParquetKeyColumn(input, child, *group, &transforms);
+			if (!column.IsValid()) {
 				continue;
 			}
-			auto &scan = op->Cast<PhysicalTableScan>();
-			if (!IsParquetScan(scan.function.name)) {
-				continue;
-			}
-			auto position = scan.projection_ids.empty() ? column : scan.projection_ids[column];
-			auto &index = scan.column_ids[position];
-			if (index.HasChildren()) {
-				continue;
-			}
-			vector<OpenFileInfo> splits;
-			for (auto &split : child.fragment.sources[0].splits) {
-				splits.push_back(DecodeFile(split.payload));
-			}
+			auto key = PartitionColumn(child, column.GetIndex());
 			pair<Value, Value> bounds;
 			vector<idx_t> assignment;
-			if (PlanParquetGroupPartitions(context, ParquetBind(scan.bind_data.get()), splits, index.GetPrimaryIndex(),
-			                               child.fragment.partition_count, assignment, &bounds) &&
-			    (assignment.empty() || !scan.extra_info.sample_options) &&
+			if (PlanParquetGroupPartitions(context, key.bind, key.splits, key.column, child.fragment.partition_count,
+			                               assignment, &bounds) &&
+			    (assignment.empty() || !child.local_scan->Cast<PhysicalTableScan>().extra_info.sample_options) &&
 			    InjectiveGroupKey(std::move(bounds), transforms)) {
 				child.fragment.sources[0].split_partitions = std::move(assignment);
 				return true;
 			}
 		}
 		return false;
+	}
+	bool CoLocateJoinInputs(PhysicalHashJoin &join, DistributedSubtree &left, DistributedSubtree &right) {
+		if (join.join_type != JoinType::INNER || join.conditions.size() != 1 || partitions < 2 ||
+		    left.fragment.partition_count != partitions || right.fragment.partition_count != partitions) {
+			return false;
+		}
+		auto &condition = join.conditions[0];
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		auto lk = ParquetKeyColumn(join.children[0], left, *condition.left);
+		auto rk = ParquetKeyColumn(join.children[1], right, *condition.right);
+		if (!lk.IsValid() || !rk.IsValid()) {
+			return false;
+		}
+		auto &left_owners = left.fragment.sources[0].split_partitions;
+		auto &right_owners = right.fragment.sources[0].split_partitions;
+		return left_owners.empty() && right_owners.empty() &&
+		       PlanParquetJoinPartitions(context, PartitionColumn(left, lk.GetIndex()),
+		                                 PartitionColumn(right, rk.GetIndex()), partitions, left_owners, right_owners);
 	}
 	DistributedSubtree Aggregate(PhysicalOperator &op, DistributedSubtree child,
 	                             const vector<unique_ptr<Expression>> &groups,
@@ -2273,6 +2316,11 @@ private:
 			right = build_producer.empty() ? Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count)
 			                               : ExchangeFrom(build_producer, join.children[1].get().types,
 			                                              count == 1 ? "gather" : "broadcast", count);
+		} else if (build_producer.empty() && CoLocateJoinInputs(join, left, right)) {
+			// The two scans share range owners for this join only. Unlike a
+			// native HASH exchange, this establishes no reusable hash keys.
+			left = Exchange(std::move(left), "passthrough", partitions);
+			right = Exchange(std::move(right), "passthrough", partitions);
 		} else {
 			auto lk = ProjectKeys(left, left_keys);
 			left = Exchange(std::move(left), "hash", partitions, lk);

@@ -27,4 +27,16 @@ DUCKDB_API bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBind
                                            const vector<OpenFileInfo> &splits, idx_t column, idx_t partitions,
                                            vector<idx_t> &assignment,
                                            optional_ptr<pair<Value, Value>> bounds = nullptr);
+
+struct ParquetPartitionColumn {
+	MultiFileBindData &bind;
+	idx_t column;
+	vector<OpenFileInfo> splits;
+};
+
+// A matching key must have the same owner across both inputs. Publish both
+// complete assignments together only when each input is balanced on its own.
+DUCKDB_API bool PlanParquetJoinPartitions(ClientContext &context, const ParquetPartitionColumn &left,
+                                          const ParquetPartitionColumn &right, idx_t partitions,
+                                          vector<idx_t> &left_owners, vector<idx_t> &right_owners);
 } // namespace duckdb

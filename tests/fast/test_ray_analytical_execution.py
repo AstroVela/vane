@@ -53,6 +53,7 @@ from tests.fast.test_parquet_aggregate_partitioning import (
     disjoint_aggregate_query,
     overlapping_components_query,
 )
+from tests.fast.test_parquet_join_partitioning import parquet_join_query
 from tests.fast.test_ray_recovery_runtime import assert_idle, options
 from tests.fast.test_ray_recovery_runtime import resources as recovery_resources
 from vane.execution.direct_exchange import DirectExchangeLimits
@@ -339,6 +340,48 @@ def test_budgeted_key_filters_preserve_shared_producer_retry(tmp_path, monkeypat
                 assert len(attempts) == 2
                 assert attempts[0].input_id == attempts[1].input_id
                 assert attempts[0].fence != attempts[1].fence
+        assert_idle(connection)
+
+
+@pytest.mark.parametrize("mode", ["pipelined", "fte_retry"])
+def test_joint_parquet_join_reuses_owned_splits(tmp_path, monkeypatch, mode):
+    import ray
+
+    from vane.execution.recovery_runtime import RecoveryScheduler
+
+    dispatch = RecoveryScheduler._dispatch
+    attempts = []
+
+    def lose_source_once(scheduler, index, partition, binding, upstream):
+        admitted = dispatch(scheduler, index, partition, binding, upstream)
+        if admitted and binding.assignments:
+            fragment = next(f for f in scheduler.spec.graph.fragments if f.fragment_id == binding.task.stage_id)
+            if any(s.split_partitions for s in fragment.sources) and (
+                not attempts or attempts[0][0].task_id == binding.task.task_id
+            ):
+                attempt = scheduler.active[index]
+                attempts.append((attempt.reservation.token, binding.assignments))
+                if len(attempts) == 1:
+                    ray.kill(attempt.worker, no_restart=True)
+        return admitted
+
+    if mode == "fte_retry":
+        monkeypatch.setattr(RecoveryScheduler, "_dispatch", lose_source_once)
+    sql = parquet_join_query(tmp_path)
+    with (
+        vane.connect(backend="local") as local,
+        vane.Runtime(resources(tmp_path, partitions=2)) as application,
+        application.connect() as connection,
+    ):
+        expected = local.execute(sql).to_arrow_table()
+        with connection.query(sql, options=options(execution=60) if mode == "fte_retry" else None) as result:
+            graph = result.context._reader.spec.graph
+            assert result.collect().equals(expected)
+            assert sum(e.distribution is Distribution.PASSTHROUGH for e in graph.exchanges) == 2
+            if mode == "fte_retry":
+                (first, splits), (second, retried) = attempts
+                assert splits == retried and all(splits.values())
+                assert first.input_id == second.input_id and first.fence != second.fence
         assert_idle(connection)
 
 

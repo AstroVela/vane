@@ -302,10 +302,16 @@ vector<OpenFileInfo> PlanParquetRowGroups(ClientContext &context, MultiFileBindD
 	return result;
 }
 
-bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
-                                idx_t column, idx_t partitions, vector<idx_t> &assignment,
-                                optional_ptr<pair<Value, Value>> bounds) {
-	assignment.clear();
+namespace {
+struct ParquetKeyRange {
+	Value lower;
+	Value upper;
+	idx_t split;
+	double rows;
+};
+
+bool ReadKeyRanges(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits, idx_t column,
+                   idx_t split_offset, vector<ParquetKeyRange> &ranges) {
 	auto &options = bind.bind_data->Cast<ParquetReadBindData>().GetParquetOptions();
 	// Schema mappings, virtual columns and casts require a separate proof. In
 	// particular, comparing file statistics before a lossy cast is not sufficient.
@@ -314,13 +320,6 @@ bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind,
 	    !bind.reader_bind.schema.empty()) {
 		return false;
 	}
-	struct KeyRange {
-		Value lower;
-		Value upper;
-		idx_t split;
-		double rows;
-	};
-	vector<KeyRange> ranges;
 	for (idx_t split_index = 0; split_index < splits.size(); split_index++) {
 		auto &split = splits[split_index];
 		if (context.IsInterrupted()) {
@@ -375,42 +374,58 @@ bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind,
 			}
 		}
 		if (!lower.IsNull()) {
-			ranges.push_back({std::move(lower), std::move(upper), split_index, rows});
+			ranges.push_back({std::move(lower), std::move(upper), split_offset + split_index, rows});
 		}
 	}
-	std::sort(ranges.begin(), ranges.end(), [](const KeyRange &a, const KeyRange &b) { return a.lower < b.lower; });
-	bool disjoint = true;
-	for (idx_t i = 1; i < ranges.size(); i++) {
-		// Equality at a boundary means a group may span both splits.
-		if (ranges[i - 1].upper >= ranges[i].lower) {
-			disjoint = false;
-			break;
+	return true;
+}
+
+bool BalancedKeyRanges(const vector<ParquetKeyRange> &ranges, const vector<idx_t> &owners, idx_t partitions,
+                       idx_t first_split, idx_t end_split) {
+	vector<double> loads(partitions, 0);
+	double total = 0;
+	for (auto &range : ranges) {
+		if (range.split >= first_split && range.split < end_split) {
+			loads[owners[range.split]] += range.rows;
+			total += range.rows;
 		}
 	}
+	auto extremes = std::minmax_element(loads.begin(), loads.end());
+	return *extremes.first > 0 && *extremes.second * double(partitions) <= total * 1.25;
+}
+
+bool AssignKeyRanges(vector<ParquetKeyRange> &ranges, idx_t split_count, idx_t partitions, vector<idx_t> &assignment,
+                     optional_ptr<pair<Value, Value>> bounds, optional_idx right_start = optional_idx()) {
+	const bool join = right_start.IsValid();
 	if (ranges.empty()) {
-		return true;
+		return !join;
 	}
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const ParquetKeyRange &a, const ParquetKeyRange &b) { return a.lower < b.lower; });
 	struct Component {
 		Value upper;
 		double rows;
-		vector<idx_t> splits;
+		idx_t begin, end;
 	};
 	vector<Component> components;
-	for (auto &range : ranges) {
+	for (idx_t i = 0; i < ranges.size(); i++) {
+		auto &range = ranges[i];
+		// Closed intervals touching at a key (including through a third
+		// split) must stay together across both sides of a join.
 		if (components.empty() || components.back().upper < range.lower) {
-			components.push_back({range.upper, 0, {}});
+			components.push_back({range.upper, 0, i, i});
 		}
 		auto &component = components.back();
 		if (component.upper < range.upper) {
 			component.upper = range.upper;
 		}
 		component.rows += range.rows;
-		component.splits.push_back(range.split);
+		component.end = i + 1;
 	}
 	if (bounds) {
 		*bounds = {ranges.front().lower, components.back().upper};
 	}
-	if (disjoint) {
+	if (!join && components.size() == ranges.size()) {
 		return true;
 	}
 	if (partitions <= 1 || components.size() < partitions) {
@@ -419,22 +434,51 @@ bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind,
 	std::stable_sort(components.begin(), components.end(),
 	                 [](const Component &a, const Component &b) { return a.rows > b.rows; });
 	vector<double> loads(partitions, 0);
-	vector<idx_t> planned(splits.size(), 0);
-	double total_rows = 0;
+	vector<idx_t> planned(split_count, 0);
 	for (auto &component : components) {
 		auto owner = idx_t(std::min_element(loads.begin(), loads.end()) - loads.begin());
 		loads[owner] += component.rows;
-		total_rows += component.rows;
-		for (auto split : component.splits) {
-			planned[split] = owner;
+		for (idx_t i = component.begin; i < component.end; i++) {
+			planned[ranges[i].split] = owner;
 		}
 	}
-	// Saving a merge must not concentrate the source on a few workers. Rows
-	// estimate the balance only; the interval proof establishes completeness.
-	if (*std::max_element(loads.begin(), loads.end()) * double(partitions) > total_rows * 1.25) {
+	// A large uniform input can mask severe skew on its join partner.
+	auto left_end = join ? right_start.GetIndex() : split_count;
+	if (!BalancedKeyRanges(ranges, planned, partitions, 0, left_end) ||
+	    (join && !BalancedKeyRanges(ranges, planned, partitions, left_end, split_count))) {
 		return false;
 	}
 	assignment = std::move(planned);
+	return true;
+}
+} // namespace
+
+bool PlanParquetGroupPartitions(ClientContext &context, MultiFileBindData &bind, const vector<OpenFileInfo> &splits,
+                                idx_t column, idx_t partitions, vector<idx_t> &assignment,
+                                optional_ptr<pair<Value, Value>> bounds) {
+	assignment.clear();
+	vector<ParquetKeyRange> ranges;
+	return ReadKeyRanges(context, bind, splits, column, 0, ranges) &&
+	       AssignKeyRanges(ranges, splits.size(), partitions, assignment, bounds);
+}
+
+bool PlanParquetJoinPartitions(ClientContext &context, const ParquetPartitionColumn &left,
+                               const ParquetPartitionColumn &right, idx_t partitions, vector<idx_t> &left_owners,
+                               vector<idx_t> &right_owners) {
+	if (left.column >= left.bind.types.size() || right.column >= right.bind.types.size() ||
+	    left.bind.types[left.column] != right.bind.types[right.column]) {
+		return false;
+	}
+	vector<ParquetKeyRange> ranges;
+	vector<idx_t> owners;
+	const auto right_start = left.splits.size();
+	if (!ReadKeyRanges(context, left.bind, left.splits, left.column, 0, ranges) ||
+	    !ReadKeyRanges(context, right.bind, right.splits, right.column, right_start, ranges) ||
+	    !AssignKeyRanges(ranges, right_start + right.splits.size(), partitions, owners, nullptr, right_start)) {
+		return false;
+	}
+	left_owners.assign(owners.begin(), owners.begin() + right_start);
+	right_owners.assign(owners.begin() + right_start, owners.end());
 	return true;
 }
 
