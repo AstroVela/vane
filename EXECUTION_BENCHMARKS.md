@@ -4335,3 +4335,55 @@ Parquet files (37.5033 GiB), and warm host caches. Local used 36 threads and
 32 GiB. Pipeline used two workers, each with 18 threads and 16 GiB, 128 MiB of
 exchange and 256 MiB of staging, 64 KiB/2,048-row frames and a 1 MiB/16-slot
 window. Baseline source was `35809ed82e` and candidate source was `d12af15d97`.
+
+## Coalescing sparse native frames on SF100 Q9 (November 28, 2026)
+
+After joining filtered `part`, the `lineitem` producer passes 32,636,547 rows
+to its local sender in 292,989 small batches per query. The native sink
+now appends directly into an owned DuckDB chunk, publishes from that chunk and
+reuses at most one empty chunk per sink task. Contiguous selections use row
+ranges and the sink uses the measured byte size when choosing how many rows fit.
+Hash routing groups the batch into one row-index array with an offset per
+target. Skewed inputs can reuse that space across different partitions.
+
+| Execution | Steady samples | Median | Range | Worker CPU median |
+| --- | ---: | ---: | ---: | ---: |
+| Local | 6 | 8.125 s | 8.047–8.273 s | — |
+| Pipeline before | 8 | 8.728 s | 8.580–8.881 s | 247.61 CPU-s |
+| Pipeline after | 8 | 8.230 s | 8.036–8.377 s | 235.98 CPU-s |
+
+Local ran on the candidate build before, between and after two crossover blocks.
+The Pipeline order was before/after/after/before, then after/before/before/after.
+Each batch used a fresh session and ran three full queries. The two runs after
+warm-up entered the table. Native worker process CPU covers both workers.
+One cluster startup was repeated after a helper process exited during CPU
+counter discovery, before its first Q9.
+Elapsed time covers the public query call through Arrow collection. All
+33 timed executions and four separate diagnostics matched the same 175 ordered
+rows and Arrow IPC SHA-256. Both builds used the same 307 SF100 Parquet files
+(37.5033 GiB), warm host caches and the resource and exchange limits above.
+Local used 36 threads and 32 GiB. Pipeline used two workers of 18 threads and
+16 GiB each. Both `orders` and `lineitem` edges used PASSTHROUGH and sent zero
+remote rows. The full query sent 23,346,075 remote rows in both builds.
+The hash exchange after the `lineitem`–`orders` join accounted for 16,316,843
+of those rows (69.89%). Its native sender consumed
+5.53 and 5.55 CPU-s in the candidate diagnostics.
+
+Pipeline saved 0.498 s (5.70%) and 4.70% of worker CPU.
+Its median was 0.105 s (1.29%) above Local, compared with
+0.603 s (7.42%) before the change.
+
+| Filtered lineitem sender | Before, CPU-s | After, CPU-s |
+| --- | ---: | ---: |
+| Whole sender | 12.793 | 6.992 |
+| Route selection | 0.921 | 0.316 |
+| Frame sizing | 1.136 | 0.612 |
+| Coalesce selected rows | 5.072 | 1.971 |
+| Prepare staged frame for writing | 1.035 | 0.033 |
+| Copy to owned frame | 0.804 | 0.834 |
+| Enqueue for consumers | 0.059 | 0.058 |
+
+Each CPU figure is the median of two separately instrumented queries per build.
+The whole-sender timer includes the individual phases and the profiling work.
+The elapsed-time table used uninstrumented release builds. Native sources were
+`d12af15d97` and `6c5904abf6`.
