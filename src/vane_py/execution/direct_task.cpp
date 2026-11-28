@@ -13,6 +13,7 @@
 
 #include <set>
 #include <chrono>
+#include <numeric>
 
 namespace duckdb {
 namespace vane_execution {
@@ -198,6 +199,28 @@ public:
 			bytes = 0;
 		}
 	};
+	struct PartitionRows {
+		vector<idx_t> offsets;
+		vector<idx_t> indexes;
+
+		void Assign(const vector<idx_t> &partitions, idx_t targets) {
+			offsets.assign(targets + 1, 0);
+			for (auto partition : partitions) {
+				offsets[partition]++;
+			}
+			std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+			indexes.resize(partitions.size());
+			// Fill each partition from its end, preserving input order. The
+			// resulting offsets delimit slices of a single batch-sized index.
+			for (idx_t i = partitions.size(); i > 0; i--) {
+				auto row = i - 1;
+				indexes[--offsets[partitions[row]]] = row;
+			}
+		}
+		FrameSelection Rows(idx_t target) const {
+			return FrameSelection(indexes).Slice(offsets[target], offsets[target + 1] - offsets[target]);
+		}
+	};
 	vector<vector<Buffer>> buffers;
 	// Keep at most one empty coalescing chunk per native sink task. Its next
 	// allocation is sized from frames this task has actually produced.
@@ -209,15 +232,10 @@ public:
 	idx_t output = 0;
 	idx_t channel = 0;
 	idx_t offset = 0;
-	vector<vector<vector<idx_t>>> selections;
+	vector<PartitionRows> selections;
 	void ResetBatchInput() override {
 		initialized = false;
 		output = channel = offset = 0;
-		for (auto &output : selections) {
-			for (auto &rows : output) {
-				rows.clear();
-			}
-		}
 	}
 };
 
@@ -258,11 +276,8 @@ public:
 		state->selections.resize(outputs.size());
 		for (idx_t i = 0; i < outputs.size(); i++) {
 			state->buffers[i].resize(outputs[i].channels.size());
-			if (!outputs[i].hash_columns.empty()) {
-				state->selections[i].resize(outputs[i].channels.size());
-				if (!state->hashes) {
-					state->hashes = make_uniq<Vector>(LogicalType::HASH);
-				}
+			if (!outputs[i].hash_columns.empty() && !state->hashes) {
+				state->hashes = make_uniq<Vector>(LogicalType::HASH);
 			}
 		}
 		return std::move(state);
@@ -358,9 +373,7 @@ public:
 					continue;
 				}
 				auto ids = HashPartitions(output.hash_columns, chunk, output.channels.size(), *state.hashes);
-				for (idx_t row = 0; row < ids.size(); row++) {
-					state.selections[out][ids[row]].push_back(row);
-				}
+				state.selections[out].Assign(ids, output.channels.size());
 			}
 			state.initialized = true;
 		}
@@ -370,7 +383,7 @@ public:
 				auto &channel = *output.channels[state.channel];
 				auto &buffer = state.buffers[state.output][state.channel];
 				auto rows = output.hash_columns.empty() ? FrameSelection(chunk.size())
-				                                        : FrameSelection(state.selections[state.output][state.channel]);
+				                                        : state.selections[state.output].Rows(state.channel);
 				while (state.offset < rows.size()) {
 					// Closed targets discard their remaining rows before sizing a
 					// frame. HasConsumers still reports a sticky channel error.
