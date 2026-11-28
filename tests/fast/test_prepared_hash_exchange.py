@@ -17,10 +17,18 @@ from vane.execution.compiler import FragmentCompileOptions, compile_fragment_gra
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("partitions", [3, 5])
 def test_multiple_hash_outputs_reuse_scratch_without_mixing_keys(threads, partitions):
+    check_hash_outputs(threads, partitions, 12299)
+
+
+def test_single_batch_hash_partitions_preserve_input_order():
+    check_hash_outputs(1, 7, 127, ordered=True)
+
+
+def check_hash_outputs(threads, partitions, row_count, *, ordered=False):
     sql = (
         "select range k, case when range%11=0 then null else range%7 end n, "
         "42::integer c, 'key-'||(range%23)::varchar s, [range%19,null] a "
-        "from range(12299) where range%3!=0"
+        f"from range({row_count}) where range%3!=0"
     )
     keys = [(2,), (0,), (1, 0), (0, 1), (3,), (4,)]
     names = ["k", "n", "c", "s", "a"]
@@ -78,7 +86,10 @@ def test_multiple_hash_outputs_reuse_scratch_without_mixing_keys(threads, partit
                             batch.close()
                 assert time.monotonic() < deadline, service.status()
             for key, channel in channels.items():
-                assert sorted(actual[key]) == sorted(expected[key])
+                if ordered:
+                    assert actual[key] == expected[key]
+                else:
+                    assert sorted(actual[key]) == sorted(expected[key])
                 assert sequences[key] == list(range(1, len(sequences[key]) + 1))
                 assert channel.snapshot()["peak_bytes"] <= 4096
         finally:
