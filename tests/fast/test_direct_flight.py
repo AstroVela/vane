@@ -17,17 +17,20 @@ from vane._native import execution_runtime as native
 from vane.execution.compiler import compile_fragment_graph
 
 
-def make_channel(connection, sql="select 1::bigint as value", *, slots=1):
+def make_channel(connection, sql="select 1::bigint as value", *, slots=1, frame_bytes=128, frame_rows=3):
     graph = compile_fragment_graph(connection, sql, query_id="flight-schema")
     root = next(f for f in graph.fragments if f.fragment_id == graph.result.fragment_id)
-    channel = native.DirectChannel(root.outputs[0].schema, native.DirectLimits(128, 128, 3, slots), 1, ["consumer"])
+    limits = native.DirectLimits(frame_bytes, frame_bytes, frame_rows, slots)
+    channel = native.DirectChannel(root.outputs[0].schema, limits, 1, ["consumer"])
     channel.add_producer("producer")
     channel.seal_producers()
     return channel
 
 
-def service():
-    return native.DirectFlight("127.0.0.1", "127.0.0.1", 4, 4 * native.DirectFlight.staging_per_link(128), 128)
+def service(frame_bytes=128):
+    return native.DirectFlight(
+        "127.0.0.1", "127.0.0.1", 4, 4 * native.DirectFlight.staging_per_link(frame_bytes), frame_bytes
+    )
 
 
 def eventually(operation, predicate, timeout=10):
@@ -66,6 +69,47 @@ def test_native_flight_data_ack_and_finish(pair):
     eventually(lambda: target.poll("consumer"), lambda result: result[0] == "end")
     batch.close()
     assert target.snapshot()["bytes"] == 0
+
+
+def test_fixed_width_flight_keeps_nullable_columns_during_receiver_backpressure():
+    frame_rows, frame_bytes = 131, 8192
+    sql = (
+        "select i, case when i%9<>0 then ((i-140)/100)::decimal(15,2) end, "
+        "case when (i//64)%2<>0 then (i-80)::decimal(8,2) end, date '2024-01-01'+i::integer "
+        f"from range({2 * frame_rows}) t(i)"
+    )
+    with vane.connect(backend="local", config={"threads": 1}) as connection:
+        expected = connection.execute(sql).fetchall()
+        source = make_channel(connection, sql, frame_bytes=frame_bytes, frame_rows=frame_rows)
+        target = make_channel(connection, sql, frame_bytes=frame_bytes, frame_rows=frame_rows)
+    sender, receiver = service(frame_bytes), service(frame_bytes)
+    try:
+        sender.publish("fixed-width", source, "consumer")
+        receiver.subscribe(sender.location, "fixed-width", target, "producer", 10)
+        assert source._write_rows("producer", 1, expected[:frame_rows]) == "accepted"
+        _, first = eventually(lambda: target.poll("consumer"), lambda result: result[0] == "data")
+        assert first.to_rows() == expected[:frame_rows]
+        borrowed = first.slice(62, 6)
+        first.close()
+        try:
+            eventually(
+                lambda: source._write_rows("producer", 2, expected[frame_rows:]),
+                lambda status: status == "accepted",
+            )
+            eventually(lambda: target.snapshot()["write_blocks"], bool)
+            assert borrowed.to_rows() == expected[62:68]
+            assert source.snapshot()["outstanding_frames"] == 1
+        finally:
+            borrowed.close()
+        source.finish("producer", 2)
+        _, second = eventually(lambda: target.poll("consumer"), lambda result: result[0] == "data")
+        assert second.to_rows() == expected[frame_rows:]
+        second.close()
+        eventually(lambda: target.poll("consumer"), lambda result: result[0] == "end")
+        assert target.snapshot()["bytes"] == source.snapshot()["bytes"] == 0
+    finally:
+        receiver.close()
+        sender.close()
 
 
 @pytest.mark.parametrize("terminal", ["finish", "close"])

@@ -297,6 +297,7 @@ struct MaterializedIO::Impl {
 		if (!schema_size || schema_size > 65536 || read(schema_size) != SerializeSchema(channel->types)) {
 			throw IOException("materialized object schema mismatch");
 		}
+		ExchangeArrowLayout layout(channel->types);
 		idx_t frames = 0, rows = 0;
 		while (true) {
 			auto size = number();
@@ -324,7 +325,7 @@ struct MaterializedIO::Impl {
 			auto buffer = arrow::Buffer::Wrap(reinterpret_cast<const uint8_t *>(encoded.data()), encoded.size());
 			auto source = std::make_shared<arrow::io::BufferReader>(buffer);
 			auto reader = Unwrap(arrow::ipc::RecordBatchStreamReader::Open(source));
-			if (!reader->schema()->Equals(*ArrowSchemaFor(channel->types))) {
+			if (!reader->schema()->Equals(*layout.schema)) {
 				throw IOException("materialized Arrow schema mismatch");
 			}
 			std::shared_ptr<arrow::RecordBatch> batch, extra;
@@ -337,7 +338,7 @@ struct MaterializedIO::Impl {
 				throw IOException("materialized frame has trailing batches");
 			}
 			DataChunk chunk;
-			Decode(*batch, channel->types, chunk);
+			Decode(*batch, channel->types, layout, chunk);
 			FrameSelection selection(count);
 			if (channel->FitFrame(chunk, selection, 0, count).rows != count) {
 				throw IOException("materialized frame exceeds reserved native window");
