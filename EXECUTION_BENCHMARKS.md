@@ -4296,3 +4296,42 @@ Baseline source `4c5e930c7f2bb58419fa83984462f5bf78d24111`, native SHA-256
 code/input identities, complete row counters and run cleanup. This round establishes
 neither fresh SF100 FTE performance nor a full-22 timing total. Operator reservations
 do not bound process RSS.
+
+## Native Parquet join partitioning on SF100 Q9 (November 28, 2026)
+
+The native planner can assign both sides of a single integral inner equality
+join by the same Parquet key ranges. In Q9 this keeps filtered `lineitem` and
+`orders` on their producing workers. It traces the probe column through the
+earlier broadcast of filtered `part`. The original SQL, scan filters and worker
+budgets apply throughout. The two inputs take PASSTHROUGH with two or four
+partitions on these files. Three and eight select HASH. Execution timings below
+use two partitions.
+
+| Execution | Steady median | Steady range | Worker CPU median |
+| --- | ---: | ---: | ---: |
+| Local | 8.051 s | 7.974–8.128 s | — |
+| Pipeline, baseline HASH | 10.674 s | 10.570–10.747 s | 308.59 CPU-s |
+| Pipeline, native common partitioning | 8.763 s | 8.653–8.913 s | 248.45 CPU-s |
+
+The two Pipeline builds ran in baseline/candidate/candidate/baseline order,
+with Local before and after. Each batch contained three full queries. The first
+warmed the session and the other two contributed to the median. Baseline batch
+medians differed by 0.14%. Native placement reduced Pipeline elapsed time by
+17.90% and worker CPU by 19.49%. Pipeline finished 0.712 s (8.84%) behind Local.
+The 22 complete executions, including separate diagnostics, matched all 175
+ordered rows and the same Arrow IPC SHA-256.
+
+The `orders` edge kept all 150,000,000 rows on their producing workers, removing
+75,008,254 remote row transfers. The filtered `lineitem` edge kept all
+32,636,547 rows local, removing 16,318,276 remote transfers. Whole-query remote
+rows fell from 114,673,475 to 23,346,075. In two separate instrumented runs,
+the send and receive operators on those two same-worker edges consumed 16.87
+and 16.88 CPU-s. The filtered `lineitem` sender accounted for 10.20–10.26
+CPU-s, the `orders` sender for 5.27–5.33 CPU-s. These thread CPU measurements
+include frame construction and publication inside the operators.
+
+Both non-editable Release builds used the same local toolchain, the same 307
+Parquet files (37.5033 GiB), and warm host caches. Local used 36 threads and
+32 GiB. Pipeline used two workers, each with 18 threads and 16 GiB, 128 MiB of
+exchange and 256 MiB of staging, 64 KiB/2,048-row frames and a 1 MiB/16-slot
+window. Baseline source was `35809ed82e` and candidate source was `d12af15d97`.
