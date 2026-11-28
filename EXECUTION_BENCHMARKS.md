@@ -4387,3 +4387,40 @@ Each CPU figure is the median of two separately instrumented queries per build.
 The whole-sender timer includes the individual phases and the profiling work.
 The elapsed-time table used uninstrumented release builds. Native sources were
 `d12af15d97` and `6c5904abf6`.
+
+## Fixed-width Flight frames after the SF100 Q9 order join (November 28, 2026)
+
+The hash exchange after the `lineitem`–`orders` join moves 16,316,843 rows
+between two workers. The Flight sender builds Arrow arrays over leased native
+buffers when their fixed-width representation matches the exchange schema.
+The receiver validates Arrow input, then borrows aligned values through the
+copy into its native channel. Channel credits follow the lifetime of borrowed
+sender buffers through IPC and gRPC.
+
+| Execution | Steady samples | Median | Range | Worker CPU-s |
+| --- | ---: | ---: | ---: | ---: |
+| Local | 6 | 8.215 s | 8.129–8.290 s | — |
+| Pipeline before | 8 | 8.275 s | 8.096–8.466 s | 236.94 |
+| Pipeline after | 8 | 8.150 s | 7.987–8.251 s | 233.84 |
+
+Both Pipeline versions used the original Q9 SQL and the same 307 Parquet
+files, totaling 37.5033 GiB. On one host with warm page cache, Local used
+36 threads and 32 GiB. Pipeline used two worker processes with 18 threads and
+16 GiB of operator memory each. The direct exchange used 64 KiB frames with
+a 2,048-row limit and 1 MiB, 16-slot windows. It returned the same 175 ordered
+rows in every execution. Two crossover blocks ran before/after/after/before
+and after/before/before/after. Local ran on the candidate build before,
+between and after the blocks.
+Each session ran three full queries and contributed its second and third
+runs to the medians. Elapsed time includes Arrow result collection.
+
+Pipeline saved 1.52% of elapsed time and
+1.31% of worker CPU. Its median was 0.065 s
+(0.79%) below Local. The two timing ranges overlap.
+Two separate diagnostics per build
+measured median sender conversion at 1.417 and 0.196 CPU-s, and
+receiver decoding at 1.603 and 0.532 CPU-s. The edge carried
+about 691 MiB of Arrow IPC records per query. This includes record
+batch metadata and excludes network protocol headers. The Pipeline row
+counters agree across versions. Native build sources were
+`6c5904abf6` and `e16d25a2ce`.
