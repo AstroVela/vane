@@ -104,16 +104,10 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const FrameSelection &
 	if (physical == PhysicalType::STRUCT) {
 		auto &children = StructVector::GetEntries(column);
 		layout.children.resize(children.size());
-		vector<idx_t> selected;
-		selected.reserve(count);
-		idx_t child_count = 0;
-		for (idx_t row = 0; row < count; row++) {
-			auto index = index_at(row);
-			selected.push_back(index);
-			child_count = MaxValue(child_count, index + 1);
-		}
+		// Slicing a STRUCT also slices each child. Its dictionary indexes
+		// address the parent validity mask, while children take logical rows.
 		for (idx_t i = 0; i < children.size(); i++) {
-			if (!VisitFrameVector(*children[i], child_count, selected, layout.children[i], size, limit, buffer)) {
+			if (!VisitFrameVector(*children[i], source_count, rows, layout.children[i], size, limit, buffer)) {
 				return false;
 			}
 		}

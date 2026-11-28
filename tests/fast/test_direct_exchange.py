@@ -648,6 +648,42 @@ def test_fixed_frame_copy_does_not_mutate_retained_frames(threads, frame_rows):
             assert service.result.snapshot()["peak_bytes"] <= limits.window_bytes
 
 
+@pytest.mark.parametrize("hash_columns", [(), (0,)])
+def test_sparse_nested_frames_own_values_across_appends_and_retries(tmp_path, connection, hash_columns):
+    path = tmp_path / "nested.parquet"
+    connection.execute(
+        f"""copy (select i, case when i%7<>0 then {{
+                'a': [i, null]::bigint[2],
+                's': [case when i%5<>0 then repeat('λ', 23)||i::varchar end, null]
+            }} end as payload from range(32768) t(i)) to '{path}' (row_group_size 2048)"""
+    )
+    sql = f"select i, payload from read_parquet('{path}') where i%257 in (0,1)"
+    expected = sorted(connection.execute(sql).fetchall())
+    spec = submission(connection, sql, partitions=3 if hash_columns else 1, hash_columns=hash_columns)
+    limits = DirectExchangeLimits(16384, 8192, 65, 2)
+    with InProcessTaskService(connection, spec, limits) as service:
+        service.start()
+        status, batch = next_batch(service)
+        assert status == "data"
+        rows = batch.to_rows()
+        held = batch.slice(0, 1)
+        first = rows[:1]
+        batch.close()
+        try:
+            # One slot stays borrowed while the other publishes more nested frames.
+            for _ in range(2):
+                status, batch = next_batch(service)
+                assert status == "data"
+                rows.extend(batch.to_rows())
+                batch.close()
+            assert held.to_rows() == first
+        finally:
+            held.close()
+        rows.extend(collect(service))
+        assert sorted(rows) == expected
+        assert service.result.snapshot()["peak_bytes"] <= limits.window_bytes
+
+
 def test_consumer_starts_before_producers_and_wakes_on_first_frame(connection):
     spec = submission(connection)
     with InProcessTaskService(connection, spec, TINY) as service:
