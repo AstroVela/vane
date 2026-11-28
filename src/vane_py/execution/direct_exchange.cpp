@@ -13,7 +13,7 @@
 namespace duckdb {
 namespace vane_execution {
 struct DirectFrame {
-	DirectFrame(shared_ptr<DirectLedger> ledger_p, DataChunk &input, const vector<idx_t> &rows, idx_t offset,
+	DirectFrame(shared_ptr<DirectLedger> ledger_p, DataChunk &input, const FrameSelection &rows, idx_t offset,
 	            idx_t count_p, idx_t size)
 	    : ledger(std::move(ledger_p)), types(input.GetTypes()), count(count_p), bytes(size) {
 		buffer = Allocator::DefaultAllocator().Allocate(bytes);
@@ -211,27 +211,39 @@ DirectRead DirectChannel::Poll(const string &id, shared_ptr<DirectBatch> &batch,
 	return DirectRead::BLOCKED;
 }
 
-idx_t DirectChannel::FrameSize(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count) const {
-	return Measure(input, rows, offset, count, limits.frame_bytes);
+bool DirectChannel::MatchesSchema(const DataChunk &input) const {
+	if (types.size() != input.ColumnCount()) {
+		return false;
+	}
+	for (idx_t i = 0; i < types.size(); i++) {
+		if (types[i] != input.data[i].GetType()) {
+			return false;
+		}
+	}
+	return true;
 }
 
-idx_t DirectChannel::FrameRows(DataChunk &input, const vector<idx_t> &rows, idx_t offset) const {
-	if (input.GetTypes() != types || offset >= rows.size()) {
+DirectFrameExtent DirectChannel::FitFrame(DataChunk &input, const FrameSelection &rows, idx_t offset,
+                                          idx_t max_rows) const {
+	if (!MatchesSchema(input) || offset >= rows.size() || !max_rows) {
 		throw InvalidInputException("direct frame schema or row selection mismatch");
 	}
-	auto count = MinValue<idx_t>(limits.frame_rows, rows.size() - offset);
-	while (Measure(input, rows, offset, count, limits.frame_bytes) > limits.frame_bytes) {
+	auto count = MinValue(MinValue(limits.frame_rows, max_rows), rows.size() - offset);
+	while (true) {
+		auto bytes = Measure(input, rows, offset, count, limits.frame_bytes);
+		if (bytes <= limits.frame_bytes) {
+			return {count, bytes};
+		}
 		if (count == 1) {
 			throw InvalidInputException("one row exceeds direct frame_bytes");
 		}
 		count = (count + 1) / 2;
 	}
-	return count;
 }
 
-DirectWrite DirectChannel::TryWrite(const string &id, idx_t sequence, DataChunk &input, const vector<idx_t> &rows,
+DirectWrite DirectChannel::TryWrite(const string &id, idx_t sequence, DataChunk &input, const FrameSelection &rows,
                                     idx_t offset, idx_t count, ExchangeWakeup wakeup) {
-	if (input.GetTypes() != types || count > limits.frame_rows) {
+	if (!MatchesSchema(input) || count > limits.frame_rows) {
 		throw InvalidInputException("direct frame schema or row count mismatch");
 	}
 	auto size = Measure(input, rows, offset, count, limits.frame_bytes);

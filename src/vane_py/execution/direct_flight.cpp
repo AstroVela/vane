@@ -355,11 +355,8 @@ struct Link {
 				}
 				DataChunk chunk;
 				Decode(*message.data, channel->types, chunk);
-				vector<idx_t> rows;
-				for (idx_t row = 0; row < chunk.size(); row++) {
-					rows.push_back(row);
-				}
-				if (channel->FrameRows(chunk, rows, 0) != rows.size()) {
+				FrameSelection rows(chunk.size());
+				if (channel->FitFrame(chunk, rows, 0, rows.size()).rows != rows.size()) {
 					throw IOException("direct Flight frame exceeds reserved native frame");
 				}
 				while (!done) {

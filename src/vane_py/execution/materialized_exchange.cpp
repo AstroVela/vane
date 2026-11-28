@@ -338,11 +338,8 @@ struct MaterializedIO::Impl {
 			}
 			DataChunk chunk;
 			Decode(*batch, channel->types, chunk);
-			vector<idx_t> selection;
-			for (idx_t row = 0; row < count; row++) {
-				selection.push_back(row);
-			}
-			if (channel->FrameRows(chunk, selection, 0) != count) {
+			FrameSelection selection(count);
+			if (channel->FitFrame(chunk, selection, 0, count).rows != count) {
 				throw IOException("materialized frame exceeds reserved native window");
 			}
 			while (true) {

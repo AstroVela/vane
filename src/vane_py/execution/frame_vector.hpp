@@ -35,21 +35,6 @@ struct FrameColumn {
 	vector<FrameColumn> children;
 };
 
-struct FrameSelection {
-	FrameSelection(const idx_t *data, idx_t count) : data(data), count(count) {
-	}
-	FrameSelection(const vector<idx_t> &rows) : FrameSelection(rows.data(), rows.size()) {
-	}
-	idx_t size() const {
-		return count;
-	}
-	idx_t operator[](idx_t row) const {
-		return data[row];
-	}
-	const idx_t *data;
-	idx_t count;
-};
-
 // Measurement and copying traverse precisely the same selected values. Lists
 // are compacted: unused elements and borrowed operator buffers never enter a
 // frame. The limit bounds even the temporary selection used for nested values.
@@ -178,20 +163,26 @@ bool VisitFrameVector(Vector &column, idx_t source_count, const FrameSelection &
 	return true;
 }
 
-idx_t Measure(DataChunk &input, const vector<idx_t> &rows, idx_t offset, idx_t count, idx_t limit,
+idx_t Measure(DataChunk &input, const FrameSelection &rows, idx_t offset, idx_t count, idx_t limit,
               vector<FrameColumn> *columns = nullptr, data_ptr_t buffer = nullptr) {
 	if (!count || offset > rows.size() || count > rows.size() - offset) {
 		throw InvalidInputException("invalid direct frame row selection");
 	}
 	// Borrow the caller's immutable selection only for this synchronous visit.
 	// Nested compaction still owns its independently derived child selections.
-	FrameSelection selected(rows.data() + offset, count);
+	auto selected = rows.Slice(offset, count);
 	bool contiguous = true;
-	for (idx_t i = offset; i < offset + count; i++) {
-		if (rows[i] >= input.size()) {
+	if (selected.IsRange()) {
+		if (selected[count - 1] >= input.size()) {
 			throw InvalidInputException("direct frame row selection is out of bounds");
 		}
-		contiguous = contiguous && rows[i] == rows[offset] + i - offset;
+	} else {
+		for (idx_t i = 0; i < count; i++) {
+			if (selected[i] >= input.size()) {
+				throw InvalidInputException("direct frame row selection is out of bounds");
+			}
+			contiguous = contiguous && selected[i] == selected[0] + i;
+		}
 	}
 	idx_t size = 0;
 	for (auto &column : input.data) {
