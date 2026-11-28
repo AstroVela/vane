@@ -812,6 +812,7 @@ public:
 	AnalyticalPlanner(ClientContext &context, PhysicalPlan &plan, FragmentGraph &graph, idx_t partitions,
 	                  idx_t worker_operator_bytes)
 	    : context(context), plan(plan), graph(graph), partitions(partitions),
+	      worker_operator_bytes(worker_operator_bytes),
 	      broadcast_limit(
 	          MaxValue<idx_t>(8 * 1024 * 1024, MinValue<idx_t>(64 * 1024 * 1024, worker_operator_bytes / 16))) {
 		// Cost 128 bytes per word for grouping, probe tables and encoded masks.
@@ -999,6 +1000,7 @@ private:
 	PhysicalPlan &plan;
 	FragmentGraph &graph;
 	idx_t partitions;
+	idx_t worker_operator_bytes;
 	idx_t broadcast_limit;
 	idx_t max_bitmap_words = 65536;
 	idx_t next_exchange = 0;
@@ -1194,6 +1196,46 @@ private:
 			filter.column = column;
 			op = &child;
 		}
+	}
+
+	bool BroadcastFilteredBuild(const PhysicalHashJoin &join, const EarlyProbeFilter &filter,
+	                            const DistributedSubtree &left, const DistributedSubtree &right) {
+		// Preserve an established probe placement. Extra replicas are useful
+		// only when the probe would otherwise need to repartition.
+		if (!filter.input || filter.input->type != PhysicalOperatorType::TABLE_SCAN ||
+		    !IsParquetScan(filter.input->Cast<PhysicalTableScan>().function.name) ||
+		    left.fragment.partition_count != partitions || right.fragment.partition_count != partitions ||
+		    !left.hash_keys.empty() ||
+		    std::none_of(left.incoming.begin(), left.incoming.end(),
+		                 [](const ExchangeSpec &edge) { return edge.distribution == "passthrough"; })) {
+			return false;
+		}
+		const auto build_bytes = EstimatedExchangeBytes(join.children[1]);
+		const auto probe_bytes = EstimatedExchangeBytes(join.children[0]);
+		// The fraction below is a selectivity estimate. Require headroom for
+		// the full build estimate as well, since key frequencies can be skewed.
+		if (build_bytes > double(worker_operator_bytes / 2) || probe_bytes == NumericLimits<double>::Maximum()) {
+			return false;
+		}
+		auto donor = filter.build;
+		while (donor->type == PhysicalOperatorType::PROJECTION || donor->type == PhysicalOperatorType::FILTER) {
+			donor = &donor->children[0].get();
+		}
+		if (donor->type != PhysicalOperatorType::TABLE_SCAN) {
+			return false;
+		}
+		auto &scan = donor->Cast<PhysicalTableScan>();
+		if (!IsParquetScan(scan.function.name) || scan.extra_info.sample_options) {
+			return false;
+		}
+		const auto input_rows = ParquetScanCardinality(context, ParquetBind(scan.bind_data.get()));
+		const auto selected_rows = filter.build->estimated_cardinality;
+		if (selected_rows >= input_rows) {
+			return false;
+		}
+		const auto estimated_bytes = build_bytes * (double(selected_rows) / double(input_rows));
+		const auto replica_budget = MinValue<idx_t>(idx_t(2) << 30, worker_operator_bytes / 8);
+		return estimated_bytes <= double(replica_budget) && estimated_bytes * (partitions - 1) * 4 < probe_bytes;
 	}
 
 	EarlyProbeFilter PlanProbeFilter(PhysicalHashJoin &join) {
@@ -2307,11 +2349,19 @@ private:
 		if (left_keys.empty() || !join.delim_types.empty()) {
 			throw NotImplementedException("distributed hash join requires uncorrelated equality keys");
 		}
-		const bool broadcast = BroadcastJoin(join, left.fragment.partition_count, join_broadcast_limit);
+		const bool broadcast_filtered =
+		    build_producer.empty() && BroadcastFilteredBuild(join, build_filter, left, right);
+		const bool broadcast =
+		    broadcast_filtered || BroadcastJoin(join, left.fragment.partition_count, join_broadcast_limit);
 		if (broadcast) {
-			// Every probe partition sees the complete build input. Preserve its
-			// existing distribution and fuse the probe subtree with the join;
-			// shuffling it by the join key adds no correctness guarantee here.
+			if (broadcast_filtered) {
+				// The two input fragments independently drain their shared
+				// donor. Keep the probe boundary so its donor input can drain
+				// before the final join's replicated build completes.
+				left = Exchange(std::move(left), "passthrough", partitions);
+			}
+			// Every probe partition sees the complete build input and retains
+			// its existing distribution.
 			auto count = left.fragment.partition_count;
 			right = build_producer.empty() ? Exchange(std::move(right), count == 1 ? "gather" : "broadcast", count)
 			                               : ExchangeFrom(build_producer, join.children[1].get().types,

@@ -224,8 +224,7 @@ def test_parquet_footer_statistics_follow_hive_file_pruning(tmp_path, partitions
         )
 
 
-def budgeted_submission(connection, sql, partitions):
-    operator_bytes = 2 << 30
+def budgeted_submission(connection, sql, partitions, *, operator_bytes=2 << 30):
     return prepare_ray_query(
         connection,
         sql,
@@ -234,6 +233,60 @@ def budgeted_submission(connection, sql, partitions):
         resources=ResourceDemand(1, 64, MemoryDemand(operator_bytes, 1 << 20, 1 << 20, 1 << 20), 1),
         compile_options=FragmentCompileOptions(partitions, worker_operator_bytes=operator_bytes),
     )
+
+
+@pytest.mark.parametrize("budget,expected_replication", [(4 << 30, False), (16 << 30, True)])
+@pytest.mark.parametrize("comparison", ["=", "is not distinct from"])
+def test_prefiltered_build_can_replicate_without_shuffling_colocated_probe(
+    tmp_path, budget, expected_replication, comparison
+):
+    fact, orders, donor, build = [tmp_path / f"{name}.parquet" for name in ("fact", "orders", "donor", "build")]
+    config = {
+        "threads": 4,
+        "disabled_optimizers": (
+            "build_side_probe_side,compressed_materialization,join_filter_pushdown,statistics_propagation"
+        ),
+    }
+    with vane.connect(backend="local", config=config) as connection:
+        for path, select in (
+            (fact, "range id, case when range%113<>0 then range%512 end k, range%4 g, range%13 v"),
+            (orders, "range id, range%17 w"),
+            (build, "case when range%113<>0 then range%512 end k, range%4 g, range%19 v"),
+        ):
+            connection.execute(f"copy (select {select} from range(32768)) to '{path}' (row_group_size 2048)")
+        connection.execute(
+            f"copy (select case when range%113<>0 then range%151 end k, "
+            f"case when range%3=0 then 'keep-me' else 'skip-me' end tag "
+            f"from range(512)) to '{donor}'"
+        )
+        sql = (
+            "select count(*),sum(p.amount+b.v) from (select d.k,f.g,f.v+o.w amount "
+            f"from read_parquet('{fact}', explicit_cardinality=1600000000) f "
+            f"join read_parquet('{donor}') d on f.k {comparison} d.k and (d.tag||coalesce(d.k::varchar,'')) like '%keep%' "
+            f"join read_parquet('{orders}', explicit_cardinality=1600000000) o on f.id=o.id) p "
+            f"join read_parquet('{build}', explicit_cardinality=80000000) b on p.k {comparison} b.k and p.g=b.g"
+        )
+        expected = connection.execute(sql).fetchall()
+        assert expected[0][0] > 0
+        spec = budgeted_submission(connection, sql, 2, operator_bytes=budget)
+        graph = spec.graph
+        colocated = {f.fragment_id for f in graph.fragments if any(s.split_partitions for s in f.sources)}
+        assert len(colocated) == 2, [(edge.exchange_id, edge.distribution) for edge in graph.exchanges]
+        joint_inputs = [edge for edge in graph.exchanges if edge.producer_fragment_id in colocated]
+        assert len(joint_inputs) == 2 and all(edge.distribution is Distribution.PASSTHROUGH for edge in joint_inputs)
+        producer = joint_inputs[0].consumer_fragment_id
+        left_edge = next(edge for edge in graph.exchanges if edge.producer_fragment_id == producer)
+        right_edge = next(
+            edge
+            for edge in graph.exchanges
+            if edge.consumer_fragment_id == left_edge.consumer_fragment_id and edge != left_edge
+        )
+        assert left_edge.distribution is (Distribution.PASSTHROUGH if expected_replication else Distribution.HASH)
+        assert right_edge.distribution is (Distribution.BROADCAST if expected_replication else Distribution.HASH)
+        with InProcessTaskService(connection, spec, DirectExchangeLimits(8192, 8192, 128, 1)) as service:
+            service.start()
+            assert collect(service) == expected
+            assert all(channel.snapshot()["bytes"] == 0 for channel in service.channels.values())
 
 
 @pytest.mark.parametrize("partitions", [2, 3])
