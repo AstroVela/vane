@@ -134,10 +134,12 @@ py::dict CompileSubmission(DuckDBPyConnection &connection, const string &sql, co
 	{
 		py::gil_scoped_release release;
 		snapshot = CaptureConnection(context);
+		unordered_map<string, string> versions;
+		auto bound_versions = !require_replay && partitions > 1 && snapshot_directory.empty() ? &versions : nullptr;
 		graph = Compile(context, sql, query_id, partitions, hash_columns, snapshot_directory, source_budget,
-		                &source_bytes, source_cache, worker_operator_bytes);
+		                &source_bytes, source_cache, worker_operator_bytes, bound_versions);
 		for (auto &fragment : graph.fragments) {
-			sources.push_back(CaptureSources(context, fragment, require_replay));
+			sources.push_back(CaptureSources(context, fragment, require_replay, bound_versions));
 		}
 		if (CaptureConnection(context) != snapshot) {
 			throw InvalidInputException("connection settings changed during submission compilation");

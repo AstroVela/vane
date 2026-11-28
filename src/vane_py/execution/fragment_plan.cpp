@@ -2498,7 +2498,8 @@ void MarkFrozenSources(vector<SourceSpec> &sources, const unordered_map<string, 
 
 FragmentGraph Compile(ClientContext &context, const string &sql, const string &query_id, idx_t partitions,
                       const vector<idx_t> &hash_columns, const string &snapshot_directory, idx_t source_budget,
-                      idx_t *source_bytes, SourceSnapshotCache *source_cache, idx_t worker_operator_bytes) {
+                      idx_t *source_bytes, SourceSnapshotCache *source_cache, idx_t worker_operator_bytes,
+                      optional_ptr<unordered_map<string, string>> bound_versions) {
 	CheckPartitions(partitions);
 	if (worker_operator_bytes > idx_t(NumericLimits<int64_t>::Maximum())) {
 		throw InvalidInputException("worker operator planning budget exceeds the supported range");
@@ -2545,6 +2546,18 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		LogicalValidator validator(partitions);
 		validator.frozen_files = !snapshot_directory.empty();
 		validator.VisitOperator(*planner.plan);
+		if (bound_versions) {
+			// The submitted snapshot must describe the same files whose footers
+			// determine scan splits and whether a join can omit repartitioning.
+			for (auto &source : validator.source_dependencies) {
+				for (auto &split : source.splits) {
+					auto file = DecodeFile(split.payload);
+					if (!bound_versions->count(file.path)) {
+						bound_versions->emplace(file.path, FileIdentity(context, file));
+					}
+				}
+			}
+		}
 		CheckTypes(planner.types);
 		if (ClientConfig::GetConfig(context).enable_optimizer && planner.plan->RequireOptimizer()) {
 			Optimizer optimizer(*planner.binder, context);
@@ -2936,7 +2949,8 @@ void ApplyConnection(ClientContext &context, const string &snapshot) {
 	}
 }
 
-string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool require_replay) {
+string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool require_replay,
+                      optional_ptr<const unordered_map<string, string>> bound_versions) {
 	vector<string> identities;
 	vector<string> dependencies;
 	vector<string> versions;
@@ -2974,7 +2988,15 @@ string CaptureSources(ClientContext &context, const FragmentSpec &fragment, bool
 			for (auto &split : source.splits) {
 				auto file = DecodeFile(split.payload);
 				if (stamped_files.insert(file.path).second) {
-					versions.push_back(FileStamp(file, FileIdentity(context, file)));
+					auto identity = FileIdentity(context, file);
+					if (bound_versions) {
+						auto bound = bound_versions->find(file.path);
+						if (bound == bound_versions->end() || bound->second != identity) {
+							throw InvalidInputException("submission source snapshot changed during planning: %s",
+							                            file.path);
+						}
+					}
+					versions.push_back(FileStamp(file, identity));
 				}
 			}
 		}

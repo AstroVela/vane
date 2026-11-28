@@ -8,8 +8,10 @@ import pyarrow.parquet as pq
 import pytest
 
 import vane
+from tests.fast.test_direct_exchange import submission
 from tests.fast.test_native_fragment_compiler import compile_sql, execute_graph
 from vane.execution.plan import Distribution, FragmentGraph
+from vane.execution.submission import prepare_worker_plan
 
 
 def parquet_join_query(directory, layout="balanced"):
@@ -46,7 +48,7 @@ def parquet_join_query(directory, layout="balanced"):
     joined = f"{a} l join {b} r on {key} = r.k"
     if layout == "downstream":
         joined += f" join {b} t on l.k = t.k"
-    return f"select count(*) n, sum(l.v * r.v) total from {joined}"
+    return f"select count(*) n, cast(sum(l.v * r.v) as bigint) total from {joined}"
 
 
 @pytest.mark.parametrize(
@@ -92,3 +94,24 @@ def test_joint_ranges_preserve_all_matches(tmp_path, layout, partitions, placed)
                 e.distribution is Distribution.BROADCAST and e.consumer_fragment_id in owners for e in graph.exchanges
             )
         assert execute_graph(connection, graph) == expected
+
+
+def test_replaced_join_input_invalidates_owners_and_replans(tmp_path):
+    sql = parquet_join_query(tmp_path)
+    with vane.connect(backend="local") as coordinator, vane.connect(backend="local") as worker:
+        coordinator.execute("set parquet_metadata_cache=true")
+        old = submission(coordinator, sql)
+        assert sum(e.distribution is Distribution.PASSTHROUGH for e in old.graph.exchanges) == 2
+        prepare_worker_plan(worker, old)
+        path = tmp_path / "b-0-2.parquet"
+        table = pq.read_table(path)
+        # This split now connects all four formerly independent intervals.
+        keys = [0, 36, 2, 4, 2] * (table.num_rows // 5)
+        replacement = tmp_path / "replacement.parquet"
+        pq.write_table(table.set_column(1, "k", pa.array(keys, type=pa.int64())), replacement, row_group_size=5)
+        replacement.replace(path)
+        with pytest.raises(vane.InvalidInputException, match="source snapshot changed"):
+            prepare_worker_plan(worker, old)
+        current = submission(coordinator, sql)
+        assert sum(e.distribution is Distribution.HASH for e in current.graph.exchanges) == 2
+        assert execute_graph(worker, current.graph) == coordinator.execute(sql).fetchall()
