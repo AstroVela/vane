@@ -4424,3 +4424,47 @@ about 691 MiB of Arrow IPC records per query. This includes record
 batch metadata and excludes network protocol headers. The Pipeline row
 counters agree across versions. Native build sources were
 `6c5904abf6` and `e16d25a2ce`.
+
+## Preserve probe placement for the final SF100 Q9 join (November 28, 2026)
+
+The planner estimates the size of a prefiltered Parquet build from the
+donor's selectivity and the build's projected width. It checks the
+unfiltered estimate against half the query's worker operator budget and
+the filtered estimate against one eighth, capped at 2 GiB. It also
+requires a fourfold margin on extra replica traffic. With an existing
+probe placement, matching partition counts and a shared donor, the
+probe crosses a partition-preserving edge and the build broadcasts.
+Separate producer fragments can drain the donor independently.
+
+| Final join input | Cross-worker rows before | Cross-worker rows after | IPC MiB before | IPC MiB after |
+| --- | ---: | ---: | ---: | ---: |
+| `lineitem`–`orders` result | 16,316,843 | 0 | 690.53 | 0.00 |
+| Filtered build | 2,175,600 | 4,351,928 | 73.43 | 146.86 |
+| Final join total | 18,492,443 | 4,351,928 | 763.96 | 146.86 |
+| All worker exchanges | 23,346,075 | 9,205,560 | 840.15 | 223.06 |
+
+Two separate instrumented queries per build measured IPC record bodies
+and metadata. The final join used 80.78% fewer IPC
+bytes. The full graph used 73.45% fewer IPC bytes.
+
+| Execution | Steady samples | Median | Range | Worker CPU-s |
+| --- | ---: | ---: | ---: | ---: |
+| Local | 12 | 8.317 s | 8.167–8.429 s | — |
+| Pipeline before | 12 | 8.180 s | 8.032–8.312 s | 234.31 |
+| Pipeline after | 12 | 7.933 s | 7.840–8.156 s | 225.36 |
+
+The original Q9 SQL used the same 307 SF100 Parquet files (37.5033 GiB)
+on one host with warm page cache. Local ran on the candidate build with
+36 threads and 32 GiB. Pipeline used two workers, each with 18 threads
+and 16 GiB of operator memory, and the same exchange limits above. Six
+blocks used every execution order once. Each batch ran three queries
+and contributed the second and third to the median. Timing covers
+submission through Arrow collection.
+
+Updated Pipeline was 0.384 s (4.62%)
+below Local at the median. Its batch median was lower in 6 of six
+Local comparisons and 6 of six comparisons against the previous Pipeline.
+Worker CPU fell by 3.82%. All 54
+timed queries and four instrumented queries returned the same 175 ordered rows and
+Arrow IPC hash. Baseline `e81be0aa93` and candidate
+`d16fd79ed9`.
